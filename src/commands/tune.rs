@@ -8,6 +8,9 @@ use crate::args::{ModelOptions, TuneProfileArg};
 use crate::load::{select_model, QuantSelection};
 
 pub async fn run_tune(model: ModelOptions, profile: TuneProfileArg, json: bool) -> Result<()> {
+    if model.cpu_moe {
+        anyhow::bail!("`tune` estimates GPU-resident experts; `--cpu-moe` is not modeled");
+    }
     let local = select_model(
         &model.source,
         &model.device,

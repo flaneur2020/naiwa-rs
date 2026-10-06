@@ -6,6 +6,7 @@ mod args;
 mod commands;
 mod guard;
 mod load;
+mod offload;
 
 use anyhow::Result;
 use clap::Parser;

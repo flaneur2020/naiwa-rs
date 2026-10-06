@@ -11,6 +11,7 @@ use crate::args::{
     ModelOptions, ModelSource,
 };
 use crate::guard;
+use crate::offload::{install_cpu_moe, ALL_LAYERS_ON_DEVICE};
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
 
@@ -218,12 +219,16 @@ pub fn base_builder(
             write_uqff: None,
         },
     )?;
+    let device_layers = device_layers(model);
+    if model.cpu_moe {
+        install_cpu_moe()?;
+    }
     let paged = &model.paged_attn;
     let mut builder = MistralRsForServerBuilder::new()
         .with_model(local.selected)
         .with_interactive_mode(false)
         .with_cpu(model.device.cpu)
-        .with_num_device_layers_optional(model.device.device_layers.clone())
+        .with_num_device_layers_optional(device_layers)
         .with_in_situ_quant_optional(model.quantization.in_situ_quant.clone())
         .with_max_model_len_optional(model.source.max_model_len)
         .with_hf_config_overrides_optional(model.source.hf_overrides.clone())
@@ -248,6 +253,14 @@ pub fn base_builder(
         builder = builder.with_encoder_cache_memory_bytes(bytes);
     }
     Ok((builder, local.display_id))
+}
+
+/// `--device-layers` as given; with `--cpu-moe` and no explicit map, every layer on the device.
+fn device_layers(model: &ModelOptions) -> Option<Vec<String>> {
+    match &model.device.device_layers {
+        None if model.cpu_moe => Some(vec![ALL_LAYERS_ON_DEVICE.to_string()]),
+        layers => layers.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +335,19 @@ mod tests {
         write_gguf(&file, "llama");
         let model = model_options(&["-f", file.to_str().unwrap()]);
         assert!(select(&model).is_err());
+    }
+
+    #[test]
+    fn cpu_moe_keeps_every_layer_on_the_device() {
+        assert_eq!(device_layers(&model_options(&["-m", "x"])), None);
+        assert_eq!(
+            device_layers(&model_options(&["-m", "x", "--cpu-moe"])),
+            Some(vec![usize::MAX.to_string()])
+        );
+        assert_eq!(
+            device_layers(&model_options(&["-m", "x", "--cpu-moe", "-n", "0:10;1:20"])),
+            Some(vec!["0:10".to_string(), "1:20".to_string()])
+        );
     }
 
     #[test]

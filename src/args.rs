@@ -224,6 +224,12 @@ pub struct ModelOptions {
 
     #[command(flatten)]
     pub paged_attn: PagedAttentionOptions,
+
+    /// Keep routed MoE experts in host memory and compute them on the CPU; attention, routers,
+    /// shared experts, the MTP head, and the KV cache stay on the GPU. Places every layer on the
+    /// GPU unless `--device-layers` is given.
+    #[arg(long)]
+    pub cpu_moe: bool,
 }
 
 #[derive(Args, Clone, Default)]
