@@ -83,8 +83,11 @@ fn init_tracing(verbose: u8) {
             LogVerbosity::Debug => "debug",
             LogVerbosity::Trace => "trace",
         };
-        default_mistralrs_filter(verbosity)
-            .add_directive(format!("qwen_fn_rs={level}").parse().expect("valid directive"))
+        default_mistralrs_filter(verbosity).add_directive(
+            format!("qwen_fn_rs={level}")
+                .parse()
+                .expect("valid directive"),
+        )
     });
     initialize_logging_with_filter(filter);
 }

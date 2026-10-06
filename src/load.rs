@@ -3,9 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use mistralrs_core::{
-    IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
-};
+use mistralrs_core::{IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig};
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 
 use crate::args::{
@@ -86,11 +84,16 @@ pub fn select_model(
     };
 
     if quant.from_uqff.is_some() {
-        bail!("`--from-uqff` loads safetensors-derived UQFF files; it cannot be combined with `-f`");
+        bail!(
+            "`--from-uqff` loads safetensors-derived UQFF files; it cannot be combined with `-f`"
+        );
     }
     let raw_files = expand_home_in_list(raw_files);
     let files = split_path_list(&raw_files)?;
-    if let Some(file) = files.iter().find(|file| !file.to_ascii_lowercase().ends_with(".gguf")) {
+    if let Some(file) = files
+        .iter()
+        .find(|file| !file.to_ascii_lowercase().ends_with(".gguf"))
+    {
         bail!("`-f` only accepts GGUF files; `{file}` is not a `.gguf` file");
     }
     let (root, filenames) = gguf_root(source.model_id.as_deref(), &files)?;
@@ -225,7 +228,12 @@ pub fn base_builder(
         .with_max_model_len_optional(model.source.max_model_len)
         .with_hf_config_overrides_optional(model.source.hf_overrides.clone())
         .with_seed_optional(global.seed)
-        .with_log_optional(global.log.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .with_log_optional(
+            global
+                .log
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
         .set_paged_attn(paged.enabled())
         .with_paged_attn_gpu_mem_optional(paged.memory_mb)
         .with_paged_attn_gpu_mem_usage_optional(paged.memory_fraction)

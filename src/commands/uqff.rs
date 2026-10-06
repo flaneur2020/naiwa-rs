@@ -12,9 +12,9 @@ use mistralrs_core::{
     TokenSource,
 };
 use mistralrs_quant::{
-    build_uqff_report_from_artifacts, verify_uqff_artifacts, write_uqff_report,
-    UqffArtifactFile, UqffArtifactGroup, UqffArtifacts, UqffGeneratedBy, UqffReport,
-    UqffReportOptions, UqffVerifyOptions, UQFF_REPORT_JSON,
+    build_uqff_report_from_artifacts, verify_uqff_artifacts, write_uqff_report, UqffArtifactFile,
+    UqffArtifactGroup, UqffArtifacts, UqffGeneratedBy, UqffReport, UqffReportOptions,
+    UqffVerifyOptions, UQFF_REPORT_JSON,
 };
 
 use crate::args::{ensure_local_dir, UqffCommand};
@@ -30,7 +30,17 @@ pub async fn run_uqff(command: UqffCommand, verbose: bool) -> Result<()> {
             write,
             json,
             base_model,
-        } => run_report(&model_id, quant.as_deref(), write, json, verbose, base_model).await,
+        } => {
+            run_report(
+                &model_id,
+                quant.as_deref(),
+                write,
+                json,
+                verbose,
+                base_model,
+            )
+            .await
+        }
         UqffCommand::Verify {
             model_id,
             quant,
@@ -130,7 +140,10 @@ struct UqffFileGroup {
     report_output: Option<usize>,
 }
 
-async fn resolve_uqff_artifacts(model_dir: &Path, quant: Option<&str>) -> Result<ResolvedUqffArtifacts> {
+async fn resolve_uqff_artifacts(
+    model_dir: &Path,
+    quant: Option<&str>,
+) -> Result<ResolvedUqffArtifacts> {
     ensure_local_dir(model_dir, "UQFF directory")?;
     let model_id = model_dir.to_string_lossy().into_owned();
     let model_id = model_id.as_str();

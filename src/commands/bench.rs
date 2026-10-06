@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
-use mistralrs_core::{Constraint, NormalRequest, Request, RequestMessage, Response, SamplingParams};
+use mistralrs_core::{
+    Constraint, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -132,26 +134,14 @@ pub async fn run_bench(
             }
             for i in 0..warmup {
                 let token_start = bench_token_start(i, prompt_idx, 0);
-                run_single_bench(
-                    &mistralrs,
-                    prompt_len,
-                    1,
-                    token_start,
-                )
-                .await?;
+                run_single_bench(&mistralrs, prompt_len, 1, token_start).await?;
             }
         }
         if gen_len > 1 {
             for (depth_idx, depth) in depths.iter().copied().enumerate() {
                 for i in 0..warmup {
                     let token_start = bench_token_start(i, depth_idx, prompt_lens.len());
-                    run_single_bench(
-                        &mistralrs,
-                        depth,
-                        gen_len,
-                        token_start,
-                        )
-                    .await?;
+                    run_single_bench(&mistralrs, depth, gen_len, token_start).await?;
                 }
             }
         }
@@ -191,13 +181,7 @@ pub async fn run_bench(
                 continue;
             }
             let token_start = bench_token_start(i + warmup, prompt_idx, 0);
-            let measurement = run_single_bench(
-                &mistralrs,
-                *prompt_len,
-                1,
-                token_start,
-            )
-            .await?;
+            let measurement = run_single_bench(&mistralrs, *prompt_len, 1, token_start).await?;
             let ttft_seconds = measurement.time_to_first_token.as_secs_f32();
             let tok_per_sec = if ttft_seconds > 0.0 {
                 *prompt_len as f32 / ttft_seconds
@@ -213,13 +197,8 @@ pub async fn run_bench(
         if gen_len > 1 {
             for (depth_idx, (depth, results)) in decode_results.iter_mut().enumerate() {
                 let token_start = bench_token_start(i + warmup, depth_idx, prompt_lens.len());
-                let measurement = run_single_bench(
-                    &mistralrs,
-                    *depth,
-                    gen_len,
-                    token_start,
-                )
-                .await?;
+                let measurement =
+                    run_single_bench(&mistralrs, *depth, gen_len, token_start).await?;
                 let decode_seconds = measurement.decode_duration.as_secs_f32();
                 let tok_per_sec = if decode_seconds > 0.0 {
                     measurement.decode_intervals as f32 / decode_seconds
@@ -405,11 +384,7 @@ async fn recv_measurement(
 
 /// Print benchmark results in a nice table
 #[allow(clippy::cast_precision_loss)]
-fn print_results(
-    model_id: &str,
-    iterations: usize,
-    results: &[BenchResult],
-) {
+fn print_results(model_id: &str, iterations: usize, results: &[BenchResult]) {
     println!();
     println!("Benchmark Results");
     println!("=================");

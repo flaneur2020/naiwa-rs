@@ -48,8 +48,8 @@ pub fn ensure_flash_next_config(
 
 /// Fail unless the GGUF file at `path` has `general.architecture = qwen4exp`.
 pub fn ensure_flash_next_gguf(path: &Path) -> Result<()> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("failed to open `{}`", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open `{}`", path.display()))?;
     let content = gguf_file::Content::read(&mut file)
         .with_context(|| format!("failed to read GGUF header of `{}`", path.display()))?;
     let Some(architecture) = content.metadata.get("general.architecture") else {
@@ -112,9 +112,8 @@ pub(crate) mod tests {
     fn hf_overrides_cannot_bypass_the_check() {
         let dir = temp_dir("override-config");
         write_config(&dir, HF_ARCHITECTURE);
-        let overrides: HfConfigOverrides = r#"{"architectures":["LlamaForCausalLM"]}"#
-            .parse()
-            .unwrap();
+        let overrides: HfConfigOverrides =
+            r#"{"architectures":["LlamaForCausalLM"]}"#.parse().unwrap();
         assert!(ensure_flash_next_config(&dir, Some(&overrides)).is_err());
     }
 

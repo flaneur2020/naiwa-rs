@@ -86,8 +86,15 @@ fn log_api_surfaces(host: &str, port: u16) {
     info!("OpenAI-compatible API: {root}/v1");
     info!("Anthropic-compatible API: {root}");
 
-    for kind in [RouteKind::OpenAi, RouteKind::Anthropic, RouteKind::MistralRs] {
-        for route in MISTRALRS_API_ROUTES.iter().filter(|route| route.kind == kind) {
+    for kind in [
+        RouteKind::OpenAi,
+        RouteKind::Anthropic,
+        RouteKind::MistralRs,
+    ] {
+        for route in MISTRALRS_API_ROUTES
+            .iter()
+            .filter(|route| route.kind == kind)
+        {
             debug!("  Route: {}, Methods: {}", route.path, route.methods);
         }
     }
