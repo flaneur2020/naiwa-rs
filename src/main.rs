@@ -4,6 +4,7 @@
 
 mod args;
 mod commands;
+mod expert_cache;
 mod guard;
 mod load;
 mod offload;

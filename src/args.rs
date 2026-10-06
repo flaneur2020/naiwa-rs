@@ -230,6 +230,11 @@ pub struct ModelOptions {
     /// GPU unless `--device-layers` is given.
     #[arg(long)]
     pub cpu_moe: bool,
+
+    /// With `--cpu-moe`, cache the most-used routed experts in VRAM, in GiB. Not implemented yet:
+    /// passing this currently refuses to start.
+    #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
+    pub expert_cache_gb: Option<f64>,
 }
 
 #[derive(Args, Clone, Default)]
