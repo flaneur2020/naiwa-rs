@@ -1,14 +1,12 @@
-[workspace]
-members = ["qwen-fn-rs"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "qwen-fn-rs"
+description = "Qwen3.8-Flash-Next-only inference server built on mistral.rs"
 version = "0.9.4"
 edition = "2021"
 license = "MIT"
 rust-version = "1.94"
 
-[workspace.dependencies]
+[dependencies]
 # mistral.rs crates, pinned to the commit that added Qwen3.8-Flash-Next (#2462).
 # To build against a local checkout instead, replace each `git`/`rev` pair with
 # `path = "../mistral.rs/<crate>"`.
@@ -23,12 +21,24 @@ candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.
 anyhow = "1.0.100"
 axum = "0.8.8"
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
+comfy-table = "7"
 dirs = "6.0.0"
 mimalloc = "0.1"
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+# CPU is the default backend; enable `cuda` (and optionally its extensions) for NVIDIA GPUs.
+[features]
+default = []
+cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda"]
+cutile = ["cuda", "mistralrs-core/cutile"]
+nccl = ["cuda", "mistralrs-core/nccl", "mistralrs-server-core/nccl"]
+cudnn = ["cuda", "mistralrs-core/cudnn", "mistralrs-server-core/cudnn"]
+flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn"]
+flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3"]
+mkl = ["mistralrs-core/mkl", "mistralrs-server-core/mkl"]
 
 [profile.release-with-debug]
 inherits = "release"
