@@ -1,0 +1,3 @@
+[net]
+# Fetch git dependencies (mistral.rs, candle) with the git CLI so SSH url rewrites and agents work.
+git-fetch-with-cli = true

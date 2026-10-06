@@ -1,0 +1,39 @@
+[workspace]
+members = ["qwen-fn-rs"]
+resolver = "2"
+
+[workspace.package]
+version = "0.9.4"
+edition = "2021"
+license = "MIT"
+rust-version = "1.94"
+
+[workspace.dependencies]
+# mistral.rs crates, pinned to the commit that added Qwen3.8-Flash-Next (#2462).
+# To build against a local checkout instead, replace each `git`/`rev` pair with
+# `path = "../mistral.rs/<crate>"`.
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294" }
+mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294", default-features = false }
+mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294" }
+
+# Must match the candle revision used by mistral.rs at the pinned commit.
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "66a8cf184a5a519671454066b1b9efd446ec9f5c" }
+
+# Third-party versions mirror mistral.rs's workspace.
+anyhow = "1.0.100"
+axum = "0.8.8"
+clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
+dirs = "6.0.0"
+mimalloc = "0.1"
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+
+[profile.dev]
+debug = true
+opt-level = 3
