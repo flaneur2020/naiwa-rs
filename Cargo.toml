@@ -7,12 +7,13 @@ license = "MIT"
 rust-version = "1.94"
 
 [dependencies]
-# mistral.rs crates, pinned to the commit that added Qwen3.8-Flash-Next (#2462).
-# To build against a local checkout instead, replace each `git`/`rev` pair with
+# mistral.rs crates from the `patch/strata` fork branch: upstream Qwen3.8-Flash-Next support
+# (#2462) plus the external routed-experts hook (`mistralrs_core::moe_offload`).
+# To build against a local checkout instead, replace each `git`/`branch` pair with
 # `path = "../mistral.rs/<crate>"`.
-mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294" }
-mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294", default-features = false }
-mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "3f2515e9b5adc2ac44949c128c50a13b15721294" }
+mistralrs-core = { git = "ssh://git@github.com/flaneur2020/mistral.rs.git", branch = "patch/strata" }
+mistralrs-server-core = { git = "ssh://git@github.com/flaneur2020/mistral.rs.git", branch = "patch/strata", default-features = false }
+mistralrs-quant = { git = "ssh://git@github.com/flaneur2020/mistral.rs.git", branch = "patch/strata" }
 
 # Must match the candle revision used by mistral.rs at the pinned commit.
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "66a8cf184a5a519671454066b1b9efd446ec9f5c" }

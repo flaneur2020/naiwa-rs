@@ -2,8 +2,10 @@
 
 A Qwen3.8-Flash-Next-only inference server built on the
 [mistral.rs](https://github.com/EricLBuehler/mistral.rs) crates (`mistralrs-core`,
-`mistralrs-server-core`, `mistralrs-quant`), pinned to commit `3f2515e9b`, the commit that
-added Qwen3.8-Flash-Next support.
+`mistralrs-server-core`, `mistralrs-quant`), taken from the `patch/strata` branch of
+[flaneur2020/mistral.rs](https://github.com/flaneur2020/mistral.rs). That branch is upstream's
+Qwen3.8-Flash-Next support (#2462) plus an external routed-experts hook
+(`mistralrs_core::moe_offload`).
 
 - Loads only `Qwen4ExpForConditionalGeneration` checkpoints (safetensors/UQFF) or GGUF files
   with `general.architecture = qwen4exp`. The architecture is checked before loading, and the
@@ -46,6 +48,7 @@ Flag names and defaults follow `mistralrs` for the options that are kept. Run
 
 ## Updating mistral.rs
 
-Bump the `rev` of the mistral.rs crates in the root `Cargo.toml`, and keep `candle-core` on the
-same candle revision that mistral.rs uses. To build against a local checkout, replace the
-`git`/`rev` pairs with `path = "../mistral.rs/<crate>"`.
+Push to `patch/strata` on the fork, then run `cargo update -p mistralrs-core` to move
+`Cargo.lock` to the new commit. Keep `candle-core` on the same candle revision that mistral.rs
+uses. To build against a local checkout, replace the `git`/`branch` pairs with
+`path = "../mistral.rs/<crate>"`.
