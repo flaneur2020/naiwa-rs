@@ -16,9 +16,9 @@
 //! # Prefill
 //!
 //! Every routed expert runs on the CPU (all of them are needed anyway). Each layer first starts
-//! a background fill of the *next* layer's empty slots, so slicing and bookkeeping stay off the
-//! token path. The copies themselves are ordered on candle's single CUDA stream, between
-//! kernels; they do not overlap compute (see `host_memory` for what pinning changes).
+//! a background fill of the *next* layer's empty slots. On CUDA a fill is a copy on a dedicated
+//! copy stream into slot memory allocated once at load, so it overlaps this layer's CPU experts
+//! and the next layer's attention (`copy_stream`). Elsewhere it uploads through candle's stream.
 //!
 //! # Decode (single token)
 //!
@@ -44,6 +44,7 @@ use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::copy_stream::{self, CopyStream, ReadFence, SlotMemory};
 use crate::host_memory::{self, PinnedStack};
 
 // Number of prefill tokens above which we skip the cache entirely.
@@ -75,6 +76,8 @@ pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
     registry: Arc<LayerRegistry>,
+    /// One copy stream per CUDA device, shared by its layers.
+    copy_streams: Mutex<Vec<(Device, Arc<CopyStream>)>>,
 }
 
 impl GpuCacheMoeProvider {
@@ -87,6 +90,30 @@ impl GpuCacheMoeProvider {
                 bytes_per_layer: None,
             }),
             registry: Arc::default(),
+            copy_streams: Mutex::default(),
+        }
+    }
+}
+
+impl GpuCacheMoeProvider {
+    /// The copy stream for `device`, created on first use; `None` off CUDA or when the stream
+    /// cannot be created (the layer then uploads through candle's stream).
+    fn copy_stream_for(&self, device: &Device) -> Option<Arc<CopyStream>> {
+        let mut streams = self.copy_streams.lock().unwrap();
+        if let Some((_, cs)) = streams.iter().find(|(d, _)| d.same_device(device)) {
+            return Some(Arc::clone(cs));
+        }
+        match CopyStream::new(device) {
+            Ok(Some(cs)) => {
+                let cs = Arc::new(cs);
+                streams.push((device.clone(), Arc::clone(&cs)));
+                Some(cs)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("expert cache: no copy stream ({e}); slot fills will not overlap compute");
+                None
+            }
         }
     }
 }
@@ -283,6 +310,34 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             }
         };
 
+        // With a copy stream, each slot's memory is allocated once here and every fill overwrites
+        // it in place from the copy stream; otherwise each fill uploads a fresh copy.
+        let mut copy_stream = self.copy_stream_for(&slot_device);
+        let mut slot_bufs = Vec::new();
+        if let (Some(cs), Some((gate, up, down))) = (&copy_stream, cpu_experts.expert_qtensors()) {
+            for _ in 0..num_slots {
+                let memory = [
+                    cs.alloc_expert(&gate)?,
+                    cs.alloc_expert(&up)?,
+                    cs.alloc_expert(&down)?,
+                ];
+                let weights = SlotWeights {
+                    gate: Arc::clone(memory[0].tensor()),
+                    up: Arc::clone(memory[1].tensor()),
+                    down: Arc::clone(memory[2].tensor()),
+                };
+                slot_bufs.push(Arc::new(SlotBuf {
+                    weights,
+                    memory: Some(memory),
+                    fence: ReadFence::new(&slot_device)?,
+                }));
+            }
+            cs.after_device_work()?;
+        }
+        if slot_bufs.is_empty() {
+            copy_stream = None;
+        }
+
         let cached = Arc::new(CachedLayer {
             _pinned: pinned,
             cpu: cpu_experts,
@@ -300,8 +355,10 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 hit_counts: vec![0u64; num_experts],
                 last_use: vec![0u64; num_slots],
                 tick: 0,
+                published: vec![None; num_slots],
             }),
-            slot_weights: (0..num_slots).map(|_| RwLock::new(None)).collect(),
+            copy_stream,
+            slot_bufs,
             filling: AtomicBool::new(false),
         });
         self.registry.insert(layer_idx, &cached);
@@ -459,6 +516,9 @@ struct CachedLayerState {
     last_use: Vec<u64>,
     /// Decode steps seen by this layer.
     tick: u64,
+    /// Slot -> its contents, for the slots listed in `slots`. Readers clone the `Arc` under
+    /// the lock, so a slot replaced later never changes what an in-flight token computes with.
+    published: Vec<Option<Arc<SlotBuf>>>,
 }
 
 /// One expert's projections in a slot.
@@ -467,6 +527,15 @@ struct SlotWeights {
     gate: Arc<QTensor>,
     up: Arc<QTensor>,
     down: Arc<QTensor>,
+}
+
+/// One slot's contents. In copy-stream mode `memory` is the slot's device memory, overwritten
+/// in place on every fill, and `weights` view it; otherwise each fill makes a new `SlotBuf`.
+struct SlotBuf {
+    weights: SlotWeights,
+    memory: Option<[SlotMemory; 3]>,
+    /// Recorded by readers after enqueueing the kernels that read this slot.
+    fence: ReadFence,
 }
 
 struct CachedLayer {
@@ -484,10 +553,10 @@ struct CachedLayer {
     /// `[num_experts, hidden]` F32 on the CPU; `None` disables the lookahead for this layer.
     router: Option<Tensor>,
     state: Mutex<CachedLayerState>,
-    /// Slot contents. Written only by `admit` after it has reserved the slot under `state`;
-    /// readers clone the `Arc`s under `state` (see `decode_forward`), so a slot reassigned
-    /// later never changes what an in-flight token computes with.
-    slot_weights: Vec<RwLock<Option<SlotWeights>>>,
+    /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
+    copy_stream: Option<Arc<CopyStream>>,
+    /// Copy-stream mode: every slot's permanent buffer (empty otherwise).
+    slot_bufs: Vec<Arc<SlotBuf>>,
     /// A background fill of this layer is running; at most one at a time.
     filling: AtomicBool,
 }
@@ -525,8 +594,9 @@ impl CachedLayer {
     }
 
     /// Replace the least-recently-used resident outside `protect` with `expert_id`. The victim
-    /// is unpublished and the slot reserved in one critical section; tokens already holding
-    /// the victim's `Arc`s keep computing with them.
+    /// is unpublished and the slot reserved in one critical section. Tokens already holding the
+    /// victim keep computing with it: a fresh upload leaves the old buffer alone, and an
+    /// in-place one waits for them (`upload_in_place`).
     fn replace(&self, expert_id: usize, protect: &[usize]) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
@@ -537,6 +607,7 @@ impl CachedLayer {
                 return Ok(None);
             };
             st.slots.remove(&victim);
+            st.published[slot] = None;
             st.resident[slot] = Some(expert_id);
             slot
         };
@@ -546,11 +617,24 @@ impl CachedLayer {
     /// Copy `expert_id` into `slot`, which the caller has reserved, then publish it. A failed
     /// copy frees the slot.
     fn load_reserved(&self, expert_id: usize, slot: usize) -> candle_core::Result<Option<usize>> {
-        let loaded = self.expert_weights(expert_id);
+        let loaded = match &self.copy_stream {
+            Some(cs) => self
+                .upload_in_place(cs, expert_id, slot)
+                .map(|done| done.then(|| Arc::clone(&self.slot_bufs[slot]))),
+            None => self.expert_weights(expert_id).map(|w| {
+                w.map(|weights| {
+                    Arc::new(SlotBuf {
+                        weights,
+                        memory: None,
+                        fence: ReadFence::none(),
+                    })
+                })
+            }),
+        };
         let mut st = self.state.lock().unwrap();
         match loaded {
-            Ok(Some(w)) => {
-                *self.slot_weights[slot].write() = Some(w);
+            Ok(Some(buf)) => {
+                st.published[slot] = Some(buf);
                 st.slots.insert(expert_id, slot);
                 st.last_use[slot] = st.tick;
                 Ok(Some(slot))
@@ -564,6 +648,33 @@ impl CachedLayer {
                 Err(e)
             }
         }
+    }
+
+    /// Overwrite `slot`'s device memory with `expert_id` on the copy stream. The slot is
+    /// reserved and unpublished, so no new reader can reach it; this waits for the readers
+    /// that captured it earlier to record their fence, then the copy waits on that fence.
+    fn upload_in_place(
+        &self,
+        cs: &CopyStream,
+        expert_id: usize,
+        slot: usize,
+    ) -> candle_core::Result<bool> {
+        let buf = &self.slot_bufs[slot];
+        let (Some(memory), Some((gate, up, down))) = (&buf.memory, self.cpu.expert_qtensors())
+        else {
+            return Ok(false);
+        };
+        copy_stream::wait_for_readers(buf);
+        let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
+        cs.upload(
+            &buf.fence,
+            &[
+                (&memory[0], &g[expert_range(&gate, expert_id)?]),
+                (&memory[1], &u[expert_range(&up, expert_id)?]),
+                (&memory[2], &d[expert_range(&down, expert_id)?]),
+            ],
+        )?;
+        Ok(true)
     }
 
     /// This layer's top-k experts for activation `x` (`[hidden]`), by its own router.
@@ -658,7 +769,7 @@ impl CachedLayer {
         let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
         let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
 
-        let mut hits: Vec<(SlotWeights, f32)> = Vec::new();
+        let mut hits: Vec<(Arc<SlotBuf>, f32)> = Vec::new();
         let mut miss_ids: Vec<u32> = Vec::new();
         let mut miss_weights: Vec<f32> = Vec::new();
         {
@@ -667,14 +778,15 @@ impl CachedLayer {
             let tick = st.tick;
             for (&id, &w) in ids_vec.iter().zip(&weights_vec) {
                 st.hit_counts[id as usize] += 1;
-                let resident =
-                    st.slots.get(&(id as usize)).copied().and_then(|slot| {
-                        self.slot_weights[slot].read().clone().map(|sw| (slot, sw))
-                    });
+                let resident = st
+                    .slots
+                    .get(&(id as usize))
+                    .copied()
+                    .and_then(|slot| st.published[slot].clone().map(|buf| (slot, buf)));
                 match resident {
-                    Some((slot, sw)) => {
+                    Some((slot, buf)) => {
                         st.last_use[slot] = tick;
-                        hits.push((sw, w));
+                        hits.push((buf, w));
                     }
                     None => {
                         miss_ids.push(id);
@@ -687,12 +799,30 @@ impl CachedLayer {
         let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
         let (gpu_result, cpu_result) = std::thread::scope(|s| {
-            let gpu = s.spawn(|| -> candle_core::Result<Tensor> {
-                let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
-                for (sw, w) in &hits {
-                    let y = Self::run_expert(sw, &x_gpu, act)?;
-                    acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
+            let gpu = s.spawn(move || -> candle_core::Result<Tensor> {
+                let acc = (|| -> candle_core::Result<Tensor> {
+                    let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
+                    for (buf, w) in &hits {
+                        let y = Self::run_expert(&buf.weights, &x_gpu, act)?;
+                        acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
+                    }
+                    Ok(acc)
+                })();
+                // Kernels reading these slots may be queued even if a later step failed: fence
+                // every slot before letting go of it, so an in-place fill cannot overtake them.
+                // If a fence cannot be recorded, wait for the device instead.
+                let mut fenced = Ok(());
+                for (buf, _) in &hits {
+                    if let Err(e) = buf.fence.record_reads(&self.slot_device) {
+                        fenced = fenced.and(Err(e));
+                    }
                 }
+                if fenced.is_err() {
+                    let _ = self.slot_device.synchronize();
+                }
+                drop(hits);
+                let acc = acc?;
+                fenced?;
                 Ok(acc)
             });
 

@@ -4,6 +4,7 @@
 
 mod args;
 mod commands;
+mod copy_stream;
 mod expert_cache;
 mod host_memory;
 mod load;

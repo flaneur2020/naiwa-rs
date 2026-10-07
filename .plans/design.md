@@ -1,6 +1,6 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-07, `main` at `ff39f29` plus the uncommitted host-memory work (§3.3).
+Status as of 2026-10-07, `main` at `04186d4` with the copy-stream work (§3.3).
 
 ## 1. What this project is
 
@@ -55,6 +55,7 @@ to the new commit. `cargo update -p mistralrs-core` does not work while the patc
 | `src/offload.rs` | `--cpu-moe` provider wiring; plain `CpuExperts` when no cache is requested |
 | `src/expert_cache.rs` | the GPU expert cache (`GpuCacheMoeProvider`) |
 | `src/host_memory.rs` | huge pages and CUDA pinning for the host expert stacks |
+| `src/copy_stream.rs` | dedicated CUDA copy stream, in-place slot memory and read fences |
 | `src/commands/*` | one file per subcommand |
 
 ## 3. Expert placement, as implemented
@@ -86,8 +87,8 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
 1. Every routed expert runs on the CPU, since all of them are needed anyway.
 2. Before that, the layer starts a background fill of layer *l+1*'s empty slots (and its
    own, which covers layer 0). At most one fill runs per layer; a full layer is a no-op.
-   What runs off the token path is the fill thread's CPU work. On the GPU, the copy is
-   ordered on candle's single stream, so it does **not** overlap compute (§3.3).
+   On CUDA the copy runs on a dedicated copy stream, so it overlaps this layer's CPU
+   experts and the next layer's attention (§3.3). Elsewhere it goes through candle's stream.
 3. Fill order is routing count, then expert id, so the first prefill fills in id order.
 
 **Decode** (one token):
@@ -110,7 +111,7 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
   replaced mid-token cannot change what that token computes with.
 - `LayerRegistry` holds weak references; the model owns the layers.
 
-### 3.3 Host memory for the expert stacks (`src/host_memory.rs`)
+### 3.3 Host memory and slot uploads (`src/host_memory.rs`, `src/copy_stream.rs`)
 
 **Why this exists.** candle's CUDA device has one stream that every thread uses, and a
 `QTensor` upload (`qtensor_from_ggml` → `load_quantized` → `memcpy_htod`) is a
@@ -133,9 +134,28 @@ all queued model work, then copy at roughly half bandwidth, in line with compute
 - Both are best effort. A failure leaves the stack pageable, logs once, and is otherwise
   harmless.
 
-**What Phase A does not give:** copy/compute overlap. Copies are still ordered on candle's
-stream, between kernels; they are just faster and no longer stall the fill thread on a stream
-sync. True overlap needs Phase B (§6).
+Phase A makes copies faster, but on its own they stay ordered on candle's stream, between
+kernels.
+
+**Implemented (Phase B, `src/copy_stream.rs`): copy/compute overlap.**
+- One extra CUDA stream per device, shared by its cached layers.
+- At load, each slot's three projections are allocated once (`QCudaStorage::zeros`). The copy
+  stream waits on an event recorded after those allocations.
+- A fill writes expert *e*'s bytes into the slot's memory in place
+  (`memcpy_htod_async` on the copy stream). It returns only after the copy stream has
+  synchronized, so a slot is published fully written, and candle's stream never waits on
+  the copy stream.
+- **In-place hazard.** Overwriting a slot while queued kernels still read it would corrupt
+  them. Two guards:
+  1. Each slot has a `ReadFence` event. A decode thread records it on candle's stream after
+     enqueueing the kernels that read the slot, even if computing a hit failed partway (if
+     the record itself fails, it waits for the device). The copy stream waits on it before
+     the overwrite.
+  2. Replacement unpublishes the slot under the layer lock. The fill thread then waits until
+     no reader still holds the slot's `Arc`, i.e. every earlier reader has recorded its fence.
+- Off CUDA, or if the copy stream cannot be created, fills allocate a fresh buffer each time
+  as before; old buffers are freed when their last reader lets go.
+- Cost: slot VRAM is allocated eagerly at load (the same budget), instead of on first fill.
 
 ### 3.4 Format support — actual, not intended
 
@@ -151,9 +171,10 @@ sync. True overlap needs Phase B (§6).
 | Check | Status |
 |---|---|
 | `cargo check --all-targets`, `cargo fmt --check` | clean (default features only) |
-| `#[cfg(feature = "cuda")]` code | **not compiled by this build.** `candle-kernels` needs `nvcc`. Its cudarc calls are type-checked in a scratch crate against cudarc 0.19.10; the candle glue around them is not |
+| `#[cfg(feature = "cuda")]` code (`host_memory`, `copy_stream`) | **not compiled by this build.** `candle-kernels` needs `nvcc`. Every cudarc call is type-checked in a scratch crate against cudarc 0.19.10; the candle glue (`Device::Cuda`, `cuda_stream()`, `QCudaStorage::zeros`, `QTensor::device_ptr`) is not |
 | Linux-only code (`madvise`) | type-checked in a scratch crate for `riscv64gc-unknown-linux-gnu` |
-| `cargo test` | 19 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing |
+| `cargo test` | 20 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait |
+| In-place copy-stream path | **cannot run here.** Only exercised on CUDA; the non-CUDA build always takes the fresh-upload path |
 | Any CUDA run | **never.** No CUDA host available; the dev machine is an M1 Mac without `nvcc` |
 | Numeric parity: cached vs uncached | not done |
 | Hit rate, tokens/s | not measured |
@@ -161,6 +182,8 @@ sync. True overlap needs Phase B (§6).
 Things that only a CUDA run will show:
 - **CUDA from non-main threads.** The decode hit thread, fill threads and lookahead thread
   all touch the CUDA device. This is the riskiest untested assumption.
+- **In-place fills.** Whether the fence protocol holds under load: look for corrupted output
+  after slot replacements, which would show as parity drift that grows with decode length.
 - **Pinning.** Registering tens of GiB takes seconds at load and may be refused (lockable
   memory limits); check the log for the "could not be pinned" warning.
 - **Parity.** CPU and CUDA kernels differ (CUDA quantizes activations to Q8_1), so compare
@@ -199,13 +222,11 @@ Ordered by priority. Small, local, testable work comes first.
 7. Parity: same prompt, cached vs uncached, logits within tolerance.
 8. Measure hit rate and tokens/s, then tune `MAX_LOOKAHEAD_SWAPS` and the per-layer split.
 
-### Then — Phase B: real copy/compute overlap (needs a CUDA host)
-9. Measure first: if slot copies are not on the critical path after Phase A, stop here.
-10. A dedicated copy stream for slot fills. Fills go to slot memory preallocated once per
-    layer (`QCudaStorage::zeros`, written through `QTensor::device_ptr`). The fill thread
-    synchronizes only the copy stream before it publishes. **Hazard:** overwriting a slot in
-    place while queued main-stream kernels still read it. The copy stream must wait on an
-    event recorded on candle's stream after the slot's last reader is enqueued.
+### Then — Phase B follow-ups (needs a CUDA host)
+9. Profile a decode step (Nsight Systems): confirm fills run on the copy stream concurrently
+   with compute kernels, and that candle's stream never waits on them.
+10. Copy-stream count: one shared stream serializes all layers' fills; try one per layer if
+    the profile shows fills queueing behind each other.
 11. Batched DMA (`cuMemcpyBatchAsync`, CUDA 12.8+) for the three projections and several
     experts at once. Mostly a Windows/WDDM win per Strata; only worth it if profiling shows
     per-copy overhead.
