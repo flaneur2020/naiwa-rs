@@ -13,26 +13,27 @@
 //! - **BF16 safetensors**: `get_qtensor()` returns `None`; the cache falls back to a dense
 //!   `Tensor` copy instead. Dense slots cost ~4× more VRAM per expert than Q4K.
 //!
-//! # Hit/miss dispatch (decode, single token)
+//! # Prefill
 //!
-//! Router assigns each token up to `top_k` experts. For each decode step:
-//! - Experts whose slot is resident → computed via `QMatMul` (or dense `matmul`) on the slot device.
-//! - Remaining experts → fall through to `MoEExperts::forward` on the CPU.
+//! Every routed expert runs on the CPU (all of them are needed anyway). Each layer first starts
+//! a background fill of the *next* layer's empty slots, so those host-to-device copies overlap
+//! this layer's CPU experts and the next layer's attention.
 //!
-//! The CPU path calls `MoEExperts::forward` with only the *miss* indices (using the fork's
-//! `forward_gather` fix that derives `top_k` from `topk_ids.dim(-1)` rather than the fixed config
-//! value). The per-expert results are summed with their router weights applied **once** at the end.
+//! # Decode (single token)
 //!
-//! Prefill (more than one token): routes everything through the CPU and primes admission counts.
-//!
-//! # Admission
-//!
-//! Per-layer slots, filled in arrival order (first-seen / compulsory-miss policy). No eviction in
-//! this stage — a fixed admission policy that also evicts has two effects moving at once and the
-//! hit rate cannot be attributed to either.
+//! - Top-k is split into slot hits and misses. Hits run via `QMatMul` on the slot device, misses
+//!   via `MoEExperts::forward` on the CPU with only the miss ids (the fork's `forward_gather`
+//!   reads top-k from `topk_ids`), both at once; router weights are applied once per side.
+//! - Misses are never loaded on the token path. Instead, each layer submits its activation to a
+//!   lookahead thread that runs the next layer's router on it and loads the predicted experts:
+//!   into empty slots freely, over least-recently-used residents at most `MAX_LOOKAHEAD_SWAPS`
+//!   times. Whatever is not resident when the next layer runs goes to the CPU.
+//! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
+//!   never changes what an in-flight token computes with.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul, QTensor};
@@ -45,6 +46,11 @@ use tracing::{debug, info};
 // Number of prefill tokens above which we skip the cache entirely.
 // A decode step is always 1 token, so PREFILL_THRESHOLD = 1 is exact.
 const PREFILL_THRESHOLD: usize = 1;
+
+/// Upper bound on resident experts the decode lookahead replaces per layer per token. Each swap
+/// copies one expert's three projections host-to-device; without a cap a poor prediction would
+/// turn every token into a full re-upload of every layer's top-k.
+const MAX_LOOKAHEAD_SWAPS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Provider state
@@ -243,6 +249,16 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         drop(inner);
 
+        // The same tensor the model loads as this block's router (`gate`); the decode lookahead
+        // runs it on the CPU. Without it the layer is still cached, just never predicted.
+        let router = match load_router(&ctx, num_experts, hidden) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                debug!("expert cache: layer {layer_idx} has no router for lookahead: {e}");
+                None
+            }
+        };
+
         let cached = Arc::new(CachedLayer {
             cpu: cpu_experts,
             slot_device,
@@ -250,10 +266,15 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             registry: Arc::clone(&self.registry),
             hidden,
             num_experts,
+            top_k: ctx.config.num_experts_per_tok,
+            act: ctx.act,
+            router,
             state: Mutex::new(CachedLayerState {
                 slots: HashMap::new(),
                 resident: vec![None; num_slots],
                 hit_counts: vec![0u64; num_experts],
+                last_use: vec![0u64; num_slots],
+                tick: 0,
             }),
             slot_weights: (0..num_slots).map(|_| RwLock::new(None)).collect(),
             filling: AtomicBool::new(false),
@@ -261,6 +282,19 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         self.registry.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))
     }
+}
+
+/// Router weights `[num_experts, hidden]` as F32 on the CPU, read the way the model reads them.
+fn load_router(
+    ctx: &ExpertLoadContext<'_>,
+    num_experts: usize,
+    hidden: usize,
+) -> candle_core::Result<Tensor> {
+    ctx.vb
+        .pp("gate")
+        .get((num_experts, hidden), "weight")?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,11 +341,71 @@ fn fill_candidate(resident: &[Option<usize>], hit_counts: &[u64]) -> Option<usiz
         .max_by_key(|&e| (hit_counts[e], std::cmp::Reverse(e)))
 }
 
+/// Indices of the `k` largest `logits`, largest first (ties: lowest index).
+fn top_k_ids(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut ids: Vec<usize> = (0..logits.len()).collect();
+    ids.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+    ids.truncate(k);
+    ids
+}
+
+/// The least-recently-used published resident that is not in `protect`, as `(expert, slot)`.
+fn lru_victim(
+    slots: &HashMap<usize, usize>,
+    last_use: &[u64],
+    protect: &[usize],
+) -> Option<(usize, usize)> {
+    slots
+        .iter()
+        .filter(|(e, _)| !protect.contains(e))
+        .min_by_key(|(&e, &slot)| (last_use[slot], e))
+        .map(|(&e, &slot)| (e, slot))
+}
+
+/// One decode lookahead request: predict `layer`'s experts from the previous layer's input.
+struct LookaheadJob {
+    layer: Arc<CachedLayer>,
+    x: Vec<f32>,
+}
+
+/// A single background thread that runs the next layer's router on the current activation and
+/// loads the predicted experts. The queue is one deep and a submission made while the worker
+/// is busy is dropped, so decode never waits on it.
+#[derive(Default)]
+struct Lookahead {
+    tx: Mutex<Option<SyncSender<LookaheadJob>>>,
+}
+
+impl Lookahead {
+    fn submit(&self, job: LookaheadJob) {
+        let mut tx = self.tx.lock().unwrap();
+        let sender = tx.get_or_insert_with(|| {
+            let (tx, rx) = sync_channel::<LookaheadJob>(1);
+            std::thread::spawn(move || {
+                for job in rx {
+                    if let Err(e) = job.layer.prefetch_predicted(&job.x) {
+                        debug!(
+                            "expert cache: layer {} lookahead failed: {e}",
+                            job.layer.layer
+                        );
+                    }
+                }
+            });
+            tx
+        });
+        match sender.try_send(job) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => *tx = None,
+        }
+    }
+}
+
 /// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling
 /// layer `l + 1`'s slots. Weak references: the model owns the layers, not the registry.
 #[derive(Default)]
 struct LayerRegistry {
     layers: RwLock<Vec<Weak<CachedLayer>>>,
+    lookahead: Lookahead,
 }
 
 impl LayerRegistry {
@@ -336,6 +430,10 @@ struct CachedLayerState {
     /// two admitters can never claim the same slot.
     resident: Vec<Option<usize>>,
     hit_counts: Vec<u64>,
+    /// Slot -> `tick` of its last decode hit (or its fill); drives LRU replacement.
+    last_use: Vec<u64>,
+    /// Decode steps seen by this layer.
+    tick: u64,
 }
 
 /// One expert's projections in a slot.
@@ -353,6 +451,10 @@ struct CachedLayer {
     registry: Arc<LayerRegistry>,
     hidden: usize,
     num_experts: usize,
+    top_k: usize,
+    act: Activation,
+    /// `[num_experts, hidden]` F32 on the CPU; `None` disables the lookahead for this layer.
+    router: Option<Tensor>,
     state: Mutex<CachedLayerState>,
     /// Slot contents. Written only by `admit` after it has reserved the slot under `state`;
     /// readers clone the `Arc`s under `state` (see `decode_forward`), so a slot reassigned
@@ -391,12 +493,38 @@ impl CachedLayer {
             st.resident[slot] = Some(expert_id);
             slot
         };
+        self.load_reserved(expert_id, slot)
+    }
+
+    /// Replace the least-recently-used resident outside `protect` with `expert_id`. The victim
+    /// is unpublished and the slot reserved in one critical section; tokens already holding
+    /// the victim's `Arc`s keep computing with them.
+    fn replace(&self, expert_id: usize, protect: &[usize]) -> candle_core::Result<Option<usize>> {
+        let slot = {
+            let mut st = self.state.lock().unwrap();
+            if st.resident.contains(&Some(expert_id)) {
+                return Ok(None);
+            }
+            let Some((victim, slot)) = lru_victim(&st.slots, &st.last_use, protect) else {
+                return Ok(None);
+            };
+            st.slots.remove(&victim);
+            st.resident[slot] = Some(expert_id);
+            slot
+        };
+        self.load_reserved(expert_id, slot)
+    }
+
+    /// Copy `expert_id` into `slot`, which the caller has reserved, then publish it. A failed
+    /// copy frees the slot.
+    fn load_reserved(&self, expert_id: usize, slot: usize) -> candle_core::Result<Option<usize>> {
         let loaded = self.expert_weights(expert_id);
         let mut st = self.state.lock().unwrap();
         match loaded {
             Ok(Some(w)) => {
                 *self.slot_weights[slot].write() = Some(w);
                 st.slots.insert(expert_id, slot);
+                st.last_use[slot] = st.tick;
                 Ok(Some(slot))
             }
             Ok(None) => {
@@ -408,6 +536,32 @@ impl CachedLayer {
                 Err(e)
             }
         }
+    }
+
+    /// This layer's top-k experts for activation `x` (`[hidden]`), by its own router.
+    fn predict(&self, x: &[f32]) -> candle_core::Result<Vec<usize>> {
+        let Some(router) = &self.router else {
+            return Ok(Vec::new());
+        };
+        let x = Tensor::from_slice(x, (self.hidden, 1), &Device::Cpu)?;
+        let logits = router.matmul(&x)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(top_k_ids(&logits, self.top_k))
+    }
+
+    /// Load the experts predicted for `x`: into empty slots freely, and over LRU residents at
+    /// most `MAX_LOOKAHEAD_SWAPS` times. A wrong prediction only costs a slot.
+    fn prefetch_predicted(&self, x: &[f32]) -> candle_core::Result<()> {
+        let predicted = self.predict(x)?;
+        let mut swaps = 0;
+        for &e in &predicted {
+            if e >= self.num_experts || self.admit(e)?.is_some() {
+                continue;
+            }
+            if swaps < MAX_LOOKAHEAD_SWAPS && self.replace(e, &predicted)?.is_some() {
+                swaps += 1;
+            }
+        }
+        Ok(())
     }
 
     /// The next expert to fill into this layer, if a slot is still empty.
@@ -462,6 +616,17 @@ impl CachedLayer {
         topk_ids: &Tensor,
         act: Activation,
     ) -> candle_core::Result<Tensor> {
+        // Start predicting the next layer's experts now, so their copies overlap this layer's
+        // compute; whatever is not resident by the time that layer runs goes to the CPU.
+        if let Some(next) = self.registry.get(self.layer + 1) {
+            if next.router.is_some() {
+                let x = xs.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                self.registry
+                    .lookahead
+                    .submit(LookaheadJob { layer: next, x });
+            }
+        }
+
         let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
         let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
 
@@ -470,14 +635,19 @@ impl CachedLayer {
         let mut miss_weights: Vec<f32> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
+            st.tick += 1;
+            let tick = st.tick;
             for (&id, &w) in ids_vec.iter().zip(&weights_vec) {
                 st.hit_counts[id as usize] += 1;
-                let resident = st
-                    .slots
-                    .get(&(id as usize))
-                    .and_then(|&slot| self.slot_weights[slot].read().clone());
+                let resident =
+                    st.slots.get(&(id as usize)).copied().and_then(|slot| {
+                        self.slot_weights[slot].read().clone().map(|sw| (slot, sw))
+                    });
                 match resident {
-                    Some(sw) => hits.push((sw, w)),
+                    Some((slot, sw)) => {
+                        st.last_use[slot] = tick;
+                        hits.push((sw, w));
+                    }
                     None => {
                         miss_ids.push(id);
                         miss_weights.push(w);
@@ -565,8 +735,7 @@ impl RoutedExperts for CachedExperts {
         }
 
         // Decode: single token, split GPU hits / CPU misses.
-        let act = Activation::Silu; // Qwen4-Exp always uses SiLU
-        layer.decode_forward(xs, &topk_weights, topk_ids, act)
+        layer.decode_forward(xs, &topk_weights, topk_ids, layer.act)
     }
 }
 
@@ -639,5 +808,21 @@ mod tests {
         let reg = LayerRegistry::default();
         assert!(reg.get(3).is_none());
         assert!(reg.layers.read().is_empty());
+    }
+
+    #[test]
+    fn top_k_ids_orders_by_logit_then_index() {
+        assert_eq!(top_k_ids(&[0.1, 0.9, 0.5, 0.9], 3), vec![1, 3, 2]);
+        assert_eq!(top_k_ids(&[1.0, 2.0], 5), vec![1, 0]);
+    }
+
+    #[test]
+    fn lru_victim_skips_protected_and_prefers_oldest() {
+        // expert -> slot; slot 1 is oldest but holds a protected (predicted) expert
+        let slots = HashMap::from([(10, 0), (11, 1), (12, 2)]);
+        let last_use = [5, 1, 3];
+        assert_eq!(lru_victim(&slots, &last_use, &[11]), Some((12, 2)));
+        assert_eq!(lru_victim(&slots, &last_use, &[]), Some((11, 1)));
+        assert_eq!(lru_victim(&slots, &last_use, &[10, 11, 12]), None);
     }
 }
