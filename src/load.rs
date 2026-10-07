@@ -3,17 +3,23 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use mistralrs_core::{IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig};
+use candle_core::quantized::gguf_file;
+use mistralrs_core::{
+    HfConfigOverrides, IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
+};
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 
 use crate::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::guard;
 use crate::offload::{install_cpu_moe, ALL_LAYERS_ON_DEVICE};
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
+
+/// The architecture this server runs on, across both on-disk representations.
+const HF_ARCHITECTURE: &str = "Qwen4ExpForConditionalGeneration";
+const GGUF_ARCHITECTURE: &str = "qwen4exp";
 
 /// Quantization inputs that shape the loader selection.
 pub struct QuantSelection {
@@ -55,7 +61,7 @@ pub fn select_model(
             .clone()
             .context("pass `-m <model-dir>` or `-f <model.gguf>`")?;
         ensure_local_dir(&model_dir, "Model directory")?;
-        guard::ensure_flash_next_config(&model_dir, source.hf_overrides.as_ref())?;
+        ensure_flash_next_config(&model_dir, source.hf_overrides.as_ref())?;
         let display_id = model_dir.to_string_lossy().into_owned();
         // The Qwen4-Exp loader is selected explicitly; no auto-detection takes place.
         let selected = ModelSelected::MultimodalPlain {
@@ -99,7 +105,7 @@ pub fn select_model(
     }
     let (root, filenames) = gguf_root(source.model_id.as_deref(), &files)?;
     let first = root.join(&filenames[0]);
-    guard::ensure_flash_next_gguf(&first)?;
+    ensure_flash_next_gguf(&first)?;
 
     let mmproj = source
         .mmproj
@@ -263,13 +269,119 @@ fn device_layers(model: &ModelOptions) -> Option<Vec<String>> {
     }
 }
 
+fn unsupported(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "qwen-fn-rs only runs Qwen3.8-Flash-Next ({HF_ARCHITECTURE}); {what} is not supported"
+    )
+}
+
+/// Fail unless `model_dir/config.json`, after `hf_overrides`, declares Qwen3.8-Flash-Next.
+fn ensure_flash_next_config(
+    model_dir: &Path,
+    hf_overrides: Option<&HfConfigOverrides>,
+) -> Result<()> {
+    let path = model_dir.join("config.json");
+    let mut config = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read `{}`", path.display()))?;
+    if let Some(overrides) = hf_overrides {
+        config = overrides.apply(&config)?;
+    }
+    let config: serde_json::Value = serde_json::from_str(&config)
+        .with_context(|| format!("failed to parse `{}`", path.display()))?;
+    let architectures: Vec<&str> = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+        .unwrap_or_default();
+    if architectures.contains(&HF_ARCHITECTURE) {
+        return Ok(());
+    }
+    Err(unsupported(&format!(
+        "`{}` declares architectures {architectures:?}, which",
+        model_dir.display()
+    )))
+}
+
+/// Fail unless the GGUF file at `path` has `general.architecture = qwen4exp`.
+fn ensure_flash_next_gguf(path: &Path) -> Result<()> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open `{}`", path.display()))?;
+    let content = gguf_file::Content::read(&mut file)
+        .with_context(|| format!("failed to read GGUF header of `{}`", path.display()))?;
+    let Some(architecture) = content.metadata.get("general.architecture") else {
+        bail!("`{}` has no `general.architecture`", path.display());
+    };
+    let architecture = architecture.to_string()?;
+    if architecture.eq_ignore_ascii_case(GGUF_ARCHITECTURE) {
+        return Ok(());
+    }
+    Err(unsupported(&format!(
+        "GGUF `{}` has architecture `{architecture}`, which",
+        path.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
     use super::*;
     use crate::args::Cli;
-    use crate::guard::tests::{temp_dir, write_config, write_gguf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qwen-fn-rs-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_config(dir: &Path, architecture: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"architectures":["{architecture}"]}}"#),
+        )
+        .unwrap();
+    }
+
+    fn write_gguf(path: &Path, architecture: &str) {
+        let mut file = std::fs::File::create(path).unwrap();
+        let architecture = gguf_file::Value::String(architecture.to_string());
+        gguf_file::write(&mut file, &[("general.architecture", &architecture)], &[]).unwrap();
+    }
+
+    #[test]
+    fn accepts_flash_next_config() {
+        let dir = temp_dir("accept-config");
+        write_config(&dir, HF_ARCHITECTURE);
+        ensure_flash_next_config(&dir, None).unwrap();
+    }
+
+    #[test]
+    fn rejects_other_configs() {
+        let dir = temp_dir("reject-config");
+        write_config(&dir, "Qwen3_5ForConditionalGeneration");
+        let err = ensure_flash_next_config(&dir, None).unwrap_err();
+        assert!(err.to_string().contains("only runs Qwen3.8-Flash-Next"));
+    }
+
+    #[test]
+    fn hf_overrides_cannot_bypass_the_check() {
+        let dir = temp_dir("override-config");
+        write_config(&dir, HF_ARCHITECTURE);
+        let overrides: HfConfigOverrides =
+            r#"{"architectures":["LlamaForCausalLM"]}"#.parse().unwrap();
+        assert!(ensure_flash_next_config(&dir, Some(&overrides)).is_err());
+    }
+
+    #[test]
+    fn checks_gguf_architecture() {
+        let dir = temp_dir("gguf");
+        let good = dir.join("good.gguf");
+        let bad = dir.join("bad.gguf");
+        write_gguf(&good, GGUF_ARCHITECTURE);
+        write_gguf(&bad, "llama");
+        ensure_flash_next_gguf(&good).unwrap();
+        assert!(ensure_flash_next_gguf(&bad).is_err());
+    }
 
     fn model_options(args: &[&str]) -> ModelOptions {
         let mut argv = vec!["qwen-fn-rs", "tune"];
