@@ -1207,6 +1207,8 @@ mod tests {
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
-        assert!(diff < 1e-4, "hit/miss split diverges by {diff}");
+        // Hits run per-expert `QMatMul`s, the reference the fused kernel: equal on aarch64, but
+        // on x86 only to Q8_0 activation rounding (~0.005). A swapped weight moves it by ~0.09.
+        assert!(diff < 2e-2, "hit/miss split diverges by {diff}");
     }
 }

@@ -432,8 +432,7 @@ mod tests {
             .map(|i| (i as f32 * 0.11).cos())
             .collect();
         let xs = Tensor::from_vec(xs, (1, tokens, hidden), &Device::Cpu).unwrap();
-        // Expert `ex` of a stack as its own QTensor (its byte slice): the reference then runs
-        // the same quantized matmul, with the same activation quantization, as the experts do.
+        // Expert `ex` of a stack as its own QTensor (its byte slice), run through `QMatMul`.
         let expert = |q: &Arc<QTensor>, ex: usize| -> QMatMul {
             let dims = q.shape().dims();
             let data = q.data().unwrap();
@@ -464,6 +463,10 @@ mod tests {
             }
             Tensor::cat(&rows, 0).unwrap().unsqueeze(0).unwrap()
         };
+        // The experts' fused kernel and `QMatMul` quantize activations alike on aarch64 but not
+        // on x86 (where the fused kernel stays in f32), so they agree only to Q8_0 rounding
+        // (~0.008 here). A swapped routing weight or wrong expert moves the output by >0.3.
+        const TOL: f32 = 2e-2;
         let ids = [[0u32, 2], [3, 1], [2, 0]];
         let ws = [[0.6f32, 0.4], [0.3, 0.7], [0.5, 0.5]];
         let max_diff = |a: &Tensor, b: &Tensor| -> f32 {
@@ -487,7 +490,7 @@ mod tests {
         let got = experts.forward(&xs, ws_t, &ids_t).unwrap();
         let want = reference(&ids, &ws, 2);
         assert_eq!(got.dims(), want.dims());
-        assert!(max_diff(&got, &want) < 1e-4, "full top-k diverges");
+        assert!(max_diff(&got, &want) < TOL, "full top-k diverges");
 
         // a subset of the routed experts (one per token)
         let sub_ids: Vec<u32> = ids.iter().map(|r| r[0]).collect();
@@ -500,6 +503,6 @@ mod tests {
             )
             .unwrap();
         let want = reference(&ids, &ws, 1);
-        assert!(max_diff(&got, &want) < 1e-4, "subset of top-k diverges");
+        assert!(max_diff(&got, &want) < TOL, "subset of top-k diverges");
     }
 }
