@@ -32,7 +32,8 @@
 //! hit rate cannot be attributed to either.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
@@ -64,6 +65,7 @@ struct ProviderInner {
 pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
+    registry: Arc<LayerRegistry>,
 }
 
 impl GpuCacheMoeProvider {
@@ -75,6 +77,7 @@ impl GpuCacheMoeProvider {
                 remaining_bytes: total_bytes,
                 bytes_per_layer: None,
             }),
+            registry: Arc::default(),
         }
     }
 }
@@ -236,26 +239,27 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         inner.remaining_bytes = inner.remaining_bytes.saturating_sub(charged);
 
         let hidden = ctx.config.hidden_size;
-        let inter = ctx.config.moe_intermediate_size;
         let slot_device = ctx.layer_device.clone();
 
         drop(inner);
 
-        Ok(Some(Arc::new(CachedLayer {
+        let cached = Arc::new(CachedLayer {
             cpu: cpu_experts,
             slot_device,
+            layer: layer_idx,
+            registry: Arc::clone(&self.registry),
             hidden,
-            inter,
             num_experts,
             state: Mutex::new(CachedLayerState {
                 slots: HashMap::new(),
                 resident: vec![None; num_slots],
                 hit_counts: vec![0u64; num_experts],
             }),
-            slot_gate: (0..num_slots).map(|_| RwLock::new(None)).collect(),
-            slot_up: (0..num_slots).map(|_| RwLock::new(None)).collect(),
-            slot_down: (0..num_slots).map(|_| RwLock::new(None)).collect(),
-        })))
+            slot_weights: (0..num_slots).map(|_| RwLock::new(None)).collect(),
+            filling: AtomicBool::new(false),
+        });
+        self.registry.insert(layer_idx, &cached);
+        Ok(Some(Arc::new(CachedExperts(cached))))
     }
 }
 
@@ -288,94 +292,169 @@ impl RoutedExperts for CpuOnlyExperts {
 // CachedLayer — the real workhorse
 // ---------------------------------------------------------------------------
 
+/// The most-routed expert not in (or reserved for) a slot, ties to the lowest id; `None` when
+/// every slot is taken.
+fn fill_candidate(resident: &[Option<usize>], hit_counts: &[u64]) -> Option<usize> {
+    if !resident.contains(&None) {
+        return None;
+    }
+    let mut taken = vec![false; hit_counts.len()];
+    for &e in resident.iter().flatten() {
+        taken[e] = true;
+    }
+    (0..hit_counts.len())
+        .filter(|&e| !taken[e])
+        .max_by_key(|&e| (hit_counts[e], std::cmp::Reverse(e)))
+}
+
+/// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling
+/// layer `l + 1`'s slots. Weak references: the model owns the layers, not the registry.
+#[derive(Default)]
+struct LayerRegistry {
+    layers: RwLock<Vec<Weak<CachedLayer>>>,
+}
+
+impl LayerRegistry {
+    fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
+        let mut layers = self.layers.write();
+        if layers.len() <= layer {
+            layers.resize_with(layer + 1, Weak::new);
+        }
+        layers[layer] = Arc::downgrade(cached);
+    }
+
+    fn get(&self, layer: usize) -> Option<Arc<CachedLayer>> {
+        self.layers.read().get(layer).and_then(Weak::upgrade)
+    }
+}
+
 struct CachedLayerState {
+    /// Published residents: expert id -> slot. Only experts whose weights are fully written
+    /// appear here, and it is the only table readers consult.
     slots: HashMap<usize, usize>,
+    /// Slot -> expert id, set when a slot is *reserved* (before its weights are written), so
+    /// two admitters can never claim the same slot.
     resident: Vec<Option<usize>>,
     hit_counts: Vec<u64>,
+}
+
+/// One expert's projections in a slot.
+#[derive(Clone)]
+struct SlotWeights {
+    gate: Arc<QTensor>,
+    up: Arc<QTensor>,
+    down: Arc<QTensor>,
 }
 
 struct CachedLayer {
     cpu: MoEExperts,
     slot_device: Device,
+    layer: usize,
+    registry: Arc<LayerRegistry>,
     hidden: usize,
-    #[allow(dead_code)] // kept for VRAM accounting / future dense-fallback path
-    inter: usize,
     num_experts: usize,
     state: Mutex<CachedLayerState>,
-    // Per-slot RwLock<Option<Arc<QTensor>>> for gate/up/down.
-    //
-    // Invariant: writes (via load_slot) only occur while holding `state` mutex, either
-    // in the prefill admission loop or in the opportunistic decode admission path — never
-    // while another thread holds a read lock on the same slot.  Reads in decode_forward
-    // hold only a read lock and never race with a concurrent write on the same slot.
-    slot_gate: Vec<RwLock<Option<Arc<QTensor>>>>,
-    slot_up: Vec<RwLock<Option<Arc<QTensor>>>>,
-    slot_down: Vec<RwLock<Option<Arc<QTensor>>>>,
+    /// Slot contents. Written only by `admit` after it has reserved the slot under `state`;
+    /// readers clone the `Arc`s under `state` (see `decode_forward`), so a slot reassigned
+    /// later never changes what an in-flight token computes with.
+    slot_weights: Vec<RwLock<Option<SlotWeights>>>,
+    /// A background fill of this layer is running; at most one at a time.
+    filling: AtomicBool,
 }
 
 impl CachedLayer {
-    #[allow(dead_code)]
-    fn num_slots(&self) -> usize {
-        self.slot_gate.len()
-    }
-
-    /// Load expert `expert_id` into slot `slot` from the CPU `MoEExperts` quantized stack.
-    ///
-    /// Uses raw byte slicing — never dequantizes.  Returns `true` if the slot was populated,
-    /// `false` if the backend has no `QTensor` (rare; caller should use a dense copy instead).
-    fn load_slot(&self, expert_id: usize, slot: usize) -> candle_core::Result<bool> {
-        let qt_opt = self.cpu.expert_qtensors();
-        let Some((gate_stack, up_stack, down_stack)) = qt_opt.as_ref() else {
-            return Ok(false);
+    /// Byte-slice expert `expert_id` out of the CPU stacks onto the slot device — never
+    /// dequantized. `None` when the backend holds no `QTensor`s.
+    fn expert_weights(&self, expert_id: usize) -> candle_core::Result<Option<SlotWeights>> {
+        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+            return Ok(None);
         };
-
-        let gate = expert_qtensor_on_device(gate_stack, expert_id, &self.slot_device)?;
-        let up = expert_qtensor_on_device(up_stack, expert_id, &self.slot_device)?;
-        let down = expert_qtensor_on_device(down_stack, expert_id, &self.slot_device)?;
-
-        // Callers hold `state` mutex before calling load_slot, which means no decode thread
-        // can be in run_slot for this layer at the same time (decode acquires `state` first,
-        // so the paths are mutually exclusive).  The RwLock write here is uncontested.
-        *self.slot_gate[slot].write() = Some(gate);
-        *self.slot_up[slot].write() = Some(up);
-        *self.slot_down[slot].write() = Some(down);
-        Ok(true)
+        Ok(Some(SlotWeights {
+            gate: expert_qtensor_on_device(&gate, expert_id, &self.slot_device)?,
+            up: expert_qtensor_on_device(&up, expert_id, &self.slot_device)?,
+            down: expert_qtensor_on_device(&down, expert_id, &self.slot_device)?,
+        }))
     }
 
-    /// Run one token through a cached expert at `slot`.
-    ///
-    /// `x2d: [1, hidden]` on `slot_device` → `[1, hidden]`.
-    fn run_slot(&self, slot: usize, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
-        let gate_qt = self.slot_gate[slot]
-            .read()
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| candle_core::Error::msg("slot gate is empty"))?;
-        let up_qt = self.slot_up[slot]
-            .read()
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| candle_core::Error::msg("slot up is empty"))?;
-        let down_qt = self.slot_down[slot]
-            .read()
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| candle_core::Error::msg("slot down is empty"))?;
+    /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the
+    /// (slow) copy and published only after it, so concurrent admitters never share a slot
+    /// and readers never see a half-written one. `None`: already resident or no empty slot.
+    fn admit(&self, expert_id: usize) -> candle_core::Result<Option<usize>> {
+        let slot = {
+            let mut st = self.state.lock().unwrap();
+            if st.resident.contains(&Some(expert_id)) {
+                return Ok(None);
+            }
+            let Some(slot) = st.resident.iter().position(Option::is_none) else {
+                return Ok(None);
+            };
+            st.resident[slot] = Some(expert_id);
+            slot
+        };
+        let loaded = self.expert_weights(expert_id);
+        let mut st = self.state.lock().unwrap();
+        match loaded {
+            Ok(Some(w)) => {
+                *self.slot_weights[slot].write() = Some(w);
+                st.slots.insert(expert_id, slot);
+                Ok(Some(slot))
+            }
+            Ok(None) => {
+                st.resident[slot] = None;
+                Ok(None)
+            }
+            Err(e) => {
+                st.resident[slot] = None;
+                Err(e)
+            }
+        }
+    }
 
-        let gate_mm = QMatMul::QTensor(gate_qt);
-        let up_mm = QMatMul::QTensor(up_qt);
-        let down_mm = QMatMul::QTensor(down_qt);
+    /// The next expert to fill into this layer, if a slot is still empty.
+    fn next_fill_candidate(&self) -> Option<usize> {
+        let st = self.state.lock().unwrap();
+        fill_candidate(&st.resident, &st.hit_counts)
+    }
 
-        let g = gate_mm.forward(x2d)?;
-        let u = up_mm.forward(x2d)?;
+    /// Fill every empty slot of this layer on a background thread and return immediately.
+    /// No-op when the layer is full or a fill is already running.
+    fn spawn_fill(self: &Arc<Self>) {
+        if self.next_fill_candidate().is_none() {
+            return;
+        }
+        if self
+            .filling
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            while let Some(e) = this.next_fill_candidate() {
+                match this.admit(e) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => {
+                        debug!("expert cache: layer {} fill stopped: {err}", this.layer);
+                        break;
+                    }
+                }
+            }
+            this.filling.store(false, Ordering::Release);
+        });
+    }
+
+    /// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
+    fn run_expert(w: &SlotWeights, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
+        let g = QMatMul::QTensor(w.gate.clone()).forward(x2d)?;
+        let u = QMatMul::QTensor(w.up.clone()).forward(x2d)?;
         let h = (act.forward(&g)? * u)?;
-        down_mm.forward(&h)
+        QMatMul::QTensor(w.down.clone()).forward(&h)
     }
 
     /// Decode path: split top-k into GPU hits and CPU misses, run both concurrently, sum.
-    ///
-    /// GPU hits and CPU misses are independent: hits read from the slot device, misses run
-    /// MoEExperts::forward on CPU.  std::thread::scope lets both happen simultaneously.
+    /// Misses are never loaded on the token path — they run on the CPU.
     fn decode_forward(
         &self,
         xs: &Tensor,
@@ -386,37 +465,22 @@ impl CachedLayer {
         let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
         let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
 
-        let mut hit_pairs: Vec<(u32, f32, usize)> = Vec::new(); // (expert_id, weight, slot)
+        let mut hits: Vec<(SlotWeights, f32)> = Vec::new();
         let mut miss_ids: Vec<u32> = Vec::new();
         let mut miss_weights: Vec<f32> = Vec::new();
-
         {
-            let mut state = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             for (&id, &w) in ids_vec.iter().zip(&weights_vec) {
-                state.hit_counts[id as usize] += 1;
-                if let Some(&slot) = state.slots.get(&(id as usize)) {
-                    hit_pairs.push((id, w, slot));
-                } else {
-                    miss_ids.push(id);
-                    miss_weights.push(w);
-
-                    // Opportunistic admission: fill the first empty slot while the lock is held.
-                    if let Some(empty_slot) = state.resident.iter().position(|s| s.is_none()) {
-                        drop(state);
-                        match self.load_slot(id as usize, empty_slot) {
-                            Ok(true) => {
-                                let mut st = self.state.lock().unwrap();
-                                st.slots.insert(id as usize, empty_slot);
-                                st.resident[empty_slot] = Some(id as usize);
-                                miss_ids.pop();
-                                miss_weights.pop();
-                                hit_pairs.push((id, w, empty_slot));
-                                state = st;
-                            }
-                            Ok(false) | Err(_) => {
-                                state = self.state.lock().unwrap();
-                            }
-                        }
+                st.hit_counts[id as usize] += 1;
+                let resident = st
+                    .slots
+                    .get(&(id as usize))
+                    .and_then(|&slot| self.slot_weights[slot].read().clone());
+                match resident {
+                    Some(sw) => hits.push((sw, w)),
+                    None => {
+                        miss_ids.push(id);
+                        miss_weights.push(w);
                     }
                 }
             }
@@ -424,12 +488,11 @@ impl CachedLayer {
 
         let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
-        // Run GPU hits and CPU misses concurrently.
         let (gpu_result, cpu_result) = std::thread::scope(|s| {
             let gpu = s.spawn(|| -> candle_core::Result<Tensor> {
                 let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
-                for (_, w, slot) in &hit_pairs {
-                    let y = self.run_slot(*slot, &x_gpu, act)?;
+                for (sw, w) in &hits {
+                    let y = Self::run_expert(sw, &x_gpu, act)?;
                     acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
                 }
                 Ok(acc)
@@ -461,64 +524,49 @@ impl CachedLayer {
     }
 }
 
-impl RoutedExperts for CachedLayer {
+/// The model holds `Arc<dyn RoutedExperts>`; this wrapper keeps an `Arc<CachedLayer>` so the
+/// layer can hand itself to background fills.
+struct CachedExperts(Arc<CachedLayer>);
+
+impl RoutedExperts for CachedExperts {
     fn forward(
         &self,
         xs: &Tensor,
         topk_weights: Tensor,
         topk_ids: &Tensor,
     ) -> candle_core::Result<Tensor> {
+        let layer = &self.0;
         let (batch, seq, hidden_dim) = xs.dims3()?;
-        debug_assert_eq!(hidden_dim, self.hidden);
+        debug_assert_eq!(hidden_dim, layer.hidden);
         let num_tokens = batch * seq;
 
-        // Prefill: route everything through CPU and update counts for admission.
+        // Prefill: every routed expert runs on the CPU. Meanwhile, fill the empty slots of the
+        // next layer in the background, so the copy overlaps this layer's CPU experts and the
+        // next layer's attention. This layer is filled too, for the first layer of the stack
+        // (no predecessor triggers it); a layer already full or filling is a no-op.
         if num_tokens > PREFILL_THRESHOLD {
-            let flat_ids = topk_ids.reshape((num_tokens * topk_ids.dim(1)?,))?;
-            let ids_vec = flat_ids.to_vec1::<u32>()?;
+            let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
             {
-                let mut state = self.state.lock().unwrap();
+                let mut st = layer.state.lock().unwrap();
                 for &id in &ids_vec {
-                    state.hit_counts[id as usize] += 1;
-                }
-                // Fill any empty slot with the most-counted uncached expert.
-                while let Some(empty_slot) = state.resident.iter().position(|s| s.is_none()) {
-                    let best = (0..self.num_experts)
-                        .filter(|e| !state.slots.contains_key(e))
-                        .max_by_key(|e| state.hit_counts[*e]);
-                    let Some(expert_id) = best else { break };
-                    if state.hit_counts[expert_id] == 0 {
-                        break;
-                    }
-                    // Release lock before slow I/O.
-                    drop(state);
-                    match self.load_slot(expert_id, empty_slot) {
-                        Ok(true) => {
-                            let mut st = self.state.lock().unwrap();
-                            st.slots.insert(expert_id, empty_slot);
-                            st.resident[empty_slot] = Some(expert_id);
-                            state = st;
-                        }
-                        _ => {
-                            // No slot filled — drop and re-acquire so the loop variable
-                            // stays consistent, then break.
-                            let _guard = self.state.lock().unwrap();
-                            break;
-                        }
-                    }
+                    st.hit_counts[id as usize] += 1;
                 }
             }
-            let out = self.cpu.forward(
+            if let Some(next) = layer.registry.get(layer.layer + 1) {
+                next.spawn_fill();
+            }
+            layer.spawn_fill();
+            let out = layer.cpu.forward(
                 &xs.to_device(&Device::Cpu)?,
                 topk_weights.to_device(&Device::Cpu)?,
                 &topk_ids.to_device(&Device::Cpu)?,
             )?;
-            return out.to_device(&self.slot_device);
+            return out.to_device(&layer.slot_device);
         }
 
         // Decode: single token, split GPU hits / CPU misses.
         let act = Activation::Silu; // Qwen4-Exp always uses SiLU
-        self.decode_forward(xs, &topk_weights, topk_ids, act)
+        layer.decode_forward(xs, &topk_weights, topk_ids, act)
     }
 }
 
@@ -570,5 +618,26 @@ mod tests {
         let qt = stacked(2, 8, 64);
         let per_expert = qt.data().unwrap().len() / 2;
         assert_eq!(slot_bytes_from_qtensor(&qt), Some(3 * per_expert as u64));
+    }
+
+    #[test]
+    fn fill_candidate_prefers_hot_unreserved_experts() {
+        // expert 2 is hottest but already reserved; 3 and 1 tie, lowest id wins
+        let resident = [Some(2), None];
+        let hits = [0, 5, 9, 5];
+        assert_eq!(fill_candidate(&resident, &hits), Some(1));
+        // with no history, fill in id order
+        assert_eq!(fill_candidate(&[None, None], &[0, 0, 0]), Some(0));
+        // full layer: nothing to do
+        assert_eq!(fill_candidate(&[Some(0), Some(1)], &[3, 3, 3]), None);
+        // every expert already placed
+        assert_eq!(fill_candidate(&[Some(0), Some(1), None], &[1, 1]), None);
+    }
+
+    #[test]
+    fn registry_does_not_keep_layers_alive() {
+        let reg = LayerRegistry::default();
+        assert!(reg.get(3).is_none());
+        assert!(reg.layers.read().is_empty());
     }
 }
