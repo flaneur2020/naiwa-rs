@@ -44,8 +44,10 @@ use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::copy_stream::{self, CopyStream, ReadFence, SlotMemory};
+use crate::copy_stream::{self, CopyStream, CopyStreams, ReadFence, SlotMemory};
 use crate::host_memory::{self, PinnedStack};
+use crate::offload::{attach_prefill, CpuExperts};
+use crate::prefill_stream::{PrefillStream, PrefillStreams};
 
 // Number of prefill tokens above which we skip the cache entirely.
 // A decode step is always 1 token, so PREFILL_THRESHOLD = 1 is exact.
@@ -76,12 +78,13 @@ pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
     registry: Arc<LayerRegistry>,
-    /// One copy stream per CUDA device, shared by its layers.
-    copy_streams: Mutex<Vec<(Device, Arc<CopyStream>)>>,
+    copy_streams: CopyStreams,
+    /// `--prefill-stream`: run long prefill chunks' experts on the GPU.
+    prefill: Option<PrefillStreams>,
 }
 
 impl GpuCacheMoeProvider {
-    pub fn new(cache_gb: f64) -> Self {
+    pub fn new(cache_gb: f64, prefill: Option<PrefillStreams>) -> Self {
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         Self {
             cache_gb,
@@ -90,30 +93,8 @@ impl GpuCacheMoeProvider {
                 bytes_per_layer: None,
             }),
             registry: Arc::default(),
-            copy_streams: Mutex::default(),
-        }
-    }
-}
-
-impl GpuCacheMoeProvider {
-    /// The copy stream for `device`, created on first use; `None` off CUDA or when the stream
-    /// cannot be created (the layer then uploads through candle's stream).
-    fn copy_stream_for(&self, device: &Device) -> Option<Arc<CopyStream>> {
-        let mut streams = self.copy_streams.lock().unwrap();
-        if let Some((_, cs)) = streams.iter().find(|(d, _)| d.same_device(device)) {
-            return Some(Arc::clone(cs));
-        }
-        match CopyStream::new(device) {
-            Ok(Some(cs)) => {
-                let cs = Arc::new(cs);
-                streams.push((device.clone(), Arc::clone(&cs)));
-                Some(cs)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!("expert cache: no copy stream ({e}); slot fills will not overlap compute");
-                None
-            }
+            copy_streams: CopyStreams::default(),
+            prefill,
         }
     }
 }
@@ -254,12 +235,16 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 "expert cache: layer {} gets 0 slots ({} bytes/slot > {}/layer budget); skipping",
                 ctx.site.layer, slot_bytes, per_layer_budget
             );
-            // Still install a CPU-only provider so the layer is consistent.
-            let layer_device = ctx.layer_device.clone();
-            return Ok(Some(Arc::new(CpuOnlyExperts {
-                cpu: cpu_experts,
-                layer_device,
-            })));
+            drop(inner);
+            let (pinned, prefill) =
+                attach_prefill(&self.prefill, &ctx, &cpu_experts, &self.copy_streams)?;
+            return Ok(Some(Arc::new(CpuExperts::new(
+                cpu_experts,
+                ctx.layer_device.clone(),
+                ctx.site.layer,
+                prefill,
+                pinned,
+            ))));
         }
 
         let layer_idx = ctx.site.layer;
@@ -300,6 +285,13 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             });
         }
 
+        let prefill = match &self.prefill {
+            Some(streams) => {
+                streams.attach(&ctx, &cpu_experts, pin_failed == 0, &self.copy_streams)?
+            }
+            None => None,
+        };
+
         // The same tensor the model loads as this block's router (`gate`); the decode lookahead
         // runs it on the CPU. Without it the layer is still cached, just never predicted.
         let router = match load_router(&ctx, num_experts, hidden) {
@@ -312,7 +304,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         // With a copy stream, each slot's memory is allocated once here and every fill overwrites
         // it in place from the copy stream; otherwise each fill uploads a fresh copy.
-        let mut copy_stream = self.copy_stream_for(&slot_device);
+        let mut copy_stream = self.copy_streams.get(&slot_device);
         let mut slot_bufs = Vec::new();
         if let (Some(cs), Some((gate, up, down))) = (&copy_stream, cpu_experts.expert_qtensors()) {
             for _ in 0..num_slots {
@@ -359,6 +351,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             }),
             copy_stream,
             slot_bufs,
+            prefill,
             filling: AtomicBool::new(false),
         });
         self.registry.insert(layer_idx, &cached);
@@ -377,31 +370,6 @@ fn load_router(
         .get((num_experts, hidden), "weight")?
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)
-}
-
-// ---------------------------------------------------------------------------
-// CPU-only fallback (zero slots)
-// ---------------------------------------------------------------------------
-
-struct CpuOnlyExperts {
-    cpu: MoEExperts,
-    layer_device: Device,
-}
-
-impl RoutedExperts for CpuOnlyExperts {
-    fn forward(
-        &self,
-        xs: &Tensor,
-        topk_weights: Tensor,
-        topk_ids: &Tensor,
-    ) -> candle_core::Result<Tensor> {
-        let ys = self.cpu.forward(
-            &xs.to_device(&Device::Cpu)?,
-            topk_weights.to_device(&Device::Cpu)?,
-            &topk_ids.to_device(&Device::Cpu)?,
-        )?;
-        ys.to_device(&self.layer_device)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +525,8 @@ struct CachedLayer {
     copy_stream: Option<Arc<CopyStream>>,
     /// Copy-stream mode: every slot's permanent buffer (empty otherwise).
     slot_bufs: Vec<Arc<SlotBuf>>,
+    /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
+    prefill: Option<Arc<PrefillStream>>,
     /// A background fill of this layer is running; at most one at a time.
     filling: AtomicBool,
 }
@@ -884,6 +854,11 @@ impl RoutedExperts for CachedExperts {
                 next.spawn_fill();
             }
             layer.spawn_fill();
+            if let Some(ps) = &layer.prefill {
+                if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
+                    return Ok(out);
+                }
+            }
             let out = layer.cpu.forward(
                 &xs.to_device(&Device::Cpu)?,
                 topk_weights.to_device(&Device::Cpu)?,

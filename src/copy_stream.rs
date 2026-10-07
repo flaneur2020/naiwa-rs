@@ -25,6 +25,34 @@ pub fn wait_for_readers<T>(owner: &Arc<T>) {
     }
 }
 
+/// One copy stream per CUDA device, created on first use and shared by its layers.
+#[derive(Default)]
+pub struct CopyStreams(std::sync::Mutex<Vec<(candle_core::Device, Arc<CopyStream>)>>);
+
+impl CopyStreams {
+    /// `None` off CUDA, or when the stream cannot be created (logged once per device).
+    pub fn get(&self, device: &candle_core::Device) -> Option<Arc<CopyStream>> {
+        let mut streams = self.0.lock().unwrap();
+        if let Some((_, cs)) = streams.iter().find(|(d, _)| d.same_device(device)) {
+            return Some(Arc::clone(cs));
+        }
+        match CopyStream::new(device) {
+            Ok(Some(cs)) => {
+                let cs = Arc::new(cs);
+                streams.push((device.clone(), Arc::clone(&cs)));
+                Some(cs)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "no CUDA copy stream ({e}); expert uploads will not overlap compute"
+                );
+                None
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::sync::{Arc, Mutex};
@@ -123,6 +151,26 @@ mod cuda {
             Ok(SlotMemory { tensor, ptr, len })
         }
 
+        /// Device memory shaped like the whole of `stack`.
+        pub fn alloc_like(&self, stack: &QTensor) -> Result<SlotMemory> {
+            let Device::Cuda(dev) = &self.device else {
+                candle_core::bail!("copy stream on a non-CUDA device");
+            };
+            let storage = QCudaStorage::zeros(dev, stack.shape().elem_count(), stack.dtype())?;
+            let len = storage.storage_size_in_bytes();
+            let ptr = storage.device_ptr()? as sys::CUdeviceptr;
+            let tensor = Arc::new(QTensor::new(
+                QStorage::Cuda(storage),
+                stack.shape().clone(),
+            )?);
+            Ok(SlotMemory { tensor, ptr, len })
+        }
+
+        /// Wait for everything queued on this stream so far.
+        pub fn synchronize(&self) -> Result<()> {
+            self.stream.synchronize().map_err(Error::wrap)
+        }
+
         /// Order this stream after everything already queued on candle's stream, i.e. the slot
         /// allocations and their zero-fill.
         pub fn after_device_work(&self) -> Result<()> {
@@ -133,9 +181,30 @@ mod cuda {
             self.stream.wait(&done).map_err(Error::wrap)
         }
 
+        /// Queue copies of each `src` into its `dst` once the readers are done (`fence`), then
+        /// record `done`; returns at once.
+        ///
+        /// # Safety
+        /// Every `src` must be page-locked (or the call blocks until it is staged) and must stay
+        /// alive and unmodified until `done` completes.
+        pub unsafe fn upload_async(
+            &self,
+            fence: &ReadFence,
+            parts: &[(&SlotMemory, &[u8])],
+            done: &CopyDone,
+        ) -> Result<()> {
+            self.queue_copies(fence, parts)?;
+            done.event.record(&self.stream).map_err(Error::wrap)
+        }
+
         /// Copy each `src` into its `dst` once the slot's readers are done (`fence`), and return
         /// after the copies have landed.
         pub fn upload(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
+            self.queue_copies(fence, parts)?;
+            self.stream.synchronize().map_err(Error::wrap)
+        }
+
+        fn queue_copies(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
             self.stream
                 .context()
                 .bind_to_thread()
@@ -151,18 +220,42 @@ mod cuda {
                         dst.len
                     );
                 }
-                // SAFETY: `dst.ptr` is a live allocation of `dst.len` bytes owned by the slot,
-                // and `src` outlives the copy: this function waits for it below.
+                // SAFETY: `dst.ptr` is a live allocation of `dst.len` bytes owned by the slot;
+                // the callers keep `src` alive until the copy completes.
                 unsafe { result::memcpy_htod_async(dst.ptr, src, self.stream.cu_stream()) }
                     .map_err(Error::wrap)?;
             }
-            self.stream.synchronize().map_err(Error::wrap)
+            Ok(())
+        }
+    }
+
+    /// Completion of an asynchronous upload, recorded on the copy stream.
+    pub struct CopyDone {
+        event: CudaEvent,
+    }
+
+    impl CopyDone {
+        pub fn new(cs: &CopyStream) -> Result<Self> {
+            let event = cs
+                .stream
+                .context()
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                .map_err(Error::wrap)?;
+            Ok(Self { event })
+        }
+
+        /// Make candle's stream wait for the upload (a GPU-side wait; the host does not block).
+        pub fn wait_on(&self, device: &Device) -> Result<()> {
+            let Device::Cuda(dev) = device else {
+                return Ok(());
+            };
+            dev.cuda_stream().wait(&self.event).map_err(Error::wrap)
         }
     }
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{CopyStream, ReadFence, SlotMemory};
+pub use cuda::{CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
@@ -198,9 +291,41 @@ mod stub {
     }
 
     /// Never constructed without CUDA.
+    pub enum CopyDone {}
+
+    impl CopyDone {
+        pub fn new(cs: &CopyStream) -> Result<Self> {
+            match *cs {}
+        }
+
+        pub fn wait_on(&self, _device: &Device) -> Result<()> {
+            match *self {}
+        }
+    }
+
+    /// Never constructed without CUDA.
     pub enum CopyStream {}
 
     impl CopyStream {
+        pub fn alloc_like(&self, _stack: &QTensor) -> Result<SlotMemory> {
+            match *self {}
+        }
+
+        pub fn synchronize(&self) -> Result<()> {
+            match *self {}
+        }
+
+        /// # Safety
+        /// See the CUDA version.
+        pub unsafe fn upload_async(
+            &self,
+            _fence: &ReadFence,
+            _parts: &[(&SlotMemory, &[u8])],
+            _done: &CopyDone,
+        ) -> Result<()> {
+            match *self {}
+        }
+
         pub fn new(_device: &Device) -> Result<Option<Self>> {
             Ok(None)
         }
@@ -220,7 +345,7 @@ mod stub {
 }
 
 #[cfg(not(feature = "cuda"))]
-pub use stub::{CopyStream, ReadFence, SlotMemory};
+pub use stub::{CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(test)]
 mod tests {

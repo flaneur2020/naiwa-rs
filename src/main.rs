@@ -9,6 +9,7 @@ mod expert_cache;
 mod host_memory;
 mod load;
 mod offload;
+mod prefill_stream;
 
 use anyhow::Result;
 use clap::Parser;

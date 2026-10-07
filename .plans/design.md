@@ -1,6 +1,6 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-07, `main` at `04186d4` with the copy-stream work (§3.3).
+Status as of 2026-10-07, `main` with the prefill stream (§3.4); fork pinned to `781f149f`.
 
 ## 1. What this project is
 
@@ -17,16 +17,17 @@ running a model whose routed experts do not fit in VRAM on one consumer GPU, usi
 
 | Crate | Source |
 |---|---|
-| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `f069ce87` |
+| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `781f149f` |
 | `candle-core` | `huggingface/candle` rev `66a8cf18`, the revision mistral.rs uses |
 
-`patch/strata` = upstream Qwen3.8-Flash-Next support (#2462) + three fork commits:
+`patch/strata` = upstream Qwen3.8-Flash-Next support (#2462) + these fork commits:
 
 | Fork commit | Change |
 |---|---|
 | `6e7a09aa` | `mistralrs_core::moe_offload`: a `RoutedExpertsProvider` hook that can take over a MoE block's routed experts (Qwen4-Exp decoder layers and MTP head) |
 | `f069ce87` | `MoEExperts::expert_qtensors()` exposes the stacked gate/up/down `QTensor`s (gather backend, replicated experts only) |
 | `f069ce87` | `forward_gather` reads top-k from `topk_ids` instead of the config, so a caller can pass a subset of the routed experts |
+| `781f149f` | `MoEExperts::from_qtensors(gate, up, down, ..)` builds routed experts over stacks the caller holds (shared, not copied), on any device; used for GPU prefill |
 
 **Fork policy: keep it minimal.** Everything else lives in this repo. The router is read
 through the existing `ExpertLoadContext::vb`, not a new accessor.
@@ -56,6 +57,7 @@ to the new commit. `cargo update -p mistralrs-core` does not work while the patc
 | `src/expert_cache.rs` | the GPU expert cache (`GpuCacheMoeProvider`) |
 | `src/host_memory.rs` | huge pages and CUDA pinning for the host expert stacks |
 | `src/copy_stream.rs` | dedicated CUDA copy stream, in-place slot memory and read fences |
+| `src/prefill_stream.rs` | `--prefill-stream`: GPU prefill experts from two streamed layer buffers |
 | `src/commands/*` | one file per subcommand |
 
 ## 3. Expert placement, as implemented
@@ -84,7 +86,8 @@ in RAM.
 gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
 
 **Prefill** (more than one token in the step):
-1. Every routed expert runs on the CPU, since all of them are needed anyway.
+1. Every routed expert runs on the CPU, since all of them are needed anyway, unless
+   `--prefill-stream` takes the chunk (§3.4).
 2. Before that, the layer starts a background fill of layer *l+1*'s empty slots (and its
    own, which covers layer 0). At most one fill runs per layer; a full layer is a no-op.
    On CUDA the copy runs on a dedicated copy stream, so it overlaps this layer's CPU
@@ -157,7 +160,39 @@ kernels.
   as before; old buffers are freed when their last reader lets go.
 - Cost: slot VRAM is allocated eagerly at load (the same budget), instead of on first fill.
 
-### 3.4 Format support — actual, not intended
+### 3.4 `--prefill-stream` (requires `--cpu-moe`, CUDA only)
+
+Runs prefill's routed experts on the GPU, streaming each layer's experts in while the previous
+layer computes. Works with or without `--expert-cache-gb`. Strata (`src/prefill/prefill.cpp`)
+does the same job with a ring of per-expert slots and its own grouped kernels; this is the
+simplest version that keeps the overlap:
+
+- **Two whole-layer buffers.** Each holds one layer's three stacked `[E, N, K]` projections in
+  VRAM and a `MoEExperts` over them (`from_qtensors`, fork `781f149f`). The GPU therefore runs
+  mistral.rs's own MoE path: grouped MMQ for 32+ tokens, which reads each expert once per chunk.
+- **Per layer *l*, nothing blocks the host:**
+  1. Layer *l+1* is uploaded into the other buffer. That is one `memcpy_htod_async` per
+     projection, straight from the pinned host stack, issued after the buffer's `released`
+     fence (layer *l-1* done) and followed by recording `ready`. It overlaps layer *l*'s MoE
+     and layer *l+1*'s attention.
+  2. candle's stream waits on layer *l*'s `ready`.
+  3. `forward` runs on the GPU, then `released` is recorded.
+- **Not hidden:** the first layer of each chunk, which has no predecessor to prefetch it.
+- **Stays on the CPU:** chunks under `MIN_TOKENS` (1024, as in Strata), layers whose stacks are
+  not all pinned (an async upload from pageable memory would block the forward thread), and
+  the MTP head.
+- **Mixed-quant GGUFs:** when a layer's dtype or shape differs from what a buffer holds, the
+  buffer is reallocated. The old memory is freed only after its in-flight upload completes.
+- **Cost:** two layers of experts in VRAM, separate from the cache budget. Bandwidth: every
+  chunk streams every layer's experts once, so this pays only for long chunks. Strata uses
+  about 8K-token chunks. Raise `--max-num-batched-tokens` (e.g. 8192); the 512-token
+  `--max-prefill-chunk-tokens` default may also bound chunks, which is still to be verified.
+- **Shared copy stream:** decode-cache slot fills and layer uploads share one copy stream, so
+  during prefill a layer upload can queue behind slot fills.
+- **Tested here:** `from_qtensors` on CPU against per-expert `QMatMul` references, for the
+  full top-k and a subset. The result is bit-identical (max diff 0).
+
+### 3.5 Format support — actual, not intended
 
 | Experts as | Cached? |
 |---|---|
@@ -173,8 +208,9 @@ kernels.
 | `cargo check --all-targets`, `cargo fmt --check` | clean (default features only) |
 | `#[cfg(feature = "cuda")]` code (`host_memory`, `copy_stream`) | **not compiled by this build.** `candle-kernels` needs `nvcc`. Every cudarc call is type-checked in a scratch crate against cudarc 0.19.10; the candle glue (`Device::Cuda`, `cuda_stream()`, `QCudaStorage::zeros`, `QTensor::device_ptr`) is not |
 | Linux-only code (`madvise`) | type-checked in a scratch crate for `riscv64gc-unknown-linux-gnu` |
-| `cargo test` | 20 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait |
+| `cargo test` | 21 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait, `from_qtensors` vs per-expert reference |
 | In-place copy-stream path | **cannot run here.** Only exercised on CUDA; the non-CUDA build always takes the fresh-upload path |
+| Prefill stream | **cannot run here** (CUDA only). Its buffer and event logic are unexercised until a CUDA run |
 | Any CUDA run | **never.** No CUDA host available; the dev machine is an M1 Mac without `nvcc` |
 | Numeric parity: cached vs uncached | not done |
 | Hit rate, tokens/s | not measured |
@@ -231,12 +267,20 @@ Ordered by priority. Small, local, testable work comes first.
     experts at once. Mostly a Windows/WDDM win per Strata; only worth it if profiling shows
     per-copy overhead.
 
+### Then — prefill stream follow-ups (needs a CUDA host)
+12. Measure tokens/s for long prompts with and without `--prefill-stream`, at several chunk
+    sizes. Find which setting bounds the chunk the MoE sees, and whether 1024 is the right
+    threshold for this hardware.
+13. Profile: confirm layer uploads overlap attention, and whether they queue behind slot
+    fills. If they do, give prefill its own copy stream.
+14. Hide the first layer of each chunk, e.g. prefetch layer 0 at the end of the previous chunk.
+
 ### Later — extend the cache's reach
-12. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
+15. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
    tokens) use the cache, not just single-token decode.
-13. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
+16. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
     `--expert-profile-save`), or fill from a static frequency profile.
-14. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
+17. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
     (Strata's LFU-style adaptive tier) once hit-rate data exists.
 
 ### Out of scope

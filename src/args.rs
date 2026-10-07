@@ -231,10 +231,16 @@ pub struct ModelOptions {
     #[arg(long)]
     pub cpu_moe: bool,
 
-    /// With `--cpu-moe`, cache the most-used routed experts in VRAM, in GiB. Not implemented yet:
-    /// passing this currently refuses to start.
+    /// With `--cpu-moe`, cache the most-used routed experts in VRAM for decode, in GiB.
     #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
     pub expert_cache_gb: Option<f64>,
+
+    /// With `--cpu-moe`, run the routed experts of prefill chunks of 1024+ tokens on the GPU,
+    /// uploading each layer's experts while the previous layer computes. Uses two layers' worth
+    /// of expert memory in VRAM. Streams every expert once per chunk, so raise
+    /// `--max-num-batched-tokens` (e.g. 8192) for long prompts. CUDA only.
+    #[arg(long, requires = "cpu_moe")]
+    pub prefill_stream: bool,
 }
 
 #[derive(Args, Clone, Default)]
