@@ -4503,6 +4503,7 @@ dependencies = [
  "mistralrs-core",
  "mistralrs-quant",
  "mistralrs-server-core",
+ "parking_lot",
  "serde_json",
  "tokio",
  "tracing",

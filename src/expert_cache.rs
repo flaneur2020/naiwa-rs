@@ -38,6 +38,7 @@ use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::MoEExperts;
+use parking_lot::RwLock;
 use tracing::{debug, info};
 
 // Number of prefill tokens above which we skip the cache entirely.
@@ -251,9 +252,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 resident: vec![None; num_slots],
                 hit_counts: vec![0u64; num_experts],
             }),
-            slot_gate: (0..num_slots).map(|_| None).collect(),
-            slot_up: (0..num_slots).map(|_| None).collect(),
-            slot_down: (0..num_slots).map(|_| None).collect(),
+            slot_gate: (0..num_slots).map(|_| RwLock::new(None)).collect(),
+            slot_up: (0..num_slots).map(|_| RwLock::new(None)).collect(),
+            slot_down: (0..num_slots).map(|_| RwLock::new(None)).collect(),
         })))
     }
 }
@@ -301,11 +302,15 @@ struct CachedLayer {
     inter: usize,
     num_experts: usize,
     state: Mutex<CachedLayerState>,
-    // Parallel Vecs: slot_gate[i] / slot_up[i] / slot_down[i] form a complete slot.
-    // None = empty slot.
-    slot_gate: Vec<Option<Arc<QTensor>>>,
-    slot_up: Vec<Option<Arc<QTensor>>>,
-    slot_down: Vec<Option<Arc<QTensor>>>,
+    // Per-slot RwLock<Option<Arc<QTensor>>> for gate/up/down.
+    //
+    // Invariant: writes (via load_slot) only occur while holding `state` mutex, either
+    // in the prefill admission loop or in the opportunistic decode admission path — never
+    // while another thread holds a read lock on the same slot.  Reads in decode_forward
+    // hold only a read lock and never race with a concurrent write on the same slot.
+    slot_gate: Vec<RwLock<Option<Arc<QTensor>>>>,
+    slot_up: Vec<RwLock<Option<Arc<QTensor>>>>,
+    slot_down: Vec<RwLock<Option<Arc<QTensor>>>>,
 }
 
 impl CachedLayer {
@@ -328,19 +333,12 @@ impl CachedLayer {
         let up = expert_qtensor_on_device(up_stack, expert_id, &self.slot_device)?;
         let down = expert_qtensor_on_device(down_stack, expert_id, &self.slot_device)?;
 
-        // SAFETY: slot indices are bounded by `num_slots()`; each slot is only written here,
-        // called from behind the state mutex.  We use raw pointer writes because the Vec is
-        // pre-allocated with `None`s and we need interior mutability without wrapping each
-        // element in an extra lock.  The subsequent GPU read is on the same thread/stream as
-        // the write in this function.
-        unsafe {
-            let gp = self.slot_gate.as_ptr().add(slot) as *mut Option<Arc<QTensor>>;
-            let up_p = self.slot_up.as_ptr().add(slot) as *mut Option<Arc<QTensor>>;
-            let dp = self.slot_down.as_ptr().add(slot) as *mut Option<Arc<QTensor>>;
-            *gp = Some(gate);
-            *up_p = Some(up);
-            *dp = Some(down);
-        }
+        // Callers hold `state` mutex before calling load_slot, which means no decode thread
+        // can be in run_slot for this layer at the same time (decode acquires `state` first,
+        // so the paths are mutually exclusive).  The RwLock write here is uncontested.
+        *self.slot_gate[slot].write() = Some(gate);
+        *self.slot_up[slot].write() = Some(up);
+        *self.slot_down[slot].write() = Some(down);
         Ok(true)
     }
 
@@ -349,27 +347,35 @@ impl CachedLayer {
     /// `x2d: [1, hidden]` on `slot_device` → `[1, hidden]`.
     fn run_slot(&self, slot: usize, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
         let gate_qt = self.slot_gate[slot]
+            .read()
             .as_ref()
+            .map(Arc::clone)
             .ok_or_else(|| candle_core::Error::msg("slot gate is empty"))?;
         let up_qt = self.slot_up[slot]
+            .read()
             .as_ref()
+            .map(Arc::clone)
             .ok_or_else(|| candle_core::Error::msg("slot up is empty"))?;
         let down_qt = self.slot_down[slot]
+            .read()
             .as_ref()
+            .map(Arc::clone)
             .ok_or_else(|| candle_core::Error::msg("slot down is empty"))?;
 
-        let gate_mm = QMatMul::QTensor(gate_qt.clone());
-        let up_mm = QMatMul::QTensor(up_qt.clone());
-        let down_mm = QMatMul::QTensor(down_qt.clone());
+        let gate_mm = QMatMul::QTensor(gate_qt);
+        let up_mm = QMatMul::QTensor(up_qt);
+        let down_mm = QMatMul::QTensor(down_qt);
 
-        // x2d: [1, hidden]; gate/up weights [inter, hidden] → output [1, inter]
         let g = gate_mm.forward(x2d)?;
         let u = up_mm.forward(x2d)?;
         let h = (act.forward(&g)? * u)?;
-        down_mm.forward(&h) // [1, hidden]
+        down_mm.forward(&h)
     }
 
-    /// Decode path: split top-k into GPU hits and CPU misses, run both, sum.
+    /// Decode path: split top-k into GPU hits and CPU misses, run both concurrently, sum.
+    ///
+    /// GPU hits and CPU misses are independent: hits read from the slot device, misses run
+    /// MoEExperts::forward on CPU.  std::thread::scope lets both happen simultaneously.
     fn decode_forward(
         &self,
         xs: &Tensor,
@@ -380,8 +386,7 @@ impl CachedLayer {
         let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
         let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
 
-        let mut hit_ids: Vec<u32> = Vec::new();
-        let mut hit_weights: Vec<f32> = Vec::new();
+        let mut hit_pairs: Vec<(u32, f32, usize)> = Vec::new(); // (expert_id, weight, slot)
         let mut miss_ids: Vec<u32> = Vec::new();
         let mut miss_weights: Vec<f32> = Vec::new();
 
@@ -390,70 +395,69 @@ impl CachedLayer {
             for (&id, &w) in ids_vec.iter().zip(&weights_vec) {
                 state.hit_counts[id as usize] += 1;
                 if let Some(&slot) = state.slots.get(&(id as usize)) {
-                    hit_ids.push(id);
-                    hit_weights.push(w);
-                    let _ = slot;
+                    hit_pairs.push((id, w, slot));
                 } else {
                     miss_ids.push(id);
                     miss_weights.push(w);
 
-                    // Opportunistic admission: if there is an empty slot, fill it now.
+                    // Opportunistic admission: fill the first empty slot while the lock is held.
                     if let Some(empty_slot) = state.resident.iter().position(|s| s.is_none()) {
-                        // Release the lock before the (potentially slow) byte copy.
                         drop(state);
                         match self.load_slot(id as usize, empty_slot) {
                             Ok(true) => {
-                                let mut st2 = self.state.lock().unwrap();
-                                st2.slots.insert(id as usize, empty_slot);
-                                st2.resident[empty_slot] = Some(id as usize);
-                                // Move from miss to hit.
+                                let mut st = self.state.lock().unwrap();
+                                st.slots.insert(id as usize, empty_slot);
+                                st.resident[empty_slot] = Some(id as usize);
                                 miss_ids.pop();
                                 miss_weights.pop();
-                                hit_ids.push(id);
-                                hit_weights.push(w);
+                                hit_pairs.push((id, w, empty_slot));
+                                state = st;
                             }
-                            Ok(false) | Err(_) => {}
+                            Ok(false) | Err(_) => {
+                                state = self.state.lock().unwrap();
+                            }
                         }
-                        state = self.state.lock().unwrap();
                     }
                 }
             }
         }
 
-        let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden] on slot_device
+        let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
-        // GPU hits.
-        let mut out = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
-        {
-            let state = self.state.lock().unwrap();
-            for (&id, &w) in hit_ids.iter().zip(&hit_weights) {
-                if let Some(&slot) = state.slots.get(&(id as usize)) {
-                    let y = self.run_slot(slot, &x_gpu, act)?;
-                    let y_f32 = y.to_dtype(DType::F32)?;
-                    out = (out + (y_f32 * w as f64)?)?;
+        // Run GPU hits and CPU misses concurrently.
+        let (gpu_result, cpu_result) = std::thread::scope(|s| {
+            let gpu = s.spawn(|| -> candle_core::Result<Tensor> {
+                let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
+                for (_, w, slot) in &hit_pairs {
+                    let y = self.run_slot(*slot, &x_gpu, act)?;
+                    acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
                 }
+                Ok(acc)
+            });
+
+            let cpu = (|| -> candle_core::Result<Option<Tensor>> {
+                if miss_ids.is_empty() {
+                    return Ok(None);
+                }
+                let miss_ids_t = Tensor::new(miss_ids.clone(), &Device::Cpu)?.unsqueeze(0)?;
+                let miss_w_t = Tensor::new(miss_weights.clone(), &Device::Cpu)?.unsqueeze(0)?;
+                let xs_cpu = xs.to_device(&Device::Cpu)?;
+                let out = self.cpu.forward(&xs_cpu, miss_w_t, &miss_ids_t)?;
+                Ok(Some(out.squeeze(0)?)) // [1, 1, hidden] -> [1, hidden]
+            })();
+
+            (gpu.join().unwrap(), cpu)
+        });
+
+        let gpu_out = gpu_result?;
+        let sum = match cpu_result? {
+            None => gpu_out.to_dtype(xs.dtype())?,
+            Some(c) => {
+                let c_gpu = c.to_device(&self.slot_device)?.to_dtype(DType::F32)?;
+                (gpu_out + c_gpu)?.to_dtype(xs.dtype())?
             }
-        }
-
-        // CPU misses.
-        if !miss_ids.is_empty() {
-            let miss_ids_t = Tensor::new(
-                miss_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(),
-                &Device::Cpu,
-            )?
-            .unsqueeze(0)?; // [1, n_miss]
-            let miss_w_t = Tensor::new(miss_weights.clone(), &Device::Cpu)?.unsqueeze(0)?;
-            let xs_cpu = xs.to_device(&Device::Cpu)?;
-            let cpu_out = self.cpu.forward(&xs_cpu, miss_w_t, &miss_ids_t)?; // [1, 1, hidden]
-            let cpu_f32 = cpu_out
-                .squeeze(0)?
-                .squeeze(0)?
-                .to_dtype(DType::F32)?
-                .to_device(&self.slot_device)?;
-            out = (out + cpu_f32)?;
-        }
-
-        out.to_dtype(xs.dtype())?.unsqueeze(0) // [1, 1, hidden]
+        };
+        sum.unsqueeze(0) // [1, 1, hidden]
     }
 }
 
@@ -515,5 +519,56 @@ impl RoutedExperts for CachedLayer {
         // Decode: single token, split GPU hits / CPU misses.
         let act = Activation::Silu; // Qwen4-Exp always uses SiLU
         self.decode_forward(xs, &topk_weights, topk_ids, act)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::quantized::GgmlDType;
+
+    /// A stacked `[E, N, K]` Q8_0 tensor whose experts hold distinct values.
+    fn stacked(e: usize, n: usize, k: usize) -> QTensor {
+        let data: Vec<f32> = (0..e * n * k)
+            .map(|i| (i % 97) as f32 * 0.01 - 0.4)
+            .collect();
+        let t = Tensor::from_vec(data, (e, n, k), &Device::Cpu).unwrap();
+        QTensor::quantize(&t, GgmlDType::Q8_0).unwrap()
+    }
+
+    #[test]
+    fn expert_bytes_slice_the_stack_exactly() {
+        let (e, n, k) = (4, 8, 64);
+        let qt = stacked(e, n, k);
+        let all = qt.data().unwrap().into_owned();
+        let stride = all.len() / e;
+        let mut rebuilt = Vec::new();
+        for i in 0..e {
+            let b = expert_bytes(&qt, i).unwrap();
+            assert_eq!(b, all[i * stride..(i + 1) * stride]);
+            rebuilt.extend_from_slice(&b);
+        }
+        assert_eq!(rebuilt, all);
+        assert!(expert_bytes(&qt, e).is_err());
+    }
+
+    #[test]
+    fn single_expert_qtensor_matches_its_slice_of_the_stack() {
+        let (e, n, k) = (3, 4, 32);
+        let qt = stacked(e, n, k);
+        let one = expert_qtensor_on_device(&qt, 1, &Device::Cpu).unwrap();
+        assert_eq!(one.shape().dims(), &[n, k]);
+        assert_eq!(one.dtype(), GgmlDType::Q8_0);
+        let full = qt.dequantize(&Device::Cpu).unwrap().get(1).unwrap();
+        let got = one.dequantize(&Device::Cpu).unwrap();
+        let diff = (full - got).unwrap().abs().unwrap().sum_all().unwrap();
+        assert_eq!(diff.to_scalar::<f32>().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn slot_bytes_count_three_projections() {
+        let qt = stacked(2, 8, 64);
+        let per_expert = qt.data().unwrap().len() / 2;
+        assert_eq!(slot_bytes_from_qtensor(&qt), Some(3 * per_expert as u64));
     }
 }
