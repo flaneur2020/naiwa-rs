@@ -47,7 +47,7 @@ use tracing::{debug, info, warn};
 use crate::copy_stream::{self, CopyStream, CopyStreams, ReadFence, SlotMemory};
 use crate::host_memory::{self, PinnedStack};
 use crate::offload::{attach_prefill, CpuExperts};
-use crate::prefill_stream::{PrefillStream, PrefillStreams};
+use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
 
 // Number of prefill tokens above which we skip the cache entirely.
 // A decode step is always 1 token, so PREFILL_THRESHOLD = 1 is exact.
@@ -86,13 +86,20 @@ pub struct GpuCacheMoeProvider {
 impl GpuCacheMoeProvider {
     pub fn new(cache_gb: f64, prefill: Option<PrefillStreams>) -> Self {
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let registry: Arc<LayerRegistry> = Arc::default();
+        // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
+        let prefill = prefill.map(|p| {
+            p.with_lender(Arc::new(CacheLoan {
+                registry: Arc::clone(&registry),
+            }))
+        });
         Self {
             cache_gb,
             inner: Mutex::new(ProviderInner {
                 remaining_bytes: total_bytes,
                 bytes_per_layer: None,
             }),
-            registry: Arc::default(),
+            registry,
             copy_streams: CopyStreams::default(),
             prefill,
         }
@@ -306,23 +313,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // it in place from the copy stream; otherwise each fill uploads a fresh copy.
         let mut copy_stream = self.copy_streams.get(&slot_device);
         let mut slot_bufs = Vec::new();
-        if let (Some(cs), Some((gate, up, down))) = (&copy_stream, cpu_experts.expert_qtensors()) {
+        if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
             for _ in 0..num_slots {
-                let memory = [
-                    cs.alloc_expert(&gate)?,
-                    cs.alloc_expert(&up)?,
-                    cs.alloc_expert(&down)?,
-                ];
-                let weights = SlotWeights {
-                    gate: Arc::clone(memory[0].tensor()),
-                    up: Arc::clone(memory[1].tensor()),
-                    down: Arc::clone(memory[2].tensor()),
-                };
-                slot_bufs.push(Arc::new(SlotBuf {
-                    weights,
-                    memory: Some(memory),
-                    fence: ReadFence::new(&slot_device)?,
-                }));
+                slot_bufs.push(SlotEntry::new(Some(alloc_slot(cs, &stacks, &slot_device)?)));
             }
             cs.after_device_work()?;
         }
@@ -348,6 +341,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 last_use: vec![0u64; num_slots],
                 tick: 0,
                 published: vec![None; num_slots],
+                usable: num_slots,
             }),
             copy_stream,
             slot_bufs,
@@ -470,6 +464,44 @@ impl LayerRegistry {
     fn get(&self, layer: usize) -> Option<Arc<CachedLayer>> {
         self.layers.read().get(layer).and_then(Weak::upgrade)
     }
+
+    fn all(&self) -> Vec<Arc<CachedLayer>> {
+        self.layers
+            .read()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+}
+
+/// Lends the cache's tail slots to the prefill stream while a prompt runs (see
+/// `prefill_stream`): each layer gives up an equal share of the bytes asked for.
+struct CacheLoan {
+    registry: Arc<LayerRegistry>,
+}
+
+impl ExpertMemoryLender for CacheLoan {
+    fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
+        let layers = self.registry.all();
+        let share = bytes.div_ceil(layers.len().max(1));
+        Ok(layers
+            .iter()
+            .map(|l| {
+                let per_slot = l.slot_bytes();
+                if per_slot == 0 {
+                    return 0;
+                }
+                l.lend(share.div_ceil(per_slot)) * per_slot
+            })
+            .sum())
+    }
+
+    fn give_back(&self) -> candle_core::Result<()> {
+        for layer in self.registry.all() {
+            layer.give_back()?;
+        }
+        Ok(())
+    }
 }
 
 struct CachedLayerState {
@@ -487,6 +519,9 @@ struct CachedLayerState {
     /// Slot -> its contents, for the slots listed in `slots`. Readers clone the `Arc` under
     /// the lock, so a slot replaced later never changes what an in-flight token computes with.
     published: Vec<Option<Arc<SlotBuf>>>,
+    /// Slots `[0, usable)` are in service; the rest are lent to the prefill stream (empty,
+    /// unpublished, and without device memory in copy-stream mode).
+    usable: usize,
 }
 
 /// One expert's projections in a slot.
@@ -504,6 +539,34 @@ struct SlotBuf {
     memory: Option<[SlotMemory; 3]>,
     /// Recorded by readers after enqueueing the kernels that read this slot.
     fence: ReadFence,
+}
+
+/// A slot's permanent buffer in copy-stream mode; `None` while the slot is lent. An upload
+/// holds the lock for its duration, so lending a slot waits for any upload into it.
+type SlotEntry = parking_lot::Mutex<Option<Arc<SlotBuf>>>;
+
+/// Allocate one slot's device memory (one expert of each of `stacks`) on the copy stream's
+/// device. The caller orders the copy stream after the allocation (`after_device_work`).
+fn alloc_slot(
+    cs: &CopyStream,
+    stacks: &(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>),
+    device: &Device,
+) -> candle_core::Result<Arc<SlotBuf>> {
+    let memory = [
+        cs.alloc_expert(&stacks.0)?,
+        cs.alloc_expert(&stacks.1)?,
+        cs.alloc_expert(&stacks.2)?,
+    ];
+    let weights = SlotWeights {
+        gate: Arc::clone(memory[0].tensor()),
+        up: Arc::clone(memory[1].tensor()),
+        down: Arc::clone(memory[2].tensor()),
+    };
+    Ok(Arc::new(SlotBuf {
+        weights,
+        memory: Some(memory),
+        fence: ReadFence::new(device)?,
+    }))
 }
 
 struct CachedLayer {
@@ -524,7 +587,7 @@ struct CachedLayer {
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     copy_stream: Option<Arc<CopyStream>>,
     /// Copy-stream mode: every slot's permanent buffer (empty otherwise).
-    slot_bufs: Vec<Arc<SlotBuf>>,
+    slot_bufs: Vec<SlotEntry>,
     /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
     prefill: Option<Arc<PrefillStream>>,
     /// A background fill of this layer is running; at most one at a time.
@@ -554,7 +617,8 @@ impl CachedLayer {
             if st.resident.contains(&Some(expert_id)) {
                 return Ok(None);
             }
-            let Some(slot) = st.resident.iter().position(Option::is_none) else {
+            let usable = st.usable;
+            let Some(slot) = st.resident[..usable].iter().position(Option::is_none) else {
                 return Ok(None);
             };
             st.resident[slot] = Some(expert_id);
@@ -588,9 +652,7 @@ impl CachedLayer {
     /// copy frees the slot.
     fn load_reserved(&self, expert_id: usize, slot: usize) -> candle_core::Result<Option<usize>> {
         let loaded = match &self.copy_stream {
-            Some(cs) => self
-                .upload_in_place(cs, expert_id, slot)
-                .map(|done| done.then(|| Arc::clone(&self.slot_bufs[slot]))),
+            Some(cs) => self.upload_in_place(cs, expert_id, slot),
             None => self.expert_weights(expert_id).map(|w| {
                 w.map(|weights| {
                     Arc::new(SlotBuf {
@@ -603,6 +665,11 @@ impl CachedLayer {
         };
         let mut st = self.state.lock().unwrap();
         match loaded {
+            // Lent while this upload ran: drop it rather than publish into a lent slot.
+            Ok(Some(_)) if slot >= st.usable => {
+                st.resident[slot] = None;
+                Ok(None)
+            }
             Ok(Some(buf)) => {
                 st.published[slot] = Some(buf);
                 st.slots.insert(expert_id, slot);
@@ -628,11 +695,17 @@ impl CachedLayer {
         cs: &CopyStream,
         expert_id: usize,
         slot: usize,
-    ) -> candle_core::Result<bool> {
-        let buf = &self.slot_bufs[slot];
-        let (Some(memory), Some((gate, up, down))) = (&buf.memory, self.cpu.expert_qtensors())
-        else {
-            return Ok(false);
+    ) -> candle_core::Result<Option<Arc<SlotBuf>>> {
+        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+            return Ok(None);
+        };
+        // Held for the whole upload: lending this slot waits for it.
+        let entry = self.slot_bufs[slot].lock();
+        let Some(buf) = entry.as_ref() else {
+            return Ok(None); // lent
+        };
+        let Some(memory) = &buf.memory else {
+            return Ok(None);
         };
         copy_stream::wait_for_readers(buf);
         let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
@@ -644,7 +717,67 @@ impl CachedLayer {
                 (&memory[2], &d[expert_range(&down, expert_id)?]),
             ],
         )?;
-        Ok(true)
+        Ok(Some(Arc::clone(buf)))
+    }
+
+    /// Bytes of one slot: one expert's gate, up and down.
+    fn slot_bytes(&self) -> usize {
+        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+            return 0;
+        };
+        [&gate, &up, &down]
+            .iter()
+            .map(|s| expert_range(s, 0).map_or(0, |r| r.len()))
+            .sum()
+    }
+
+    /// Take the top `k` usable slots out of service for the prefill stream: unpublish and empty
+    /// them, then release their device memory. A free is ordered on candle's stream after any
+    /// kernel already reading the slot. Returns the number of slots lent.
+    fn lend(&self, k: usize) -> usize {
+        let (from, to) = {
+            let mut st = self.state.lock().unwrap();
+            let to = st.usable;
+            let from = to.saturating_sub(k);
+            for slot in from..to {
+                if let Some(e) = st.resident[slot].take() {
+                    if st.slots.get(&e) == Some(&slot) {
+                        st.slots.remove(&e);
+                    }
+                }
+                st.published[slot] = None;
+            }
+            st.usable = from;
+            (from, to)
+        };
+        for entry in &self.slot_bufs[from.min(self.slot_bufs.len())..to.min(self.slot_bufs.len())] {
+            // Waits for an upload into the slot; its result is then discarded.
+            if let Some(buf) = entry.lock().take() {
+                copy_stream::wait_for_readers(&buf);
+            }
+        }
+        to - from
+    }
+
+    /// Put every lent slot back in service, empty (with fresh device memory in copy-stream
+    /// mode), and refill the layer in the background by routing count.
+    fn give_back(self: &Arc<Self>) -> candle_core::Result<()> {
+        let (from, to) = {
+            let st = self.state.lock().unwrap();
+            (st.usable, st.resident.len())
+        };
+        if from == to {
+            return Ok(());
+        }
+        if let (Some(cs), Some(stacks)) = (&self.copy_stream, self.cpu.expert_qtensors()) {
+            for entry in &self.slot_bufs[from..to] {
+                *entry.lock() = Some(alloc_slot(cs, &stacks, &self.slot_device)?);
+            }
+            cs.after_device_work()?;
+        }
+        self.state.lock().unwrap().usable = to;
+        self.spawn_fill();
+        Ok(())
     }
 
     /// This layer's top-k experts for activation `x` (`[hidden]`), by its own router.
@@ -676,7 +809,7 @@ impl CachedLayer {
     /// The next expert to fill into this layer, if a slot is still empty.
     fn next_fill_candidate(&self) -> Option<usize> {
         let st = self.state.lock().unwrap();
-        fill_candidate(&st.resident, &st.hit_counts)
+        fill_candidate(&st.resident[..st.usable], &st.hit_counts)
     }
 
     /// Fill every empty slot of this layer on a background thread and return immediately.
@@ -868,6 +1001,9 @@ impl RoutedExperts for CachedExperts {
         }
 
         // Decode: single token, split GPU hits / CPU misses.
+        if let Some(ps) = &layer.prefill {
+            ps.note_decode(layer.layer)?;
+        }
         layer.decode_forward(xs, &topk_weights, topk_ids, layer.act)
     }
 }
@@ -957,5 +1093,120 @@ mod tests {
         assert_eq!(lru_victim(&slots, &last_use, &[11]), Some((12, 2)));
         assert_eq!(lru_victim(&slots, &last_use, &[]), Some((11, 1)));
         assert_eq!(lru_victim(&slots, &last_use, &[10, 11, 12]), None);
+    }
+
+    /// A cached layer on the CPU (fresh-upload mode) over small Q8_0 stacks: `e` experts,
+    /// `slots` slots, top-2.
+    fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
+        let (hidden, inter) = (64, 32);
+        let q = |n: usize, k: usize, seed: f32| {
+            let data: Vec<f32> = (0..e * n * k)
+                .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.5)
+                .collect();
+            let t = Tensor::from_vec(data, (e, n, k), &Device::Cpu).unwrap();
+            Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
+        };
+        let comm = Arc::new(
+            mistralrs_quant::Comm::from_device(mistralrs_quant::Id::new(), &Device::Cpu, 0, 1)
+                .unwrap(),
+        );
+        let cpu = MoEExperts::from_qtensors(
+            q(inter, hidden, 0.1),
+            q(inter, hidden, 0.7),
+            q(hidden, inter, 1.3),
+            e,
+            2,
+            &comm,
+            Activation::Silu,
+        )
+        .unwrap();
+        Arc::new(CachedLayer {
+            _pinned: Vec::new(),
+            cpu,
+            slot_device: Device::Cpu,
+            layer: 0,
+            registry: Arc::default(),
+            hidden,
+            num_experts: e,
+            top_k: 2,
+            act: Activation::Silu,
+            router: None,
+            state: Mutex::new(CachedLayerState {
+                slots: HashMap::new(),
+                resident: vec![None; slots],
+                hit_counts: vec![0; e],
+                last_use: vec![0; slots],
+                tick: 0,
+                published: vec![None; slots],
+                usable: slots,
+            }),
+            copy_stream: None,
+            slot_bufs: Vec::new(),
+            prefill: None,
+            filling: AtomicBool::new(false),
+        })
+    }
+
+    fn wait_for_fill(layer: &CachedLayer) {
+        while layer.filling.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn lent_slots_leave_service_and_come_back_refilled() {
+        let layer = cpu_layer(8, 4);
+        for e in [5, 6, 7, 4] {
+            assert!(layer.admit(e).unwrap().is_some());
+        }
+        assert_eq!(layer.lend(2), 2);
+        {
+            let st = layer.state.lock().unwrap();
+            assert_eq!(st.usable, 2);
+            assert_eq!(st.resident, vec![Some(5), Some(6), None, None]);
+            assert!(st.published[2].is_none() && st.published[3].is_none());
+            assert_eq!(st.slots.len(), 2);
+        }
+        // no room while lent: lent slots are not admitted into, nor filled
+        assert!(layer.admit(1).unwrap().is_none());
+        assert!(layer.next_fill_candidate().is_none());
+
+        // give back: refilled by routing count (2 and 3 are the hottest non-residents)
+        layer.state.lock().unwrap().hit_counts = vec![0, 1, 9, 8, 0, 0, 0, 0];
+        layer.give_back().unwrap();
+        wait_for_fill(&layer);
+        let st = layer.state.lock().unwrap();
+        assert_eq!(st.usable, 4);
+        assert_eq!(st.resident, vec![Some(5), Some(6), Some(2), Some(3)]);
+        assert!(st.published.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn decode_split_matches_running_every_expert_on_the_cpu() {
+        let layer = cpu_layer(8, 4);
+        for e in [0, 2] {
+            assert!(layer.admit(e).unwrap().is_some());
+        }
+        let xs: Vec<f32> = (0..64).map(|i| (i as f32 * 0.11).cos()).collect();
+        let xs = Tensor::from_vec(xs, (1, 1, 64), &Device::Cpu).unwrap();
+        // expert 0 is a hit, expert 3 a miss
+        let ids = Tensor::new(&[[0u32, 3]], &Device::Cpu).unwrap();
+        let ws = Tensor::new(&[[0.6f32, 0.4]], &Device::Cpu).unwrap();
+        let got = layer
+            .decode_forward(&xs, &ws, &ids, Activation::Silu)
+            .unwrap();
+        let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
+        assert_eq!(got.dims(), want.dims());
+        let diff = (got - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-4, "hit/miss split diverges by {diff}");
     }
 }

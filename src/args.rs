@@ -236,8 +236,9 @@ pub struct ModelOptions {
     pub expert_cache_gb: Option<f64>,
 
     /// With `--cpu-moe`, run the routed experts of prefill chunks of 1024+ tokens on the GPU,
-    /// uploading each layer's experts while the previous layer computes. Uses two layers' worth
-    /// of expert memory in VRAM. Streams every expert once per chunk, so raise
+    /// uploading each layer's experts while the previous layer computes. Needs two layers' worth
+    /// of expert memory in VRAM, borrowed from `--expert-cache-gb` while a prompt runs when that
+    /// is set. Streams every expert once per chunk, so raise
     /// `--max-num-batched-tokens` (e.g. 8192) for long prompts. CUDA only.
     #[arg(long, requires = "cpu_moe")]
     pub prefill_stream: bool,

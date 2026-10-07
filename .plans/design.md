@@ -1,6 +1,6 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-07, `main` with the prefill stream (§3.4); fork pinned to `781f149f`.
+Status as of 2026-10-07, `main` with the prefill stream and its loan from the cache (§3.4); fork pinned to `781f149f`.
 
 ## 1. What this project is
 
@@ -183,14 +183,37 @@ simplest version that keeps the overlap:
   the MTP head.
 - **Mixed-quant GGUFs:** when a layer's dtype or shape differs from what a buffer holds, the
   buffer is reallocated. The old memory is freed only after its in-flight upload completes.
-- **Cost:** two layers of experts in VRAM, separate from the cache budget. Bandwidth: every
+- **VRAM, without `--expert-cache-gb`:** two layers of experts, allocated on first use and
+  kept.
+- **VRAM, with `--expert-cache-gb`: lent by the cache, no extra memory** (Strata's "loan").
+  candle cannot view part of one allocation as another tensor, so lending means freeing one
+  set of allocations and allocating another:
+  1. *Borrow*, before the first long chunk. Each cached layer gives up an equal share of
+     about two layers' bytes, taken from its tail slots (`CacheLoan`, `CachedLayer::lend`).
+     Lent slots are emptied and unpublished, and `usable` shrinks so no admission, fill or
+     lookahead touches them. An upload in flight into a lent slot holds that slot's lock, so
+     the lend waits for it, and its result is discarded instead of published. The memory is
+     freed in candle's stream order, so after any queued reader.
+  2. Chunks then run as above. The buffers stay across chunks, including a short tail chunk.
+  3. *Give back*, after 8 decode steps in a row (`seq == 1`); a long chunk resets the count.
+     The buffers are freed after their last upload, the lent slots get fresh memory, and
+     `spawn_fill` refills them in the background by routing count, so learned popularity
+     survives. Until then, those experts are CPU misses.
+  4. candle frees into a CUDA memory pool (`cuMemFreeAsync`), and freed memory returns at the
+     next synchronize. Each hand-over therefore syncs candle's stream once between the free
+     and the allocation. Whether peak VRAM really stays at `N` (pool fragmentation) is to be
+     checked on hardware.
+  5. If the cache is too small to lend two layers, the shortfall is warned about and comes on
+     top of `N`.
+- **Bandwidth:** every
   chunk streams every layer's experts once, so this pays only for long chunks. Strata uses
   about 8K-token chunks. Raise `--max-num-batched-tokens` (e.g. 8192); the 512-token
   `--max-prefill-chunk-tokens` default may also bound chunks, which is still to be verified.
 - **Shared copy stream:** decode-cache slot fills and layer uploads share one copy stream, so
   during prefill a layer upload can queue behind slot fills.
 - **Tested here:** `from_qtensors` on CPU against per-expert `QMatMul` references, for the
-  full top-k and a subset. The result is bit-identical (max diff 0).
+  full top-k and a subset (bit-identical, max diff 0). Also lend and give back on a CPU
+  cached layer: lent slots leave service and come back refilled by routing count.
 
 ### 3.5 Format support — actual, not intended
 
@@ -208,9 +231,9 @@ simplest version that keeps the overlap:
 | `cargo check --all-targets`, `cargo fmt --check` | clean (default features only) |
 | `#[cfg(feature = "cuda")]` code (`host_memory`, `copy_stream`) | **not compiled by this build.** `candle-kernels` needs `nvcc`. Every cudarc call is type-checked in a scratch crate against cudarc 0.19.10; the candle glue (`Device::Cuda`, `cuda_stream()`, `QCudaStorage::zeros`, `QTensor::device_ptr`) is not |
 | Linux-only code (`madvise`) | type-checked in a scratch crate for `riscv64gc-unknown-linux-gnu` |
-| `cargo test` | 21 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait, `from_qtensors` vs per-expert reference |
+| `cargo test` | 23 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait, `from_qtensors` vs per-expert reference, lend/give back, and the decode hit/miss split end to end on CPU (vs all experts on the CPU) |
 | In-place copy-stream path | **cannot run here.** Only exercised on CUDA; the non-CUDA build always takes the fresh-upload path |
-| Prefill stream | **cannot run here** (CUDA only). Its buffer and event logic are unexercised until a CUDA run |
+| Prefill stream | **cannot run here** (CUDA only). Its buffer, event and loan hand-over logic are unexercised until a CUDA run |
 | Any CUDA run | **never.** No CUDA host available; the dev machine is an M1 Mac without `nvcc` |
 | Numeric parity: cached vs uncached | not done |
 | Hit rate, tokens/s | not measured |
@@ -274,13 +297,16 @@ Ordered by priority. Small, local, testable work comes first.
 13. Profile: confirm layer uploads overlap attention, and whether they queue behind slot
     fills. If they do, give prefill its own copy stream.
 14. Hide the first layer of each chunk, e.g. prefetch layer 0 at the end of the previous chunk.
+15. Loan: measure peak VRAM across a borrow/give-back cycle (does the pool really hand freed
+    slots to the buffers?), the cost of the two syncs, and the decode slowdown while lent
+    slots refill. Tune `GIVE_BACK_AFTER_DECODE_STEPS` for interleaved serving.
 
 ### Later — extend the cache's reach
-15. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
+16. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
    tokens) use the cache, not just single-token decode.
-16. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
+17. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
     `--expert-profile-save`), or fill from a static frequency profile.
-17. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
+18. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
     (Strata's LFU-style adaptive tier) once hit-rate data exists.
 
 ### Out of scope

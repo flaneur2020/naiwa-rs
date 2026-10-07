@@ -15,6 +15,12 @@
 //! The first layer of each chunk has no predecessor to prefetch it, so its upload is not
 //! hidden. Every chunk streams every layer's experts once, so this only pays for long chunks:
 //! shorter ones (`MIN_TOKENS`) and layers whose stacks are not pinned stay on the CPU.
+//!
+//! With `--expert-cache-gb`, the two buffers do not add to VRAM: before the first long chunk
+//! the cache lends (frees) about two layers' worth of its tail slots, and after
+//! `GIVE_BACK_AFTER_DECODE_STEPS` decode steps in a row the buffers are freed and the cache
+//! takes the slots back, refilling them in the background. candle frees into a CUDA memory
+//! pool, so both hand-overs synchronize candle's stream once in between.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,12 +31,30 @@ use mistralrs_core::moe_offload::ExpertLoadContext;
 use mistralrs_core::MoEExperts;
 use mistralrs_quant::Comm;
 use parking_lot::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::copy_stream::{CopyDone, CopyStream, CopyStreams, ReadFence, SlotMemory};
 
 /// Chunks shorter than this stay on the CPU (Strata streams every expert from 1024 tokens).
 pub const MIN_TOKENS: usize = 1024;
+
+/// Decode steps in a row after which the buffers are given back to the expert cache. Several,
+/// so a server alternating prompts and decodes does not hand two layers back and forth per step.
+const GIVE_BACK_AFTER_DECODE_STEPS: usize = 8;
+
+/// Device memory that can make room for the prefill buffers: the expert cache.
+pub trait ExpertMemoryLender: Send + Sync {
+    /// Free about `bytes` of device memory; returns the bytes actually freed.
+    fn lend(&self, bytes: usize) -> candle_core::Result<usize>;
+    /// Take the memory back (the buffers have been freed).
+    fn give_back(&self) -> candle_core::Result<()>;
+}
+
+#[derive(Default)]
+struct Loan {
+    lent: bool,
+    decode_steps: usize,
+}
 
 /// One layer's host stacks (gate, up, down). Holding them keeps the memory that in-flight
 /// uploads read alive.
@@ -56,6 +80,9 @@ pub struct PrefillStream {
     comm: Arc<Comm>,
     layers: RwLock<Vec<Option<HostStacks>>>,
     bufs: [Mutex<LayerBuf>; 2],
+    /// `None`: the buffers have their own memory and are kept for good.
+    lender: Option<Arc<dyn ExpertMemoryLender>>,
+    loan: Mutex<Loan>,
 }
 
 impl PrefillStream {
@@ -67,6 +94,7 @@ impl PrefillStream {
         top_k: usize,
         act: Activation,
         comm: Arc<Comm>,
+        lender: Option<Arc<dyn ExpertMemoryLender>>,
     ) -> candle_core::Result<Option<Self>> {
         let Some(copy) = copy else {
             return Ok(None);
@@ -89,6 +117,8 @@ impl PrefillStream {
             act,
             comm,
             layers: RwLock::default(),
+            lender,
+            loan: Mutex::default(),
         }))
     }
 
@@ -111,6 +141,94 @@ impl PrefillStream {
             .get(layer)
             .and_then(|s| s.as_ref())
             .map(|s| s.0.clone())
+    }
+
+    /// Bytes of the two buffers: twice the largest registered layer.
+    fn buffer_bytes(&self) -> usize {
+        let largest = self
+            .layers
+            .read()
+            .iter()
+            .flatten()
+            .map(|s| s.0.iter().map(|t| t.storage_size_in_bytes()).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        2 * largest
+    }
+
+    fn first_layer(&self) -> Option<usize> {
+        self.layers.read().iter().position(Option::is_some)
+    }
+
+    /// Before the buffers are first allocated, have the lender make room for them.
+    fn borrow(&self) -> candle_core::Result<()> {
+        let Some(lender) = &self.lender else {
+            return Ok(());
+        };
+        let mut loan = self.loan.lock().unwrap();
+        if loan.lent {
+            return Ok(());
+        }
+        let need = self.buffer_bytes();
+        let freed = lender.lend(need)?;
+        info!(
+            "prefill stream: borrowed {} MiB of expert-cache slots for {} MiB of layer buffers",
+            freed >> 20,
+            need >> 20
+        );
+        if freed < need {
+            warn!(
+                "prefill stream: the expert cache could lend only {} of {} MiB; the layer \
+                 buffers exceed --expert-cache-gb by the rest",
+                freed >> 20,
+                need >> 20
+            );
+        }
+        // Freed slots go back to candle's memory pool; let them land before allocating.
+        self.device.synchronize()?;
+        loan.lent = true;
+        loan.decode_steps = 0;
+        Ok(())
+    }
+
+    /// Called by every decode step (one token per sequence). After enough of them in a row,
+    /// free the buffers and give the memory back to the lender.
+    pub fn note_decode(&self, layer: usize) -> candle_core::Result<()> {
+        let Some(lender) = &self.lender else {
+            return Ok(());
+        };
+        if self.first_layer() != Some(layer) {
+            return Ok(());
+        }
+        let mut loan = self.loan.lock().unwrap();
+        if !loan.lent {
+            return Ok(());
+        }
+        loan.decode_steps += 1;
+        if loan.decode_steps < GIVE_BACK_AFTER_DECODE_STEPS {
+            return Ok(());
+        }
+        self.release()?;
+        self.device.synchronize()?;
+        lender.give_back()?;
+        loan.lent = false;
+        loan.decode_steps = 0;
+        info!("prefill stream: gave the layer buffers back to the expert cache");
+        Ok(())
+    }
+
+    /// Free both buffers, each after its last upload (readers are ordered by candle's stream).
+    fn release(&self) -> candle_core::Result<()> {
+        for buf in &self.bufs {
+            let mut buf = buf.lock().unwrap();
+            if buf.memory.is_some() {
+                buf.ready.wait_on(&self.device)?;
+            }
+            buf.experts = None;
+            buf.memory = None;
+            buf.loaded = None;
+        }
+        Ok(())
     }
 
     /// Queue the upload of `layer` into its buffer, unless it is already there. `false`: the
@@ -184,7 +302,16 @@ impl PrefillStream {
         topk_ids: &Tensor,
     ) -> candle_core::Result<Option<Tensor>> {
         let (batch, seq, _) = xs.dims3()?;
-        if batch * seq < MIN_TOKENS || !self.load(layer)? {
+        if seq == 1 {
+            self.note_decode(layer)?;
+            return Ok(None);
+        }
+        self.loan.lock().unwrap().decode_steps = 0;
+        if batch * seq < MIN_TOKENS || self.stacks(layer).is_none() {
+            return Ok(None);
+        }
+        self.borrow()?;
+        if !self.load(layer)? {
             return Ok(None);
         }
         // Stream the next layer in while this one computes.
@@ -206,9 +333,18 @@ impl PrefillStream {
 
 /// The prefill stream of each CUDA device, created by the first layer that loads on it.
 #[derive(Default)]
-pub struct PrefillStreams(Mutex<Vec<(Device, Arc<PrefillStream>)>>);
+pub struct PrefillStreams {
+    streams: Mutex<Vec<(Device, Arc<PrefillStream>)>>,
+    lender: Option<Arc<dyn ExpertMemoryLender>>,
+}
 
 impl PrefillStreams {
+    /// Borrow the buffers' memory from `lender` instead of keeping it for good.
+    pub fn with_lender(mut self, lender: Arc<dyn ExpertMemoryLender>) -> Self {
+        self.lender = Some(lender);
+        self
+    }
+
     /// Register `experts` (this block's CPU stacks) for streaming and return the device's
     /// stream. `None` for the MTP head, for stacks that are not all page-locked (`pinned`), and
     /// off CUDA: such a layer keeps its prefill on the CPU.
@@ -223,7 +359,7 @@ impl PrefillStreams {
             return Ok(None);
         }
         let device = ctx.layer_device;
-        let mut streams = self.0.lock().unwrap();
+        let mut streams = self.streams.lock().unwrap();
         let stream = match streams.iter().find(|(d, _)| d.same_device(device)) {
             Some((_, ps)) => Arc::clone(ps),
             None => {
@@ -234,6 +370,7 @@ impl PrefillStreams {
                     ctx.config.num_experts_per_tok,
                     ctx.act,
                     Arc::clone(ctx.comm),
+                    self.lender.clone(),
                 )?
                 else {
                     return Ok(None);
