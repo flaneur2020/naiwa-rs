@@ -1,6 +1,6 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-07, `main` at `ca433e4`.
+Status as of 2026-10-07, `main` at `ff39f29` plus the uncommitted host-memory work (§3.3).
 
 ## 1. What this project is
 
@@ -54,6 +54,7 @@ to the new commit. `cargo update -p mistralrs-core` does not work while the patc
 | `src/load.rs` | model selection, Qwen3.8-Flash-Next architecture checks (formerly `guard.rs`), device-layer map, `install_cpu_moe` call |
 | `src/offload.rs` | `--cpu-moe` provider wiring; plain `CpuExperts` when no cache is requested |
 | `src/expert_cache.rs` | the GPU expert cache (`GpuCacheMoeProvider`) |
+| `src/host_memory.rs` | huge pages and CUDA pinning for the host expert stacks |
 | `src/commands/*` | one file per subcommand |
 
 ## 3. Expert placement, as implemented
@@ -84,8 +85,9 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
 **Prefill** (more than one token in the step):
 1. Every routed expert runs on the CPU, since all of them are needed anyway.
 2. Before that, the layer starts a background fill of layer *l+1*'s empty slots (and its
-   own, which covers layer 0). The copies overlap this layer's CPU experts and the next
-   layer's attention. At most one fill runs per layer; a full layer is a no-op.
+   own, which covers layer 0). At most one fill runs per layer; a full layer is a no-op.
+   What runs off the token path is the fill thread's CPU work. On the GPU, the copy is
+   ordered on candle's single stream, so it does **not** overlap compute (§3.3).
 3. Fill order is routing count, then expert id, so the first prefill fills in id order.
 
 **Decode** (one token):
@@ -108,7 +110,34 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
   replaced mid-token cannot change what that token computes with.
 - `LayerRegistry` holds weak references; the model owns the layers.
 
-### 3.3 Format support — actual, not intended
+### 3.3 Host memory for the expert stacks (`src/host_memory.rs`)
+
+**Why this exists.** candle's CUDA device has one stream that every thread uses, and a
+`QTensor` upload (`qtensor_from_ggml` → `load_quantized` → `memcpy_htod`) is a
+`cuMemcpyHtoDAsync` on it. From pageable memory, CUDA performs a **stream sync before the
+copy** and stages the bytes through a driver buffer. A slot fill therefore used to wait for
+all queued model work, then copy at roughly half bandwidth, in line with compute.
+
+**Implemented (Phase A):**
+- **No intermediate buffer.** A slot fill copies expert *e*'s byte range straight out of the
+  stack (`expert_range`), instead of `to_vec()` first.
+- **Huge pages** (Linux): every `--cpu-moe` stack is advised `MADV_HUGEPAGE`, and the pages
+  already populated are collapsed with `MADV_COLLAPSE` (Linux 6.1+; older kernels leave it to
+  khugepaged). Only whole 2 MiB pages inside a stack are touched. This helps the CPU GEMV for
+  misses (TLB reach).
+- **Pinning** (CUDA, cache layers only): each stack is registered with
+  `cuMemHostRegister(PORTABLE)`. A slot fill is then a true async DMA. Pinning happens after
+  the huge-page advice, because pinned pages cannot be collapsed. `PinnedStack` holds an
+  `Arc` of its stack, so the memory stays valid while it is registered, and unregisters on
+  drop.
+- Both are best effort. A failure leaves the stack pageable, logs once, and is otherwise
+  harmless.
+
+**What Phase A does not give:** copy/compute overlap. Copies are still ordered on candle's
+stream, between kernels; they are just faster and no longer stall the fill thread on a stream
+sync. True overlap needs Phase B (§6).
+
+### 3.4 Format support — actual, not intended
 
 | Experts as | Cached? |
 |---|---|
@@ -121,8 +150,10 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
 
 | Check | Status |
 |---|---|
-| `cargo check --all-targets`, `cargo fmt --check` | clean |
-| `cargo test` | 16 pass: architecture checks, device-layer map, expert byte slicing, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice |
+| `cargo check --all-targets`, `cargo fmt --check` | clean (default features only) |
+| `#[cfg(feature = "cuda")]` code | **not compiled by this build.** `candle-kernels` needs `nvcc`. Its cudarc calls are type-checked in a scratch crate against cudarc 0.19.10; the candle glue around them is not |
+| Linux-only code (`madvise`) | type-checked in a scratch crate for `riscv64gc-unknown-linux-gnu` |
+| `cargo test` | 19 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing |
 | Any CUDA run | **never.** No CUDA host available; the dev machine is an M1 Mac without `nvcc` |
 | Numeric parity: cached vs uncached | not done |
 | Hit rate, tokens/s | not measured |
@@ -130,6 +161,8 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
 Things that only a CUDA run will show:
 - **CUDA from non-main threads.** The decode hit thread, fill threads and lookahead thread
   all touch the CUDA device. This is the riskiest untested assumption.
+- **Pinning.** Registering tens of GiB takes seconds at load and may be refused (lockable
+  memory limits); check the log for the "could not be pinned" warning.
 - **Parity.** CPU and CUDA kernels differ (CUDA quantizes activations to Q8_1), so compare
   logits with a tolerance (~1e-3 relative), never for bit equality.
 
@@ -166,16 +199,28 @@ Ordered by priority. Small, local, testable work comes first.
 7. Parity: same prompt, cached vs uncached, logits within tolerance.
 8. Measure hit rate and tokens/s, then tune `MAX_LOOKAHEAD_SWAPS` and the per-layer split.
 
+### Then — Phase B: real copy/compute overlap (needs a CUDA host)
+9. Measure first: if slot copies are not on the critical path after Phase A, stop here.
+10. A dedicated copy stream for slot fills. Fills go to slot memory preallocated once per
+    layer (`QCudaStorage::zeros`, written through `QTensor::device_ptr`). The fill thread
+    synchronizes only the copy stream before it publishes. **Hazard:** overwriting a slot in
+    place while queued main-stream kernels still read it. The copy stream must wait on an
+    event recorded on candle's stream after the slot's last reader is enqueued.
+11. Batched DMA (`cuMemcpyBatchAsync`, CUDA 12.8+) for the three projections and several
+    experts at once. Mostly a Windows/WDDM win per Strata; only worth it if profiling shows
+    per-copy overhead.
+
 ### Later — extend the cache's reach
-9. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
+12. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
    tokens) use the cache, not just single-token decode.
-10. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
+13. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
     `--expert-profile-save`), or fill from a static frequency profile.
-11. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
+14. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
     (Strata's LFU-style adaptive tier) once hit-rate data exists.
 
 ### Out of scope
 - **Streaming misses to the GPU** (Strata's PCIe share: H2D copy + GPU compute for missed
   experts). Misses always run on the CPU.
-- Pinned / huge-page expert arenas, `cudaHostRegister`, batched DMA.
+- An expert arena owned by qwen-fn-rs (Strata's `PinnedArena`, loading the expert file
+  itself). The stacks stay owned by mistral.rs; we only advise and pin them.
 - Multi-GPU expert tiers, remote experts.

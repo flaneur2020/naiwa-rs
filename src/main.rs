@@ -5,6 +5,7 @@
 mod args;
 mod commands;
 mod expert_cache;
+mod host_memory;
 mod load;
 mod offload;
 

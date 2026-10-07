@@ -4499,6 +4499,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "dirs",
+ "libc",
  "mimalloc",
  "mistralrs-core",
  "mistralrs-quant",

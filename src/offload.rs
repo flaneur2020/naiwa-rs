@@ -17,6 +17,7 @@ use mistralrs_core::MoEExperts;
 use tracing::{debug, info};
 
 use crate::expert_cache::GpuCacheMoeProvider;
+use crate::host_memory::advise_expert_stacks;
 
 /// Device-layer map that keeps every decoder layer on the main device; mistral.rs clamps the
 /// count to the model's layer count. Taken-over experts are not counted, so auto mapping would
@@ -52,8 +53,11 @@ impl RoutedExpertsProvider for CpuMoeProvider {
             if ctx.site.is_mtp { "MTP" } else { "decoder" },
             ctx.site.layer
         );
+        let experts = ctx.load_builtin(Device::Cpu)?;
+        let huge_bytes = advise_expert_stacks(&experts)?;
+        debug!("  {} MiB of its stacks on huge pages", huge_bytes >> 20);
         Ok(Some(Arc::new(CpuExperts {
-            experts: ctx.load_builtin(Device::Cpu)?,
+            experts,
             layer_device: ctx.layer_device.clone(),
         })))
     }

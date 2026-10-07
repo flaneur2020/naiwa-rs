@@ -16,8 +16,9 @@
 //! # Prefill
 //!
 //! Every routed expert runs on the CPU (all of them are needed anyway). Each layer first starts
-//! a background fill of the *next* layer's empty slots, so those host-to-device copies overlap
-//! this layer's CPU experts and the next layer's attention.
+//! a background fill of the *next* layer's empty slots, so slicing and bookkeeping stay off the
+//! token path. The copies themselves are ordered on candle's single CUDA stream, between
+//! kernels; they do not overlap compute (see `host_memory` for what pinning changes).
 //!
 //! # Decode (single token)
 //!
@@ -41,7 +42,9 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::host_memory::{self, PinnedStack};
 
 // Number of prefill tokens above which we skip the cache entirely.
 // A decode step is always 1 token, so PREFILL_THRESHOLD = 1 is exact.
@@ -92,13 +95,12 @@ impl GpuCacheMoeProvider {
 // Byte-level expert extraction (never dequantize)
 // ---------------------------------------------------------------------------
 
-/// Bytes for expert `e` from a stacked `[E, N, K]` `QTensor`.
+/// The byte range of expert `e` in a stacked `[E, N, K]` `QTensor`.
 ///
-/// Row-block formats never cross expert boundaries, so slicing
-/// `[e·stride, (e+1)·stride)` from the host buffer is always exact.
-fn expert_bytes(qt: &QTensor, e: usize) -> candle_core::Result<Vec<u8>> {
+/// Row-block formats never cross expert boundaries, so `[e·stride, (e+1)·stride)` of the
+/// stack's buffer is exactly expert `e`.
+fn expert_range(qt: &QTensor, e: usize) -> candle_core::Result<std::ops::Range<usize>> {
     let dims = qt.shape().dims();
-    // Expect [E, N, K] or [N, K]
     if dims.len() < 2 {
         candle_core::bail!("expert QTensor must be at least 2-D, got {:?}", dims);
     }
@@ -110,21 +112,22 @@ fn expert_bytes(qt: &QTensor, e: usize) -> candle_core::Result<Vec<u8>> {
             qt.dtype()
         );
     }
-    let type_size = qt.dtype().type_size();
-    let stride = n * (k / block_size) * type_size;
-    let all_bytes = qt.data()?;
-    let start = e * stride;
-    let end = start + stride;
-    if end > all_bytes.len() {
+    let stride = n * (k / block_size) * qt.dtype().type_size();
+    let range = e * stride..(e + 1) * stride;
+    if range.end > qt.storage_size_in_bytes() {
         candle_core::bail!(
-            "expert {e} byte range [{start}..{end}) exceeds buffer length {}",
-            all_bytes.len()
+            "expert {e} byte range {range:?} exceeds buffer length {}",
+            qt.storage_size_in_bytes()
         );
     }
-    Ok(all_bytes[start..end].to_vec())
+    Ok(range)
 }
 
 /// Build a single-expert `[N, K]` `QTensor` on `device` from a stacked `[E, N, K]` `QTensor`.
+///
+/// Copies straight out of the stack, with no intermediate host buffer. When the stack is pinned
+/// (`host_memory`), that copy is an asynchronous DMA that may still be reading after this
+/// returns; it is safe because the stack outlives every copy (the layer owns it).
 fn expert_qtensor_on_device(
     stack: &QTensor,
     e: usize,
@@ -132,8 +135,9 @@ fn expert_qtensor_on_device(
 ) -> candle_core::Result<Arc<QTensor>> {
     let dims = stack.shape().dims();
     let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
-    let bytes = expert_bytes(stack, e)?;
-    let qt = qtensor_from_ggml(stack.dtype(), &bytes, vec![n, k], device)?;
+    let range = expert_range(stack, e)?;
+    let data = stack.data()?;
+    let qt = qtensor_from_ggml(stack.dtype(), &data[range], vec![n, k], device)?;
     Ok(Arc::new(qt))
 }
 
@@ -171,6 +175,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         }
 
         let cpu_experts = ctx.load_builtin(Device::Cpu)?;
+        let huge_bytes = host_memory::advise_expert_stacks(&cpu_experts)?;
         let num_experts = ctx.config.num_experts;
 
         // Try to get the quantized stacked weight for the gate projection — this tells us
@@ -249,6 +254,25 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         drop(inner);
 
+        // Page-lock the stacks so slot fills copy from them by DMA (after the huge-page advice:
+        // pinned pages can no longer be collapsed).
+        let (pinned, pin_failed) = host_memory::pin_expert_stacks(&cpu_experts, &slot_device);
+        let pinned_bytes: usize = pinned.iter().map(PinnedStack::len).sum();
+        debug!(
+            "expert cache: layer {layer_idx} stacks: {} MiB on huge pages, {} MiB pinned",
+            huge_bytes >> 20,
+            pinned_bytes >> 20,
+        );
+        if pin_failed > 0 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                warn!(
+                    "expert cache: some expert stacks could not be pinned; their slot fills \
+                     copy from pageable memory (slower). Run with -v for details"
+                )
+            });
+        }
+
         // The same tensor the model loads as this block's router (`gate`); the decode lookahead
         // runs it on the CPU. Without it the layer is still cached, just never predicted.
         let router = match load_router(&ctx, num_experts, hidden) {
@@ -260,6 +284,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         };
 
         let cached = Arc::new(CachedLayer {
+            _pinned: pinned,
             cpu: cpu_experts,
             slot_device,
             layer: layer_idx,
@@ -445,6 +470,9 @@ struct SlotWeights {
 }
 
 struct CachedLayer {
+    /// Page-locked registrations of `cpu`'s stacks; each holds its stack, so it stays valid
+    /// for as long as it is registered.
+    _pinned: Vec<PinnedStack>,
     cpu: MoEExperts,
     slot_device: Device,
     layer: usize,
@@ -616,8 +644,8 @@ impl CachedLayer {
         topk_ids: &Tensor,
         act: Activation,
     ) -> candle_core::Result<Tensor> {
-        // Start predicting the next layer's experts now, so their copies overlap this layer's
-        // compute; whatever is not resident by the time that layer runs goes to the CPU.
+        // Start predicting the next layer's experts now, off the token path; whatever is not
+        // resident by the time that layer runs goes to the CPU.
         if let Some(next) = self.registry.get(self.layer + 1) {
             if next.router.is_some() {
                 let x = xs.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -711,8 +739,8 @@ impl RoutedExperts for CachedExperts {
         let num_tokens = batch * seq;
 
         // Prefill: every routed expert runs on the CPU. Meanwhile, fill the empty slots of the
-        // next layer in the background, so the copy overlaps this layer's CPU experts and the
-        // next layer's attention. This layer is filled too, for the first layer of the stack
+        // next layer in the background, off the token path. This layer is filled too, for the
+        // first layer of the stack
         // (no predecessor triggers it); a layer already full or filling is a no-op.
         if num_tokens > PREFILL_THRESHOLD {
             let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
@@ -754,19 +782,19 @@ mod tests {
     }
 
     #[test]
-    fn expert_bytes_slice_the_stack_exactly() {
+    fn expert_ranges_tile_the_stack_exactly() {
         let (e, n, k) = (4, 8, 64);
         let qt = stacked(e, n, k);
         let all = qt.data().unwrap().into_owned();
         let stride = all.len() / e;
         let mut rebuilt = Vec::new();
         for i in 0..e {
-            let b = expert_bytes(&qt, i).unwrap();
-            assert_eq!(b, all[i * stride..(i + 1) * stride]);
-            rebuilt.extend_from_slice(&b);
+            let r = expert_range(&qt, i).unwrap();
+            assert_eq!(r, i * stride..(i + 1) * stride);
+            rebuilt.extend_from_slice(&all[r]);
         }
         assert_eq!(rebuilt, all);
-        assert!(expert_bytes(&qt, e).is_err());
+        assert!(expert_range(&qt, e).is_err());
     }
 
     #[test]
