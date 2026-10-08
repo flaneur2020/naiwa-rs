@@ -105,8 +105,8 @@ pub fn select_model(
         bail!("`-f` only accepts GGUF files; `{file}` is not a `.gguf` file");
     }
     let (root, filenames) = gguf_root(source.model_id.as_deref(), &files)?;
-    let first = root.join(&filenames[0]);
-    ensure_flash_next_gguf(&first)?;
+    let shards: Vec<PathBuf> = filenames.iter().map(|name| root.join(name)).collect();
+    ensure_flash_next_gguf(&shards)?;
 
     let mmproj = source
         .mmproj
@@ -156,7 +156,7 @@ pub fn select_model(
     };
     Ok(LocalModel {
         selected,
-        display_id: first.to_string_lossy().into_owned(),
+        display_id: shards[0].to_string_lossy().into_owned(),
     })
 }
 
@@ -303,10 +303,11 @@ fn ensure_flash_next_config(
     )))
 }
 
-/// Fail unless the GGUF file at `path` has `general.architecture = qwen4exp` and stores its tensors
-/// in types candle can run.
-fn ensure_flash_next_gguf(path: &Path) -> Result<()> {
-    let archive = GgufArchive::open_file(path)
+/// Fail unless the GGUF model (every shard of a split file) has `general.architecture = qwen4exp`
+/// and stores its tensors in types candle can run.
+fn ensure_flash_next_gguf(shards: &[PathBuf]) -> Result<()> {
+    let path = &shards[0];
+    let archive = GgufArchive::open(shards)
         .with_context(|| format!("failed to read GGUF header of `{}`", path.display()))?;
     let Some(architecture) = archive.metadata_value("general.architecture") else {
         bail!("`{}` has no `general.architecture`", path.display());
@@ -400,8 +401,8 @@ mod tests {
         let bad = dir.join("bad.gguf");
         write_gguf(&good, GGUF_ARCHITECTURE);
         write_gguf(&bad, "llama");
-        ensure_flash_next_gguf(&good).unwrap();
-        assert!(ensure_flash_next_gguf(&bad).is_err());
+        ensure_flash_next_gguf(&[good]).unwrap();
+        assert!(ensure_flash_next_gguf(&[bad]).is_err());
     }
 
     #[test]
@@ -418,7 +419,7 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        ensure_flash_next_gguf(&path).unwrap();
+        ensure_flash_next_gguf(std::slice::from_ref(&path)).unwrap();
 
         // IQ4_NL blocks are as large as Q4_0's, so retyping the tensor keeps the file valid.
         let mut bytes = std::fs::read(&path).unwrap();
@@ -428,7 +429,7 @@ mod tests {
         assert_eq!(bytes[dtype..dtype + 4], 2u32.to_le_bytes()); // Q4_0
         bytes[dtype..dtype + 4].copy_from_slice(&20u32.to_le_bytes()); // IQ4_NL
         std::fs::write(&path, bytes).unwrap();
-        let err = ensure_flash_next_gguf(&path).unwrap_err().to_string();
+        let err = ensure_flash_next_gguf(&[path]).unwrap_err().to_string();
         assert!(err.contains("IQ4_NL x1"), "{err}");
     }
 
