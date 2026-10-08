@@ -1,12 +1,13 @@
 //! Turns local model arguments into the mistral.rs loader selection and server builder.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use candle_core::quantized::gguf_file;
 use mistralrs_core::{
     HfConfigOverrides, IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
 };
+use mistralrs_quant::GgufArchive;
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 
 use crate::args::{
@@ -302,27 +303,47 @@ fn ensure_flash_next_config(
     )))
 }
 
-/// Fail unless the GGUF file at `path` has `general.architecture = qwen4exp`.
+/// Fail unless the GGUF file at `path` has `general.architecture = qwen4exp` and stores its tensors
+/// in types candle can run.
 fn ensure_flash_next_gguf(path: &Path) -> Result<()> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open `{}`", path.display()))?;
-    let content = gguf_file::Content::read(&mut file)
+    let archive = GgufArchive::open_file(path)
         .with_context(|| format!("failed to read GGUF header of `{}`", path.display()))?;
-    let Some(architecture) = content.metadata.get("general.architecture") else {
+    let Some(architecture) = archive.metadata_value("general.architecture") else {
         bail!("`{}` has no `general.architecture`", path.display());
     };
     let architecture = architecture.to_string()?;
-    if architecture.eq_ignore_ascii_case(GGUF_ARCHITECTURE) {
+    if !architecture.eq_ignore_ascii_case(GGUF_ARCHITECTURE) {
+        return Err(unsupported(&format!(
+            "GGUF `{}` has architecture `{architecture}`, which",
+            path.display()
+        )));
+    }
+    // The fork reads the PLE n-gram table itself (IQ4_NL included); every other tensor goes through candle.
+    let mut unrunnable = BTreeMap::<&str, usize>::new();
+    for info in archive.tensors().values() {
+        if info.name() != "per_layer_token_embd.weight" && info.dtype().candle_dtype().is_err() {
+            *unrunnable.entry(info.dtype().name()).or_default() += 1;
+        }
+    }
+    if unrunnable.is_empty() {
         return Ok(());
     }
-    Err(unsupported(&format!(
-        "GGUF `{}` has architecture `{architecture}`, which",
+    let types = unrunnable
+        .iter()
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "`{}` stores tensors in quantization types candle cannot run ({types}); \
+         re-quantize them to K-quants first",
         path.display()
-    )))
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
     use clap::Parser;
 
     use super::*;
@@ -381,6 +402,34 @@ mod tests {
         write_gguf(&bad, "llama");
         ensure_flash_next_gguf(&good).unwrap();
         assert!(ensure_flash_next_gguf(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_gguf_tensors_candle_cannot_run() {
+        let path = temp_dir("gguf-iq").join("iq.gguf");
+        let architecture = gguf_file::Value::String(GGUF_ARCHITECTURE.to_string());
+        let weights = Tensor::zeros((2, 32), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let q4_0 = QTensor::quantize(&weights, GgmlDType::Q4_0).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        gguf_file::write(
+            &mut file,
+            &[("general.architecture", &architecture)],
+            &[("blk.0.ffn_down_exps.weight", &q4_0)],
+        )
+        .unwrap();
+        drop(file);
+        ensure_flash_next_gguf(&path).unwrap();
+
+        // IQ4_NL blocks are as large as Q4_0's, so retyping the tensor keeps the file valid.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let name = b"blk.0.ffn_down_exps.weight";
+        let at = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        let dtype = at + name.len() + 4 + 2 * 8; // n_dims: u32, dims: 2 x u64
+        assert_eq!(bytes[dtype..dtype + 4], 2u32.to_le_bytes()); // Q4_0
+        bytes[dtype..dtype + 4].copy_from_slice(&20u32.to_le_bytes()); // IQ4_NL
+        std::fs::write(&path, bytes).unwrap();
+        let err = ensure_flash_next_gguf(&path).unwrap_err().to_string();
+        assert!(err.contains("IQ4_NL x1"), "{err}");
     }
 
     fn model_options(args: &[&str]) -> ModelOptions {
