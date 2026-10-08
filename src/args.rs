@@ -467,6 +467,14 @@ pub struct RuntimeOptions {
 
 #[derive(Args, Clone)]
 pub struct BenchRuntimeOptions {
+    /// Maximum tokens processed in one paged-attention scheduler step
+    #[arg(long, default_value_t = default_max_num_batched_tokens())]
+    pub max_num_batched_tokens: NonZeroUsize,
+
+    /// CUDA prompt-token quantum used while decode is resident and for recurrent prefill batching
+    #[arg(long, default_value_t = default_max_prefill_chunk_tokens())]
+    pub max_prefill_chunk_tokens: NonZeroUsize,
+
     /// Disable KV cache entirely
     #[arg(long)]
     pub no_kv_cache: bool,

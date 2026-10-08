@@ -90,6 +90,8 @@ pub async fn run_bench(
     let (builder, model_id) = base_builder(&model, &global)?;
     let builder = builder
         .with_max_seqs(1) // Single sequence for benchmarking
+        .with_max_num_batched_tokens(runtime.max_num_batched_tokens)
+        .with_max_prefill_chunk_tokens(runtime.max_prefill_chunk_tokens)
         .with_no_kv_cache(runtime.no_kv_cache)
         .with_prefix_cache_n(0) // Disable prefix cache for benchmarking
         .with_disable_eos_stop(true) // Always generate exactly gen_len tokens
