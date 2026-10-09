@@ -2,8 +2,8 @@
 
 Status as of 2026-10-09, `main` at the `--prefill-stream-min-tokens` commit; fork pinned to `0c2c9ad`.
 First CUDA runs done on ubi (RTX 4070 12 GB, PCIe Gen3, 30 GB RAM); measurements and logs are in
-`benchmark.md`. Prefill runs at the PCIe floor; decode (~7 tok/s) and the expert cache (NaN, G8)
-are the open problems.
+`benchmark.md`. Prefill runs at the PCIe floor; the expert cache works since the G8 fix (decode 7.1 → ~9.3
+tok/s at 2 GB); decode speed is the open problem.
 
 ## 1. What this project is
 
@@ -115,7 +115,11 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
    never waits on it.
 2. Top-k is split into hits (resident) and misses. Hits run via `QMatMul` on the GPU and
    misses via `MoEExperts::forward` on the CPU with only the miss ids. The two run at once
-   (`std::thread::scope`) and are summed. Router weights are applied once per side.
+   and are summed; router weights are applied once per side. **Every CUDA call stays on the
+   calling thread**: it copies the miss inputs to the host, spawns a scoped thread for the
+   CPU misses, then enqueues the hits' kernels (asynchronous, so they still overlap). The
+   earlier layout, hits launched from the scoped thread while the caller copied the
+   activation to the host, produced NaN logits once the lookahead swapped slots (G8).
 3. **A miss is never copied to the GPU on demand.** If an expert is not resident in time, it
    runs on the CPU.
 
@@ -266,15 +270,15 @@ queue depth) and the table is advised `MADV_RANDOM` (no 128 KiB readahead per 1 
 | CUDA from non-main threads (decode hit thread, fill threads, lookahead) | runs without context/thread errors |
 | Pinning ~25 GiB of expert stacks | works on ubi (no "could not be pinned" warning) |
 | Prefill stream, no cache | **works**, at the PCIe floor (§3.4). Greedy output byte-identical between the pre- and post-PLE-fix binaries, short (CPU) and 2100-token (stream) prompts |
-| Prefill stream + cache loan | borrow / give-back cycles run (`borrowed 1380 MiB … gave the layer buffers back`), but see G8 |
-| Expert cache decode | **broken: NaN logits** on the first decode (G8), with or without the prefill stream |
-| Numeric parity: cached vs uncached | blocked on G8 |
+| Prefill stream + cache loan | works: 2048 tokens in 2.39 s with `--expert-cache-gb 2`, peak VRAM 11.07 GB |
+| Expert cache decode | works since the G8 fix: 9.0–9.7 tok/s at 2 GB (7.1 uncached), no NaN over 2×3×128 tokens |
+| Numeric parity: cached vs uncached | **128 greedy tokens byte-identical** (`serve`, short and 2100-token prompts, lookahead swapping throughout) |
 | Hit rate | not measured (G6) |
-| Decode tokens/s | ~7 tok/s with `--cpu-moe` (5.9 before the PLE fix), not profiled |
+| Decode tokens/s | ~7 tok/s uncached, ~9.3 with a 2 GB cache; not profiled |
 
 Things still to watch for on CUDA:
-- **In-place fills.** Whether the fence protocol holds under load: parity drift that grows
-  with decode length would mean a slot was overwritten mid-read. Untestable until G8 is fixed.
+- **In-place fills.** No drift over 128 tokens; recheck over thousands of tokens and with
+  larger caches (more swaps per token).
 - **Parity.** CPU and CUDA kernels differ (CUDA quantizes activations to Q8_1), so compare
   logits with a tolerance (~1e-3 relative), never for bit equality.
 - **Shutdown.** Some runs log `CUDA_ERROR_DEINITIALIZED` from mistral.rs's memory maintenance
@@ -291,7 +295,7 @@ Things still to watch for on CUDA:
 | G5 | Cache flags undocumented | README does not mention `--cpu-moe`, `--expert-cache-gb`, `--prefill-stream*` |
 | G6 | No hit-rate / timing counters | cache effectiveness cannot be observed |
 | G7 | First prefill fills in expert-id order | cold-start residency is arbitrary until routing counts or the lookahead correct it |
-| G8 | **`--expert-cache-gb` yields NaN logits** on the real model | the cache is unusable; the CPU unit test of the hit/miss split passes, so the difference is in the real-model path (`benchmark.md` B5) |
+| G8 | ~~`--expert-cache-gb` yields NaN logits~~ **fixed** | cause: decode hits launched from a scoped thread while the calling thread did CUDA work too; bisection in `benchmark.md` §4c |
 | G9 | Prefill-stream VRAM is not reserved up front | `serve` with default `--max-seqs` OOMs on a long prompt (B6); 4 GB cache + loan OOMs (B1). Failures surface mid-request, not at startup |
 | G10 | `--prefill-stream-min-tokens` default is Strata's 1024 | on ubi the break-even is ~37 tokens; the right value is upload time × CPU prefill rate, i.e. hardware-specific |
 | G11 | `CUDA_ERROR_DEINITIALIZED` warnings at exit | cosmetic so far; exit code is 0 |
@@ -301,47 +305,45 @@ Things still to watch for on CUDA:
 
 Ordered by priority. `benchmark.md` holds the measurements behind each item.
 
-### Now — make the expert cache correct (G8)
-1. **Bisect the NaN.** Reproduce with `--cpu-moe --expert-cache-gb 2 --pa-context-len 4096
-   --prompt-len 64 --gen-len 64`, no prefill stream. Then, one at a time: lookahead off
-   (fills only from prefill), hits forced to the CPU path (rules out slot contents vs the
-   split), a check for non-finite values per layer after the MoE sum. Suspects: slot byte
-   ranges for mixed-quant layers (requant mixes Q2_K/Q3_K/Q4_K/Q4_0 per projection), the
-   hit path's `QMatMul` on 4D activations (cf. fork `3e28196`), and summing a BF16 GPU
-   result with an F32 CPU result.
-2. **Parity, cached vs uncached** (logits within ~1e-3 relative), then a long decode to
-   check the in-place fence protocol.
-3. **G6:** per-layer hit / miss / lookahead / swap counters, reported by `bench`.
+### Done
+1. ~~G8, the expert-cache NaN~~ (§3.2, `benchmark.md` §4c).
+2. ~~Parity, cached vs uncached~~: 128 greedy tokens identical.
 
-### Next — decode speed (~7 tok/s)
-4. **Profile one decode step** (nsys, `MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1`): split host
+### Now — see what the cache is doing
+3. **G6:** per-layer hit / miss / lookahead / swap counters, reported by `bench`. Needed
+   to size the cache and to judge the lookahead.
+4. **Cache size sweep** on ubi: 1 / 2 / 3 GB × `--pa-context-len`, with and without
+   `--prefill-stream` (VRAM headroom is ~1 GB at 2 GB + loan + 4096 context).
+
+### Next — decode speed (~9 tok/s cached)
+5. **Profile one decode step** (nsys, `MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1`): split host
    expert GEMV, PLE gather, activation round trips and launch overhead. This decides the
    next item.
-5. Depending on 4: tune the CPU routed GEMV (threads, huge pages), cut per-layer
+6. Depending on 5: tune the CPU routed GEMV (threads, huge pages), cut per-layer
    GPU↔CPU syncs, or cache hot PLE rows (G12, below).
-6. With the cache fixed: measure hit rate vs cache size, tune `MAX_LOOKAHEAD_SWAPS` and
+7. With the cache fixed: measure hit rate vs cache size, tune `MAX_LOOKAHEAD_SWAPS` and
    the per-layer split.
 
 ### Next — prefill robustness
-7. **G9:** account for the two prefill layer buffers (~1.35 GiB) when sizing the KV cache
+8. **G9:** account for the two prefill layer buffers (~1.35 GiB) when sizing the KV cache
    and expert cache, or fail at startup with the numbers, instead of OOM mid-request.
-8. **G10:** lower the default threshold (e.g. 128), or derive it at load from the measured
+9. **G10:** lower the default threshold (e.g. 128), or derive it at load from the measured
    pinned H2D rate and stack bytes.
-9. **Short chunks: upload only routed experts.** A 64-token chunk touches a fraction of
+10. **Short chunks: upload only routed experts.** A 64-token chunk touches a fraction of
    each layer's experts but pays the full 2 s. Measure routed-expert coverage per chunk
    size first; if it is low below ~512 tokens, upload per expert (Strata's slot ring).
-10. **Long prompts beyond one chunk** pay 2 s per chunk: keep chunks as large as VRAM
+11. **Long prompts beyond one chunk** pay 2 s per chunk: keep chunks as large as VRAM
     allows, and consider lending more cache slots so some layers stay resident across
     chunks.
 
 ### Later
-11. **G12:** a host-RAM or VRAM cache of hot PLE rows (n-gram hashes of a code prompt
+12. **G12:** a host-RAM or VRAM cache of hot PLE rows (n-gram hashes of a code prompt
     repeat), or a smaller table encoding, to take the disk out of the step.
-12. Hide the first layer of each chunk; give prefill its own copy stream. Both small at
+13. Hide the first layer of each chunk; give prefill its own copy stream. Both small at
     current scale (one layer ≈ 42 ms), revisit after 9–10.
-13. Hygiene: G1, G2, G3, G5.
-14. **G4:** per-token hit/miss split so batched decode and MTP verify windows use the cache.
-15. **G7:** warm start (save/restore residency, or a static frequency profile); adaptive
+14. Hygiene: G1, G2, G3, G5.
+15. **G4:** per-token hit/miss split so batched decode and MTP verify windows use the cache.
+16. **G7:** warm start (save/restore residency, or a static frequency profile); adaptive
     admission once hit-rate data exists.
 
 ### Out of scope

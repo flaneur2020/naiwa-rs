@@ -103,7 +103,7 @@ beat 25.2 GiB / 13.35 GB/s ≈ **2.03 s**, whatever its length.
 | C1 | + PLE fix | no stream | 64 / 256 | 3.83 / 13.42 s (17–19 tok/s) | 4.8 tok/s | release CPU prefill rate |
 | S4 | + min-tokens | S1 + `--prefill-stream-min-tokens 64` | 32 / 64 / 256 / 512 | 2.03 / 2.04 / **2.08 / 2.09 s** | 6.5 tok/s | 256: 13.4 → 2.1 s |
 | S5 | + min-tokens | S4 with chunk 8192 | 2100 / 4096 / 8000 | **2.16 / 2.94 / 5.55 s** | | 974 / 1394 / 1441 tok/s; peak VRAM 11.7 GB |
-| K1 | any | `--expert-cache-gb 2 --pa-context-len 4096` (± stream) | | | | **NaN logits on the first decode** (B5) |
+| K1 | any | `--expert-cache-gb 2 --pa-context-len 4096` (± stream) | | | | **NaN logits on the first decode** (B5, fixed in §4c) |
 
 Where the time went (nsys, S1, one 2048-token prefill, 9.2 s): H2D 2.06 s (25 GiB at
 full PCIe speed), kernels 1.13 s, and **one 7.06 s window with the GPU idle** before
@@ -132,13 +132,50 @@ Recommended prefill config on ubi:
     --cpu-moe --prefill-stream --prefill-stream-min-tokens 64 \
       --max-num-batched-tokens 8192 --max-prefill-chunk-tokens 4096 --pa-context-len 8192
 
+## 4c. Expert-cache NaN: bisection and fix (2026-10-09)
+
+Repro: `--cpu-moe --expert-cache-gb 2 --pa-context-len 4096 --prompt-len 64 --gen-len 64
+--iterations 3 --warmup 1` — NaN in every run. Debug switches (env vars in a throwaway build):
+
+| Variant | NaN | Decode |
+|---|---|---:|
+| as shipped | yes | — |
+| hits forced to the CPU | no | 6.6 tok/s |
+| lookahead off | no | 7.2 tok/s |
+| lookahead admits empty slots only (`MAX_LOOKAHEAD_SWAPS = 0`) | no | 7.6 tok/s |
+| prefill fills off | yes | — |
+| device sync after each step / before each upload | yes | — |
+| hits enqueued on the calling thread | **no** | **8.4 tok/s** |
+
+Per-hit checks while it ran: GPU hit outputs matched the CPU reference within 5e-2 (Q8_1
+activations); the slot bytes equalled the host stack's bytes even after the NaN; and the
+first non-finite value appeared in a layer's *input*, after a step where 9 hits had summed
+to exactly 0. So the slots and kernels were fine, and stream ordering was not the problem
+(syncs did not help). What mattered was launching the hits from the scoped thread while
+the calling thread did its own CUDA work (`xs.to_device(Cpu)` for the misses), with the
+lookahead's swap uploads adding a third thread.
+
+Fix (`decode_forward`): the calling thread does every CUDA call. It copies the miss inputs
+to the host, spawns the CPU misses on a scoped thread, and then only enqueues the hits'
+kernels, which still overlap the CPU work.
+
+| Run | Prompt | TTFT | Decode | Peak VRAM |
+|---|---:|---:|---:|---:|
+| cache 2 GB, no stream (×2) | 64 | 4.0–4.2 s | **9.0 / 9.7 tok/s** | 8.6 GB |
+| cache 2 GB + stream, min-tokens 64, chunk 4096 | 512 / 2048 | 2.13 / 2.39 s | **9.3 tok/s** | 11.07 GB |
+| no cache (S4, for reference) | | | 6.5–7.1 tok/s | |
+
+Parity via `serve` (`~/bench-rel/scripts/parity.sh`, chunk 4096, ctx 4096): 128 greedy
+tokens byte-identical with and without `--expert-cache-gb 2`, for the 15-token and the
+2100-token prompt.
+
 ## 5. Known issues
 
 | # | Issue | Detail |
 |---|---|---|
 | B1 | `--expert-cache-gb 4` OOMs with prefill stream (design G9) | Only 5882 MiB free after the KV cache. The prefill stream borrows ~1380 MiB of cache slots for layer buffers, then `CUDA_ERROR_OUT_OF_MEMORY` on layer 1 prefetch. Setup log: `4.0 GB total, ~42 slots/layer (estimated 48 layers, 2112000 bytes/slot)`. Workaround: `--expert-cache-gb 2 --pa-context-len 4096` fits (then hits B5). |
 | B2 | PLE table lives in host memory | The `per_layer_token_embd.weight` n-gram table is large and not cached on the GPU, so every token does a slow host gather. Visible in R1/R3. **Mitigated** by the parallel gather + `MADV_RANDOM` (§4b): 7.06 s → 0.48 s per 2048-token prompt; still disk-bound. |
-| B5 | `--expert-cache-gb` produces NaN logits (design G8) | `--expert-cache-gb 2 --pa-context-len 4096` fits now (B1 was the 4 GB size), but the first decode after warmup samples NaN, with or without `--prefill-stream`, on the stock release binary too. The unit test `decode_split_matches_running_every_expert_on_the_cpu` passes, so the real-model path differs from it. Logs: `~/bench-rel/bench-cache2-*.log`. **Not fixed.** |
+| B5 | ~~`--expert-cache-gb` produces NaN logits~~ **fixed** (§4c, design G8) | `--expert-cache-gb 2 --pa-context-len 4096` fits now (B1 was the 4 GB size), but the first decode after warmup samples NaN, with or without `--prefill-stream`, on the stock release binary too. The unit test `decode_split_matches_running_every_expert_on_the_cpu` passes, so the real-model path differs from it. Logs: `~/bench-rel/bench-cache2-*.log`, `dbg-*.log`. |
 | B6 | `serve` OOMs on a 2100-token prompt with the R3 flags (design G9) | `bench` uses `max_seqs = 1`; `serve`'s default reserves more, leaving too little VRAM for the prefill buffers. `--max-seqs 1` works. |
 | B3 | Decode at ~7 tok/s (release, after the PLE fix; 3.7 in the debug R1) | Not bus-bound. Needs a per-step profile (design §6 item 4). |
 | B4 | `--prefill-stream` chunk size defaults to 512 | Below the 1024-token streaming threshold (now `--prefill-stream-min-tokens`), so the GPU path silently does nothing unless `--max-prefill-chunk-tokens` is raised (fixed in code at `7895b94`; documented here so config is deliberate). |
@@ -159,7 +196,7 @@ prefill profile (§4b).
         --max-num-batched-tokens 8192 --max-prefill-chunk-tokens 4096 --pa-context-len 8192 \
         --prompt-len 256,2048,4096 --gen-len 16 --depth 4 --iterations 2 --warmup 1
     ~/rel-bench.sh cache2 --cpu-moe --expert-cache-gb 2 --pa-context-len 4096 \
-        --prompt-len 64 --gen-len 64 --depth 4 --iterations 3 --warmup 1   # reproduces B5
+        --prompt-len 64 --gen-len 128 --depth 4 --iterations 3 --warmup 1   # was B5
 
     # nsys profile of the measured iterations only
     MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1 nsys profile -o prof -t cuda,osrt \
