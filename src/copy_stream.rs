@@ -136,19 +136,39 @@ mod cuda {
             }))
         }
 
-        /// Device memory shaped like one expert of `stack` (`[E, N, K]` -> `[N, K]`). Allocated
-        /// and zeroed on candle's stream; call [`Self::after_device_work`] before the first upload.
-        pub fn alloc_expert(&self, stack: &QTensor) -> Result<SlotMemory> {
+        /// Device memory for `slots` experts of `stack` (`[E, N, K]` -> `[slots, N, K]`) and one
+        /// view per expert, each holding the allocation. Allocated and zeroed on candle's stream;
+        /// call [`Self::after_device_work`] before the first upload.
+        pub fn alloc_bank(
+            &self,
+            stack: &QTensor,
+            slots: usize,
+        ) -> Result<(Arc<QTensor>, Vec<SlotMemory>)> {
             let Device::Cuda(dev) = &self.device else {
                 candle_core::bail!("copy stream on a non-CUDA device");
             };
             let dims = stack.shape().dims();
             let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
-            let storage = QCudaStorage::zeros(dev, n * k, stack.dtype())?;
-            let len = storage.storage_size_in_bytes();
-            let ptr = storage.device_ptr()? as sys::CUdeviceptr;
-            let tensor = Arc::new(QTensor::new(QStorage::Cuda(storage), (n, k))?);
-            Ok(SlotMemory { tensor, ptr, len })
+            let dtype = stack.dtype();
+            let stride = n * (k / dtype.block_size()) * dtype.type_size();
+            let storage = QCudaStorage::zeros(dev, slots * n * k, dtype)?;
+            if storage.storage_size_in_bytes() < slots * stride {
+                candle_core::bail!(
+                    "bank of {slots} experts got {} bytes, needs {}",
+                    storage.storage_size_in_bytes(),
+                    slots * stride
+                );
+            }
+            let base = storage.device_ptr()? as sys::CUdeviceptr;
+            let tensor = Arc::new(QTensor::new(QStorage::Cuda(storage), (slots, n, k))?);
+            let views = (0..slots)
+                .map(|i| SlotMemory {
+                    tensor: Arc::clone(&tensor),
+                    ptr: base + (i * stride) as sys::CUdeviceptr,
+                    len: stride,
+                })
+                .collect();
+            Ok((tensor, views))
         }
 
         /// Device memory shaped like the whole of `stack`.
@@ -330,7 +350,11 @@ mod stub {
             Ok(None)
         }
 
-        pub fn alloc_expert(&self, _stack: &QTensor) -> Result<SlotMemory> {
+        pub fn alloc_bank(
+            &self,
+            _stack: &QTensor,
+            _slots: usize,
+        ) -> Result<(Arc<QTensor>, Vec<SlotMemory>)> {
             match *self {}
         }
 

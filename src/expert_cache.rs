@@ -34,7 +34,7 @@
 //!   never changes what an in-flight token computes with.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -58,6 +58,72 @@ const PREFILL_THRESHOLD: usize = 1;
 /// copies one expert's three projections host-to-device; without a cap a poor prediction would
 /// turn every token into a full re-upload of every layer's top-k.
 const MAX_LOOKAHEAD_SWAPS: usize = 2;
+
+/// With `--prefill-stream`, each layer keeps its last slots in a separate bank of about its
+/// share of the loan: two layers of experts, spread over the estimated 48 layers, plus a
+/// quarter for layers with smaller slots than the largest one. The loan lends whole banks.
+fn loan_bank_slots(num_experts: usize) -> usize {
+    (2 * num_experts * 5).div_ceil(4 * 48)
+}
+
+// ---------------------------------------------------------------------------
+// Counters
+// ---------------------------------------------------------------------------
+
+/// Decode-path counters over every cached layer of the process (one model per process).
+struct Counters {
+    installed: AtomicBool,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    lookahead_loads: AtomicU64,
+    swaps: AtomicU64,
+    lookahead_dropped: AtomicU64,
+}
+
+static COUNTERS: Counters = Counters {
+    installed: AtomicBool::new(false),
+    hits: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    lookahead_loads: AtomicU64::new(0),
+    swaps: AtomicU64::new(0),
+    lookahead_dropped: AtomicU64::new(0),
+};
+
+/// Expert-cache counters since the last call to `take_stats`.
+pub struct CacheStats {
+    /// Routed experts of decode steps served from a slot.
+    pub hits: u64,
+    /// Routed experts of decode steps run on the CPU.
+    pub misses: u64,
+    /// Experts the lookahead loaded into empty slots.
+    pub lookahead_loads: u64,
+    /// Experts the lookahead loaded over a least-recently-used resident.
+    pub swaps: u64,
+    /// Lookahead requests dropped because the worker was busy.
+    pub lookahead_dropped: u64,
+}
+
+impl CacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        self.hits as f64 / (self.hits + self.misses).max(1) as f64
+    }
+}
+
+/// Read and reset the counters; `None` when no expert cache is installed.
+pub fn take_stats() -> Option<CacheStats> {
+    let c = &COUNTERS;
+    if !c.installed.load(Ordering::Relaxed) {
+        return None;
+    }
+    let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    Some(CacheStats {
+        hits: take(&c.hits),
+        misses: take(&c.misses),
+        lookahead_loads: take(&c.lookahead_loads),
+        swaps: take(&c.swaps),
+        lookahead_dropped: take(&c.lookahead_dropped),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Provider state
@@ -86,6 +152,7 @@ pub struct GpuCacheMoeProvider {
 
 impl GpuCacheMoeProvider {
     pub fn new(cache_gb: f64, prefill: Option<PrefillStreams>) -> Self {
+        COUNTERS.installed.store(true, Ordering::Relaxed);
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let registry: Arc<LayerRegistry> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
@@ -312,11 +379,25 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         // With a copy stream, each slot's memory is allocated once here and every fill overwrites
         // it in place from the copy stream; otherwise each fill uploads a fresh copy.
+        // The slots are grouped in banks, one allocation per projection, so that a decode step
+        // runs all of a bank's hits in one fused call; with a prefill stream the last bank is
+        // the one lent to it.
+        let tail = if prefill.is_some() {
+            loan_bank_slots(num_experts).min(num_slots)
+        } else {
+            0
+        };
+        let banks: Vec<(usize, usize)> = [(0, num_slots - tail), (num_slots - tail, tail)]
+            .into_iter()
+            .filter(|&(_, len)| len > 0)
+            .collect();
         let mut copy_stream = self.copy_streams.get(&slot_device);
         let mut slot_bufs = Vec::new();
         if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
-            for _ in 0..num_slots {
-                slot_bufs.push(SlotEntry::new(Some(alloc_slot(cs, &stacks, &slot_device)?)));
+            for &(first, len) in &banks {
+                for buf in alloc_bank(cs, &stacks, first, len, &slot_device)? {
+                    slot_bufs.push(SlotEntry::new(Some(buf)));
+                }
             }
             cs.after_device_work()?;
         }
@@ -346,6 +427,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             }),
             copy_stream,
             slot_bufs,
+            banks,
             prefill,
             filling: AtomicBool::new(false),
         });
@@ -439,7 +521,10 @@ impl Lookahead {
             tx
         });
         match sender.try_send(job) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                COUNTERS.lookahead_dropped.fetch_add(1, Ordering::Relaxed);
+            }
             Err(TrySendError::Disconnected(_)) => *tx = None,
         }
     }
@@ -533,11 +618,24 @@ struct SlotWeights {
     down: Arc<QTensor>,
 }
 
-/// One slot's contents. In copy-stream mode `memory` is the slot's device memory, overwritten
-/// in place on every fill, and `weights` view it; otherwise each fill makes a new `SlotBuf`.
+/// Slots `[first, first + len)` of a layer in copy-stream mode: one `[len, N, K]` device
+/// allocation per projection, which the fused decode kernel indexes by `slot - first`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct Bank {
+    first: usize,
+    gate: Arc<QTensor>,
+    up: Arc<QTensor>,
+    down: Arc<QTensor>,
+}
+
+/// One slot's contents. In copy-stream mode `memory` is the slot's view of its bank, overwritten
+/// in place on every fill; otherwise each fill makes a new `SlotBuf` with its own `weights`.
 struct SlotBuf {
-    weights: SlotWeights,
+    weights: Option<SlotWeights>,
     memory: Option<[SlotMemory; 3]>,
+    /// Copy-stream mode: the bank this slot is part of (held, so the bank outlives readers).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    bank: Option<Arc<Bank>>,
     /// Recorded by readers after enqueueing the kernels that read this slot.
     fence: ReadFence,
 }
@@ -546,28 +644,90 @@ struct SlotBuf {
 /// holds the lock for its duration, so lending a slot waits for any upload into it.
 type SlotEntry = parking_lot::Mutex<Option<Arc<SlotBuf>>>;
 
-/// Allocate one slot's device memory (one expert of each of `stacks`) on the copy stream's
+/// Allocate the device memory of slots `[first, first + len)` as one bank on the copy stream's
 /// device. The caller orders the copy stream after the allocation (`after_device_work`).
-fn alloc_slot(
+fn alloc_bank(
     cs: &CopyStream,
     stacks: &(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>),
+    first: usize,
+    len: usize,
     device: &Device,
-) -> candle_core::Result<Arc<SlotBuf>> {
-    let memory = [
-        cs.alloc_expert(&stacks.0)?,
-        cs.alloc_expert(&stacks.1)?,
-        cs.alloc_expert(&stacks.2)?,
-    ];
-    let weights = SlotWeights {
-        gate: Arc::clone(memory[0].tensor()),
-        up: Arc::clone(memory[1].tensor()),
-        down: Arc::clone(memory[2].tensor()),
+) -> candle_core::Result<Vec<Arc<SlotBuf>>> {
+    let (gate, gate_views) = cs.alloc_bank(&stacks.0, len)?;
+    let (up, up_views) = cs.alloc_bank(&stacks.1, len)?;
+    let (down, down_views) = cs.alloc_bank(&stacks.2, len)?;
+    let bank = Arc::new(Bank {
+        first,
+        gate,
+        up,
+        down,
+    });
+    gate_views
+        .into_iter()
+        .zip(up_views)
+        .zip(down_views)
+        .map(|((g, u), d)| {
+            Ok(Arc::new(SlotBuf {
+                weights: None,
+                memory: Some([g, u, d]),
+                bank: Some(Arc::clone(&bank)),
+                fence: ReadFence::new(device)?,
+            }))
+        })
+        .collect()
+}
+
+/// The fused MoE decode kernel's activation id, if it has one for `act`.
+#[cfg(feature = "cuda")]
+fn fused_act(act: Activation) -> Option<i32> {
+    match act {
+        Activation::Silu | Activation::Swish => Some(mistralrs_quant::ACT_SILU),
+        Activation::GeluPytorchTanh => Some(mistralrs_quant::ACT_GELU_PYTORCH_TANH),
+        _ => None,
+    }
+}
+
+/// `sum_i weights[i] * expert(bank, ids[i])(x2d)` for one token, `[1, hidden]` F32, by
+/// mistral.rs's fused MoE decode (quantize, gate+up+act, quantize, down+weighted sum).
+#[cfg(feature = "cuda")]
+fn fused_decode(
+    bank: &Bank,
+    x2d: &Tensor,
+    ids: Vec<u32>,
+    weights: Vec<f32>,
+    act_type: i32,
+) -> candle_core::Result<Tensor> {
+    use candle_core::cuda::cudarc::driver::DevicePtr;
+    let dev = x2d.device().as_cuda_device()?;
+    let topk = ids.len();
+    let ids = Tensor::new(ids, x2d.device())?;
+    let weights = Tensor::new(weights, x2d.device())?;
+    let (ids_storage, _) = ids.storage_and_layout();
+    let candle_core::Storage::Cuda(ids_cuda) = &*ids_storage else {
+        candle_core::bail!("expert cache: fused decode ids are not on CUDA");
     };
-    Ok(Arc::new(SlotBuf {
-        weights,
-        memory: Some(memory),
-        fence: ReadFence::new(device)?,
-    }))
+    let (w_storage, _) = weights.storage_and_layout();
+    let candle_core::Storage::Cuda(w_cuda) = &*w_storage else {
+        candle_core::bail!("expert cache: fused decode weights are not on CUDA");
+    };
+    let w_slice = w_cuda.as_cuda_slice::<f32>()?;
+    let w_ptr = w_slice.device_ptr(w_slice.stream()).0 as *const f32;
+    // SAFETY: `w_ptr` points at `topk` f32s of `weights`, whose free is ordered on candle's
+    // stream after the kernels queued here.
+    unsafe {
+        mistralrs_quant::indexed_moe_fused_decode(
+            &bank.gate,
+            &bank.up,
+            &bank.down,
+            x2d,
+            ids_cuda.as_cuda_slice::<u32>()?,
+            w_ptr,
+            1,
+            topk,
+            act_type,
+            dev,
+        )
+    }
 }
 
 struct CachedLayer {
@@ -589,6 +749,8 @@ struct CachedLayer {
     copy_stream: Option<Arc<CopyStream>>,
     /// Copy-stream mode: every slot's permanent buffer (empty otherwise).
     slot_bufs: Vec<SlotEntry>,
+    /// Copy-stream mode: the banks as `(first slot, len)`, in slot order. Lent whole.
+    banks: Vec<(usize, usize)>,
     /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
     prefill: Option<Arc<PrefillStream>>,
     /// A background fill of this layer is running; at most one at a time.
@@ -657,8 +819,9 @@ impl CachedLayer {
             None => self.expert_weights(expert_id).map(|w| {
                 w.map(|weights| {
                     Arc::new(SlotBuf {
-                        weights,
+                        weights: Some(weights),
                         memory: None,
+                        bank: None,
                         fence: ReadFence::none(),
                     })
                 })
@@ -732,14 +895,23 @@ impl CachedLayer {
             .sum()
     }
 
-    /// Take the top `k` usable slots out of service for the prefill stream: unpublish and empty
-    /// them, then release their device memory. A free is ordered on candle's stream after any
-    /// kernel already reading the slot. Returns the number of slots lent.
+    /// Take at least the top `k` usable slots out of service for the prefill stream (whole banks
+    /// in copy-stream mode): unpublish and empty them, then release their device memory. A free
+    /// is ordered on candle's stream after any kernel already reading the slot. Returns the
+    /// number of slots lent.
     fn lend(&self, k: usize) -> usize {
         let (from, to) = {
             let mut st = self.state.lock().unwrap();
             let to = st.usable;
-            let from = to.saturating_sub(k);
+            let want = to.saturating_sub(k);
+            // A bank's memory is one allocation: lend from the start of the bank holding `want`.
+            let from = self
+                .banks
+                .iter()
+                .map(|&(first, _)| first)
+                .filter(|&first| first <= want)
+                .max()
+                .unwrap_or(want);
             for slot in from..to {
                 if let Some(e) = st.resident[slot].take() {
                     if st.slots.get(&e) == Some(&slot) {
@@ -771,8 +943,11 @@ impl CachedLayer {
             return Ok(());
         }
         if let (Some(cs), Some(stacks)) = (&self.copy_stream, self.cpu.expert_qtensors()) {
-            for entry in &self.slot_bufs[from..to] {
-                *entry.lock() = Some(alloc_slot(cs, &stacks, &self.slot_device)?);
+            for &(first, len) in self.banks.iter().filter(|&&(first, _)| first >= from) {
+                let bufs = alloc_bank(cs, &stacks, first, len, &self.slot_device)?;
+                for (entry, buf) in self.slot_bufs[first..first + len].iter().zip(bufs) {
+                    *entry.lock() = Some(buf);
+                }
             }
             cs.after_device_work()?;
         }
@@ -797,11 +972,16 @@ impl CachedLayer {
         let predicted = self.predict(x)?;
         let mut swaps = 0;
         for &e in &predicted {
-            if e >= self.num_experts || self.admit(e)?.is_some() {
+            if e >= self.num_experts {
+                continue;
+            }
+            if self.admit(e)?.is_some() {
+                COUNTERS.lookahead_loads.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if swaps < MAX_LOOKAHEAD_SWAPS && self.replace(e, &predicted)?.is_some() {
                 swaps += 1;
+                COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -842,6 +1022,66 @@ impl CachedLayer {
         });
     }
 
+    /// The weighted sum of the hits' outputs for one token, `[1, hidden]` F32 on the slot
+    /// device. In copy-stream mode each bank's hits run as one fused MoE decode (four kernels);
+    /// otherwise every expert runs on its own.
+    fn run_hits(
+        &self,
+        hits: &[(Arc<SlotBuf>, usize, f32)],
+        x2d: &Tensor,
+        act: Activation,
+    ) -> candle_core::Result<Tensor> {
+        let mut acc: Option<Tensor> = None;
+        let mut add = |y: Tensor| -> candle_core::Result<()> {
+            acc = Some(match acc.take() {
+                Some(a) => (a + y)?,
+                None => y,
+            });
+            Ok(())
+        };
+        #[cfg(feature = "cuda")]
+        if let (Some(act_type), true) = (
+            fused_act(act),
+            hits.iter().all(|(buf, _, _)| buf.bank.is_some()),
+        ) {
+            let mut groups: Vec<(&Arc<Bank>, Vec<u32>, Vec<f32>)> = Vec::new();
+            for (buf, slot, w) in hits {
+                let bank = buf.bank.as_ref().expect("checked above");
+                let local = (slot - bank.first) as u32;
+                match groups.iter_mut().find(|(b, _, _)| Arc::ptr_eq(b, bank)) {
+                    Some((_, ids, ws)) => {
+                        ids.push(local);
+                        ws.push(*w);
+                    }
+                    None => groups.push((bank, vec![local], vec![*w])),
+                }
+            }
+            for (bank, ids, ws) in groups {
+                add(fused_decode(bank, x2d, ids, ws, act_type)?)?;
+            }
+        } else {
+            for (buf, _, w) in hits {
+                let Some(weights) = &buf.weights else {
+                    candle_core::bail!("expert cache: slot has no weights to run");
+                };
+                let y = Self::run_expert(weights, x2d, act)?;
+                add((y.to_dtype(DType::F32)? * *w as f64)?)?;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        for (buf, _, w) in hits {
+            let Some(weights) = &buf.weights else {
+                candle_core::bail!("expert cache: slot has no weights to run");
+            };
+            let y = Self::run_expert(weights, x2d, act)?;
+            add((y.to_dtype(DType::F32)? * *w as f64)?)?;
+        }
+        match acc {
+            Some(acc) => Ok(acc),
+            None => Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device),
+        }
+    }
+
     /// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
     fn run_expert(w: &SlotWeights, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
         let g = QMatMul::QTensor(w.gate.clone()).forward(x2d)?;
@@ -878,7 +1118,7 @@ impl CachedLayer {
         let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
         let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
 
-        let mut hits: Vec<(Arc<SlotBuf>, f32)> = Vec::new();
+        let mut hits: Vec<(Arc<SlotBuf>, usize, f32)> = Vec::new();
         let mut miss_ids: Vec<u32> = Vec::new();
         let mut miss_weights: Vec<f32> = Vec::new();
         {
@@ -895,7 +1135,7 @@ impl CachedLayer {
                 match resident {
                     Some((slot, buf)) => {
                         st.last_use[slot] = tick;
-                        hits.push((buf, w));
+                        hits.push((buf, slot, w));
                     }
                     None => {
                         miss_ids.push(id);
@@ -905,6 +1145,12 @@ impl CachedLayer {
             }
         }
 
+        COUNTERS
+            .hits
+            .fetch_add(hits.len() as u64, Ordering::Relaxed);
+        COUNTERS
+            .misses
+            .fetch_add(miss_ids.len() as u64, Ordering::Relaxed);
         let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
         // Host inputs for the misses, copied before any thread starts.
@@ -926,19 +1172,12 @@ impl CachedLayer {
                 })
             });
 
-            let acc = (|| -> candle_core::Result<Tensor> {
-                let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
-                for (buf, w) in &hits {
-                    let y = Self::run_expert(&buf.weights, &x_gpu, act)?;
-                    acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
-                }
-                Ok(acc)
-            })();
+            let acc = self.run_hits(&hits, &x_gpu, act);
             // Kernels reading these slots may be queued even if a later step failed: fence
             // every slot before letting go of it, so an in-place fill cannot overtake them.
             // If a fence cannot be recorded, wait for the device instead.
             let mut fenced = Ok(());
-            for (buf, _) in &hits {
+            for (buf, _, _) in &hits {
                 if let Err(e) = buf.fence.record_reads(&self.slot_device) {
                     fenced = fenced.and(Err(e));
                 }
@@ -1152,6 +1391,7 @@ mod tests {
             }),
             copy_stream: None,
             slot_bufs: Vec::new(),
+            banks: Vec::new(),
             prefill: None,
             filling: AtomicBool::new(false),
         })
