@@ -24,7 +24,8 @@
 //!
 //! - Top-k is split into slot hits and misses. Hits run via `QMatMul` on the slot device, misses
 //!   via `MoEExperts::forward` on the CPU with only the miss ids (the fork's `forward_gather`
-//!   reads top-k from `topk_ids`), both at once; router weights are applied once per side.
+//!   reads top-k from `topk_ids`), both at once; router weights are applied once per side. The
+//!   misses run on a scoped thread over host copies; every CUDA call stays on the calling thread.
 //! - Misses are never loaded on the token path. Instead, each layer submits its activation to a
 //!   lookahead thread that runs the next layer's router on it and loads the predicted experts:
 //!   into empty slots freely, over least-recently-used residents at most `MAX_LOOKAHEAD_SWAPS`
@@ -851,6 +852,11 @@ impl CachedLayer {
 
     /// Decode path: split top-k into GPU hits and CPU misses, run both concurrently, sum.
     /// Misses are never loaded on the token path — they run on the CPU.
+    ///
+    /// Every CUDA call stays on the calling thread: the hits' kernels are only enqueued here, so
+    /// they still run while a scoped thread computes the misses on host tensors. Launching the
+    /// hits from a second thread while this one copied the activation to the host produced NaN
+    /// logits on CUDA once the lookahead was swapping slots.
     fn decode_forward(
         &self,
         xs: &Tensor,
@@ -901,46 +907,50 @@ impl CachedLayer {
 
         let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
+        // Host inputs for the misses, copied before any thread starts.
+        let miss_inputs = if miss_ids.is_empty() {
+            None
+        } else {
+            Some((
+                xs.to_device(&Device::Cpu)?,
+                Tensor::new(miss_weights, &Device::Cpu)?.unsqueeze(0)?,
+                Tensor::new(miss_ids, &Device::Cpu)?.unsqueeze(0)?,
+            ))
+        };
+
         let (gpu_result, cpu_result) = std::thread::scope(|s| {
-            let gpu = s.spawn(move || -> candle_core::Result<Tensor> {
-                let acc = (|| -> candle_core::Result<Tensor> {
-                    let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
-                    for (buf, w) in &hits {
-                        let y = Self::run_expert(&buf.weights, &x_gpu, act)?;
-                        acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
-                    }
-                    Ok(acc)
-                })();
-                // Kernels reading these slots may be queued even if a later step failed: fence
-                // every slot before letting go of it, so an in-place fill cannot overtake them.
-                // If a fence cannot be recorded, wait for the device instead.
-                let mut fenced = Ok(());
-                for (buf, _) in &hits {
-                    if let Err(e) = buf.fence.record_reads(&self.slot_device) {
-                        fenced = fenced.and(Err(e));
-                    }
-                }
-                if fenced.is_err() {
-                    let _ = self.slot_device.synchronize();
-                }
-                drop(hits);
-                let acc = acc?;
-                fenced?;
-                Ok(acc)
+            let cpu = miss_inputs.map(|(xs_cpu, miss_w_t, miss_ids_t)| {
+                s.spawn(move || -> candle_core::Result<Tensor> {
+                    let out = self.cpu.forward(&xs_cpu, miss_w_t, &miss_ids_t)?;
+                    out.squeeze(0) // [1, 1, hidden] -> [1, hidden]
+                })
             });
 
-            let cpu = (|| -> candle_core::Result<Option<Tensor>> {
-                if miss_ids.is_empty() {
-                    return Ok(None);
+            let acc = (|| -> candle_core::Result<Tensor> {
+                let mut acc = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
+                for (buf, w) in &hits {
+                    let y = Self::run_expert(&buf.weights, &x_gpu, act)?;
+                    acc = (acc + (y.to_dtype(DType::F32)? * *w as f64)?)?;
                 }
-                let miss_ids_t = Tensor::new(miss_ids.clone(), &Device::Cpu)?.unsqueeze(0)?;
-                let miss_w_t = Tensor::new(miss_weights.clone(), &Device::Cpu)?.unsqueeze(0)?;
-                let xs_cpu = xs.to_device(&Device::Cpu)?;
-                let out = self.cpu.forward(&xs_cpu, miss_w_t, &miss_ids_t)?;
-                Ok(Some(out.squeeze(0)?)) // [1, 1, hidden] -> [1, hidden]
+                Ok(acc)
             })();
+            // Kernels reading these slots may be queued even if a later step failed: fence
+            // every slot before letting go of it, so an in-place fill cannot overtake them.
+            // If a fence cannot be recorded, wait for the device instead.
+            let mut fenced = Ok(());
+            for (buf, _) in &hits {
+                if let Err(e) = buf.fence.record_reads(&self.slot_device) {
+                    fenced = fenced.and(Err(e));
+                }
+            }
+            if fenced.is_err() {
+                let _ = self.slot_device.synchronize();
+            }
+            drop(hits);
+            let gpu = acc.and_then(|acc| fenced.map(|()| acc));
 
-            (gpu.join().unwrap(), cpu)
+            let cpu = cpu.map(|h| h.join().unwrap()).transpose();
+            (gpu, cpu)
         });
 
         let gpu_out = gpu_result?;
