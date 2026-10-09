@@ -14,7 +14,8 @@
 //!
 //! The first layer of each chunk has no predecessor to prefetch it, so its upload is not
 //! hidden. Every chunk streams every layer's experts once, so this only pays for long chunks:
-//! shorter ones (`MIN_TOKENS`) and layers whose stacks are not pinned stay on the CPU.
+//! shorter ones (`--prefill-stream-min-tokens`) and layers whose stacks are not pinned stay on
+//! the CPU.
 //!
 //! With `--expert-cache-gb`, the two buffers do not add to VRAM: before the first long chunk
 //! the cache lends (frees) about two layers' worth of its tail slots, and after
@@ -35,8 +36,9 @@ use tracing::{debug, info, warn};
 
 use crate::copy_stream::{CopyDone, CopyStream, CopyStreams, ReadFence, SlotMemory};
 
-/// Chunks shorter than this stay on the CPU (Strata streams every expert from 1024 tokens).
-pub const MIN_TOKENS: usize = 1024;
+/// Default for `--prefill-stream-min-tokens`: chunks shorter than this stay on the CPU (Strata
+/// streams every expert from 1024 tokens).
+pub const DEFAULT_MIN_TOKENS: usize = 1024;
 
 /// Decode steps in a row after which the buffers are given back to the expert cache. Several,
 /// so a server alternating prompts and decodes does not hand two layers back and forth per step.
@@ -83,6 +85,8 @@ pub struct PrefillStream {
     /// `None`: the buffers have their own memory and are kept for good.
     lender: Option<Arc<dyn ExpertMemoryLender>>,
     loan: Mutex<Loan>,
+    /// Chunks shorter than this stay on the CPU.
+    min_tokens: usize,
 }
 
 impl PrefillStream {
@@ -95,6 +99,7 @@ impl PrefillStream {
         act: Activation,
         comm: Arc<Comm>,
         lender: Option<Arc<dyn ExpertMemoryLender>>,
+        min_tokens: usize,
     ) -> candle_core::Result<Option<Self>> {
         let Some(copy) = copy else {
             return Ok(None);
@@ -119,6 +124,7 @@ impl PrefillStream {
             layers: RwLock::default(),
             lender,
             loan: Mutex::default(),
+            min_tokens,
         }))
     }
 
@@ -307,7 +313,7 @@ impl PrefillStream {
             return Ok(None);
         }
         self.loan.lock().unwrap().decode_steps = 0;
-        if batch * seq < MIN_TOKENS || self.stacks(layer).is_none() {
+        if batch * seq < self.min_tokens || self.stacks(layer).is_none() {
             return Ok(None);
         }
         self.borrow()?;
@@ -332,13 +338,22 @@ impl PrefillStream {
 }
 
 /// The prefill stream of each CUDA device, created by the first layer that loads on it.
-#[derive(Default)]
 pub struct PrefillStreams {
     streams: Mutex<Vec<(Device, Arc<PrefillStream>)>>,
     lender: Option<Arc<dyn ExpertMemoryLender>>,
+    min_tokens: usize,
 }
 
 impl PrefillStreams {
+    /// Streams that run prefill chunks of `min_tokens` or more on the GPU.
+    pub fn new(min_tokens: usize) -> Self {
+        Self {
+            streams: Mutex::default(),
+            lender: None,
+            min_tokens,
+        }
+    }
+
     /// Borrow the buffers' memory from `lender` instead of keeping it for good.
     pub fn with_lender(mut self, lender: Arc<dyn ExpertMemoryLender>) -> Self {
         self.lender = Some(lender);
@@ -371,6 +386,7 @@ impl PrefillStreams {
                     ctx.act,
                     Arc::clone(ctx.comm),
                     self.lender.clone(),
+                    self.min_tokens,
                 )?
                 else {
                     return Ok(None);

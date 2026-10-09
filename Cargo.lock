@@ -3427,7 +3427,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3438,7 +3438,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3457,7 +3457,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "ahash",
  "akin",
@@ -3561,7 +3561,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3572,7 +3572,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3593,7 +3593,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3606,7 +3606,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -3640,7 +3640,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "itoa",
@@ -3657,7 +3657,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-server-core"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "anyhow",
  "axum",
@@ -3691,7 +3691,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.4"
-source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#3e281961e06a026ca0d9d97da9609f85488c944f"
+source = "git+ssh://git@github.com/flaneur2020/mistral.rs.git?branch=patch%2Fstrata#0c2c9ad83c86893e6dd6a02cc3b15b8057f128fb"
 dependencies = [
  "candle-core",
  "image",

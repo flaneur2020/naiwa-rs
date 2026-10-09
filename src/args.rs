@@ -235,13 +235,23 @@ pub struct ModelOptions {
     #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
     pub expert_cache_gb: Option<f64>,
 
-    /// With `--cpu-moe`, run the routed experts of prefill chunks of 1024+ tokens on the GPU,
+    /// With `--cpu-moe`, run the routed experts of long prefill chunks on the GPU,
     /// uploading each layer's experts while the previous layer computes. Needs two layers' worth
     /// of expert memory in VRAM, borrowed from `--expert-cache-gb` while a prompt runs when that
     /// is set. Streams every expert once per chunk, so raise
     /// `--max-num-batched-tokens` (e.g. 8192) for long prompts. CUDA only.
     #[arg(long, requires = "cpu_moe")]
     pub prefill_stream: bool,
+
+    /// With `--prefill-stream`, the shortest prefill chunk whose experts run on the GPU; shorter
+    /// ones stay on the CPU. A streamed chunk costs about one upload of every routed expert
+    /// whatever its length, so the break-even is that upload time times the CPU prefill rate.
+    #[arg(
+        long,
+        requires = "prefill_stream",
+        default_value_t = NonZeroUsize::new(crate::prefill_stream::DEFAULT_MIN_TOKENS).unwrap()
+    )]
+    pub prefill_stream_min_tokens: NonZeroUsize,
 }
 
 #[derive(Args, Clone, Default)]

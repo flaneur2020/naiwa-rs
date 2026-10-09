@@ -25,12 +25,12 @@ use crate::prefill_stream::{PrefillStream, PrefillStreams};
 /// spill whole layers to the CPU.
 pub const ALL_LAYERS_ON_DEVICE: usize = usize::MAX;
 
-pub fn install_cpu_moe(expert_cache_gb: Option<f64>, prefill_stream: bool) -> Result<()> {
-    let prefill = prefill_stream.then(PrefillStreams::default);
-    if prefill.is_some() {
+/// `prefill_stream`: `Some(min_tokens)` with `--prefill-stream`.
+pub fn install_cpu_moe(expert_cache_gb: Option<f64>, prefill_stream: Option<usize>) -> Result<()> {
+    let prefill = prefill_stream.map(PrefillStreams::new);
+    if let Some(min_tokens) = prefill_stream {
         info!(
-            "--prefill-stream: prefill chunks of {} tokens or more run their experts on the GPU",
-            crate::prefill_stream::MIN_TOKENS
+            "--prefill-stream: prefill chunks of {min_tokens} tokens or more run their experts on the GPU"
         );
     }
     if let Some(gb) = expert_cache_gb {

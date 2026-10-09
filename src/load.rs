@@ -228,7 +228,12 @@ pub fn base_builder(
     )?;
     let device_layers = device_layers(model);
     if model.cpu_moe {
-        install_cpu_moe(model.expert_cache_gb, model.prefill_stream)?;
+        install_cpu_moe(
+            model.expert_cache_gb,
+            model
+                .prefill_stream
+                .then_some(model.prefill_stream_min_tokens.get()),
+        )?;
     }
     let paged = &model.paged_attn;
     let mut builder = MistralRsForServerBuilder::new()
