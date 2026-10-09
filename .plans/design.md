@@ -1,9 +1,10 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-09, `main` at the `--prefill-stream-min-tokens` commit; fork pinned to `0c2c9ad`.
+Status as of 2026-10-09, `main` at the fused-bank decode commit; fork pinned to `6f740bc`.
 First CUDA runs done on ubi (RTX 4070 12 GB, PCIe Gen3, 30 GB RAM); measurements and logs are in
-`benchmark.md`. Prefill runs at the PCIe floor; the expert cache works since the G8 fix (decode 7.1 → ~9.3
-tok/s at 2 GB); decode speed is the open problem.
+`benchmark.md`. Prefill runs at the PCIe floor. Decode: 8.2 tok/s uncached, ~11.5 with a 2 GB
+cache, ~14 with 4 GB (`benchmark.md` §4d); the host-side launch overhead between MoE calls is
+now the largest fixed cost.
 
 ## 1. What this project is
 
@@ -20,7 +21,7 @@ running a model whose routed experts do not fit in VRAM on one consumer GPU, usi
 
 | Crate | Source |
 |---|---|
-| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `0c2c9ad` |
+| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `6f740bc` |
 | `candle-core` | `huggingface/candle` rev `66a8cf18`, the revision mistral.rs uses |
 
 `patch/strata` = upstream Qwen3.8-Flash-Next support (#2462) + these fork commits:
@@ -34,6 +35,7 @@ running a model whose routed experts do not fit in VRAM on one consumer GPU, usi
 | `5cd26a9f` | CPU MoE fallback runs a GEMV over only the routed experts instead of every expert |
 | `3e281961` | the routed-expert GEMV accepts the model's 4D activations |
 | `0c2c9ad` | host PLE gather: rows read in parallel (rayon), table advised `MADV_RANDOM` (§3.6) |
+| `6f740bc` | CPU routed GEMV splits each expert's rows across threads (32-row tasks), so 1–3 decode misses use every core |
 
 **Fork policy: keep it minimal.** Everything else lives in this repo. The router is read
 through the existing `ExpertLoadContext::vb`, not a new accessor.
@@ -113,8 +115,14 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
    the least-recently-used non-predicted resident, at most `MAX_LOOKAHEAD_SWAPS = 2` per
    layer per token. The queue is one deep and a busy worker drops the request, so decode
    never waits on it.
-2. Top-k is split into hits (resident) and misses. Hits run via `QMatMul` on the GPU and
-   misses via `MoEExperts::forward` on the CPU with only the miss ids. The two run at once
+2. Top-k is split into hits (resident) and misses. Hits run on the GPU, misses via
+   `MoEExperts::forward` on the CPU with only the miss ids. In copy-stream mode a layer's
+   slots live in **banks**: one `[slots, N, K]` allocation per projection (a main bank, and
+   with `--prefill-stream` a tail bank of `loan_bank_slots` ≈ 14 slots that the loan lends
+   and returns whole). The hits are grouped by bank and each group runs through
+   `mistralrs_quant::indexed_moe_fused_decode` (4 kernels: quantize, gate+up+act, quantize,
+   down+weighted sum), indexing by `slot - bank.first`. Fresh-upload mode (no copy stream,
+   the CPU tests) runs one `QMatMul` chain per hit. The two run at once
    and are summed; router weights are applied once per side. **Every CUDA call stays on the
    calling thread**: it copies the miss inputs to the host, spawns a scoped thread for the
    CPU misses, then enqueues the hits' kernels (asynchronous, so they still overlap). The
@@ -273,8 +281,9 @@ queue depth) and the table is advised `MADV_RANDOM` (no 128 KiB readahead per 1 
 | Prefill stream + cache loan | works: 2048 tokens in 2.39 s with `--expert-cache-gb 2`, peak VRAM 11.07 GB |
 | Expert cache decode | works since the G8 fix: 9.0–9.7 tok/s at 2 GB (7.1 uncached), no NaN over 2×3×128 tokens |
 | Numeric parity: cached vs uncached | **128 greedy tokens byte-identical** (`serve`, short and 2100-token prompts, lookahead swapping throughout) |
-| Hit rate | not measured (G6) |
-| Decode tokens/s | ~7 tok/s uncached, ~9.3 with a 2 GB cache; not profiled |
+| Hit rate | `bench` reports it: 63–69% at 2 GB, 74–81% at 4 GB on the synthetic bench prompt |
+| Decode tokens/s | 8.2 uncached, ~11.5 at 2 GB, ~14 at 4 GB; profiled (`benchmark.md` §4d) |
+| Fused bank decode | 128 greedy tokens byte-identical to uncached at 2 GB (two banks, a loan cycle) |
 
 Things still to watch for on CUDA:
 - **In-place fills.** No drift over 128 tokens; recheck over thousands of tokens and with
@@ -293,7 +302,7 @@ Things still to watch for on CUDA:
 | G3 | BF16 experts: budget charged, nothing cached | silent no-op cache; module doc claims a dense fallback |
 | G4 | `num_tokens > 1` is treated as prefill | batched decode (several sequences) and MTP verify windows run all-CPU and get no cache hits |
 | G5 | Cache flags undocumented | README does not mention `--cpu-moe`, `--expert-cache-gb`, `--prefill-stream*` |
-| G6 | No hit-rate / timing counters | cache effectiveness cannot be observed |
+| G6 | ~~No hit-rate counters~~ done | `bench` prints hits, misses, lookahead swaps, dropped requests; no per-layer split or timing yet |
 | G7 | First prefill fills in expert-id order | cold-start residency is arbitrary until routing counts or the lookahead correct it |
 | G8 | ~~`--expert-cache-gb` yields NaN logits~~ **fixed** | cause: decode hits launched from a scoped thread while the calling thread did CUDA work too; bisection in `benchmark.md` §4c |
 | G9 | Prefill-stream VRAM is not reserved up front | `serve` with default `--max-seqs` OOMs on a long prompt (B6); 4 GB cache + loan OOMs (B1). Failures surface mid-request, not at startup |
@@ -309,20 +318,26 @@ Ordered by priority. `benchmark.md` holds the measurements behind each item.
 1. ~~G8, the expert-cache NaN~~ (§3.2, `benchmark.md` §4c).
 2. ~~Parity, cached vs uncached~~: 128 greedy tokens identical.
 
-### Now — see what the cache is doing
-3. **G6:** per-layer hit / miss / lookahead / swap counters, reported by `bench`. Needed
-   to size the cache and to judge the lookahead.
-4. **Cache size sweep** on ubi: 1 / 2 / 3 GB × `--pa-context-len`, with and without
-   `--prefill-stream` (VRAM headroom is ~1 GB at 2 GB + loan + 4096 context).
+### Done (decode, 2026-10-09)
+3. ~~G6~~ counters; ~~profile a decode step~~; ~~CPU GEMV parallelism~~ (fork `6f740bc`);
+   ~~fused per-bank hit decode~~; ~~residency-policy sweep~~ (lookahead swaps, Strata-style
+   decayed LFU, LFU-gated swaps, wider prediction): the current policy (top-10 lookahead,
+   LRU victim, 2 swaps) is at the knee; see `benchmark.md` §4d.
 
-### Next — decode speed (~9 tok/s cached)
-5. **Profile one decode step** (nsys, `MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1`): split host
-   expert GEMV, PLE gather, activation round trips and launch overhead. This decides the
-   next item.
-6. Depending on 5: tune the CPU routed GEMV (threads, huge pages), cut per-layer
-   GPU↔CPU syncs, or cache hot PLE rows (G12, below).
-7. With the cache fixed: measure hit rate vs cache size, tune `MAX_LOOKAHEAD_SWAPS` and
-   the per-layer split.
+### Next — decode speed (~11.5 tok/s at 2 GB, ~14 at 4 GB)
+4. **Host overhead between MoE calls** (~25 ms/token, the largest fixed cost): mistral.rs
+   turns CUDA graphs off for the whole step when experts are external. Capture the
+   segments between MoE calls (attention / DeltaNet / norms / router) as graphs, or let the
+   fork capture a step with the MoE as a host callback boundary. Needs fork work.
+5. **Stream part of the misses to the GPU** (Strata's PCIe share): DMA a miss into a
+   staging slot and run it in the same fused call. Host DRAM (~18 GB/s on ubi) is shared by
+   the CPU GEMV and the DMA, so expect at most the DRAM headroom the GEMV leaves (~25%).
+6. **More VRAM for the cache:** keep `token_embd` (341 MiB) on the host; let `serve` start
+   with 3–4 GB (its startup headroom check fails where `bench` fits, G9).
+7. **Prediction:** precision is ~66–69% (top-10 from layer *l*'s MoE input through layer
+   *l+1*'s router); 53% of misses were not predicted at all, 37% were predicted but not
+   resident in time. Ideas not yet tried: predict from layer *l*'s post-MoE residual (one
+   step closer to *l+1*'s input), and prioritize copies by router weight.
 
 ### Next — prefill robustness
 8. **G9:** account for the two prefill layer buffers (~1.35 GiB) when sizing the KV cache
@@ -343,8 +358,9 @@ Ordered by priority. `benchmark.md` holds the measurements behind each item.
     current scale (one layer ≈ 42 ms), revisit after 9–10.
 14. Hygiene: G1, G2, G3, G5.
 15. **G4:** per-token hit/miss split so batched decode and MTP verify windows use the cache.
-16. **G7:** warm start (save/restore residency, or a static frequency profile); adaptive
-    admission once hit-rate data exists.
+16. **G7:** warm start (save/restore residency; Strata's `STRP` profile format). Static
+    residency alone is weak here (12% hit rate with no swaps), so this only shortens the
+    first tokens.
 
 ### Out of scope
 - **Streaming misses to the GPU** (Strata's PCIe share). Misses always run on the CPU.

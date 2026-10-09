@@ -169,6 +169,81 @@ Parity via `serve` (`~/bench-rel/scripts/parity.sh`, chunk 4096, ctx 4096): 128 
 tokens byte-identical with and without `--expert-cache-gb 2`, for the 15-token and the
 2100-token prompt.
 
+## 4d. Decode: profile, fixes and residency-policy sweep (2026-10-09)
+
+All runs: `--cpu-moe --pa-context-len 4096 --gen-len 128 --depth 4 --iterations 2 --warmup 1`,
+release build. Run-to-run noise is about ±1 tok/s and a few points of hit rate (the lookahead's
+timing is not deterministic), so repeated runs are given as ranges.
+
+**Where the time went before the fixes** (nsys + main-thread timers):
+
+- Uncached: the GPU is busy 6% of a token. The CPU routed experts take ~108 of 138 ms; they read
+  10 experts × 48 layers × 2.33 MB = 1.12 GB per token at ~10 GB/s.
+- Unpinned (`--cpu-moe` without `--prefill-stream` or a cache): the expert stacks swap out
+  under the PLE table's page-cache pressure (8.3k pages/s swapped in, 490 MB of the process
+  in swap): 4.8–5.4 tok/s vs 6.4–7.1 pinned.
+- ubi's memory reads at **~17.9 GB/s** regardless of thread count (`scripts/membw.c`), so the
+  CPU-expert floor is ~62 ms/token uncached.
+- With a 4 GB cache (78% hits): 6,200 kernel launches per token (vs 2,050 uncached), ~11 per
+  hit; launch API time ~28 ms/token, async alloc/free ~8 ms; GPU busy 30%.
+- After the fused banks, main-thread time per token at 4 GB: waiting for the CPU misses 35–54
+  ms, everything between MoE calls 24–45 ms, enqueueing the hits 3–4 ms, top-k readback 0.5 ms.
+  The miss wait was out of proportion to ~1.7 misses per layer.
+
+**Fixes:**
+
+1. *Fused hit decode per slot bank* (`1231276`): kernels per token 6,200 → 2,389 at 4 GB.
+2. *CPU GEMV row split* (fork `6f740bc`): the routed GEMV parallelized over (token, expert)
+   only, so 2 misses used 2 of 12 threads. Microbenchmark (`~/bench-rel/gemvbench`, 1–3
+   experts per call): Q4_0 down 4.1 → 11.5 GB/s, Q3_K/Q2_K gate/up 7–9 → 11–14 GB/s. At 10
+   experts it changes little (12.5–15 GB/s either way, near the DRAM ceiling).
+
+| Config | Before | Fused banks | + row-split GEMV |
+|---|---:|---:|---:|
+| no cache (pinned via `--prefill-stream`) | 7.1 | — | **8.2** |
+| `--expert-cache-gb 2` | 9.3 | 10.2 | **11.4–11.7** (one run 12.3) |
+| `--expert-cache-gb 3` | 11.0 | | |
+| `--expert-cache-gb 4` | 12.4 | 13.0 | **13.8–14.7** |
+| `--expert-cache-gb 5`/`6` | OOM at startup | | |
+
+Peak VRAM: 8.6 GB at 2 GB, 11.0 GB at 4 GB. Parity: 128 greedy tokens byte-identical to
+the uncached run at 2 GB (short and 2100-token prompts, with `--prefill-stream`, so two banks
+and a loan cycle). `serve` cannot start with a 3–4 GB cache even without the stream (`KV
+cache requires 118 MB but only 0 MB is safely available`), while `bench` runs 4 GB with
+965 MiB free; this predates the fused banks (same failure on the previous binary).
+
+**Residency policy** (2 GB, 21 slots/layer; temporary env knobs, reverted):
+
+| Policy | Hit rate | Decode | Swaps |
+|---|---:|---:|---:|
+| current: top-10 lookahead, LRU victim, ≤ 2 swaps/layer/token | 63–69% | 10.3–13.1 | ~20k |
+| ≤ 1 swap | 52–55% (one run 63%) | 9.6–11.4 | ~11k |
+| ≤ 3 / ≤ 4 swaps | 63–68% | 11.1–11.6 | 30–39k |
+| no swaps (residency frozen after prefill) | 11.9% | 6.8 | 0 |
+| Strata-style decayed LFU rounds only (every 4 tokens, 1 swap, ×0.7, ≥ 2.0, +1.5) | 46.6% | 10.0 | 3k |
+| LFU rounds every token, ×0.9 | 54.0% | 10.6 | 6k |
+| lookahead, victim must be LFU-colder than the prediction | 37.6% | 8.2 | 1k |
+| LFU-gated lookahead + LFU rounds | 57.3% | 10.5 | 11k |
+| predict top-12/14/16 with 3–4 swaps | 66.9–67.8% | 10.4–11.7 | 33–46k |
+
+Miss breakdown with the current policy at 2 GB: 53% of misses were not in the prediction, 37%
+were predicted but not resident when the layer ran, 10% had no prediction for that token yet.
+Prediction precision (routed experts that were in the top-10 prediction): 69% at 2 GB, 66% at
+4 GB.
+
+**Strata comparison** (github.com/Niko1221/Strata `fb58e0d`; the local clone at
+`~/code/strata` is an unfinished fetch with no files). Strata keeps residency by decayed
+frequency: `usage[l][e] += 1` per routed token, a round every 4 verify windows swaps in
+non-residents with usage ≥ 2.0 over residents colder by ≥ 1.5, at most 96 swaps globally
+(sorted by gain), then `usage *= 0.7`. Its paper credits this for ~50% → 72%. Its next-layer
+router lookahead matches ours, but by default only warms OS pages; copying predictions into a
+separate VRAM pool lost 0–9% decode there. Here the opposite holds: single-token decode, with
+predictions loaded into the main slots, gets most of its hit rate from the lookahead, and
+frequency alone or as a gate does worse. Strata also sizes per-layer slot counts from a
+global frequency ranking (≈1.5× spread), saves a residency profile for warm start, and
+streams a share of the misses to the GPU (`--pcie-frac`); those are on the roadmap
+(design §6).
+
 ## 5. Known issues
 
 | # | Issue | Detail |
