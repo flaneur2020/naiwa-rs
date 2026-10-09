@@ -1,6 +1,6 @@
 # qwen-fn-rs — benchmark plan and roadmap
 
-Status as of 2026-10-08, `main` at `7895b94`. First measurements on the ubi box
+Status as of 2026-10-09, `main` with fork `0c2c9ad` (§4b); first measurements 2026-10-08 at `7895b94`. First measurements on the ubi box
 (RTX 4070 12 GB VRAM, 30 GB RAM) with a re-quantized Qwen3.8-Flash-Next Coder GGUF.
 
 ## 1. Hardware and model
@@ -59,8 +59,13 @@ All runs use `qwen-fn-rs bench` with the re-quantized Coder model:
       --prompt-len 512 --gen-len 128 --depth 4 --iterations 3 --warmup 1
 
 Defaults: `--prompt-len 512` (TTFT), `--gen-len 128`, `--depth 4` (decode TPOT),
-3 iterations + 1 warmup. The helper `~/one-bench.sh NAME [extra flags]` rebuilds
-with `--features cuda` and samples RAM/VRAM every 2 s while the bench runs.
+3 iterations + 1 warmup. Use **release** builds: `~/rel-bench.sh NAME [bench flags]` runs
+`target/release/qwen-fn-rs` (or `$BIN`), samples RAM/VRAM every second, and writes
+`~/bench-rel/{bench,mem}-NAME.log`. The older `~/one-bench.sh` builds and runs the *debug*
+binary with a fixed workload; its numbers (R1–R4) are not comparable.
+
+Report the bench table's TTFT, not the engine logger's `prefill` rate: the logger divides by
+the forward time only and overstated R3 by ~1.7×.
 
 Logged metrics: TTFT (tok/s), decode TPOT (tok/s), peak RAM, peak VRAM, min free RAM.
 
@@ -131,68 +136,38 @@ Recommended prefill config on ubi:
 
 | # | Issue | Detail |
 |---|---|---|
-| B1 | `--expert-cache-gb 4` OOMs with prefill stream | Only 5882 MiB free after the KV cache. The prefill stream borrows ~1380 MiB of cache slots for layer buffers, then `CUDA_ERROR_OUT_OF_MEMORY` on layer 1 prefetch. Setup log: `4.0 GB total, ~42 slots/layer (estimated 48 layers, 2112000 bytes/slot)`. **Not yet fixed** — needs a smaller cache, a smaller KV cache (`--pa-context-len`), or both. |
+| B1 | `--expert-cache-gb 4` OOMs with prefill stream (design G9) | Only 5882 MiB free after the KV cache. The prefill stream borrows ~1380 MiB of cache slots for layer buffers, then `CUDA_ERROR_OUT_OF_MEMORY` on layer 1 prefetch. Setup log: `4.0 GB total, ~42 slots/layer (estimated 48 layers, 2112000 bytes/slot)`. Workaround: `--expert-cache-gb 2 --pa-context-len 4096` fits (then hits B5). |
 | B2 | PLE table lives in host memory | The `per_layer_token_embd.weight` n-gram table is large and not cached on the GPU, so every token does a slow host gather. Visible in R1/R3. **Mitigated** by the parallel gather + `MADV_RANDOM` (§4b): 7.06 s → 0.48 s per 2048-token prompt; still disk-bound. |
-| B5 | `--expert-cache-gb` produces NaN logits | `--expert-cache-gb 2 --pa-context-len 4096` fits now (B1 was the 4 GB size), but the first decode after warmup samples NaN, with or without `--prefill-stream`, on the stock release binary too. The unit test `decode_split_matches_running_every_expert_on_the_cpu` passes, so the real-model path differs from it. Logs: `~/bench-rel/bench-cache2-*.log`. **Not fixed.** |
-| B6 | `serve` OOMs on a 2100-token prompt with the R3 flags | `bench` uses `max_seqs = 1`; `serve`'s default reserves more, leaving too little VRAM for the prefill buffers. `--max-seqs 1` works. |
-| B3 | Decode at 3.7 tok/s is ~10x below the CPU↔host bandwidth ceiling | Suggests the bottleneck is not bus bandwidth but per-token host compute / launch overhead. Needs profiling (see roadmap §6.3). |
+| B5 | `--expert-cache-gb` produces NaN logits (design G8) | `--expert-cache-gb 2 --pa-context-len 4096` fits now (B1 was the 4 GB size), but the first decode after warmup samples NaN, with or without `--prefill-stream`, on the stock release binary too. The unit test `decode_split_matches_running_every_expert_on_the_cpu` passes, so the real-model path differs from it. Logs: `~/bench-rel/bench-cache2-*.log`. **Not fixed.** |
+| B6 | `serve` OOMs on a 2100-token prompt with the R3 flags (design G9) | `bench` uses `max_seqs = 1`; `serve`'s default reserves more, leaving too little VRAM for the prefill buffers. `--max-seqs 1` works. |
+| B3 | Decode at ~7 tok/s (release, after the PLE fix; 3.7 in the debug R1) | Not bus-bound. Needs a per-step profile (design §6 item 4). |
 | B4 | `--prefill-stream` chunk size defaults to 512 | Below the 1024-token streaming threshold (now `--prefill-stream-min-tokens`), so the GPU path silently does nothing unless `--max-prefill-chunk-tokens` is raised (fixed in code at `7895b94`; documented here so config is deliberate). |
 
 ## 6. Roadmap
 
-Ordered by priority. Each item is a single, testable change.
-
-### 6.1 Make `--expert-cache-gb` fit (unblock GPU decode caching)
-
-1. **Re-run R4 with a smaller cache + smaller KV:** try
-   `--expert-cache-gb 2 --pa-context-len 4096` first, then bisect up. Goal: a
-   working decode-with-cache data point, even if the cache is small.
-2. **Measure hit rate** once it runs: add the per-layer hit/miss counters
-   (design.md G6) or at least log `[layer l] hit X / miss Y / lookahead Z`.
-3. **Tune `MAX_LOOKAHEAD_SWAPS`** and the per-layer slot split from the hit-rate
-   data.
-
-### 6.2 Decode speed (the real bottleneck)
-
-4. **Profile one decode step with Nsight Systems** on a `--cpu-moe` run: is the
-   time in host GEMV, in the H2D/D2H activation copy, or in CUDA launch overhead?
-   This decides whether to optimize the CPU kernel, batch misses, or cut launches.
-5. **Batch CPU misses:** when several tokens in a step miss the same expert (e.g.
-   MTP verify windows, batched decode), run them together. Today `num_tokens > 1`
-   is treated as prefill (design.md G4) and misses are not batched.
-6. **CPU prefill grouped-by-expert (gemm) fallback** for when the GPU prefill
-   stream is unavailable or OOMs: gather activations per routed expert and run a
-   single f32 GEMM per expert, instead of per-token GEMV. This is the path
-   mistral.rs's fallback took before the fork's `routed_gemv`; revisiting it as a
-   deliberate fallback gives a CPU prefill floor that does not need VRAM.
-
-### 6.3 Correctness and observability (no GPU strictly needed, but verify on GPU)
-
-7. **Parity: cached vs uncached.** Same prompt, logits within ~1e-3 relative.
-   CPU and CUDA kernels differ (CUDA quantizes activations to Q8_1), so never
-   assert bit equality.
-8. **In-place fill fence protocol** under load: watch for parity drift that grows
-   with decode length — that would mean a slot was overwritten mid-read.
-9. **Hit-rate / throughput counters** reported by `bench` (design.md G6).
-
-### 6.4 Prefill stream polish
-
-10. **Hide the first layer of each chunk** (prefetch layer 0 at the end of the
-    previous chunk).
-11. **Separate copy stream for prefill** if the profile shows layer uploads
-    queueing behind decode slot fills (they share one copy stream today).
-12. **Verify `MAX_TOKENS = 1024` threshold** suits this hardware; measure tokens/s
-    at chunk sizes 1024 / 2048 / 4096 / 8192.
+Moved to `design.md` §6, the single roadmap. Items there cite the B-numbers and runs above.
+Done since the first version of this plan: release-build measurements, chunk-size sweep and
+threshold check (old items 12), the R4 retry at 2 GB (old item 1, which exposed B5), and the
+prefill profile (§4b).
 
 ## 7. Commands cheat sheet (on ubi)
 
-    # rebuild + run one bench, sampling RAM/VRAM
-    ~/one-bench.sh cpumoe --cpu-moe
-    ~/one-bench.sh stream --cpu-moe --prefill-stream \
-        --max-num-batched-tokens 8192 --max-prefill-chunk-tokens 2048 \
-        --pa-context-len 8192
-    ~/one-bench.sh cache2 --cpu-moe --prefill-stream --expert-cache-gb 2 \
-        --pa-context-len 4096 --max-prefill-chunk-tokens 2048
+    # release build, then one bench sampling RAM/VRAM (logs in ~/bench-rel/)
+    source ~/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH CUDA_COMPUTE_CAP=89
+    cd ~/code/qflash-rs && cargo build --release --features cuda
+    ~/rel-bench.sh stream --cpu-moe --prefill-stream --prefill-stream-min-tokens 64 \
+        --max-num-batched-tokens 8192 --max-prefill-chunk-tokens 4096 --pa-context-len 8192 \
+        --prompt-len 256,2048,4096 --gen-len 16 --depth 4 --iterations 2 --warmup 1
+    ~/rel-bench.sh cache2 --cpu-moe --expert-cache-gb 2 --pa-context-len 4096 \
+        --prompt-len 64 --gen-len 64 --depth 4 --iterations 3 --warmup 1   # reproduces B5
+
+    # nsys profile of the measured iterations only
+    MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1 nsys profile -o prof -t cuda,osrt \
+        --capture-range=cudaProfilerApi --capture-range-end=stop \
+        target/release/qwen-fn-rs bench ...
+
+    # greedy-output parity between two binaries (short + 2100-token prompt, via serve)
+    ~/bench-rel/scripts/parity.sh BIN TAG
 
     # the requant converter (already built; rerun only if the model changes)
     ~/requant/requant ~/models/qwen3-coder/*.gguf ~/models/qwen3-coder/requant/out.gguf --dry-run

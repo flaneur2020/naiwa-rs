@@ -1,6 +1,9 @@
 # qwen-fn-rs — design and roadmap
 
-Status as of 2026-10-07, `main` with the prefill stream and its loan from the cache (§3.4); fork pinned to `781f149f`.
+Status as of 2026-10-09, `main` at the `--prefill-stream-min-tokens` commit; fork pinned to `0c2c9ad`.
+First CUDA runs done on ubi (RTX 4070 12 GB, PCIe Gen3, 30 GB RAM); measurements and logs are in
+`benchmark.md`. Prefill runs at the PCIe floor; decode (~7 tok/s) and the expert cache (NaN, G8)
+are the open problems.
 
 ## 1. What this project is
 
@@ -17,7 +20,7 @@ running a model whose routed experts do not fit in VRAM on one consumer GPU, usi
 
 | Crate | Source |
 |---|---|
-| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `781f149f` |
+| `mistralrs-core`, `mistralrs-server-core`, `mistralrs-quant` | `flaneur2020/mistral.rs`, branch `patch/strata`, pinned in `Cargo.lock` to `0c2c9ad` |
 | `candle-core` | `huggingface/candle` rev `66a8cf18`, the revision mistral.rs uses |
 
 `patch/strata` = upstream Qwen3.8-Flash-Next support (#2462) + these fork commits:
@@ -28,6 +31,9 @@ running a model whose routed experts do not fit in VRAM on one consumer GPU, usi
 | `f069ce87` | `MoEExperts::expert_qtensors()` exposes the stacked gate/up/down `QTensor`s (gather backend, replicated experts only) |
 | `f069ce87` | `forward_gather` reads top-k from `topk_ids` instead of the config, so a caller can pass a subset of the routed experts |
 | `781f149f` | `MoEExperts::from_qtensors(gate, up, down, ..)` builds routed experts over stacks the caller holds (shared, not copied), on any device; used for GPU prefill |
+| `5cd26a9f` | CPU MoE fallback runs a GEMV over only the routed experts instead of every expert |
+| `3e281961` | the routed-expert GEMV accepts the model's 4D activations |
+| `0c2c9ad` | host PLE gather: rows read in parallel (rayon), table advised `MADV_RANDOM` (§3.6) |
 
 **Fork policy: keep it minimal.** Everything else lives in this repo. The router is read
 through the existing `ExpertLoadContext::vb`, not a new accessor.
@@ -45,6 +51,13 @@ mistralrs-quant = { path = "../mistral.rs/mistralrs-quant" }
 To land a fork change: commit it, then `git push flaneur2020 patch/strata` (`origin` is
 upstream EricLBuehler). Remove the `[patch]` block, then run `cargo update` so the lock moves
 to the new commit. `cargo update -p mistralrs-core` does not work while the patch is active.
+
+Alternative that leaves `Cargo.toml` alone (used on ubi, which has no fork checkout): copy the
+pinned checkout from `~/.cargo/git/checkouts/mistral.rs-*/<rev>`, edit it, and build with
+`--config 'patch."ssh://git@github.com/flaneur2020/mistral.rs.git".mistralrs-core.path="…"'`
+(same for `-server-core`, `-quant`). Restore `Cargo.lock` afterwards (`git checkout
+Cargo.lock`). Switching between the git and path sources rebuilds the fork's CUDA kernels
+(~18 min release on ubi); a later edit rebuilds in ~2 min.
 
 ## 2. Source layout
 
@@ -178,8 +191,8 @@ simplest version that keeps the overlap:
   2. candle's stream waits on layer *l*'s `ready`.
   3. `forward` runs on the GPU, then `released` is recorded.
 - **Not hidden:** the first layer of each chunk, which has no predecessor to prefetch it.
-- **Stays on the CPU:** chunks under `MIN_TOKENS` (1024, as in Strata), layers whose stacks are
-  not all pinned (an async upload from pageable memory would block the forward thread), and
+- **Stays on the CPU:** chunks under `--prefill-stream-min-tokens` (default 1024, as in
+  Strata; ~64 on ubi, see *Measured* below), layers whose stacks are not all pinned (an async upload from pageable memory would block the forward thread), and
   the MTP head.
 - **Mixed-quant GGUFs:** when a layer's dtype or shape differs from what a buffer holds, the
   buffer is reallocated. The old memory is freed only after its in-flight upload completes.
@@ -205,10 +218,17 @@ simplest version that keeps the overlap:
      checked on hardware.
   5. If the cache is too small to lend two layers, the shortfall is warned about and comes on
      top of `N`.
-- **Bandwidth:** every
-  chunk streams every layer's experts once, so this pays only for long chunks. Strata uses
-  about 8K-token chunks. Raise `--max-num-batched-tokens` (e.g. 8192); the 512-token
-  `--max-prefill-chunk-tokens` default may also bound chunks, which is still to be verified.
+- **Bandwidth:** every chunk streams every layer's experts once (25.2 GiB for the requant
+  Coder GGUF), so a chunk costs a flat ~2.05 s on PCIe Gen3 whatever its length. The chunk
+  the MoE sees is bounded by **both** `--max-num-batched-tokens` and
+  `--max-prefill-chunk-tokens` (default 512, below the default threshold, so the stream
+  silently never engaged until both were raised). Set the chunk ≥ the prompt; a tail chunk
+  under the threshold falls back to the CPU (2100 tokens with chunk 2048: 5.4 s vs 2.2 s).
+- **Measured (ubi, 2026-10-09):** 2048 tokens in 2.08 s (982 tok/s), 4096 in 2.94 s, 8000
+  in 5.55 s (chunk 8192, peak VRAM 11.7 / 12 GB). Short prompts cost the same ~2.05 s, which
+  beats CPU prefill (~18 tok/s) from ~37 tokens, hence the lower threshold. The nsys profile
+  shows uploads at full PCIe speed and overlapping compute; the first-layer upload and the
+  shared copy stream are not visible costs at this scale.
 - **Shared copy stream:** decode-cache slot fills and layer uploads share one copy stream, so
   during prefill a layer upload can queue behind slot fills.
 - **Tested here:** `from_qtensors` on CPU against per-expert `QMatMul` references, for the
@@ -223,30 +243,42 @@ simplest version that keeps the overlap:
 | `--isq` | expected yes (ISQ leaves a `QTensor`); not yet confirmed on a real load |
 | BF16 safetensors | **no.** `expert_qtensors()` is `None` and every load gives up, so the layer never hits. It still takes its share of the budget. The module doc's "dense fallback" does not exist. |
 | Fused / Cutlass / Cutile backends, sharded experts | no (`expert_qtensors()` is `None`) |
+| GGUF IQ*/Q2_0/TQ*/MXFP4 experts | **refused at load** (`f6e5c78`, names the types): candle cannot run them. Convert with `~/requant/requant` to Q2_K/Q3_K/Q4_K (`benchmark.md` §2) |
+
+### 3.6 The PLE n-gram table (fork, `qwen4_exp/ple.rs`)
+
+Qwen3.8-Flash-Next adds per-layer embeddings looked up from a hashed n-gram table: 16 rows of
+~1 KiB per token (`per_layer_token_embd.weight`, 26.8 GiB IQ4_NL in the Coder GGUF). It is
+made device-resident only if it fits beside a 2 GiB reserve, which on a 12 GB card it never
+does, so every step gathers rows on the host from the GGUF mmap and uploads them.
+
+With `--cpu-moe` the pinned expert stacks hold ~25 of 30 GB RAM, so the table cannot stay in
+page cache and every row is a major fault. Read one at a time, that left the GPU idle for
+7.06 s of a 9.2 s 2048-token prefill. Since `0c2c9ad` the rows are gathered with rayon (disk
+queue depth) and the table is advised `MADV_RANDOM` (no 128 KiB readahead per 1 KiB row):
+0.48 s. It is still disk-bound and also costs decode a share of each token.
 
 ## 4. Verification status
 
 | Check | Status |
 |---|---|
-| `cargo check --all-targets`, `cargo fmt --check` | clean (default features only) |
-| `#[cfg(feature = "cuda")]` code (`host_memory`, `copy_stream`) | **not compiled by this build.** `candle-kernels` needs `nvcc`. Every cudarc call is type-checked in a scratch crate against cudarc 0.19.10; the candle glue (`Device::Cuda`, `cuda_stream()`, `QCudaStorage::zeros`, `QTensor::device_ptr`) is not |
-| Linux-only code (`madvise`) | type-checked in a scratch crate for `riscv64gc-unknown-linux-gnu` |
-| `cargo test` | 23 pass: architecture checks, device-layer map, expert byte ranges, single-expert `QTensor` equality, slot-byte accounting, fill order, top-k, LRU victim choice, huge-page span math, host-byte borrowing, reader wait, `from_qtensors` vs per-expert reference, lend/give back, and the decode hit/miss split end to end on CPU (vs all experts on the CPU) |
-| In-place copy-stream path | **cannot run here.** Only exercised on CUDA; the non-CUDA build always takes the fresh-upload path |
-| Prefill stream | **cannot run here** (CUDA only). Its buffer, event and loan hand-over logic are unexercised until a CUDA run |
-| Any CUDA run | **never.** No CUDA host available; the dev machine is an M1 Mac without `nvcc` |
-| Numeric parity: cached vs uncached | not done |
-| Hit rate, tokens/s | not measured |
+| `cargo build --release --features cuda`, `cargo test` | clean on ubi (CUDA 13.1, sm_89); 23 tests pass |
+| CUDA from non-main threads (decode hit thread, fill threads, lookahead) | runs without context/thread errors |
+| Pinning ~25 GiB of expert stacks | works on ubi (no "could not be pinned" warning) |
+| Prefill stream, no cache | **works**, at the PCIe floor (§3.4). Greedy output byte-identical between the pre- and post-PLE-fix binaries, short (CPU) and 2100-token (stream) prompts |
+| Prefill stream + cache loan | borrow / give-back cycles run (`borrowed 1380 MiB … gave the layer buffers back`), but see G8 |
+| Expert cache decode | **broken: NaN logits** on the first decode (G8), with or without the prefill stream |
+| Numeric parity: cached vs uncached | blocked on G8 |
+| Hit rate | not measured (G6) |
+| Decode tokens/s | ~7 tok/s with `--cpu-moe` (5.9 before the PLE fix), not profiled |
 
-Things that only a CUDA run will show:
-- **CUDA from non-main threads.** The decode hit thread, fill threads and lookahead thread
-  all touch the CUDA device. This is the riskiest untested assumption.
-- **In-place fills.** Whether the fence protocol holds under load: look for corrupted output
-  after slot replacements, which would show as parity drift that grows with decode length.
-- **Pinning.** Registering tens of GiB takes seconds at load and may be refused (lockable
-  memory limits); check the log for the "could not be pinned" warning.
+Things still to watch for on CUDA:
+- **In-place fills.** Whether the fence protocol holds under load: parity drift that grows
+  with decode length would mean a slot was overwritten mid-read. Untestable until G8 is fixed.
 - **Parity.** CPU and CUDA kernels differ (CUDA quantizes activations to Q8_1), so compare
   logits with a tolerance (~1e-3 relative), never for bit equality.
+- **Shutdown.** Some runs log `CUDA_ERROR_DEINITIALIZED` from mistral.rs's memory maintenance
+  after the bench finishes (G11).
 
 ## 5. Known gaps
 
@@ -256,62 +288,64 @@ Things that only a CUDA run will show:
 | G2 | Layer count hardcoded to 48 for the budget split | wrong per-layer quota for any other layer count |
 | G3 | BF16 experts: budget charged, nothing cached | silent no-op cache; module doc claims a dense fallback |
 | G4 | `num_tokens > 1` is treated as prefill | batched decode (several sequences) and MTP verify windows run all-CPU and get no cache hits |
-| G5 | Cache flags undocumented | README does not mention `--cpu-moe` or `--expert-cache-gb` |
+| G5 | Cache flags undocumented | README does not mention `--cpu-moe`, `--expert-cache-gb`, `--prefill-stream*` |
 | G6 | No hit-rate / timing counters | cache effectiveness cannot be observed |
 | G7 | First prefill fills in expert-id order | cold-start residency is arbitrary until routing counts or the lookahead correct it |
+| G8 | **`--expert-cache-gb` yields NaN logits** on the real model | the cache is unusable; the CPU unit test of the hit/miss split passes, so the difference is in the real-model path (`benchmark.md` B5) |
+| G9 | Prefill-stream VRAM is not reserved up front | `serve` with default `--max-seqs` OOMs on a long prompt (B6); 4 GB cache + loan OOMs (B1). Failures surface mid-request, not at startup |
+| G10 | `--prefill-stream-min-tokens` default is Strata's 1024 | on ubi the break-even is ~37 tokens; the right value is upload time × CPU prefill rate, i.e. hardware-specific |
+| G11 | `CUDA_ERROR_DEINITIALIZED` warnings at exit | cosmetic so far; exit code is 0 |
+| G12 | PLE rows come from disk every step | 0.48 s per 2048-token prefill and part of every decode step (§3.6) |
 
 ## 6. Roadmap
 
-Ordered by priority. Small, local, testable work comes first.
+Ordered by priority. `benchmark.md` holds the measurements behind each item.
 
-### Next — correctness and hygiene (no GPU needed)
-1. **G1:** `parse_positive_f64` for `--expert-cache-gb`, plus clap tests in the
-   `Cli::try_parse_from` style already used in `load.rs`.
-2. **G3:** refuse BF16 experts with a clear message, or skip charging the budget for them,
-   and fix the module doc.
-3. **G2:** take the layer count from the model config / GGUF metadata before install and pass
-   it to the provider. Refuse if it is unknown rather than guess.
-4. **G6:** per-layer counters for hits, misses, lookahead loads, swaps and dropped lookahead
-   requests, logged at debug level and reported by `bench`.
-5. **G5:** document the two flags in the README.
+### Now — make the expert cache correct (G8)
+1. **Bisect the NaN.** Reproduce with `--cpu-moe --expert-cache-gb 2 --pa-context-len 4096
+   --prompt-len 64 --gen-len 64`, no prefill stream. Then, one at a time: lookahead off
+   (fills only from prefill), hits forced to the CPU path (rules out slot contents vs the
+   split), a check for non-finite values per layer after the MoE sum. Suspects: slot byte
+   ranges for mixed-quant layers (requant mixes Q2_K/Q3_K/Q4_K/Q4_0 per projection), the
+   hit path's `QMatMul` on 4D activations (cf. fork `3e28196`), and summing a BF16 GPU
+   result with an F32 CPU result.
+2. **Parity, cached vs uncached** (logits within ~1e-3 relative), then a long decode to
+   check the in-place fence protocol.
+3. **G6:** per-layer hit / miss / lookahead / swap counters, reported by `bench`.
 
-### Then — first CUDA run (needs a CUDA host)
-6. Build with `--features cuda` and run `serve` and `bench` with and without
-   `--expert-cache-gb`. Confirm there are no CUDA context/thread errors.
-7. Parity: same prompt, cached vs uncached, logits within tolerance.
-8. Measure hit rate and tokens/s, then tune `MAX_LOOKAHEAD_SWAPS` and the per-layer split.
+### Next — decode speed (~7 tok/s)
+4. **Profile one decode step** (nsys, `MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1`): split host
+   expert GEMV, PLE gather, activation round trips and launch overhead. This decides the
+   next item.
+5. Depending on 4: tune the CPU routed GEMV (threads, huge pages), cut per-layer
+   GPU↔CPU syncs, or cache hot PLE rows (G12, below).
+6. With the cache fixed: measure hit rate vs cache size, tune `MAX_LOOKAHEAD_SWAPS` and
+   the per-layer split.
 
-### Then — Phase B follow-ups (needs a CUDA host)
-9. Profile a decode step (Nsight Systems): confirm fills run on the copy stream concurrently
-   with compute kernels, and that candle's stream never waits on them.
-10. Copy-stream count: one shared stream serializes all layers' fills; try one per layer if
-    the profile shows fills queueing behind each other.
-11. Batched DMA (`cuMemcpyBatchAsync`, CUDA 12.8+) for the three projections and several
-    experts at once. Mostly a Windows/WDDM win per Strata; only worth it if profiling shows
-    per-copy overhead.
+### Next — prefill robustness
+7. **G9:** account for the two prefill layer buffers (~1.35 GiB) when sizing the KV cache
+   and expert cache, or fail at startup with the numbers, instead of OOM mid-request.
+8. **G10:** lower the default threshold (e.g. 128), or derive it at load from the measured
+   pinned H2D rate and stack bytes.
+9. **Short chunks: upload only routed experts.** A 64-token chunk touches a fraction of
+   each layer's experts but pays the full 2 s. Measure routed-expert coverage per chunk
+   size first; if it is low below ~512 tokens, upload per expert (Strata's slot ring).
+10. **Long prompts beyond one chunk** pay 2 s per chunk: keep chunks as large as VRAM
+    allows, and consider lending more cache slots so some layers stay resident across
+    chunks.
 
-### Then — prefill stream follow-ups (needs a CUDA host)
-12. Measure tokens/s for long prompts with and without `--prefill-stream`, at several chunk
-    sizes. Find which setting bounds the chunk the MoE sees, and whether 1024 is the right
-    threshold for this hardware.
-13. Profile: confirm layer uploads overlap attention, and whether they queue behind slot
-    fills. If they do, give prefill its own copy stream.
-14. Hide the first layer of each chunk, e.g. prefetch layer 0 at the end of the previous chunk.
-15. Loan: measure peak VRAM across a borrow/give-back cycle (does the pool really hand freed
-    slots to the buffers?), the cost of the two syncs, and the decode slowdown while lent
-    slots refill. Tune `GIVE_BACK_AFTER_DECODE_STEPS` for interleaved serving.
-
-### Later — extend the cache's reach
-16. **G4:** run the hit/miss split per token so batched decode and MTP verify windows (a few
-   tokens) use the cache, not just single-token decode.
-17. **G7:** warm start, e.g. save learned residency on exit and reload it (Strata's
-    `--expert-profile-save`), or fill from a static frequency profile.
-18. Adaptive admission: decide whether lookahead swaps should be gated by routing frequency
-    (Strata's LFU-style adaptive tier) once hit-rate data exists.
+### Later
+11. **G12:** a host-RAM or VRAM cache of hot PLE rows (n-gram hashes of a code prompt
+    repeat), or a smaller table encoding, to take the disk out of the step.
+12. Hide the first layer of each chunk; give prefill its own copy stream. Both small at
+    current scale (one layer ≈ 42 ms), revisit after 9–10.
+13. Hygiene: G1, G2, G3, G5.
+14. **G4:** per-token hit/miss split so batched decode and MTP verify windows use the cache.
+15. **G7:** warm start (save/restore residency, or a static frequency profile); adaptive
+    admission once hit-rate data exists.
 
 ### Out of scope
-- **Streaming misses to the GPU** (Strata's PCIe share: H2D copy + GPU compute for missed
-  experts). Misses always run on the CPU.
-- An expert arena owned by qwen-fn-rs (Strata's `PinnedArena`, loading the expert file
-  itself). The stacks stay owned by mistral.rs; we only advise and pin them.
+- **Streaming misses to the GPU** (Strata's PCIe share). Misses always run on the CPU.
+- An expert arena owned by qwen-fn-rs (Strata's `PinnedArena`). The stacks stay owned by
+  mistral.rs; we only advise and pin them.
 - Multi-GPU expert tiers, remote experts.
