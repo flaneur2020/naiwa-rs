@@ -2,9 +2,9 @@
 
 Status as of 2026-10-09, `main` at the fused-bank decode commit; fork pinned to `6f740bc`.
 First CUDA runs done on ubi (RTX 4070 12 GB, PCIe Gen3, 30 GB RAM); measurements and logs are in
-`benchmark.md`. Prefill runs at the PCIe floor. Decode: 8.2 tok/s uncached, ~11.5 with a 2 GB
-cache, ~14 with 4 GB (`benchmark.md` §4d); the host-side launch overhead between MoE calls is
-now the largest fixed cost.
+`benchmark.md`. Prefill runs at the PCIe floor. Decode: 8.7 tok/s uncached, ~13 with a 2 GB
+cache, 15–17.6 with 4 GB (`benchmark.md` §4d–e). The CPU experts now overlap the next layer's
+launches (`src/deferred.rs`); single-channel DRAM (~18 GB/s) bounds the CPU side.
 
 ## 1. What this project is
 
@@ -122,7 +122,14 @@ gate + up + down bytes. MTP-head experts and CPU-mapped layers are not cached.
    and returns whole). The hits are grouped by bank and each group runs through
    `mistralrs_quant::indexed_moe_fused_decode` (4 kernels: quantize, gate+up+act, quantize,
    down+weighted sum), indexing by `slot - bank.first`. Fresh-upload mode (no copy stream,
-   the CPU tests) runs one `QMatMul` chain per hit. The two run at once
+   the CPU tests) runs one `QMatMul` chain per hit.
+   **The misses do not block the step** (`src/deferred.rs`): they run on a persistent worker
+   thread, and candle's stream gets a host function that waits for the worker, then a copy
+   of the result from a pinned staging buffer. `decode_forward` returns right after queueing
+   that, so the host launches the next layer's attention/norms/router while the CPU computes,
+   and only blocks at the next layer's top-k read-back. The worker makes no CUDA calls; a
+   failed computation is reported by the next `deferred::start`. Uncached decode
+   (`CpuExperts`, `seq == 1`) uses the same path. The two run at once
    and are summed; router weights are applied once per side. **Every CUDA call stays on the
    calling thread**: it copies the miss inputs to the host, spawns a scoped thread for the
    CPU misses, then enqueues the hits' kernels (asynchronous, so they still overlap). The
@@ -325,10 +332,9 @@ Ordered by priority. `benchmark.md` holds the measurements behind each item.
    LRU victim, 2 swaps) is at the knee; see `benchmark.md` §4d.
 
 ### Next — decode speed (~11.5 tok/s at 2 GB, ~14 at 4 GB)
-4. **Host overhead between MoE calls** (~25 ms/token, the largest fixed cost): mistral.rs
-   turns CUDA graphs off for the whole step when experts are external. Capture the
-   segments between MoE calls (attention / DeltaNet / norms / router) as graphs, or let the
-   fork capture a step with the MoE as a host callback boundary. Needs fork work.
+4. ~~Host overhead between MoE calls~~: hidden behind the CPU experts by the deferred
+   upload (`benchmark.md` §4e). Piecewise CUDA graphs (fork work) would now only help layers
+   without misses; re-profile before considering them.
 5. **Stream part of the misses to the GPU** (Strata's PCIe share): DMA a miss into a
    staging slot and run it in the same fused call. Host DRAM (~18 GB/s on ubi) is shared by
    the CPU GEMV and the DMA, so expect at most the DRAM headroom the GEMV leaves (~25%).

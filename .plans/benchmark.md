@@ -244,6 +244,24 @@ global frequency ranking (≈1.5× spread), saves a residency profile for warm s
 streams a share of the misses to the GPU (`--pcie-frac`); those are on the roadmap
 (design §6).
 
+## 4e. Overlapping the CPU experts with the next layer's launches (2026-10-10)
+
+`src/deferred.rs`: the decode misses (and uncached decode's experts) run on a persistent
+worker; candle's stream gets a host function that waits for it, then a copy from pinned
+staging, and the MoE block returns at once, so the host launches the next layer while the CPU
+computes. Same workload as §4d (`--gen-len 128 --depth 4`, 2 iterations + warmup):
+
+| Config | §4d | Overlap | Runs |
+|---|---:|---:|---|
+| no cache (pinned via `--prefill-stream`) | 8.2 | **8.7** | 8.7, 8.7 |
+| `--expert-cache-gb 2` | ~11.5 | **12.9–13.2** | 12.9, 13.2, 13.0 |
+| `--expert-cache-gb 4` | 13.8–14.7 | **15.0–17.6** | 17.6, 15.0, 16.3 (hit rate 80 / 72.5 / 77%) |
+
+Predicted beforehand: 4 GB 17–19, 2 GB 14–15, uncached ~10. The 4 GB result is at the low end
+and its spread follows the hit rate; the uncached gain is smaller than predicted. Parity: 128
+greedy tokens byte-identical to the reference, uncached and with `--expert-cache-gb 2
+--prefill-stream`, for the 15-token and 2100-token prompts.
+
 ## 5. Known issues
 
 | # | Issue | Detail |

@@ -104,7 +104,7 @@ pub(crate) fn attach_prefill(
 pub(crate) struct CpuExperts {
     /// Page-locked registrations of `experts`' stacks (prefill streaming only).
     _pinned: Vec<PinnedStack>,
-    experts: MoEExperts,
+    experts: Arc<MoEExperts>,
     layer_device: Device,
     layer: usize,
     prefill: Option<Arc<PrefillStream>>,
@@ -120,7 +120,7 @@ impl CpuExperts {
     ) -> Self {
         Self {
             _pinned: pinned,
-            experts,
+            experts: Arc::new(experts),
             layer_device,
             layer,
             prefill,
@@ -140,11 +140,25 @@ impl RoutedExperts for CpuExperts {
                 return Ok(ys);
             }
         }
-        let ys = self.experts.forward(
-            &xs.to_device(&Device::Cpu)?,
-            topk_weights.to_device(&Device::Cpu)?,
-            &topk_ids.to_device(&Device::Cpu)?,
-        )?;
+        let xs_cpu = xs.to_device(&Device::Cpu)?;
+        let weights_cpu = topk_weights.to_device(&Device::Cpu)?;
+        let ids_cpu = topk_ids.to_device(&Device::Cpu)?;
+        let (batch, seq, hidden) = xs.dims3()?;
+        if seq == 1 && self.layer_device.is_cuda() {
+            // Decode: return before the CPU experts finish; the next layer's launches overlap
+            // them (`deferred`).
+            let experts = Arc::clone(&self.experts);
+            let ys = crate::deferred::start(&self.layer_device, batch, hidden, move || {
+                experts
+                    .forward(&xs_cpu, weights_cpu, &ids_cpu)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+            })?
+            .upload()?;
+            return ys.reshape((batch, seq, hidden))?.to_dtype(xs.dtype());
+        }
+        let ys = self.experts.forward(&xs_cpu, weights_cpu, &ids_cpu)?;
         ys.to_device(&self.layer_device)
     }
 }

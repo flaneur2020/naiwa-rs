@@ -46,6 +46,7 @@ use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::copy_stream::{self, CopyStream, CopyStreams, ReadFence, SlotMemory};
+use crate::deferred;
 use crate::host_memory::{self, PinnedStack};
 use crate::offload::{attach_prefill, CpuExperts};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
@@ -1093,12 +1094,14 @@ impl CachedLayer {
     /// Decode path: split top-k into GPU hits and CPU misses, run both concurrently, sum.
     /// Misses are never loaded on the token path — they run on the CPU.
     ///
-    /// Every CUDA call stays on the calling thread: the hits' kernels are only enqueued here, so
-    /// they still run while a scoped thread computes the misses on host tensors. Launching the
-    /// hits from a second thread while this one copied the activation to the host produced NaN
-    /// logits on CUDA once the lookahead was swapping slots.
+    /// Every CUDA call stays on the calling thread; the misses run on the `deferred` worker over
+    /// host copies. Launching the hits from a second thread while this one copied the activation
+    /// to the host produced NaN logits on CUDA once the lookahead was swapping slots.
+    ///
+    /// Returns without waiting for the misses: their sum is copied in on candle's stream when
+    /// the worker is done (`deferred`), so the next layer's launches overlap the CPU experts.
     fn decode_forward(
-        &self,
+        self: &Arc<Self>,
         xs: &Tensor,
         topk_weights: &Tensor,
         topk_ids: &Tensor,
@@ -1153,52 +1156,49 @@ impl CachedLayer {
             .fetch_add(miss_ids.len() as u64, Ordering::Relaxed);
         let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
 
-        // Host inputs for the misses, copied before any thread starts.
-        let miss_inputs = if miss_ids.is_empty() {
+        // Start the misses first, on host copies, so they run while the hits are queued.
+        let misses = if miss_ids.is_empty() {
             None
         } else {
-            Some((
-                xs.to_device(&Device::Cpu)?,
-                Tensor::new(miss_weights, &Device::Cpu)?.unsqueeze(0)?,
-                Tensor::new(miss_ids, &Device::Cpu)?.unsqueeze(0)?,
-            ))
+            let xs_cpu = xs.to_device(&Device::Cpu)?;
+            let miss_w_t = Tensor::new(miss_weights, &Device::Cpu)?.unsqueeze(0)?;
+            let miss_ids_t = Tensor::new(miss_ids, &Device::Cpu)?.unsqueeze(0)?;
+            let this = Arc::clone(self);
+            Some(deferred::start(
+                &self.slot_device,
+                1,
+                self.hidden,
+                move || {
+                    this.cpu
+                        .forward(&xs_cpu, miss_w_t, &miss_ids_t)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                },
+            )?)
         };
 
-        let (gpu_result, cpu_result) = std::thread::scope(|s| {
-            let cpu = miss_inputs.map(|(xs_cpu, miss_w_t, miss_ids_t)| {
-                s.spawn(move || -> candle_core::Result<Tensor> {
-                    let out = self.cpu.forward(&xs_cpu, miss_w_t, &miss_ids_t)?;
-                    out.squeeze(0) // [1, 1, hidden] -> [1, hidden]
-                })
-            });
-
-            let acc = self.run_hits(&hits, &x_gpu, act);
-            // Kernels reading these slots may be queued even if a later step failed: fence
-            // every slot before letting go of it, so an in-place fill cannot overtake them.
-            // If a fence cannot be recorded, wait for the device instead.
-            let mut fenced = Ok(());
-            for (buf, _, _) in &hits {
-                if let Err(e) = buf.fence.record_reads(&self.slot_device) {
-                    fenced = fenced.and(Err(e));
-                }
+        let acc = self.run_hits(&hits, &x_gpu, act);
+        // Kernels reading these slots may be queued even if a later step failed: fence every
+        // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
+        // cannot be recorded, wait for the device instead.
+        let mut fenced = Ok(());
+        for (buf, _, _) in &hits {
+            if let Err(e) = buf.fence.record_reads(&self.slot_device) {
+                fenced = fenced.and(Err(e));
             }
-            if fenced.is_err() {
-                let _ = self.slot_device.synchronize();
-            }
-            drop(hits);
-            let gpu = acc.and_then(|acc| fenced.map(|()| acc));
-
-            let cpu = cpu.map(|h| h.join().unwrap()).transpose();
-            (gpu, cpu)
-        });
-
-        let gpu_out = gpu_result?;
-        let sum = match cpu_result? {
+        }
+        if fenced.is_err() {
+            let _ = self.slot_device.synchronize();
+        }
+        drop(hits);
+        // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
+        let cpu_out = misses.map(deferred::Pending::upload).transpose();
+        let gpu_out = acc?;
+        fenced?;
+        let sum = match cpu_out? {
             None => gpu_out.to_dtype(xs.dtype())?,
-            Some(c) => {
-                let c_gpu = c.to_device(&self.slot_device)?.to_dtype(DType::F32)?;
-                (gpu_out + c_gpu)?.to_dtype(xs.dtype())?
-            }
+            Some(c) => (gpu_out + c)?.to_dtype(xs.dtype())?,
         };
         sum.unsqueeze(0) // [1, 1, hidden]
     }
