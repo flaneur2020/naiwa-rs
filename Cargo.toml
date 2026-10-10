@@ -1,5 +1,5 @@
 [package]
-name = "qwen-fn-rs"
+name = "naiwa-rs"
 description = "Qwen3.8-Flash-Next-only inference server built on mistral.rs"
 version = "0.9.4"
 edition = "2021"

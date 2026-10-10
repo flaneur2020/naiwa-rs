@@ -63,7 +63,7 @@ async fn run_report(
     let report = build_uqff_report_from_artifacts(
         &resolved.artifacts,
         UqffReportOptions {
-            generated_by: generated_by("qwen-fn-rs uqff report"),
+            generated_by: generated_by("naiwa-rs uqff report"),
             base_model,
             repo_id: None,
         },

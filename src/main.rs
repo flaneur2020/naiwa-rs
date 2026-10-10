@@ -1,4 +1,4 @@
-//! qwen-fn-rs: a Qwen3.8-Flash-Next-only inference server built on the mistral.rs crates.
+//! naiwa-rs: a Qwen3.8-Flash-Next-only inference server built on the mistral.rs crates.
 //!
 //! Models are loaded from the local filesystem only; Hugging Face Hub access is disabled.
 
@@ -89,7 +89,7 @@ fn init_tracing(verbose: u8) {
             LogVerbosity::Trace => "trace",
         };
         default_mistralrs_filter(verbosity).add_directive(
-            format!("qwen_fn_rs={level}")
+            format!("naiwa_rs={level}")
                 .parse()
                 .expect("valid directive"),
         )

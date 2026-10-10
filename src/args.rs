@@ -16,7 +16,7 @@ use mistralrs_server_core::metrics::{AccessLogFormat, ObservabilityConfig};
 
 /// Qwen3.8-Flash-Next inference server, powered by mistral.rs
 #[derive(Parser)]
-#[command(name = "qwen-fn-rs", version, about, long_about = None, propagate_version = true)]
+#[command(name = "naiwa-rs", version, about, long_about = None, propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -619,7 +619,7 @@ pub fn split_path_list(value: &str) -> Result<Vec<&str>> {
 pub fn ensure_local_dir(path: &Path, what: &str) -> Result<()> {
     if !path.is_dir() {
         bail!(
-            "{what} `{}` is not a local directory; qwen-fn-rs only loads models that already \
+            "{what} `{}` is not a local directory; naiwa-rs only loads models that already \
              exist on the filesystem",
             path.display()
         );

@@ -1,4 +1,4 @@
-# qwen-fn-rs — benchmark plan and roadmap
+# naiwa-rs — benchmark plan and roadmap
 
 Status as of 2026-10-09, `main` with fork `0c2c9ad` (§4b); first measurements 2026-10-08 at `7895b94`. First measurements on the ubi box
 (RTX 4070 12 GB VRAM, 30 GB RAM) with a re-quantized Qwen3.8-Flash-Next Coder GGUF.
@@ -48,9 +48,9 @@ Usage:
 
 ## 3. Bench methodology
 
-All runs use `qwen-fn-rs bench` with the re-quantized Coder model:
+All runs use `naiwa-rs bench` with the re-quantized Coder model:
 
-    qwen-fn-rs bench \
+    naiwa-rs bench \
       -m ~/models/qwen3-coder/requant \
       -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
       --cpu-moe \
@@ -60,7 +60,7 @@ All runs use `qwen-fn-rs bench` with the re-quantized Coder model:
 
 Defaults: `--prompt-len 512` (TTFT), `--gen-len 128`, `--depth 4` (decode TPOT),
 3 iterations + 1 warmup. Use **release** builds: `~/rel-bench.sh NAME [bench flags]` runs
-`target/release/qwen-fn-rs` (or `$BIN`), samples RAM/VRAM every second, and writes
+`target/release/naiwa-rs` (or `$BIN`), samples RAM/VRAM every second, and writes
 `~/bench-rel/{bench,mem}-NAME.log`. The older `~/one-bench.sh` builds and runs the *debug*
 binary with a fixed workload; its numbers (R1–R4) are not comparable.
 
@@ -294,7 +294,7 @@ prefill profile (§4b).
     # nsys profile of the measured iterations only
     MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1 nsys profile -o prof -t cuda,osrt \
         --capture-range=cudaProfilerApi --capture-range-end=stop \
-        target/release/qwen-fn-rs bench ...
+        target/release/naiwa-rs bench ...
 
     # greedy-output parity between two binaries (short + 2100-token prompt, via serve)
     ~/bench-rel/scripts/parity.sh BIN TAG

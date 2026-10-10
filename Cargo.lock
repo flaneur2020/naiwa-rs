@@ -3754,6 +3754,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
+name = "naiwa-rs"
+version = "0.9.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "candle-core",
+ "clap",
+ "comfy-table",
+ "dirs",
+ "libc",
+ "mimalloc",
+ "mistralrs-core",
+ "mistralrs-quant",
+ "mistralrs-server-core",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nalgebra"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4487,28 +4509,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "qwen-fn-rs"
-version = "0.9.4"
-dependencies = [
- "anyhow",
- "axum",
- "candle-core",
- "clap",
- "comfy-table",
- "dirs",
- "libc",
- "mimalloc",
- "mistralrs-core",
- "mistralrs-quant",
- "mistralrs-server-core",
- "parking_lot",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

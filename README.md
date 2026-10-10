@@ -1,4 +1,4 @@
-# qwen-fn-rs
+# naiwa-rs
 
 A Qwen3.8-Flash-Next-only inference server built on the
 [mistral.rs](https://github.com/EricLBuehler/mistral.rs) crates (`mistralrs-core`,
@@ -27,24 +27,24 @@ Optional CUDA extras: `cudnn`, `flash-attn`, `flash-attn-v3`, `nccl`, `cutile`. 
 
 ```bash
 # OpenAI-compatible API at http://localhost:1234/v1 (Anthropic-compatible at the root)
-qwen-fn-rs serve -m /models/Qwen3.8-Flash-Next
-qwen-fn-rs serve -m /models/Qwen3.8-Flash-Next --isq 4 --mtp
-qwen-fn-rs serve -f /models/gguf/Qwen3.8-Flash-Next-Q4_K_M.gguf --mmproj mmproj-BF16.gguf
+naiwa-rs serve -m /models/Qwen3.8-Flash-Next
+naiwa-rs serve -m /models/Qwen3.8-Flash-Next --isq 4 --mtp
+naiwa-rs serve -f /models/gguf/Qwen3.8-Flash-Next-Q4_K_M.gguf --mmproj mmproj-BF16.gguf
 
 # Throughput / latency
-qwen-fn-rs bench -m /models/Qwen3.8-Flash-Next --prompt-len 512,2048 --depth 4,4096
+naiwa-rs bench -m /models/Qwen3.8-Flash-Next --prompt-len 512,2048 --depth 4,4096
 
 # Write UQFF, then serve it
-qwen-fn-rs quantize -m /models/Qwen3.8-Flash-Next --isq q4k -o /models/Qwen3.8-Flash-Next
-qwen-fn-rs serve -m /models/Qwen3.8-Flash-Next --from-uqff q4k
+naiwa-rs quantize -m /models/Qwen3.8-Flash-Next --isq q4k -o /models/Qwen3.8-Flash-Next
+naiwa-rs serve -m /models/Qwen3.8-Flash-Next --from-uqff q4k
 
 # Inspect UQFF artifacts; recommend a quantization for this machine
-qwen-fn-rs uqff verify -m /models/Qwen3.8-Flash-Next
-qwen-fn-rs tune -m /models/Qwen3.8-Flash-Next
+naiwa-rs uqff verify -m /models/Qwen3.8-Flash-Next
+naiwa-rs tune -m /models/Qwen3.8-Flash-Next
 ```
 
 Flag names and defaults follow `mistralrs` for the options that are kept. Run
-`qwen-fn-rs <command> --help` for the full list.
+`naiwa-rs <command> --help` for the full list.
 
 ## Updating mistral.rs
 

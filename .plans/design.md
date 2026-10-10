@@ -1,4 +1,4 @@
-# qwen-fn-rs — design and roadmap
+# naiwa-rs — design and roadmap
 
 Status as of 2026-10-09, `main` at the fused-bank decode commit; fork pinned to `6f740bc`.
 First CUDA runs done on ubi (RTX 4070 12 GB, PCIe Gen3, 30 GB RAM); measurements and logs are in
@@ -370,6 +370,6 @@ Ordered by priority. `benchmark.md` holds the measurements behind each item.
 
 ### Out of scope
 - **Streaming misses to the GPU** (Strata's PCIe share). Misses always run on the CPU.
-- An expert arena owned by qwen-fn-rs (Strata's `PinnedArena`). The stacks stay owned by
+- An expert arena owned by naiwa-rs (Strata's `PinnedArena`). The stacks stay owned by
   mistral.rs; we only advise and pin them.
 - Multi-GPU expert tiers, remote experts.

@@ -146,7 +146,7 @@ pub async fn run_tune(model: ModelOptions, profile: TuneProfileArg, json: bool) 
     println!("-------------------");
     let command = result.recommended_command.trim_start();
     let command = command.strip_prefix("mistralrs ").unwrap_or(command);
-    println!("  qwen-fn-rs {command}");
+    println!("  naiwa-rs {command}");
     println!();
 
     if let Some(mode) = &result.paged_attn_mode {

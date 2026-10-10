@@ -277,7 +277,7 @@ fn device_layers(model: &ModelOptions) -> Option<Vec<String>> {
 
 fn unsupported(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "qwen-fn-rs only runs Qwen3.8-Flash-Next ({HF_ARCHITECTURE}); {what} is not supported"
+        "naiwa-rs only runs Qwen3.8-Flash-Next ({HF_ARCHITECTURE}); {what} is not supported"
     )
 }
 
@@ -356,7 +356,7 @@ mod tests {
     use crate::args::Cli;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qwen-fn-rs-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("naiwa-rs-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -439,7 +439,7 @@ mod tests {
     }
 
     fn model_options(args: &[&str]) -> ModelOptions {
-        let mut argv = vec!["qwen-fn-rs", "tune"];
+        let mut argv = vec!["naiwa-rs", "tune"];
         argv.extend_from_slice(args);
         match Cli::try_parse_from(argv).unwrap().command {
             crate::args::Command::Tune { model, .. } => model,
