@@ -253,9 +253,22 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         &self,
         ctx: ExpertLoadContext<'_>,
     ) -> candle_core::Result<Option<Arc<dyn RoutedExperts>>> {
-        // Never cache MTP-head experts or CPU-device layers.
-        if ctx.site.is_mtp || ctx.layer_device.is_cpu() {
+        // Never cache CPU-device layers.
+        if ctx.layer_device.is_cpu() {
             return Ok(None);
+        }
+        // The MTP head's experts run on the CPU like an uncached layer's. Returning `None` would
+        // load all of them onto the GPU (512 Q4_0 experts, ~1.35 GB), which the cache needs.
+        if ctx.site.is_mtp {
+            let experts = ctx.load_builtin(Device::Cpu)?;
+            host_memory::advise_expert_stacks(&experts)?;
+            return Ok(Some(Arc::new(CpuExperts::new(
+                experts,
+                ctx.layer_device.clone(),
+                ctx.site.layer,
+                None,
+                Vec::new(),
+            ))));
         }
 
         let cpu_experts = ctx.load_builtin(Device::Cpu)?;

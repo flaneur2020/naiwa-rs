@@ -319,6 +319,44 @@ from 3% to 100% and is dominated by whether the draft happens to emit numeric-lo
 `serve` run with one real prompt gives a stable number; `~/bench-rel/serve-r2-*.log` holds the runs
 above, and greedy output parity between two `serve` runs is the correctness check (`scripts/parity.sh`).
 
+### MTP benchmark matrix (2026-10-11, `2da8b11` + expert-cache fix)
+
+`serve` with `--cpu-moe --prefill-stream --prefill-stream-min-tokens 64 --pa-context-len 4096
+--max-seqs 1`, greedy, 256 new tokens, three real prompts (a Fibonacci stub, the 2100-token helper
+file, an `LRUCache` docstring), two requests each; decode tok/s from the response `usage`
+(`~/bench-rel/mtpbench/`, script `/tmp/mtpbench.sh`).
+
+| Config | Decode (mean of 6) | Range | MTP acceptance |
+|---|---:|---:|---:|
+| no cache | 8.71 | 8.60–8.75 | — |
+| no cache + MTP (n_predict 6, auto) | **9.52** (+9%) | 8.88–10.35 | 89.3% |
+| no cache + MTP, n_predict 2 | 9.25 | 8.54–10.31 | 97.2% |
+| `--expert-cache-gb 2` | **12.49** | 11.59–13.38 | — |
+| cache 2 GB + MTP | 9.99 (−20%) | 8.43–10.70 | 91.1% |
+| cache 2 GB + MTP, n_predict 2 | 9.48 | 8.91–10.02 | 92.5% |
+
+MTP drafts well (89–97% accepted) but barely pays here, and costs throughput with the cache. Decode
+is bound by reading routed-expert bytes (§4d), and a verify step runs one forward over n+1 tokens
+whose top-10 sets mostly differ, so a layer reads the union of their experts — several tokens' worth
+of bytes per step instead of one. Speculation saves the per-step fixed costs (launches, attention,
+the dense weights), not the expert reads. With the cache it is worse: the union blows past the
+lookahead's prediction and the per-layer slots, so most of the extra experts are CPU misses. MTP
+would pay where expert reads are cheap relative to per-step overhead (all experts in VRAM, or a
+dense model), not on this box.
+
+Greedy parity: the 2100-token prompt's 256 tokens are identical in every configuration. The two
+short prompts diverge after ~150 tokens at near-tie choices (`fibonacci_formula` vs
+`fibonacci_generator`; one blank line vs two), and the **no-MTP** 2 GB-cache run picks the same
+alternatives at the same points, so these are numeric ties flipped by computing experts differently
+(GPU hits, multi-token verify), not a draft that leaks into the output. The uncached run is
+deterministic run to run.
+
+Fix found by this run: the expert-cache provider returned `None` for the MTP site, which made the
+builtin loader put all 512 of the head's experts (~1.35 GB) on the GPU; `--expert-cache-gb 2 --mtp`
+then failed with `KV cache requires 128 MB but only 0 MB` and 1.5 GB OOMed in the first prefill.
+MTP experts now run on the CPU under the cache provider too, as they already did without it (free
+VRAM after startup 2520 → 3126 MiB at 1.5→2 GB).
+
 ## 5. Known issues
 
 | # | Issue | Detail |
