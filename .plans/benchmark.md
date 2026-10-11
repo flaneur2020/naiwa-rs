@@ -262,6 +262,63 @@ and its spread follows the hit rate; the uncached gain is smaller than predicted
 greedy tokens byte-identical to the reference, uncached and with `--expert-cache-gb 2
 --prefill-stream`, for the 15-token and 2100-token prompts.
 
+## 4f. MTP speculative decoding (2026-10-11)
+
+The published `ggml-org/Qwen3.8-Flash-Next-GGUF` repo also carries the checkpoint's MTP draft block
+as `mtp-Q4_0.gguf`, which llama.cpp's `--mtp` export writes with the head's tensors under the
+*upstream* `blk.48.*` names (block 48 = one past the 48 decoder blocks). That file is a complete
+GGUF, so it cannot be a third `-f` shard (its `general.type` is `model` and it has no split
+metadata). Instead `~/bench-rel/mtp/repack.py` rewrites it into a component the engine's
+`merge_components(mmproj)` accepts:
+
+* `general.type` becomes `mmproj` (what `validate_component_type` requires);
+* `general.*` keys are dropped by the merge, and the expert numbers are moved to
+  `qwen4exp.mtp.expert_count` / `.expert_used_count` — the unsuffixed keys already exist in the
+  main archive with different values (256 vs the head's 512) and a conflicting value makes
+  `merge_components` bail;
+* `token_embd.weight` and `output.weight` are dropped (they duplicate the main model's);
+* **every tensor name is kept verbatim** — the head binds from the `blk.<block>.*` names, so no
+  rename is needed and the component is a pure rewrite with no byte surgery. `repack.py` verifies
+  all offsets land exactly and the file has zero slack.
+
+Model side (fork `patch/mtp-gguf`, five files, ~177 lines):
+
+1. `mtp_num_experts: Option<usize>` on `TextConfig` (with `mtp_experts()`), so the head can route
+   its own 512 experts while the pruned target keeps 256. `SparseMoeBlock::new` takes it when
+   `site.is_mtp`.
+2. `bind_mtp_head` in `gguf/qwen4exp.rs`: binds the head's `blk.<block>.*` tensors to the native
+   `mtp.layers.0.*` names (reusing `LAYER_TENSORS`/`SHIFTED_NORMS`, so the layouts match the decoder
+   block exactly), plus `nextn.hc_head_*` → `mtp.hyper_connection_mixer.*` and the two `nextn.*norm`
+   → `mtp.pre_fc_norm_*`.
+3. `mtp.fc_embedding` / `mtp.fc_hidden` are `Slice` bindings over the fused `blk.<block>.nextn.eh_proj.weight`
+   `[5120, 2560]`. Which half is which was settled against the BF16 checkpoint, not guessed: the
+   first half of the fused axis is `fc_embedding` (cosine 0.996 over sampled rows) and the second is
+   `fc_hidden` (0.998).
+4. **All nine of the head's norms are stored shifted** (`1 + w`): every one of them is exactly
+   `checkpoint + 1.0`, so `pre_fc_norm_*` uses `bind_shifted_norm` like the rest. (An independent
+   check agrees: the checkpoint's `layers.3.self_attn.q_norm.weight` has mean 0.2833 = the GGUF's
+   1.2833 − 1, confirming the checkpoint stores true weights and llama.cpp adds the 1.)
+5. The `Built-in MTP is not supported for GGUF or GGML models` bail is removed for `ModelSelected::GGUF`
+   and the flag is threaded through a new `GGUFLoaderBuilder::with_mtp` into
+   `MultimodalLoaderBuilder`.
+
+Measured on ubi (release, `--cpu-moe`, 4096 ctx, greedy drafting):
+
+| Run | Greedy output | Decode |
+|---|---|---:|
+| `serve`, 15-token and 2100-token prompts, no MTP | reference | 8.63–8.76 tok/s |
+| same, `--mmproj mtp-component.gguf --mtp` | **byte-identical to the reference** | 9.62 / **10.98** tok/s |
+
+**MTP acceptance on real text: mean 89.1%** over 7 logger windows (range 66.7–100%, mean drafted
+length up to 7.00, depth up to 6.0) — the same range Strata reports for this head (~85–89%), which
+is the strongest evidence the bindings are right.
+
+Do **not** judge the head from `bench`: its prompts are synthetic pseudo-random tokens
+(`BENCH_TOKEN_BASE + idx % SPAN`), which are near-unpredictable, so acceptance there reads anywhere
+from 3% to 100% and is dominated by whether the draft happens to emit numeric-looking text. A short
+`serve` run with one real prompt gives a stable number; `~/bench-rel/serve-r2-*.log` holds the runs
+above, and greedy output parity between two `serve` runs is the correctness check (`scripts/parity.sh`).
+
 ## 5. Known issues
 
 | # | Issue | Detail |
