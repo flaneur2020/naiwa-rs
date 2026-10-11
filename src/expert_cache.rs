@@ -39,7 +39,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul, QTensor};
-use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
@@ -52,10 +52,13 @@ use crate::offload::{attach_prefill, CpuExperts};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
 
 // Number of prefill tokens above which we skip the cache entirely.
-// A decode step is always 1 token, so PREFILL_THRESHOLD = 1 is exact.
-const PREFILL_THRESHOLD: usize = 1;
+// Calls with more tokens than this are prefill chunks: every expert runs on the CPU (or the
+// prefill stream). Up to it they take the decode split, which is what a speculative verify step
+// needs (the target runs the n drafts plus one token in one forward).
+const PREFILL_THRESHOLD: usize = 16;
 
-/// Upper bound on resident experts the decode lookahead replaces per layer per token. Each swap
+/// Upper bound on resident experts the decode lookahead replaces per layer per token (per row of
+/// a verify step). Each swap
 /// copies one expert's three projections host-to-device; without a cap a poor prediction would
 /// turn every token into a full re-upload of every layer's top-k.
 const MAX_LOOKAHEAD_SWAPS: usize = 2;
@@ -490,6 +493,22 @@ fn top_k_ids(logits: &[f32], k: usize) -> Vec<usize> {
     ids
 }
 
+/// Every expert in `rankings` once, ordered by how many rankings list it, then by its best rank,
+/// then by id.
+fn union_by_votes(rankings: impl IntoIterator<Item = Vec<usize>>) -> Vec<usize> {
+    let mut seen: HashMap<usize, (usize, usize)> = HashMap::new(); // expert -> (votes, best rank)
+    for ranking in rankings {
+        for (rank, e) in ranking.into_iter().enumerate() {
+            let entry = seen.entry(e).or_insert((0, rank));
+            entry.0 += 1;
+            entry.1 = entry.1.min(rank);
+        }
+    }
+    let mut union: Vec<(usize, (usize, usize))> = seen.into_iter().collect();
+    union.sort_by(|(a, (va, ra)), (b, (vb, rb))| vb.cmp(va).then(ra.cmp(rb)).then(a.cmp(b)));
+    union.into_iter().map(|(e, _)| e).collect()
+}
+
 /// The least-recently-used published resident that is not in `protect`, as `(expert, slot)`.
 fn lru_victim(
     slots: &HashMap<usize, usize>,
@@ -503,10 +522,12 @@ fn lru_victim(
         .map(|(&e, &slot)| (e, slot))
 }
 
-/// One decode lookahead request: predict `layer`'s experts from the previous layer's input.
+/// One decode lookahead request: predict `layer`'s experts from the previous layer's input,
+/// `rows` activations of `hidden` values each.
 struct LookaheadJob {
     layer: Arc<CachedLayer>,
     x: Vec<f32>,
+    rows: usize,
 }
 
 /// A single background thread that runs the next layer's router on the current activation and
@@ -524,7 +545,7 @@ impl Lookahead {
             let (tx, rx) = sync_channel::<LookaheadJob>(1);
             std::thread::spawn(move || {
                 for job in rx {
-                    if let Err(e) = job.layer.prefetch_predicted(&job.x) {
+                    if let Err(e) = job.layer.prefetch_predicted(&job.x, job.rows) {
                         debug!(
                             "expert cache: layer {} lookahead failed: {e}",
                             job.layer.layer
@@ -701,19 +722,21 @@ fn fused_act(act: Activation) -> Option<i32> {
     }
 }
 
-/// `sum_i weights[i] * expert(bank, ids[i])(x2d)` for one token, `[1, hidden]` F32, by
-/// mistral.rs's fused MoE decode (quantize, gate+up+act, quantize, down+weighted sum).
+/// `sum_j weights[t, j] * expert(bank, ids[t, j])(x2d[t])` for each of `rows` tokens,
+/// `[rows, hidden]` F32, by mistral.rs's fused MoE decode (quantize, gate+up+act, quantize,
+/// down+weighted sum). `ids` and `weights` are row-major `[rows, topk]`.
 #[cfg(feature = "cuda")]
 fn fused_decode(
     bank: &Bank,
     x2d: &Tensor,
     ids: Vec<u32>,
     weights: Vec<f32>,
+    rows: usize,
     act_type: i32,
 ) -> candle_core::Result<Tensor> {
     use candle_core::cuda::cudarc::driver::DevicePtr;
     let dev = x2d.device().as_cuda_device()?;
-    let topk = ids.len();
+    let topk = ids.len() / rows;
     let ids = Tensor::new(ids, x2d.device())?;
     let weights = Tensor::new(weights, x2d.device())?;
     let (ids_storage, _) = ids.storage_and_layout();
@@ -736,13 +759,16 @@ fn fused_decode(
             x2d,
             ids_cuda.as_cuda_slice::<u32>()?,
             w_ptr,
-            1,
+            rows,
             topk,
             act_type,
             dev,
         )
     }
 }
+
+/// A resident expert a token is routed to: its slot buffer, slot index and routing weight.
+type Hit = (Arc<SlotBuf>, usize, f32);
 
 struct CachedLayer {
     /// Page-locked registrations of `cpu`'s stacks; each holds its stack, so it stays valid
@@ -970,20 +996,24 @@ impl CachedLayer {
         Ok(())
     }
 
-    /// This layer's top-k experts for activation `x` (`[hidden]`), by its own router.
-    fn predict(&self, x: &[f32]) -> candle_core::Result<Vec<usize>> {
+    /// This layer's predicted experts for `rows` activations `x` (`[rows, hidden]`), by its own
+    /// router: the union of each row's top-k, the experts most rows want first.
+    fn predict(&self, x: &[f32], rows: usize) -> candle_core::Result<Vec<usize>> {
         let Some(router) = &self.router else {
             return Ok(Vec::new());
         };
-        let x = Tensor::from_slice(x, (self.hidden, 1), &Device::Cpu)?;
-        let logits = router.matmul(&x)?.flatten_all()?.to_vec1::<f32>()?;
-        Ok(top_k_ids(&logits, self.top_k))
+        let x = Tensor::from_slice(x, (rows, self.hidden), &Device::Cpu)?;
+        let logits = router.matmul(&x.t()?)?.t()?.to_vec2::<f32>()?; // [rows, experts]
+        Ok(union_by_votes(
+            logits.iter().map(|row| top_k_ids(row, self.top_k)),
+        ))
     }
 
     /// Load the experts predicted for `x`: into empty slots freely, and over LRU residents at
-    /// most `MAX_LOOKAHEAD_SWAPS` times. A wrong prediction only costs a slot.
-    fn prefetch_predicted(&self, x: &[f32]) -> candle_core::Result<()> {
-        let predicted = self.predict(x)?;
+    /// most `MAX_LOOKAHEAD_SWAPS` times per row. A wrong prediction only costs a slot.
+    fn prefetch_predicted(&self, x: &[f32], rows: usize) -> candle_core::Result<()> {
+        let predicted = self.predict(x, rows)?;
+        let max_swaps = MAX_LOOKAHEAD_SWAPS * rows;
         let mut swaps = 0;
         for &e in &predicted {
             if e >= self.num_experts {
@@ -993,7 +1023,7 @@ impl CachedLayer {
                 COUNTERS.lookahead_loads.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if swaps < MAX_LOOKAHEAD_SWAPS && self.replace(e, &predicted)?.is_some() {
+            if swaps < max_swaps && self.replace(e, &predicted)?.is_some() {
                 swaps += 1;
                 COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
             }
@@ -1036,15 +1066,17 @@ impl CachedLayer {
         });
     }
 
-    /// The weighted sum of the hits' outputs for one token, `[1, hidden]` F32 on the slot
-    /// device. In copy-stream mode each bank's hits run as one fused MoE decode (four kernels);
-    /// otherwise every expert runs on its own.
+    /// The weighted sum of the hits' outputs, `[rows, hidden]` F32 on the slot device, for
+    /// `hits[t]` the hits of row `t` of `x2d: [rows, hidden]`. In copy-stream mode each bank's hits
+    /// run as one fused MoE decode over every row (four kernels); otherwise every expert runs on
+    /// its own.
     fn run_hits(
         &self,
-        hits: &[(Arc<SlotBuf>, usize, f32)],
+        hits: &[Vec<Hit>],
         x2d: &Tensor,
         act: Activation,
     ) -> candle_core::Result<Tensor> {
+        let rows = hits.len();
         let mut acc: Option<Tensor> = None;
         let mut add = |y: Tensor| -> candle_core::Result<()> {
             acc = Some(match acc.take() {
@@ -1056,44 +1088,61 @@ impl CachedLayer {
         #[cfg(feature = "cuda")]
         if let (Some(act_type), true) = (
             fused_act(act),
-            hits.iter().all(|(buf, _, _)| buf.bank.is_some()),
+            hits.iter().flatten().all(|(buf, _, _)| buf.bank.is_some()),
         ) {
-            let mut groups: Vec<(&Arc<Bank>, Vec<u32>, Vec<f32>)> = Vec::new();
-            for (buf, slot, w) in hits {
-                let bank = buf.bank.as_ref().expect("checked above");
-                let local = (slot - bank.first) as u32;
-                match groups.iter_mut().find(|(b, _, _)| Arc::ptr_eq(b, bank)) {
-                    Some((_, ids, ws)) => {
-                        ids.push(local);
-                        ws.push(*w);
-                    }
-                    None => groups.push((bank, vec![local], vec![*w])),
+            // Per bank, each row's (local slot, weight) pairs. The kernel takes the same number
+            // per row, so short rows are padded with a weight-0 entry on a slot of that bank that
+            // some row hits (published and fenced, so it holds finite values).
+            let mut groups: Vec<(&Arc<Bank>, Vec<Vec<(u32, f32)>>)> = Vec::new();
+            for (t, row) in hits.iter().enumerate() {
+                for (buf, slot, w) in row {
+                    let bank = buf.bank.as_ref().expect("checked above");
+                    let local = (slot - bank.first) as u32;
+                    let i = match groups.iter().position(|(b, _)| Arc::ptr_eq(b, bank)) {
+                        Some(i) => i,
+                        None => {
+                            groups.push((bank, vec![Vec::new(); rows]));
+                            groups.len() - 1
+                        }
+                    };
+                    groups[i].1[t].push((local, *w));
                 }
             }
-            for (bank, ids, ws) in groups {
-                add(fused_decode(bank, x2d, ids, ws, act_type)?)?;
+            for (bank, per_row) in groups {
+                let width = per_row.iter().map(Vec::len).max().unwrap_or(0);
+                let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
+                let mut ids = Vec::with_capacity(rows * width);
+                let mut ws = Vec::with_capacity(rows * width);
+                for row in &per_row {
+                    for i in 0..width {
+                        let (l, w) = row.get(i).copied().unwrap_or((pad, 0.0));
+                        ids.push(l);
+                        ws.push(w);
+                    }
+                }
+                add(fused_decode(bank, x2d, ids, ws, rows, act_type)?)?;
             }
-        } else {
-            for (buf, _, w) in hits {
+            return match acc {
+                Some(acc) => Ok(acc),
+                None => Tensor::zeros((rows, self.hidden), DType::F32, &self.slot_device),
+            };
+        }
+        // One expert at a time, row by row.
+        let mut out = Vec::with_capacity(rows);
+        for (t, row) in hits.iter().enumerate() {
+            let x = x2d.narrow(0, t, 1)?;
+            let mut sum = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
+            for (buf, _, w) in row {
                 let Some(weights) = &buf.weights else {
                     candle_core::bail!("expert cache: slot has no weights to run");
                 };
-                let y = Self::run_expert(weights, x2d, act)?;
-                add((y.to_dtype(DType::F32)? * *w as f64)?)?;
+                let y = Self::run_expert(weights, &x, act)?;
+                sum = (sum + (y.to_dtype(DType::F32)? * *w as f64)?)?;
             }
+            out.push(sum);
         }
-        #[cfg(not(feature = "cuda"))]
-        for (buf, _, w) in hits {
-            let Some(weights) = &buf.weights else {
-                candle_core::bail!("expert cache: slot has no weights to run");
-            };
-            let y = Self::run_expert(weights, x2d, act)?;
-            add((y.to_dtype(DType::F32)? * *w as f64)?)?;
-        }
-        match acc {
-            Some(acc) => Ok(acc),
-            None => Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device),
-        }
+        add(Tensor::cat(&out, 0)?)?;
+        Ok(acc.expect("added above"))
     }
 
     /// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
@@ -1104,8 +1153,9 @@ impl CachedLayer {
         QMatMul::QTensor(w.down.clone()).forward(&h)
     }
 
-    /// Decode path: split top-k into GPU hits and CPU misses, run both concurrently, sum.
-    /// Misses are never loaded on the token path — they run on the CPU.
+    /// Decode path (one token, or the few rows of a speculative verify step): split each row's
+    /// top-k into GPU hits and CPU misses, run both concurrently, sum. Misses are never loaded on
+    /// the token path — they run on the CPU.
     ///
     /// Every CUDA call stays on the calling thread; the misses run on the `deferred` worker over
     /// host copies. Launching the hits from a second thread while this one copied the activation
@@ -1120,66 +1170,80 @@ impl CachedLayer {
         topk_ids: &Tensor,
         act: Activation,
     ) -> candle_core::Result<Tensor> {
+        let (batch, seq, hidden) = xs.dims3()?;
+        let rows = batch * seq;
+        let x2d = xs.reshape((rows, hidden))?;
         // Start predicting the next layer's experts now, off the token path; whatever is not
         // resident by the time that layer runs goes to the CPU.
         if let Some(next) = self.registry.get(self.layer + 1) {
             if next.router.is_some() {
-                let x = xs.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let x = x2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                 self.registry
                     .lookahead
-                    .submit(LookaheadJob { layer: next, x });
+                    .submit(LookaheadJob { layer: next, x, rows });
             }
         }
 
-        let ids_vec = topk_ids.i(0)?.to_vec1::<u32>()?;
-        let weights_vec = topk_weights.i(0)?.to_vec1::<f32>()?;
+        let ids_rows = topk_ids.reshape((rows, ()))?.to_vec2::<u32>()?;
+        let weight_rows = topk_weights
+            .reshape((rows, ()))?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?;
 
-        let mut hits: Vec<(Arc<SlotBuf>, usize, f32)> = Vec::new();
-        let mut miss_ids: Vec<u32> = Vec::new();
-        let mut miss_weights: Vec<f32> = Vec::new();
+        let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
+        let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
         {
             let mut st = self.state.lock().unwrap();
             st.tick += 1;
             let tick = st.tick;
-            for (&id, &w) in ids_vec.iter().zip(&weights_vec) {
-                st.hit_counts[id as usize] += 1;
-                let resident = st
-                    .slots
-                    .get(&(id as usize))
-                    .copied()
-                    .and_then(|slot| st.published[slot].clone().map(|buf| (slot, buf)));
-                match resident {
-                    Some((slot, buf)) => {
-                        st.last_use[slot] = tick;
-                        hits.push((buf, slot, w));
-                    }
-                    None => {
-                        miss_ids.push(id);
-                        miss_weights.push(w);
+            for (t, (ids, ws)) in ids_rows.iter().zip(&weight_rows).enumerate() {
+                for (&id, &w) in ids.iter().zip(ws) {
+                    st.hit_counts[id as usize] += 1;
+                    let resident = st
+                        .slots
+                        .get(&(id as usize))
+                        .copied()
+                        .and_then(|slot| st.published[slot].clone().map(|buf| (slot, buf)));
+                    match resident {
+                        Some((slot, buf)) => {
+                            st.last_use[slot] = tick;
+                            hits[t].push((buf, slot, w));
+                        }
+                        None => misses[t].push((id, w)),
                     }
                 }
             }
         }
 
-        COUNTERS
-            .hits
-            .fetch_add(hits.len() as u64, Ordering::Relaxed);
-        COUNTERS
-            .misses
-            .fetch_add(miss_ids.len() as u64, Ordering::Relaxed);
-        let x_gpu = xs.i((0, 0))?.unsqueeze(0)?; // [1, hidden]
+        let n_hits: usize = hits.iter().map(Vec::len).sum();
+        let n_misses: usize = misses.iter().map(Vec::len).sum();
+        COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
+        COUNTERS.misses.fetch_add(n_misses as u64, Ordering::Relaxed);
 
-        // Start the misses first, on host copies, so they run while the hits are queued.
-        let misses = if miss_ids.is_empty() {
+        // Start the misses first, on host copies, so they run while the hits are queued. The CPU
+        // experts take the same number of ids per row: short rows are padded with weight-0
+        // entries on an expert another row misses anyway, which the expert-major gemv reads once.
+        let cpu = if n_misses == 0 {
             None
         } else {
-            let xs_cpu = xs.to_device(&Device::Cpu)?;
-            let miss_w_t = Tensor::new(miss_weights, &Device::Cpu)?.unsqueeze(0)?;
-            let miss_ids_t = Tensor::new(miss_ids, &Device::Cpu)?.unsqueeze(0)?;
+            let width = misses.iter().map(Vec::len).max().unwrap_or(0);
+            let pad = misses.iter().flatten().next().map_or(0, |&(id, _)| id);
+            let mut ids = Vec::with_capacity(rows * width);
+            let mut ws = Vec::with_capacity(rows * width);
+            for row in &misses {
+                for i in 0..width {
+                    let (id, w) = row.get(i).copied().unwrap_or((pad, 0.0));
+                    ids.push(id);
+                    ws.push(w);
+                }
+            }
+            let xs_cpu = x2d.unsqueeze(0)?.to_device(&Device::Cpu)?;
+            let miss_w_t = Tensor::from_vec(ws, (rows, width), &Device::Cpu)?;
+            let miss_ids_t = Tensor::from_vec(ids, (rows, width), &Device::Cpu)?;
             let this = Arc::clone(self);
             Some(deferred::start(
                 &self.slot_device,
-                1,
+                rows,
                 self.hidden,
                 move || {
                     this.cpu
@@ -1191,12 +1255,12 @@ impl CachedLayer {
             )?)
         };
 
-        let acc = self.run_hits(&hits, &x_gpu, act);
+        let acc = self.run_hits(&hits, &x2d, act);
         // Kernels reading these slots may be queued even if a later step failed: fence every
         // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
         // cannot be recorded, wait for the device instead.
         let mut fenced = Ok(());
-        for (buf, _, _) in &hits {
+        for (buf, _, _) in hits.iter().flatten() {
             if let Err(e) = buf.fence.record_reads(&self.slot_device) {
                 fenced = fenced.and(Err(e));
             }
@@ -1206,14 +1270,14 @@ impl CachedLayer {
         }
         drop(hits);
         // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
-        let cpu_out = misses.map(deferred::Pending::upload).transpose();
+        let cpu_out = cpu.map(deferred::Pending::upload).transpose();
         let gpu_out = acc?;
         fenced?;
         let sum = match cpu_out? {
-            None => gpu_out.to_dtype(xs.dtype())?,
-            Some(c) => (gpu_out + c)?.to_dtype(xs.dtype())?,
+            None => gpu_out,
+            Some(c) => (gpu_out + c)?,
         };
-        sum.unsqueeze(0) // [1, 1, hidden]
+        sum.to_dtype(xs.dtype())?.reshape((batch, seq, hidden))
     }
 }
 
@@ -1339,6 +1403,14 @@ mod tests {
         let reg = LayerRegistry::default();
         assert!(reg.get(3).is_none());
         assert!(reg.layers.read().is_empty());
+    }
+
+    #[test]
+    fn union_by_votes_orders_by_votes_then_rank() {
+        // 7 is in all three rankings; 3 in two; 1 and 9 once, 1 at a better rank.
+        let got = union_by_votes([vec![3, 7, 9], vec![7, 3], vec![1, 7]]);
+        assert_eq!(got, vec![7, 3, 1, 9]);
+        assert_eq!(union_by_votes([vec![4, 2]]), vec![4, 2]);
     }
 
     #[test]
@@ -1473,5 +1545,35 @@ mod tests {
         // Hits run per-expert `QMatMul`s, the reference the fused kernel: equal on aarch64, but
         // on x86 only to Q8_0 activation rounding (~0.005). A swapped weight moves it by ~0.09.
         assert!(diff < 2e-2, "hit/miss split diverges by {diff}");
+    }
+
+    #[test]
+    fn verify_rows_split_matches_running_every_expert_on_the_cpu() {
+        // A verify step: three rows, with hits and misses mixed, rows with no hit (row 2) and no
+        // miss (row 1), and expert 3 missed by two rows.
+        let layer = cpu_layer(8, 4);
+        for e in [0, 2] {
+            assert!(layer.admit(e).unwrap().is_some());
+        }
+        let xs: Vec<f32> = (0..3 * 64).map(|i| (i as f32 * 0.11).cos()).collect();
+        let xs = Tensor::from_vec(xs, (1, 3, 64), &Device::Cpu).unwrap();
+        let ids = Tensor::new(&[[0u32, 3], [2, 0], [3, 5]], &Device::Cpu).unwrap();
+        let ws = Tensor::new(&[[0.6f32, 0.4], [0.7, 0.3], [0.5, 0.5]], &Device::Cpu).unwrap();
+        let got = layer
+            .decode_forward(&xs, &ws, &ids, Activation::Silu)
+            .unwrap();
+        let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
+        assert_eq!(got.dims(), want.dims());
+        let diff = (got - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 2e-2, "verify-row split diverges by {diff}");
     }
 }
