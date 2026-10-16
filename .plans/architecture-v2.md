@@ -15,7 +15,7 @@ qflash-rs 的问题不是某个 kernel 慢，而是**控制模型**：host 驱�
 经手 host 若干次（两次同步 D2H、一次挡住 stream 的 `cudaLaunchHostFunc`），并发射约 61 个 kernel、
 做约 123 次分配（W66）。在这条链上做的任何局部优化（spin pool、host_works、segment、
 round-robin）都被 W93–W98 证明为中性或负收益——因为它们要的前提是「host 很闲」，而我们的
-host 恰恰最忙。
+host 恰恰最忙（池化的例外与拆分见 §6.3：lookahead 半边是赢的，专家半边是输的）。
 
 v2 的目标是换掉控制模型本身：
 
@@ -53,7 +53,7 @@ v2 的目标是换掉控制模型本身：
 | "notify GPU about the uncached result" | host→GPU：结果 + seq（第 11 步读取） |
 | DMA preload the next layer's Expert Cache（黄） | lookahead 的槽位装填，**独立 copy stream** |
 | "notify GPU about synced Expert Caches with a list" | host→GPU：新的驻留列表，供下一层 dispatch 分类（指向下一层的 Dispatch Experts） |
-| 脚注："CPU spins doorbell get the list of uncached Experts to DMA to GPU; and compute in CPU in parallel; also, get the predicted experts of the next layer" | **一个自旋池，三件事**：读未命中列表 → （a）发起 DMA（b）算 CPU 部分 → 顺带跑下一层的预测 |
+| 脚注："CPU spins doorbell get the list of uncached Experts to DMA to GPU; and compute in CPU in parallel; also, get the predicted experts of the next layer" | **不是一个池，而是按角色拆开**（§6.3）：lookahead/预测走专用 spin-then-park 线程，读 mapped 得到未命中列表；CPU 那部分未命中走 **rayon**；DMA 由 token 线程在 copy stream 上发起（worker 不发起 CUDA 调用，见 X5） |
 
 ### 1.3 三个关键读解（与 qflash-rs 现状的差异）
 
@@ -334,6 +334,7 @@ shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 �
 | X3 | W100：第一次 D2H 的 x 与第二次 `to_device(Cpu)` 重复 | 图上已经解决：x 只经 mapped 通道走一次（"GPU copy from mapped result" 是**回程**） |
 | X4 | design.md R5 说整步 graph + 每层 kernel 降到 20 多个 | 与 §1.3(A) 的 per-layer MoE graph **不是同一件事**。图是可行的第一步；整步 graph 需要先解 PLE |
 | X5 | W99：worker 上的 CUDA 调用会迟到 | 图上的 CPU 支路只做**列清单 + CPU 计算 + 预测**；自旋池 worker **不发起任何 CUDA 调用**。55% 那路是真 H2D（pinned→VRAM），捕获期禁 H2D，因此必须在 graph 外由 **token 线程（或一个专职 copy-issuer 线程）**在 copy stream 上 `cudaMemcpyAsync`；worker 只把「未命中列表」写进 mapped 让 token 线程看到。文档初稿「CPU 支路做 DMA 发起」的措辞在此修正 |
+| X6 | W94：spin pool 「loses stably」，但同一条 finding #3 说 lookahead 半边是 **win** | 拆开处理：专家批保持 rayon、lookahead 走专用 spin-then-park 线程（§6.3）。W94 的失败机制（host 在 `drain_epoch` 上的关键路径 + per-call publish/fence）正是 M2 要删的东西，所以它既不能证成也不能证伪 v2 里的池；而 lookahead 的收益已实测 |
 
 ---
 
@@ -407,6 +408,33 @@ PCIe（graph 内自旋等 DMA，§1.1 node 5–6）和 CPU（graph 内自旋等 
 §3.2），三路在 gather 节点求和。**唯一允许的 eager 回退是「行数超出已捕获的 `rows_bucket`」**，
 且惰性捕获该 bucket 即可消掉。上面第 2 点的 np0/np1 属于这一类，**不是** miss 回退。
 
+### 6.3 专家批的派发：rayon vs spin pool
+
+**结论：按角色拆开，不二选一。** 专家批保持 **rayon**（fork 的 `install_moe_task_dispatcher`
+默认）；lookahead/预测走 **1–2 个专用 spin-then-park 线程**（照 strata `kSpinBeforeSleep`，自旋窗口
+按层间隔 ~560 µs）；保留 A/B 开关。
+
+依据（W94，18 runs；胜负在同一次实验的两半里就分好了）：
+
+- **反对池的理由只落在专家批半边**：np2 下池 −19%~−25%，而 np0（小批、多次小调用）几乎打平。
+  W94 finding #2：损失**随每次调用工作量增长**而非调用频率——是 host 在 `drain_epoch` 上的关键
+  路径（发布线程自己 drain 完整个 segment 才 `wait_done`）加 per-call publish/fence，而 rayon 把
+  这些摊薄了；**不是** claim 争用（W94 换成 segment dispatch 反而更差；W95 的 round-robin 只收回
+  5.6 里的 0.6）。
+- **支持池的理由只落在 lookahead 半边**：W94 finding #3「The lookahead half of the pool is a win,
+  still」，命中率每个 cell 都更高（最好 75.8%）。
+- 所以 §1.2 脚注的「一个自旋池，三件事」合并错了：两半的需求相反——专家要吞吐/负载均衡（rayon
+  的强项，也天然吃下混合 quant 的 7 种 shape 成本差异），lookahead 要最低延迟且**不能排队在专家
+  任务之后**（专用线程的强项）。
+
+**v2 改变了什么**：M2 删掉了 `drain_epoch` / 发布线程 drain / per-call host fence，即 W94 的失败
+机制本身。因此 **W94 不能作为 v2 里「池会输」的证据**；但它同样**不是「池会赢」的证据**——池唯一
+已证的优势在 lookahead 半边。专家批没有理由改用池，而池的持续空转会直接消耗 v2 想腾出来的 host
+资源。
+
+**决策门（M4）**：默认 rayon；只有 STEP_DBG 证明专家派发确实在关键路径上（预期不是，W105b），
+才重估「专家批也进池」。
+
 ---
 
 ## 7. 实施顺序（Q1/Q3/Q5 已定）
@@ -430,8 +458,11 @@ PCIe 那部分未命中进 graph：graph 内自旋等 DMA 完成再算。至此�
 在图内，**任何 miss 组合都不触发重捕获或 eager**（§3.3.3 方案 A）。frac 仅作带宽旋钮，不再当
 TPOT 杠杆（X1/Q5）。
 
-**M4 — 自旋池 + lookahead 进池**
-（图上脚注的三件事合一；此时 host 才真的闲下来——W93–W98 的前提在 M4 之后才成立）
+**M4 — lookahead 进专用线程 + 重估专家批**
+lookahead/预测进 1–2 个专用 **spin-then-park** 线程（不是无条件空转）；专家批保持 rayon（§6.3）。
+到 M4 才第一次具备公平评估条件：host 此时已从关键路径移除，用 STEP_DBG 测 (a) 专家派发是否真的在
+关键路径上、(b) 命中率是否因 lookahead 迟到跌破 W105 的 ~78% 拐点；只有 (a) 成立才重估「专家批也
+进池」。保留 A/B 开关。
 
 **M5 — PLE（若 Q2 选 b/c）+ 整步 graph**
 
