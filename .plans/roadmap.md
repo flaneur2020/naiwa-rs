@@ -87,8 +87,9 @@ must already be off the critical path to make the comparison fair).
 
 > See [`worklogs/m2.md`](worklogs/m2.md). The four-kernel MoE segment now captures into **one**
 > CUDA graph and replays with live staging data, **bitwise identical** to the eager path
-> (fork `0359eaae`). Still open: the `MoEGraphKey` registry, per-layer launch on the engine, the
-> launch-count measurement, and the ~150-capture one-time cost.
+> (fork `0359eaae`). Criterion ③ is answered: **150 captures cost 11.6 ms** (0.078 ms/graph,
+> fork `20407494`), so pre-capture the whole set at load. Still open: the `MoEGraphKey` registry,
+> per-layer launch on the engine, the launch-count measurement, and BF16 vs F32 staging.
 
 - **Does**: the MoE registry (`MoEGraphKey`, architecture-v2 §6.2 — **not** the
   whole-step key), the F2 emitter, per-layer capture and launch.
