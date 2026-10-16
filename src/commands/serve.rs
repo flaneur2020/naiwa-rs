@@ -46,6 +46,13 @@ pub async fn run_serve(
         .build()
         .await?;
 
+    // v2 M1: build every staging ring up front, after load and before the first request, so
+    // ring addresses are fixed for the process lifetime (a capture needs that).
+    match crate::offload::warmup_rings()? {
+        0 => {}
+        n => info!("staging rings warmed up: {n} quant shape(s)"),
+    }
+
     let app = MistralRsServerRouterBuilder::new()
         .with_mistralrs(mistralrs)
         .with_observability_config(server.observability_config())

@@ -5,7 +5,7 @@
 //! (`expert_cache`). With `--prefill-stream`, long prefill chunks run the experts on the GPU,
 //! streaming each layer's experts in while the previous layer computes (`prefill_stream`).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -40,7 +40,9 @@ pub fn install_cpu_moe(
         );
     }
     if let Some(gb) = expert_cache_gb {
-        install_routed_experts_provider(Arc::new(GpuCacheMoeProvider::new(gb, prefill, pcie_frac)))?;
+        let provider = Arc::new(GpuCacheMoeProvider::new(gb, prefill, pcie_frac));
+        let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
+        install_routed_experts_provider(provider)?;
         info!(
             "--cpu-moe + expert cache: routed experts in host memory; {:.1} GB GPU cache",
             gb
@@ -53,6 +55,28 @@ pub fn install_cpu_moe(
         info!("--cpu-moe: routed experts load into host memory and run on the CPU");
     }
     Ok(())
+}
+
+/// The installed GPU expert-cache provider, kept so the engine can warm it up after the
+/// model finishes loading (`warmup_rings`). `None` when `--expert-cache-gb` was not used.
+static GPU_CACHE_PROVIDER: OnceLock<Arc<GpuCacheMoeProvider>> = OnceLock::new();
+
+/// v2 M1: build every quant shape's staging ring now. Call once after the model is loaded and
+/// before the first decode, so the ring addresses are fixed for the process lifetime (a
+/// capture needs that; the W105 lazy-at-first-decode creation cannot provide it). Returns the
+/// number of rings, or 0 when no GPU expert cache is installed.
+pub fn warmup_rings() -> Result<usize> {
+    match GPU_CACHE_PROVIDER.get() {
+        Some(provider) => Ok(provider.warmup_rings()?),
+        None => Ok(0),
+    }
+}
+
+/// v2 M1 criterion ①: staging rings created so far. Must not change after warmup — a further
+/// increment means a ring materialized on the decode path, i.e. an address that was not fixed
+/// up front (which a capture cannot tolerate).
+pub fn ring_creations() -> usize {
+    GPU_CACHE_PROVIDER.get().map_or(0, |p| p.ring_creations())
 }
 
 struct CpuMoeProvider {

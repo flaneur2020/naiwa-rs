@@ -35,7 +35,7 @@
 //!   never changes what an in-flight token computes with.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul, QTensor};
@@ -211,6 +211,31 @@ impl GpuCacheMoeProvider {
             prefill,
             pcie_frac,
         }
+    }
+
+    /// v2 M1: materialize every quant shape's staging ring now, i.e. after model load but
+    /// before the first decode, so all ring addresses are fixed for the process lifetime.
+    ///
+    /// W105 bug (a) forced the ring to be created lazily at the first decode: a contiguous
+    /// bank allocated during load OOM'd 2-in-3 runs against load-time fragmentation. Load is
+    /// over by the time this runs, so the allocator has large free blocks again — but the
+    /// first *decode* is too late for a capture, which needs the address up front. Warmup
+    /// closes that window. No-op for layers without a copy stream. Returns the ring count.
+    pub fn warmup_rings(&self) -> candle_core::Result<usize> {
+        // The rings exist only for the `--pcie-frac` path; do not spend the ~215 MiB otherwise.
+        if self.pcie_frac <= 0.0 {
+            return Ok(0);
+        }
+        for layer in self.registry.all() {
+            layer.warmup_scratch_ring()?;
+        }
+        Ok(self.registry.ring_creations.load(Ordering::Relaxed))
+    }
+
+    /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
+    /// decode has started.
+    pub fn ring_creations(&self) -> usize {
+        self.registry.ring_creations.load(Ordering::Relaxed)
     }
 }
 
@@ -892,6 +917,10 @@ struct LayerRegistry {
     /// 627200-byte slot). Each shape gets its own ring of `scratch_ring_slots()` slots.
     /// Behind a `Mutex` because `ScratchRing::acquire` mutates each ring's cursor.
     scratch: Mutex<HashMap<ScratchKey, Arc<Mutex<ScratchRing>>>>,
+    /// v2 M1: how many rings have actually been *created* (not looked up). `warmup_rings` runs
+    /// after load and before the first decode; any further increment means a ring materialized
+    /// on the decode path, i.e. an address that was not fixed up front.
+    ring_creations: AtomicUsize,
 }
 
 /// A staging ring's shape key: every projection's per-expert byte count (folds in dtype and
@@ -958,6 +987,7 @@ impl LayerRegistry {
             (per_slot * len) >> 20
         );
         rings.insert(key, Arc::clone(&ring));
+        self.ring_creations.fetch_add(1, Ordering::Relaxed);
         Ok(Some(ring))
     }
 }
@@ -1221,6 +1251,27 @@ struct CachedLayer {
 }
 
 impl CachedLayer {
+    /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
+    /// A no-op when the layer has no copy stream or no CPU `QTensor`s. Called once after load.
+    fn warmup_scratch_ring(&self) -> candle_core::Result<()> {
+        let Some(cs) = &self.copy_stream else {
+            return Ok(());
+        };
+        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+            return Ok(());
+        };
+        self.registry.scratch_ring(
+            cs,
+            &(
+                Arc::clone(&gate),
+                Arc::clone(&up),
+                Arc::clone(&down),
+            ),
+            &self.slot_device,
+        )?;
+        Ok(())
+    }
+
     /// Byte-slice expert `expert_id` out of the CPU stacks onto the slot device — never
     /// dequantized. `None` when the backend holds no `QTensor`s.
     fn expert_weights(&self, expert_id: usize) -> candle_core::Result<Option<SlotWeights>> {
