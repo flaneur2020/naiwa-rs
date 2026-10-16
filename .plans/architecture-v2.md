@@ -25,7 +25,7 @@ v2 的目标是换掉控制模型本身：
 
 ## 1. 架构图的读解（逐节点）
 
-图：`architecture.png`（作者手绘，2026-10-16）。
+图：`architecture.png`（作者手绘，2026-10-16，已随本目录提交）。
 
 ### 1.1 主链（虚线框内 = 一张 CUDA graph）
 
@@ -274,12 +274,15 @@ v2 要把它做成描述符驱动）。
 
 ### 3.4 静态地址布局（graph 的前提）
 
-一层的指针一旦固化，就永远不能变。因此：
+一层的指针一旦固化，就永远不能变。加载顺序因此被固定：**load → 7-ring 预热（一次性建齐 7 个
+shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 → 服务**。预热必须在捕获
+之前：W105 bug (a) 证明 load 期连续分配会 OOM（11.6 GiB 空闲下 2/3 概率），ring 只能惰性创建，
+而 graph 要求地址在捕获时已经有效。因此：
 
 ```
 [VRAM]
-  expert_banks      : 全局 arena，所有层共享？还是 per-layer？  ← 见待确认 Q3
-  staging_ring      : 全局共享（图上明说），per-shape 分组（W105：7 个形状族）
+  expert_banks      : per-layer bank（Q3=(b)：48+MTP 张 graph，逐层基址烘死在各自 graph 里）
+  staging_ring      : 全局共享（图上明说），per-shape 分组（W105：7 个形状族，混合 quant）
   flag_gpu_to_host  : per-layer，ring depth 8  （ids, weights, x）
   flag_host_to_gpu  : per-layer，ring depth 8  （命中描述符, DMA 列表, CPU 结果, 驻留列表）
   desc_{in,out}     : per-layer，计数 + 索引数组
@@ -296,7 +299,7 @@ v2 要把它做成描述符驱动）。
 | # | 切入点 | 改动 | 为什么必须 |
 |---|---|---|---|
 | F1 | `supports_decode_graphs()`（`qwen4_exp/text.rs:789`） | 门 2 改成「provider 声明自己可捕获」而不是无条件 `!has_external_experts()` | 否则 graph 永远不启动 |
-| F2 | `RoutedExperts` / `RoutedExpertsProvider`（`moe_offload.rs`） | 从「提供 experts」扩展为「提供**可捕获的区域发射器**」：一个在捕获期被调用的回调，内部发射 dispatch→wait→copy→decode→gather 的节点序列 | 现在 provider 只能在 eager 路径被调用 |
+| F2 | `RoutedExperts` / `RoutedExpertsProvider`（`mistralrs-core/src/moe_offload.rs`） | 从「提供 experts」扩展为「提供 **MoE 段的可捕获 emitter**」：emitter 发射 dispatch→wait→copy→decode→gather 的节点序列。**注意**：Q1=(c) 不做整步捕获，所以 emitter 是**每个 site 在自己的 per-layer 捕获会话里被调用一次**，而不是在一次整步捕获里被调用 48 次 | 现在 provider 只能在 eager 路径被调用 |
 | F3 | `cuda/doorbell.cu` + `doorbell.rs` | 加 `wait_ge_ptr` / `wait_copy_ptr`（指针版）；`FlagBuf` 的 target 描述符化管理 | §3.1 的零实参要求 |
 | F4 | `mistralrs-quant` 的 `fused_moe_decode` | 描述符驱动形态（计数来自 device 描述符） | §3.3.3 方案 A |
 | F5 | PLE（若走 §3.3.4 路线 2/3） | hash 所有权 / 预取接口 | 唯一能打开整步 graph 的路 |
@@ -326,23 +329,77 @@ v2 要把它做成描述符驱动）。
 | X2 | W105f：np3/np4 无收益，np2 已饱和 | v2 的设计按 **np2（3 rows）** 定型；行数不影响节点形状（描述符驱动），但 G=2 分组流水（R6）留作后续 |
 | X3 | W100：第一次 D2H 的 x 与第二次 `to_device(Cpu)` 重复 | 图上已经解决：x 只经 mapped 通道走一次（"GPU copy from mapped result" 是**回程**） |
 | X4 | design.md R5 说整步 graph + 每层 kernel 降到 20 多个 | 与 §1.3(A) 的 per-layer MoE graph **不是同一件事**。图是可行的第一步；整步 graph 需要先解 PLE |
-| X5 | W99：worker 上的 CUDA 调用会迟到 | 图上的 CPU 支路**只做 DMA 发起 + CPU 计算 + 预测**，全部无 CUDA 调用；DMA 走 copy stream，由 token 线程/已有 stream 语义保证顺序 |
+| X5 | W99：worker 上的 CUDA 调用会迟到 | 图上的 CPU 支路只做**列清单 + CPU 计算 + 预测**；自旋池 worker **不发起任何 CUDA 调用**。55% 那路是真 H2D（pinned→VRAM），捕获期禁 H2D，因此必须在 graph 外由 **token 线程（或一个专职 copy-issuer 线程）**在 copy stream 上 `cudaMemcpyAsync`；worker 只把「未命中列表」写进 mapped 让 token 线程看到。文档初稿「CPU 支路做 DMA 发起」的措辞在此修正 |
 
 ---
 
-## 6. 待确认的决策
+## 6. 决策记录
 
-| # | 问题 | 选项 |
+2026-10-16 对齐结论。Q1/Q3/Q4/Q5 已定；Q2 仍开放。
+
+| # | 问题 | 结论 |
 |---|---|---|
-| Q1 | graph 的范围 | (a) per-layer MoE 段，48 次 launch（图上画的，可行）<br>(b) 整步一张 graph，1 次 launch（需先解 PLE）<br>(c) 先 (a)，PLE 单独立项，之后升级到 (b) |
-| Q2 | PLE 的策略 | (a) 接受 eager，graph 只覆盖 MoE 段<br>(b) host 预取到 pre-graph staging（需确认 hash 可否 host 复现）<br>(c) device 侧热点表 + 一步预取余量 |
-| Q3 | expert bank 布局 | (a) 全局 arena，所有层共享一组固定地址 → **一张 graph 可 replay 48 次**，per-layer 差异走描述符<br>(b) per-layer bank → 48 张结构相同、指针不同的 graph |
-| Q4 | 第一个里程碑 | 见 §7 |
-| Q5 | CPU 侧 45% 的固定比例，还是按 miss 数动态决定？ | 图上写 55/45 固定 |
+| Q1 | graph 的范围 | **(c)** 先做 per-layer MoE 段 graph（48 次 launch，图上画的）；PLE 单独立项，之后视 PLE 结果再升级到整步 (b) |
+| Q2 | PLE 的策略 | **仍开放**。上一轮已把天平显著推向 (b)：PLE 每 step 只有一个节点（§1.3(A)），host 预取到 pre-graph staging 的性价比远高于文档初稿的估计；唯一 blocker 是 n-gram hash 依赖 device 上的 per-layer conv history 能否在 host 复现——应在 M0/M1 期间用半天验证 |
+| Q3 | expert bank 布局 | **(b)** per-layer bank + 48 张 graph（+ MTP 头 1 张）。理由见 §6.1 |
+| Q4 | 第一个里程碑 | **M0**（见 §7）：零实参原语的可见性 + replay 200 次，是硬阻塞项 |
+| Q5 | CPU/PCIe 分路比例 | **动态**，按 miss 数决定；`frac` 只作为带宽旋钮，不再当 TPOT 杠杆（X1） |
+
+### 6.1 Q3=(b) 的理由：混合 quant
+
+本轮核实（W105 bug (c)）：该模型**确实是混合 quant**——各层 expert 的 per-projection 字节数与
+dtype 不一致，实测 **7 种 expert shape**（IQ3_XXS ×2、IQ2_S ×2、IQ3_S ×2、IQ4XS；如 524800
+与 627200、921600 与 460800 字节的 expert 并存），`expert_cache.rs:897` 的
+`ScratchKey = ([usize; 3], u8)` 已经把它编码进去（甚至同一层 gate/up/down 三投影也可不同）。
+
+- **Q3(a) 被它直接否决**：一张捕获 graph 的 kernel 节点只能固定一种 dtype/几何，覆盖不了 7 种。
+- **Q3(b) 天然吃下**：每层的 graph 在**捕获期**钉死自己的 quant instantiation，replay 零运行时
+  分支、零 warp divergence。
+- 措辞修正：Q3(b) 原文「48 张**结构相同**」不准确，应为「48+MTP 张 graph，节点拓扑按 shape
+  group 只有 ~7 种 variant，逐层的 bank 基址/描述符/staging 指针不同」。
+- 共享结构（`FlagBuf`、描述符 schema、全局 staging ring）必须 **format-agnostic**：只放
+  count/offset/pointer，格式几何全部烘进各层 graph。**这是 F4 的硬性规则。**
+- staging ring 保持 shape-keyed（已有 7 个 ring）；slot offset 继续走描述符/device 计数，不能烘死
+  （否则与 `ScratchRing.cursor` 的 round-robin 冲突）。
+- 驻留路径与 DMA/staging 路径共用同一 quant 格式（cache 存 raw expert bytes），所以一张 graph 内
+  「compute cached」与「compute DMA copied」两节点格式一致，无需格式转换。
+
+### 6.2 捕获 key 与捕获时机
+
+fork 现有的 `CudaDecodeGraphKey`（`cuda_graph.rs:924`）带 context-len / recurrent kind /
+decode_rows / 全输入张量形状等维度，捕获单元是**整步 decode**。若把 `layer` 直接塞进去，
+图数量 = (现有 key 数) × 48，会为 attention-only 维度付出 48 倍捕获成本。
+
+**结论：per-layer MoE graph 用另起的窄 key，不复用整步 registry 的语义。**
+
+```
+MoEGraphKey = (device, site_index, rows_bucket)
+  site_index  = 48 个 decoder 层 + 1 个 MTP 头（ExpertSite.is_mtp）
+  rows_bucket = np0/np1/np2 → 3
+```
+
+数量 ≈ 49 × 3 ≈ **150 张**。context length / KV layout / recurrent kind 不影响 MoE 段形状，不进
+key；命中的**数量**由描述符驱动，也不进 key。因为 §3.3.5 选了静态预分配，这些图在捕获期
+**零分配、零 H2D**，不消耗 `CudaGraphMemoryPoolScope`（`:64`）也不碰 `CudaGraphHtodCache`。
+
+实现选择：**另起一个小的 MoE registry**（`HashMap<MoEGraphKey, CudaGraphLaunch>`，只复用
+`stream.begin_capture` / `end_capture` / `instantiate` / `upload` 原语，约 100 行），**不**把
+`site_index` 塞进整步 `cuda_graph.rs`——整步 registry 的 pad-row KV/recurrent 写入、spec state
+admission、flashinfer scratch 对 MoE 段全是噪音。因此 §3.3.1 的「不要自己写 graph 捕获框架」
+限定为「不要重写整步框架」。
+
+捕获时机（用户已定，与 §3.4 的加载顺序一致）：
+1. load 完成后、任何捕获之前，先跑 **7-ring 预热**，把 7 个 shape 的 staging ring 与所有
+   per-layer bank 一次性建好。
+2. 再按 `MoEGraphKey` 捕获。M1 需实测 150 次 `begin_capture→instantiate→upload` 的总耗时；
+   若偏大，退路是只预捕获稳态 bucket（np2），np0/np1 保持 eager（attention 本来就在 graph 外，
+   回退路径天然存在）。
+3. **pad rows**：整步框架的 pad 行别名到 row 0；MoE 段里 pad 行会产生多余的专家计算与描述符项。
+   描述符必须带 `real_rows`，DMA/命中列表在 host 侧按 `real_rows` 生成（pad 行不进列表）。
 
 ---
 
-## 7. 建议的实施顺序（待 Q1–Q3 定后细化）
+## 7. 实施顺序（Q1/Q3/Q5 已定）
 
 **M0 — 同步原语 harness（1 天）**
 零实参 `wait_ge_ptr` / `wait_copy_ptr` 的可见性验证；捕获进 graph 后 replay 200 次不丢。
@@ -350,7 +407,8 @@ v2 要把它做成描述符驱动）。
 
 **M1 — 单层 MoE graph 跑通（骨架）**
 不开 cache、不开 PCIe、只有「驻留或不驻留」两态。目标：一层 MoE 从 ~60 kernel 发射
-降到 1 次 launch + 2 次自旋，且 greedy 输出与 eager 一致。
+降到 1 次 launch + 2 次自旋，且 greedy 输出与 eager 一致。同时实测 150 次
+`begin_capture→instantiate→upload` 的一次性成本（§6.2），并验证 pad rows 被 `real_rows` 正确排除。
 
 **M2 — 双向通道 + CPU 结果回程**
 把 `deferred` 的 host function 换成 `wait_copy_ptr`。目标：token 线程上零同步点。
@@ -369,7 +427,8 @@ PCIe 路进 graph。
 
 | 事实 | 位置 |
 |---|---|
-| 外部 experts 否决 graph 捕获 | `mistralrs-core/src/vision_models/qwen4_exp/text.rs:789`；`moe_offload.rs:13` |
+| 外部 experts 否决 graph 捕获 | `mistralrs-core/src/vision_models/qwen4_exp/text.rs:789`；`mistralrs-core/src/moe_offload.rs:13`（不在 `qwen4_exp/` 下） |
+| 混合 quant：7 种 expert shape | W105 bug (c)（`worklog.md` 4993 段附近）；`qflash-rs/src/expert_cache.rs:897`（`ScratchKey`） |
 | PLE 在每层 attention 之前 | `qwen4_exp/text.rs:985–1010` |
 | PLE 表只在装得下时常驻 | `qwen4_exp/ple.rs:429`（`make_resident`）、`:862`（`gathers_on_device`） |
 | 已有 4 个 doorbell kernel，target 为实参 | `mistralrs-core/src/cuda/doorbell.cu` |
