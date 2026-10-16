@@ -305,7 +305,7 @@ shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 �
 | F1 | `supports_decode_graphs()`（`qwen4_exp/text.rs:789`） | 门 2 改成「provider 声明自己可捕获」而不是无条件 `!has_external_experts()` | 否则 graph 永远不启动 |
 | F2 | `RoutedExperts` / `RoutedExpertsProvider`（`mistralrs-core/src/moe_offload.rs`） | 从「提供 experts」扩展为「提供 **MoE 段的可捕获 emitter**」：emitter 发射 dispatch→wait→copy→decode→gather 的节点序列。**注意**：Q1=(c) 不做整步捕获，所以 emitter 是**每个 site 在自己的 per-layer 捕获会话里被调用一次**，而不是在一次整步捕获里被调用 48 次 | 现在 provider 只能在 eager 路径被调用 |
 | F3 | `cuda/doorbell.cu` + `doorbell.rs` | 加 `wait_ge_ptr` / `wait_copy_ptr`（指针版）；`FlagBuf` 的 target 描述符化管理 | §3.1 的零实参要求 |
-| F4 | `mistralrs-quant` 的 `fused_moe_decode` | 描述符驱动形态（计数来自 device 描述符） | §3.3.3 方案 A |
+| F4 | **`mistralrs-quant` 的 `indexed_moe_fused_decode`**（GPU 路径，`gguf/cuda.rs:1586`）——**不是** CPU 的 `fused_moe_decode`（`fused_cpu.rs`，那是 `/par_tasks` 的 CPU 派发，跟捕获无关） | 描述符驱动 / 定长网格形态：`MoeDecodeCapture` 用自有的一次性缓冲 + 固定网格 `(⌈n/8⌉, max_topk, max_batch)`，计数由填好的 ids/weights 描述符表达 | §3.3.3 方案 A。已落地（M1.1，fork `729d2c64`） |
 | F5 | PLE（若走 §3.3.4 路线 2/3） | hash 所有权 / 预取接口 | 唯一能打开整步 graph 的路 |
 
 现有可复用的（不要重写）：`pipeline/cuda_graph.rs` 全套、`moa_router_topk`、`indexed_copy`、
@@ -453,6 +453,22 @@ commit 为单位记录两侧配置（benchmark 记录 commit hash，而不是 en
 
 **仍然保留：只读探针。** `NAIWA_STEP_DBG` 这类 env 门控的日志/事件插桩**不是** A/B 开关——M5
 的判据（W105e 的 dry bucket 测量）依赖它，且它不改行为、无分叉。
+
+### 6.5 M1 落地修正（实现期，2026-10-16）
+
+- **F4 的目标是 GPU 的 `indexed_moe_fused_decode`，不是 CPU 的 `fused_moe_decode`。** 原表写错
+  了（§4.1 已改）。GPU 路径是 `expert_cache.rs:1145 fused_decode → indexed_moe_fused_decode`，
+  四个 kernel，网格由 **value 实参**算出（`dim3 grid(⌈n/8⌉, topk, batch)`）——所以「传入
+  `batch=max_batch, topk=max_topk` 就得到固定网格」，**无需改 kernel**。
+- **V1–V3 是被「绕开」而不是「修好」的。** 捕获的三个阻碍（全局 workspace 会增长并 retire、
+  `alloc_zeros` 每调用一次分配、gate+up workspace 随 `batch*topk` 变）都属旧路径；
+  `MoeDecodeCapture` 用**自有一次性缓冲**，因此 v2 全程走它时这些路径不进 v2。旧
+  `indexed_moe_fused_decode` 保持不变（additive），eager 路径零回归。
+- **`MoeDecodeCapture::output()` 是指定缓冲的别名**，只在下次 `run` 前有效。这是 graph 的语义
+  （图拥有该缓冲）；eager 调用方必须自己 copy。不是缺陷，是设计。
+- **sentinel guard 推到 M2。** `moe_gemv_fused_gate_up_impl` 没有 `expert_id` 越界检查（forward
+  变体有），所以 M1 用「valid slot + weight 0」填充（qflash 既有做法）。加 sentinel
+  （`expert_id >= num_experts` 写零 + launcher/FFI 增加 `num_experts`）推迟到 M2 真正需要它时。
 
 ---
 
