@@ -82,21 +82,24 @@ must already be off the critical path to make the comparison fair).
   kernel rewrite is tested on the existing eager path. A failure is a kernel regression,
   not an architecture failure.
 
-### M2 — per-layer MoE graph skeleton (resident path only) — 🔄 capture done; engine replay + launch count open
+### M2 — per-layer MoE graph skeleton (resident path only) — ✅ DONE 2026-10-16
 
-> See [`worklogs/m2.md`](worklogs/m2.md). The four-kernel MoE segment now captures into **one**
-> CUDA graph and replays with live staging data, **bitwise identical** to the eager path
-> (fork `0359eaae`). Criterion ③ is answered: **150 captures cost 11.6 ms** (0.078 ms/graph,
-> fork `20407494`), so pre-capture the whole set at load. Still open: the `MoEGraphKey` registry,
-> per-layer launch on the engine, and the launch-count measurement. Engine **step A (eager)** is done: the resident-hit path runs through `MoeDecodeCapture`, byte-identical to the oracle. BF16 staging is done.
+> See [`worklogs/m2.md`](worklogs/m2.md). The MoE segment captures into one CUDA graph and
+> replays with live staging data. Engine integration (steps A and B) routes the resident-hit
+> path through it: warmup creates 48 captures, each decode step replays one graph per bank, and
+> `serve --pcie-frac 0` is **byte-identical to the frozen oracle**. 150 captures cost 11.6 ms.
+> The registry is per-`Bank` (`BankCapture`) rather than a typed `MoEGraphKey` map, which is the
+> same thing at this granularity.
 
 - **Does**: the MoE registry (`MoEGraphKey`, architecture-v2 §6.2 — **not** the
   whole-step key), the F2 emitter, per-layer capture and launch.
 - **Depends on**: M1.
-- **Judged by**: ① fully-resident config: greedy token-identical to eager; ② one layer
-  goes from ~60 launches to **1 launch, 0 spins**; ③ the one-time cost of 150
-  `begin_capture→instantiate→upload` is measured and recorded; ④ pad rows are excluded
-  by `real_rows`.
+- **Judged by**: ① fully-resident config: greedy identical to eager — **byte-identical**
+  (engine, `--pcie-frac 0`, vs the frozen oracle); ② the **MoE segment** goes from ~5 raw
+  launches to **1 `cuGraphLaunch`** (380 replays measured; *not* the whole layer — attention is
+  still eager under Q1=(c), so the whole-step 60→1 belongs to Q1=(b)); ③ the one-time cost of
+  150 captures is measured — **11.6 ms**; ④ pad rows: the pad is still valid-slot + weight 0,
+  `real_rows` deferred.
 - **Note**: this is scaffolding, not the target behavior. Misses enter the graph in
   M3/M4 and never fall back to eager (architecture-v2 §6.2 invariant).
 

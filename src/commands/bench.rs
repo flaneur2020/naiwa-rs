@@ -338,6 +338,12 @@ pub async fn run_bench(
                 stats.pcie_bytes as f64 / (1024.0 * 1024.0),
             );
         }
+        if stats.capture_replays > 0 {
+            println!(
+                "  M2 capture: {} MoE segment(s) replayed as 1 graph launch (eager: ~5 raw launches each)",
+                stats.capture_replays,
+            );
+        }
         println!();
     }
 

@@ -107,6 +107,9 @@ struct Counters {
     lookahead_dropped: AtomicU64,
     pcie_misses: AtomicU64,
     pcie_bytes: AtomicU64,
+    /// v2 M2: decode-step MoE segments served by replaying a captured graph (1 `cuGraphLaunch`
+    /// each) rather than ~5 raw launches.
+    capture_replays: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -118,6 +121,7 @@ static COUNTERS: Counters = Counters {
     lookahead_dropped: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
     pcie_bytes: AtomicU64::new(0),
+    capture_replays: AtomicU64::new(0),
 };
 
 /// Expert-cache counters since the last call to `take_stats`.
@@ -136,6 +140,8 @@ pub struct CacheStats {
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
     pub pcie_bytes: u64,
+    /// v2 M2: MoE segments replayed from a captured graph.
+    pub capture_replays: u64,
 }
 
 impl CacheStats {
@@ -159,6 +165,7 @@ pub fn take_stats() -> Option<CacheStats> {
         lookahead_dropped: take(&c.lookahead_dropped),
         pcie_misses: take(&c.pcie_misses),
         pcie_bytes: take(&c.pcie_bytes),
+        capture_replays: take(&c.capture_replays),
     })
 }
 
@@ -1199,6 +1206,7 @@ impl Bank {
         max_batch: usize,
         max_topk: usize,
         stage_dtype: DType,
+        act_type: i32,
     ) -> candle_core::Result<bool> {
         let mut slot = self.capture.lock().unwrap();
         if slot.is_some() {
@@ -1218,6 +1226,12 @@ impl Bank {
         let n = max_batch * max_topk;
         let ids = dev.alloc_zeros::<u32>(n)?;
         let weights = dev.alloc_zeros::<f32>(n)?;
+        // M2: capture the segment here, at load, so a decode step replays one graph instead of
+        // issuing ~5 raw launches. If capture fails, keep the eager segment (`is_captured` false).
+        let mut cap = cap;
+        if let Err(e) = cap.capture(&self.gate, &self.up, &self.down, &ids, &weights, act_type) {
+            warn!("expert cache: bank capture failed, staying on the eager segment: {e}");
+        }
         *slot = Some(BankCapture { cap, ids, weights });
         Ok(true)
     }
@@ -1261,8 +1275,15 @@ impl Bank {
         let dev = x2d.device().as_cuda_device()?;
         dev.memcpy_htod(ids.as_slice(), &mut c.ids)?;
         dev.memcpy_htod(ws.as_slice(), &mut c.weights)?;
-        c.cap
-            .run(&self.gate, &self.up, &self.down, x2d, &c.ids, &c.weights, act_type)?;
+        c.cap.stage(x2d)?;
+        if c.cap.is_captured() {
+            c.cap.replay()?;
+            COUNTERS.capture_replays.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Capture failed at warmup; stay on the eager segment rather than lose the bank.
+            c.cap
+                .run(&self.gate, &self.up, &self.down, x2d, &c.ids, &c.weights, act_type)?;
+        }
         Ok(Some(c.cap.output()?.narrow(0, 0, rows)?))
     }
 }
@@ -1383,8 +1404,11 @@ impl CachedLayer {
             banks.push(Arc::clone(bank));
         }
         let mut made = 0;
+        let Some(act_type) = fused_act(self.act) else {
+            return Ok(0);
+        };
         for bank in banks {
-            if bank.create_capture(CAPTURE_MAX_BATCH, self.top_k, stage_dtype)? {
+            if bank.create_capture(CAPTURE_MAX_BATCH, self.top_k, stage_dtype, act_type)? {
                 made += 1;
             }
         }
