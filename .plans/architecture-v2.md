@@ -464,13 +464,17 @@ commit 为单位记录两侧配置（benchmark 记录 commit hash，而不是 en
   也能判定通过与否（性能另记，不作为门槛）。
 - 每个里程碑只引入一类新机制，保证失败时归因单一。
 
-**M0 — 同步原语 harness（~1 天，独立于引擎）**
+**M0 — 同步原语 harness（~1 天，独立于引擎）— ✅ DONE 2026-10-16（见 `worklogs/m0.md`）**
 - 内容：零实参 `wait_ge_ptr` / `wait_copy_ptr` 的 ① 跨 host/GPU 可见性（目标卡 fence 语义：Ada
   一次、RDNA 两次）② 捕获进 graph 后 replay 200 次不丢。
 - 依赖：无（**硬阻塞项**）。
-- 判据：① 1000 次循环 100% 可见；② 捕获后 replay 200 次 payload 全部正确。
-- 产物：`~/bench-rel/naiwa-v2/harness/`（10 行 kernel + 循环）。
+- 判据：① 1000 次循环 100% 可见；② 捕获后 replay 200 次 payload 全部正确；③ **内核确实自旋**
+  （`waited == iters/replays`）。
+- 产物：源码 `harness/m0/`（kernel + 四臂 fence 对照 + must-fail 的 baking 反证）；二进制与日志
+  `~/bench-rel/naiwa-v2/m0/`。
 - 可行性：纯 harness，不碰引擎。
+- 结果：全过（RTX 4070 / Ada）。注意：Ada 上两个 fence 对此 pattern 均非必需（保留以备 RDNA）；
+  且**数值正确 ≠ 未烘焙**——baking 对照里值仍全对，只有 `waited` 抓到它。
 
 **M1 — 静态地址布局 + 描述符驱动 kernel（不做 graph）**
 - 内容：① load → 7-ring 预热（7 个 shape 的 staging ring + 所有 per-layer bank 一次建齐）；
