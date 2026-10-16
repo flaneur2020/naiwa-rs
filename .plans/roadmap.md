@@ -13,14 +13,15 @@ Progress scratch per milestone lives in [`worklogs/`](worklogs/) (`worklogs/m0.m
 Every step must be **feasible on its own** and **independently verifiable**:
 
 1. **Numeric oracle** — a frozen eager reference: fixed prompt set + greedy decode.
-   **Bitwise-identical output is only achievable at the kernel level**, where a test can run two
-   launches on the same input and diff them (M1.1 does exactly this, `0.000000`). At engine
-   level the decode is **not** bit-reproducible: measured 2026-10-16, five greedy runs of the
-   *same* binary gave two different continuations (3x "The capital of Japan…" / 2x "The Eiffel
-   Tower…"). `temperature 0` removes *sampling* randomness, not float reduction order (the
-   down+aggregate kernel sums across topk blocks with `atomicAdd`; the CPU expert path reduces
-   in parallel). So the engine-level check is **distributional**: N runs each, same variant set
-   and a bounded divergence position, plus the structural counters — not a byte diff.
+   Bitwise identity is realizable at two levels we can actually use:
+   - **kernel level** — diff two launches on the same input (M1.1: `0.000000`);
+   - **engine level with `--pcie-frac 0`** — measured 2026-10-16: **8/8 runs identical**
+     across two dispatcher configs (spin pool and single-thread rayon).
+   It breaks down only with the **PCIe path on** (`--pcie-frac 0.55`: 5 runs gave 2
+   continuations, 3× "The capital of Japan…" / 2× "The Eiffel Tower…"). So use
+   `--pcie-frac 0` for M1/M2's engine-level oracle; **M3/M4 must first characterize why the
+   PCIe path is nondeterministic** (float order from extra `atomicAdd` terms, or a
+   staging-ring read race — unknown). See [`worklogs/m1.md`](worklogs/m1.md).
 2. **Structural criteria** — launch count / capture count / allocation count / dry
    bucket. These do not depend on performance numbers, so they can be judged inside
    the ~8% run-to-run noise. Performance is recorded, never used as a gate.
@@ -74,11 +75,10 @@ must already be off the critical path to make the comparison fair).
   descriptor array", F4).
 - **Depends on**: M0 + F4.
 - **Judged by**: ① no new allocation and no address change across a whole decode
-  (assertion); ② **under eager**, old host-computed launch geometry vs descriptor-driven is
-  **bit-identical at kernel level** (done, M1.1) and, at engine level, *distributionally*
-  equivalent — N greedy runs of each binary give the same variant set and no earlier
-  divergence (see the reproducibility finding in [`worklogs/m1.md`](worklogs/m1.md));
-  ③ no graph / PCIe machinery involved.
+  (assertion); ② **under eager with `--pcie-frac 0`**, old host-computed launch geometry vs
+  descriptor-driven is token-identical — bitwise at kernel level (done, M1.1) **and** at
+  engine level (the oracle is bit-reproducible at `frac 0`); ③ no graph / PCIe machinery
+  involved.
 - **Why independently verifiable**: it does not touch capture at all, so the largest
   kernel rewrite is tested on the existing eager path. A failure is a kernel regression,
   not an architecture failure.
@@ -151,3 +151,7 @@ must already be off the critical path to make the comparison fair).
 - **Q2 (PLE strategy)** — the only prerequisite of M6. Decide within M0–M2 by reading
   `ple.rs`'s n-gram hash / prefetch path: can the per-layer conv history be reproduced
   on the host? (~half a day.) See architecture-v2 §3.3.4.
+- **Nondeterminism of the PCIe path** — with `--pcie-frac > 0` (and the spin pool on) greedy
+  decode is not bit-reproducible (5 runs → 2 continuations); `--pcie-frac 0` is 8/8 stable.
+  Does not block M1/M2. Must be characterized before M3/M4, because those milestones build
+  directly on that path. See [`worklogs/m1.md`](worklogs/m1.md).

@@ -15,6 +15,8 @@ MAXTOK=${MAXTOK:-16}
 # A small KV budget: the server's auto-size reserving runtime memory too squeezed the KV pool
 # out on this 12 GB card. Context length does not affect a 16-token greedy decode.
 PA_CTX=${PA_CTX:-4096}
+FRAC=${FRAC:-0.55}
+EXTRA=${EXTRA:-}
 TAG=${TAG:-$(basename "$BIN")}
 mkdir -p "$OUT"
 LOG="$OUT/serve.$TAG.log"
@@ -22,8 +24,8 @@ LOG="$OUT/serve.$TAG.log"
 "$BIN" serve \
     -m "$HOME/models/qwen3-coder/requant" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
-    --cpu-moe --expert-cache-gb 2 --pcie-frac 0.55 --seed 0 \
-    --pa-context-len "$PA_CTX" --prefix-cache-n 0 \
+    --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
+    --pa-context-len "$PA_CTX" --prefix-cache-n 0 $EXTRA \
     --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true' EXIT
