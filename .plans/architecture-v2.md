@@ -240,6 +240,10 @@ graph 的节点是固定的，但**每 step 的命中集合是变的**。三种�
 **这是最大的一块 kernel 侧工作，也是 R4 的自然归宿**（W101–W103 已经把 row kernel 做快了，
 v2 要把它做成描述符驱动）。
 
+**方案 A 的存在意义，就是让「每 step 变长的命中/未命中集」在同一个已捕获 graph 内被吃下——
+不重捕获、更不回退 eager。** 这是 v2 相对 fork 现有整步 graph 的关键差别（也是一条不变量，
+见 §6.2）。
+
 #### 3.3.4 PLE：整步 graph 的唯一结构性阻碍
 
 - PLE 表（Coder GGUF 里 IQ4_NL 26.8 GiB）在 12 GB 卡上**不可能常驻**（`ple.rs:429`）。
@@ -392,10 +396,16 @@ admission、flashinfer scratch 对 MoE 段全是噪音。因此 §3.3.1 的「�
 1. load 完成后、任何捕获之前，先跑 **7-ring 预热**，把 7 个 shape 的 staging ring 与所有
    per-layer bank 一次性建好。
 2. 再按 `MoEGraphKey` 捕获。M1 需实测 150 次 `begin_capture→instantiate→upload` 的总耗时；
-   若偏大，退路是只预捕获稳态 bucket（np2），np0/np1 保持 eager（attention 本来就在 graph 外，
-   回退路径天然存在）。
+   若偏大，退路是只预捕获稳态 bucket（np2），np0/np1 保持 eager。**注意这个退路是「行数
+   bucket」回退，与 miss 无关**（attention 本来就在 graph 外，回退路径天然存在）。
 3. **pad rows**：整步框架的 pad 行别名到 row 0；MoE 段里 pad 行会产生多余的专家计算与描述符项。
    描述符必须带 `real_rows`，DMA/命中列表在 host 侧按 `real_rows` 生成（pad 行不进列表）。
+
+**不变量（本轮澄清）：miss 永不回退 eager。** 变长的命中集是常态（W105：hit 77–93%），必须由
+§3.3.3 方案 A 的**描述符驱动 kernel** 在同一个已捕获 graph 内吃下：命中走驻留槽位，未命中走
+PCIe（graph 内自旋等 DMA，§1.1 node 5–6）和 CPU（graph 内自旋等 mapped 结果再 D2D 拷回，
+§3.2），三路在 gather 节点求和。**唯一允许的 eager 回退是「行数超出已捕获的 `rows_bucket`」**，
+且惰性捕获该 bucket 即可消掉。上面第 2 点的 np0/np1 属于这一类，**不是** miss 回退。
 
 ---
 
@@ -405,16 +415,20 @@ admission、flashinfer scratch 对 MoE 段全是噪音。因此 §3.3.1 的「�
 零实参 `wait_ge_ptr` / `wait_copy_ptr` 的可见性验证；捕获进 graph 后 replay 200 次不丢。
 产物：`~/bench-rel/naiwa-v2/harness/`，10 行 kernel + 1000 次循环。
 
-**M1 — 单层 MoE graph 跑通（骨架）**
-不开 cache、不开 PCIe、只有「驻留或不驻留」两态。目标：一层 MoE 从 ~60 kernel 发射
-降到 1 次 launch + 2 次自旋，且 greedy 输出与 eager 一致。同时实测 150 次
-`begin_capture→instantiate→upload` 的一次性成本（§6.2），并验证 pad rows 被 `real_rows` 正确排除。
+**M1 — 单层 MoE graph 骨架（只跑驻留路径）**
+用「全驻留」配置，只验证 graph 骨架本身：一层 MoE 从 ~60 次发射降到 **1 次 launch、0 次自旋**，
+greedy 输出与 eager 一致。这是**脚手架范围，不是目标行为**——miss 路径不在 M1 里，但它由 M2/M3
+加进 graph，**绝不回退 eager**（见 §6.2 不变量）。同时实测 150 次
+`begin_capture→instantiate→upload` 的一次性成本（§6.2），并验证 pad rows 被 `real_rows` 排除。
 
-**M2 — 双向通道 + CPU 结果回程**
-把 `deferred` 的 host function 换成 `wait_copy_ptr`。目标：token 线程上零同步点。
+**M2 — 双向通道 + CPU 结果回程（miss 进入 graph）**
+把 `deferred` 的 host function 换成 `wait_copy_ptr`：CPU 那部分未命中改为 graph 内自旋等 mapped
+结果 + D2D 拷回。目标：token 线程上零同步点；**miss 从这一刻起全程在 graph 内**。
 
-**M3 — 全局 staging + 55/45 分路**
-PCIe 路进 graph。
+**M3 — 全局 staging + PCIe 路（三路齐）**
+PCIe 那部分未命中进 graph：graph 内自旋等 DMA 完成再算。至此命中 / PCIe / CPU 三路与 gather 全部
+在图内，**任何 miss 组合都不触发重捕获或 eager**（§3.3.3 方案 A）。frac 仅作带宽旋钮，不再当
+TPOT 杠杆（X1/Q5）。
 
 **M4 — 自旋池 + lookahead 进池**
 （图上脚注的三件事合一；此时 host 才真的闲下来——W93–W98 的前提在 M4 之后才成立）
