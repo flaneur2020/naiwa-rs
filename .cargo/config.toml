@@ -1,0 +1,7 @@
+# Build artifacts live outside the source tree and away from the qflash-rs oracle.
+#
+# qflash-rs is the read-only eager oracle: its `target/release/naiwa-rs` binary must not be
+# overwritten by a v2 build (both crates are `name = "naiwa-rs"`). This target dir was seeded
+# with a copy of qflash-rs/target so the dependency cache is warm; only the local crate rebuilds.
+[build]
+target-dir = "/home/yazhou/naiwa-rs/target"

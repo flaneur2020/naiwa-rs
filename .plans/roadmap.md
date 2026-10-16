@@ -12,8 +12,15 @@ Progress scratch per milestone lives in [`worklogs/`](worklogs/) (`worklogs/m0.m
 
 Every step must be **feasible on its own** and **independently verifiable**:
 
-1. **Numeric oracle** — a frozen eager reference: fixed prompt set + greedy decode,
-   compared token by token. "Correct" means identical output, not "close".
+1. **Numeric oracle** — a frozen eager reference: fixed prompt set + greedy decode.
+   **Bitwise-identical output is only achievable at the kernel level**, where a test can run two
+   launches on the same input and diff them (M1.1 does exactly this, `0.000000`). At engine
+   level the decode is **not** bit-reproducible: measured 2026-10-16, five greedy runs of the
+   *same* binary gave two different continuations (3x "The capital of Japan…" / 2x "The Eiffel
+   Tower…"). `temperature 0` removes *sampling* randomness, not float reduction order (the
+   down+aggregate kernel sums across topk blocks with `atomicAdd`; the CPU expert path reduces
+   in parallel). So the engine-level check is **distributional**: N runs each, same variant set
+   and a bounded divergence position, plus the structural counters — not a byte diff.
 2. **Structural criteria** — launch count / capture count / allocation count / dry
    bucket. These do not depend on performance numbers, so they can be judged inside
    the ~8% run-to-run noise. Performance is recorded, never used as a gate.
@@ -67,9 +74,11 @@ must already be off the critical path to make the comparison fair).
   descriptor array", F4).
 - **Depends on**: M0 + F4.
 - **Judged by**: ① no new allocation and no address change across a whole decode
-  (assertion); ② **under eager**, old host-computed launch geometry vs descriptor-driven
-  is token-identical, with the hit set changing every step; ③ no graph / PCIe machinery
-  involved.
+  (assertion); ② **under eager**, old host-computed launch geometry vs descriptor-driven is
+  **bit-identical at kernel level** (done, M1.1) and, at engine level, *distributionally*
+  equivalent — N greedy runs of each binary give the same variant set and no earlier
+  divergence (see the reproducibility finding in [`worklogs/m1.md`](worklogs/m1.md));
+  ③ no graph / PCIe machinery involved.
 - **Why independently verifiable**: it does not touch capture at all, so the largest
   kernel rewrite is tested on the existing eager path. A failure is a kernel regression,
   not an architecture failure.
