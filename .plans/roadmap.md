@@ -50,7 +50,13 @@ must already be off the critical path to make the comparison fair).
   pattern (kept for RDNA portability), and **correct values are not evidence of no baking**
   — only the structural `waited` check caught the baked-target control.
 
-### M1 — static address layout + descriptor-driven kernel (no graph)
+### M1 — static address layout + descriptor-driven kernel (no graph) — 🔄 IN PROGRESS
+
+> Recon + first slice landed: see [`worklogs/m1.md`](worklogs/m1.md). The F4 target is
+> `indexed_moe_fused_decode` (the GPU path), **not** the CPU `fused_moe_decode` the plan
+> named. `MoeDecodeCapture` (fixed-grid, fixed buffers) is implemented and verified
+> bit-identical to the host-geometry path under eager. Still open: the 7-ring warmup and
+> wiring the engine to it.
 
 - **Does**: ① `load → 7-ring warmup` — create the 7 quant shapes' staging rings and
   all per-layer banks once, before any capture; ② all `FlagBuf` / descriptor /
