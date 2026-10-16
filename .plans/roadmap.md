@@ -58,15 +58,14 @@ must already be off the critical path to make the comparison fair).
   pattern (kept for RDNA portability), and **correct values are not evidence of no baking**
   — only the structural `waited` check caught the baked-target control.
 
-### M1 — static address layout + descriptor-driven kernel (no graph) — 🔄 engine wiring left
+### M1 — static address layout + descriptor-driven kernel (no graph) — ✅ DONE 2026-10-16
 
-> Recon, M1.1 and M1.2 landed: see [`worklogs/m1.md`](worklogs/m1.md). The F4 target is
+> See [`worklogs/m1.md`](worklogs/m1.md). Engine wiring landed in M2 step A: `serve --pcie-frac 0` is **byte-identical to the frozen oracle** with 48 captures engaged, and the ring set is frozen across the decode. Recon: The F4 target is
 > `indexed_moe_fused_decode` (the GPU path), **not** the CPU `fused_moe_decode` the plan
 > named. `MoeDecodeCapture` (fixed-grid, fixed buffers) is verified **bit-identical** to the
 > host-geometry path under eager (fork `729d2c64`); the v2 engine is the imported `naiwa-rs`
 > baseline with the 7-ring warmup + a frozen-ring-set assertion (`--pcie-frac > 0`: 3 rings,
 > all created after load, 0 created during decode). Remaining: route the engine's resident-hit
-> path through `MoeDecodeCapture` and re-run the eager A/B at engine level.
 
 - **Does**: ① `load → 7-ring warmup` — create the 7 quant shapes' staging rings and
   all per-layer banks once, before any capture; ② all `FlagBuf` / descriptor /
@@ -83,13 +82,13 @@ must already be off the critical path to make the comparison fair).
   kernel rewrite is tested on the existing eager path. A failure is a kernel regression,
   not an architecture failure.
 
-### M2 — per-layer MoE graph skeleton (resident path only) — 🔄 kernel-level done, engine open
+### M2 — per-layer MoE graph skeleton (resident path only) — 🔄 capture done; engine replay + launch count open
 
 > See [`worklogs/m2.md`](worklogs/m2.md). The four-kernel MoE segment now captures into **one**
 > CUDA graph and replays with live staging data, **bitwise identical** to the eager path
 > (fork `0359eaae`). Criterion ③ is answered: **150 captures cost 11.6 ms** (0.078 ms/graph,
 > fork `20407494`), so pre-capture the whole set at load. Still open: the `MoEGraphKey` registry,
-> per-layer launch on the engine, the launch-count measurement, and BF16 vs F32 staging.
+> per-layer launch on the engine, and the launch-count measurement. Engine **step A (eager)** is done: the resident-hit path runs through `MoeDecodeCapture`, byte-identical to the oracle. BF16 staging is done.
 
 - **Does**: the MoE registry (`MoEGraphKey`, architecture-v2 §6.2 — **not** the
   whole-step key), the F2 emitter, per-layer capture and launch.
