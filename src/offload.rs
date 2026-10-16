@@ -61,14 +61,13 @@ pub fn install_cpu_moe(
 /// model finishes loading (`warmup_rings`). `None` when `--expert-cache-gb` was not used.
 static GPU_CACHE_PROVIDER: OnceLock<Arc<GpuCacheMoeProvider>> = OnceLock::new();
 
-/// v2 M1: build every quant shape's staging ring now. Call once after the model is loaded and
-/// before the first decode, so the ring addresses are fixed for the process lifetime (a
-/// capture needs that; the W105 lazy-at-first-decode creation cannot provide it). Returns the
-/// number of rings, or 0 when no GPU expert cache is installed.
-pub fn warmup_rings() -> Result<usize> {
+/// v2 M1/M2: build every fixed-address structure after load and before the first decode — each
+/// resident bank's fixed-grid capture path, and (with `--pcie-frac`) the quant shapes' staging
+/// rings. Returns `(captures, rings)`; `(0, 0)` when no GPU expert cache is installed.
+pub fn warmup() -> Result<(usize, usize)> {
     match GPU_CACHE_PROVIDER.get() {
-        Some(provider) => Ok(provider.warmup_rings()?),
-        None => Ok(0),
+        Some(provider) => Ok(provider.warmup()?),
+        None => Ok((0, 0)),
     }
 }
 

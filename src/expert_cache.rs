@@ -221,15 +221,25 @@ impl GpuCacheMoeProvider {
     /// over by the time this runs, so the allocator has large free blocks again — but the
     /// first *decode* is too late for a capture, which needs the address up front. Warmup
     /// closes that window. No-op for layers without a copy stream. Returns the ring count.
-    pub fn warmup_rings(&self) -> candle_core::Result<usize> {
-        // The rings exist only for the `--pcie-frac` path; do not spend the ~215 MiB otherwise.
-        if self.pcie_frac <= 0.0 {
-            return Ok(0);
+    /// v2 M1/M2: build everything that must have a fixed address before the first decode — every
+    /// resident bank's fixed-grid capture path (always), and the staging rings (only with
+    /// `--pcie-frac`, which is where the ~215 MiB belongs). Returns `(captures, rings)`.
+    pub fn warmup(&self) -> candle_core::Result<(usize, usize)> {
+        let layers = self.registry.all();
+        #[allow(unused_mut)]
+        let mut captures = 0usize;
+        #[cfg(feature = "cuda")]
+        for layer in &layers {
+            captures += layer.warmup_captures(DType::BF16)?;
         }
-        for layer in self.registry.all() {
-            layer.warmup_scratch_ring()?;
+        let mut rings = 0usize;
+        if self.pcie_frac > 0.0 {
+            for layer in &layers {
+                layer.warmup_scratch_ring()?;
+            }
+            rings = self.registry.ring_creations.load(Ordering::Relaxed);
         }
-        Ok(self.registry.ring_creations.load(Ordering::Relaxed))
+        Ok((captures, rings))
     }
 
     /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
@@ -1061,11 +1071,31 @@ struct SlotWeights {
 /// Slots `[first, first + len)` of a layer in copy-stream mode: one `[len, N, K]` device
 /// allocation per projection, which the fused decode kernel indexes by `slot - first`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// v2 M1/M2: the fixed-grid capture path for one bank. `cap` owns every fixed buffer and (from
+/// M2) the captured graph; `ids`/`weights` are its persistent `[max_batch, max_topk]`
+/// descriptors, written per step with a stream-ordered H2D. Created once, after load.
+#[cfg(feature = "cuda")]
+struct BankCapture {
+    cap: mistralrs_quant::MoeDecodeCapture,
+    ids: candle_core::cuda::cudarc::driver::CudaSlice<u32>,
+    weights: candle_core::cuda::cudarc::driver::CudaSlice<f32>,
+}
+
+// SAFETY: `CudaGraph` is `!Send` because CUDA graph handles are not internally thread-safe, not
+// because this use is unsound. The capture is only ever touched from the token thread and the
+// `Mutex` serializes access; the fork's own graph handle asserts the same
+// (`unsafe impl Send for CudaGraphHandle`).
+#[cfg(feature = "cuda")]
+unsafe impl Send for BankCapture {}
+
 struct Bank {
     first: usize,
     gate: Arc<QTensor>,
     up: Arc<QTensor>,
     down: Arc<QTensor>,
+    /// Lazily created once in the post-load warmup; `None` until then and for the staging ring.
+    #[cfg(feature = "cuda")]
+    capture: Mutex<Option<BankCapture>>,
 }
 
 /// One slot's contents. In copy-stream mode `memory` is the slot's view of its bank, overwritten
@@ -1142,6 +1172,8 @@ fn alloc_bank(
         gate,
         up,
         down,
+        #[cfg(feature = "cuda")]
+        capture: Mutex::new(None),
     });
     gate_views
         .into_iter()
@@ -1157,6 +1189,90 @@ fn alloc_bank(
         })
         .collect()
 }
+
+impl Bank {
+    /// v2 M1/M2: create this bank's fixed-grid capture path. Idempotent; called once per bank in
+    /// the post-load warmup, so every buffer address is fixed before the first decode.
+    #[cfg(feature = "cuda")]
+    fn create_capture(
+        &self,
+        max_batch: usize,
+        max_topk: usize,
+        stage_dtype: DType,
+    ) -> candle_core::Result<bool> {
+        let mut slot = self.capture.lock().unwrap();
+        if slot.is_some() {
+            return Ok(false);
+        }
+        let gate_device = self.gate.device();
+        let dev = gate_device.as_cuda_device()?;
+        let cap = mistralrs_quant::MoeDecodeCapture::new(
+            &self.gate,
+            &self.up,
+            &self.down,
+            max_batch,
+            max_topk,
+            stage_dtype,
+            dev,
+        )?;
+        let n = max_batch * max_topk;
+        let ids = dev.alloc_zeros::<u32>(n)?;
+        let weights = dev.alloc_zeros::<f32>(n)?;
+        *slot = Some(BankCapture { cap, ids, weights });
+        Ok(true)
+    }
+
+    /// Run this bank's hits through the fixed-grid path, or `None` when it cannot serve the call
+    /// (no capture yet, too many rows, or an activation dtype/size it was not built for) — the
+    /// caller then uses the old host-geometry path. `rows` may not exceed the capture's
+    /// `max_batch`; that is the allowed row-bucket fallback, unrelated to misses.
+    #[cfg(feature = "cuda")]
+    fn fused_decode_capture(
+        &self,
+        x2d: &Tensor,
+        per_row: &[Vec<(u32, f32)>],
+        rows: usize,
+        act_type: i32,
+    ) -> candle_core::Result<Option<Tensor>> {
+        let mut guard = self.capture.lock().unwrap();
+        let Some(c) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let (max_batch, max_topk, hidden, _) = c.cap.dims();
+        if rows > max_batch || x2d.dim(1)? != hidden {
+            return Ok(None);
+        }
+        if x2d.dtype() != DType::BF16 {
+            // Built for BF16 activations; fall back rather than mis-stage.
+            return Ok(None);
+        }
+
+        // Padded `[max_batch, max_topk]` descriptors: unused slots repeat a valid local slot
+        // index with weight 0 (the fused gate+up kernel has no `expert_id` bound check).
+        let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
+        let mut ids = vec![pad; max_batch * max_topk];
+        let mut ws = vec![0f32; max_batch * max_topk];
+        for (t, row) in per_row.iter().enumerate().take(rows) {
+            for (j, &(local, w)) in row.iter().enumerate().take(max_topk) {
+                ids[t * max_topk + j] = local;
+                ws[t * max_topk + j] = w;
+            }
+        }
+        let dev = x2d.device().as_cuda_device()?;
+        dev.memcpy_htod(ids.as_slice(), &mut c.ids)?;
+        dev.memcpy_htod(ws.as_slice(), &mut c.weights)?;
+        c.cap
+            .run(&self.gate, &self.up, &self.down, x2d, &c.ids, &c.weights, act_type)?;
+        Ok(Some(c.cap.output()?.narrow(0, 0, rows)?))
+    }
+}
+
+/// The v2 M1/M2 fixed-grid batch bound, matching the lookahead channel's policy
+/// (`LookaheadChannel::new`): it must cover the largest decode batch, with 16 rows of headroom
+/// over any current window (np4 verify = 5, observed verify = 7). Calls above it use the old
+/// host-geometry path — the allowed row-bucket fallback.
+#[cfg(feature = "cuda")]
+const CAPTURE_MAX_BATCH: usize = 16;
 
 /// The fused MoE decode kernel's activation id, if it has one for `act`.
 #[cfg(feature = "cuda")]
@@ -1251,6 +1367,30 @@ struct CachedLayer {
 }
 
 impl CachedLayer {
+    /// v2 M1/M2: create every resident bank's fixed-grid capture path. Runs after load and before
+    /// the first decode, so all capture buffers have fixed addresses. Returns how many banks were
+    /// newly given a capture. No-op without `cuda` or with no copy-stream banks.
+    #[cfg(feature = "cuda")]
+    fn warmup_captures(&self, stage_dtype: DType) -> candle_core::Result<usize> {
+        let mut banks: Vec<Arc<Bank>> = Vec::new();
+        for entry in &self.slot_bufs {
+            let guard = entry.lock();
+            let Some(buf) = guard.as_ref() else { continue };
+            let Some(bank) = buf.bank.as_ref() else { continue };
+            if banks.iter().any(|b| Arc::ptr_eq(b, bank)) {
+                continue;
+            }
+            banks.push(Arc::clone(bank));
+        }
+        let mut made = 0;
+        for bank in banks {
+            if bank.create_capture(CAPTURE_MAX_BATCH, self.top_k, stage_dtype)? {
+                made += 1;
+            }
+        }
+        Ok(made)
+    }
+
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
     /// A no-op when the layer has no copy stream or no CPU `QTensor`s. Called once after load.
     fn warmup_scratch_ring(&self) -> candle_core::Result<()> {
@@ -1592,6 +1732,13 @@ impl CachedLayer {
                 }
             }
             for (bank, per_row) in groups {
+                // v2 M1/M2: the fixed-grid path, when the bank has a capture that can serve this
+                // call. `None` (no capture, too many rows, wrong activation shape/graph build) is
+                // the allowed row-bucket fallback, not a miss fallback.
+                if let Some(y) = bank.fused_decode_capture(x2d, &per_row, rows, act_type)? {
+                    add(y)?;
+                    continue;
+                }
                 let width = per_row.iter().map(Vec::len).max().unwrap_or(0);
                 let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
                 let mut ids = Vec::with_capacity(rows * width);
