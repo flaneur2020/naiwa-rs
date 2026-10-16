@@ -83,7 +83,12 @@ must already be off the critical path to make the comparison fair).
   kernel rewrite is tested on the existing eager path. A failure is a kernel regression,
   not an architecture failure.
 
-### M2 — per-layer MoE graph skeleton (resident path only)
+### M2 — per-layer MoE graph skeleton (resident path only) — 🔄 kernel-level done, engine open
+
+> See [`worklogs/m2.md`](worklogs/m2.md). The four-kernel MoE segment now captures into **one**
+> CUDA graph and replays with live staging data, **bitwise identical** to the eager path
+> (fork `0359eaae`). Still open: the `MoEGraphKey` registry, per-layer launch on the engine, the
+> launch-count measurement, and the ~150-capture one-time cost.
 
 - **Does**: the MoE registry (`MoEGraphKey`, architecture-v2 §6.2 — **not** the
   whole-step key), the F2 emitter, per-layer capture and launch.
