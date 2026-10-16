@@ -159,7 +159,9 @@ must already be off the critical path to make the comparison fair).
 - **Q2 (PLE strategy)** — the only prerequisite of M6. Decide within M0–M2 by reading
   `ple.rs`'s n-gram hash / prefetch path: can the per-layer conv history be reproduced
   on the host? (~half a day.) See architecture-v2 §3.3.4.
-- **Nondeterminism of the PCIe path** — with `--pcie-frac > 0` (and the spin pool on) greedy
-  decode is not bit-reproducible (5 runs → 2 continuations); `--pcie-frac 0` is 8/8 stable.
-  Does not block M1/M2. Must be characterized before M3/M4, because those milestones build
-  directly on that path. See [`worklogs/m1.md`](worklogs/m1.md).
+- **PCIe-path nondeterminism — RESOLVED (benign).** Characterized 2026-10-16: it is float
+  summation order, not a data race (a 64-slot ring does not stabilize it; `NAIWA_NO_LOOKAHEAD=1`
+  gives 10/10 identical). The advisory lookahead's timing changes the resident/miss split, hence
+  the `atomicAdd` term set, so near-ties flip. **M3/M4 are numerically safe to build on it**; but
+  bitwise engine-level verification must use `--pcie-frac 0`, and M3/M4 checks are distributional
+  otherwise. See [`worklogs/m1.md`](worklogs/m1.md).
