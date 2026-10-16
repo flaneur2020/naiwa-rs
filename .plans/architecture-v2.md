@@ -334,7 +334,7 @@ shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 �
 | X3 | W100：第一次 D2H 的 x 与第二次 `to_device(Cpu)` 重复 | 图上已经解决：x 只经 mapped 通道走一次（"GPU copy from mapped result" 是**回程**） |
 | X4 | design.md R5 说整步 graph + 每层 kernel 降到 20 多个 | 与 §1.3(A) 的 per-layer MoE graph **不是同一件事**。图是可行的第一步；整步 graph 需要先解 PLE |
 | X5 | W99：worker 上的 CUDA 调用会迟到 | 图上的 CPU 支路只做**列清单 + CPU 计算 + 预测**；自旋池 worker **不发起任何 CUDA 调用**。55% 那路是真 H2D（pinned→VRAM），捕获期禁 H2D，因此必须在 graph 外由 **token 线程（或一个专职 copy-issuer 线程）**在 copy stream 上 `cudaMemcpyAsync`；worker 只把「未命中列表」写进 mapped 让 token 线程看到。文档初稿「CPU 支路做 DMA 发起」的措辞在此修正 |
-| X6 | W94：spin pool 「loses stably」，但同一条 finding #3 说 lookahead 半边是 **win** | 拆开处理：专家批保持 rayon、lookahead 走专用 spin-then-park 线程（§6.3）。W94 的失败机制（host 在 `drain_epoch` 上的关键路径 + per-call publish/fence）正是 M2 要删的东西，所以它既不能证成也不能证伪 v2 里的池；而 lookahead 的收益已实测 |
+| X6 | W94：spin pool 「loses stably」，但同一条 finding #3 说 lookahead 半边是 **win** | 拆开处理：专家批保持 rayon、lookahead 走专用 spin-then-park 线程（§6.3）。W94 的失败机制（host 在 `drain_epoch` 上的关键路径 + per-call publish/fence）正是 M3 要删的东西，所以它既不能证成也不能证伪 v2 里的池；而 lookahead 的收益已实测 |
 
 ---
 
@@ -345,7 +345,7 @@ shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 �
 | # | 问题 | 结论 |
 |---|---|---|
 | Q1 | graph 的范围 | **(c)** 先做 per-layer MoE 段 graph（48 次 launch，图上画的）；PLE 单独立项，之后视 PLE 结果再升级到整步 (b) |
-| Q2 | PLE 的策略 | **仍开放**。上一轮已把天平显著推向 (b)：PLE 每 step 只有一个节点（§1.3(A)），host 预取到 pre-graph staging 的性价比远高于文档初稿的估计；唯一 blocker 是 n-gram hash 依赖 device 上的 per-layer conv history 能否在 host 复现——应在 M0/M1 期间用半天验证 |
+| Q2 | PLE 的策略 | **仍开放**。上一轮已把天平显著推向 (b)：PLE 每 step 只有一个节点（§1.3(A)），host 预取到 pre-graph staging 的性价比远高于文档初稿的估计；唯一 blocker 是 n-gram hash 依赖 device 上的 per-layer conv history 能否在 host 复现——应在 M0–M2 期间用半天验证 |
 | Q3 | expert bank 布局 | **(b)** per-layer bank + 48 张 graph（+ MTP 头 1 张）。理由见 §6.1 |
 | Q4 | 第一个里程碑 | **M0**（见 §7）：零实参原语的可见性 + replay 200 次，是硬阻塞项 |
 | Q5 | CPU/PCIe 分路比例 | **动态**，按 miss 数决定；`frac` 只作为带宽旋钮，不再当 TPOT 杠杆（X1） |
@@ -396,7 +396,7 @@ admission、flashinfer scratch 对 MoE 段全是噪音。因此 §3.3.1 的「�
 捕获时机（用户已定，与 §3.4 的加载顺序一致）：
 1. load 完成后、任何捕获之前，先跑 **7-ring 预热**，把 7 个 shape 的 staging ring 与所有
    per-layer bank 一次性建好。
-2. 再按 `MoEGraphKey` 捕获。M1 需实测 150 次 `begin_capture→instantiate→upload` 的总耗时；
+2. 再按 `MoEGraphKey` 捕获。M2 需实测 150 次 `begin_capture→instantiate→upload` 的总耗时；
    若偏大，退路是只预捕获稳态 bucket（np2），np0/np1 保持 eager。**注意这个退路是「行数
    bucket」回退，与 miss 无关**（attention 本来就在 graph 外，回退路径天然存在）。
 3. **pad rows**：整步框架的 pad 行别名到 row 0；MoE 段里 pad 行会产生多余的专家计算与描述符项。
@@ -427,12 +427,12 @@ PCIe（graph 内自旋等 DMA，§1.1 node 5–6）和 CPU（graph 内自旋等 
   的强项，也天然吃下混合 quant 的 7 种 shape 成本差异），lookahead 要最低延迟且**不能排队在专家
   任务之后**（专用线程的强项）。
 
-**v2 改变了什么**：M2 删掉了 `drain_epoch` / 发布线程 drain / per-call host fence，即 W94 的失败
+**v2 改变了什么**：M3 删掉了 `drain_epoch` / 发布线程 drain / per-call host fence，即 W94 的失败
 机制本身。因此 **W94 不能作为 v2 里「池会输」的证据**；但它同样**不是「池会赢」的证据**——池唯一
 已证的优势在 lookahead 半边。专家批没有理由改用池，而池的持续空转会直接消耗 v2 想腾出来的 host
 资源。
 
-**派发配置在 v2 里固定**为 rayon + 专用 lookahead 线程（§6.4，无 A/B 开关）。M4 仍要用
+**派发配置在 v2 里固定**为 rayon + 专用 lookahead 线程（§6.4，无 A/B 开关）。M5 仍要用
 STEP_DBG 测 (a) 专家派发是否在关键路径上、(b) 命中率是否跌破 W105 的 ~78% 拐点；这是**验证**
 既定配置，不是翻开关。若 (a) 反常成立，把它当作一个需要单独处理的测量问题（临时改代码验证），
 而不是常备一条分叉。
@@ -447,43 +447,83 @@ STEP_DBG 测 (a) 专家派发是否在关键路径上、(b) 命中率是否跌�
 已经成了复杂度。而 v2 的两项前置结论（W94 分半、W105b CPU 路径全隐藏）已经把派发选择定住，
 再为「万一要翻案」保留开关，收益不抵复杂度。
 
-代价与接受方式：v2 无法在不改代码的情况下翻臂。若 M4 的 STEP_DBG 出现与预期相反的异常
+代价与接受方式：v2 无法在不改代码的情况下翻臂。若 M5 的 STEP_DBG 出现与预期相反的异常
 （专家派发确实在关键路径上），处理方式是**临时改代码验证**，而不是常备一个开关；此时以 git
 commit 为单位记录两侧配置（benchmark 记录 commit hash，而不是 env 组合）。
 
-**仍然保留：只读探针。** `NAIWA_STEP_DBG` 这类 env 门控的日志/事件插桩**不是** A/B 开关——M4
+**仍然保留：只读探针。** `NAIWA_STEP_DBG` 这类 env 门控的日志/事件插桩**不是** A/B 开关——M5
 的判据（W105e 的 dry bucket 测量）依赖它，且它不改行为、无分叉。
 
 ---
 
-## 7. 实施顺序（Q1/Q3/Q5 已定）
+## 7. 实施顺序（每步可行、可独立验证）
 
-**M0 — 同步原语 harness（1 天）**
-零实参 `wait_ge_ptr` / `wait_copy_ptr` 的可见性验证；捕获进 graph 后 replay 200 次不丢。
-产物：`~/bench-rel/naiwa-v2/harness/`，10 行 kernel + 1000 次循环。
+**共同判据**：
+- **数值 oracle**：冻结的 eager 参考——固定 prompt 集 + greedy，逐 token 比对。
+- **结构性判据**：发射计数 / 捕获计数 / 分配计数 / dry bucket。它不依赖性能数字，因此在 8% 噪声里
+  也能判定通过与否（性能另记，不作为门槛）。
+- 每个里程碑只引入一类新机制，保证失败时归因单一。
 
-**M1 — 单层 MoE graph 骨架（只跑驻留路径）**
-用「全驻留」配置，只验证 graph 骨架本身：一层 MoE 从 ~60 次发射降到 **1 次 launch、0 次自旋**，
-greedy 输出与 eager 一致。这是**脚手架范围，不是目标行为**——miss 路径不在 M1 里，但它由 M2/M3
-加进 graph，**绝不回退 eager**（见 §6.2 不变量）。同时实测 150 次
-`begin_capture→instantiate→upload` 的一次性成本（§6.2），并验证 pad rows 被 `real_rows` 排除。
+**M0 — 同步原语 harness（~1 天，独立于引擎）**
+- 内容：零实参 `wait_ge_ptr` / `wait_copy_ptr` 的 ① 跨 host/GPU 可见性（目标卡 fence 语义：Ada
+  一次、RDNA 两次）② 捕获进 graph 后 replay 200 次不丢。
+- 依赖：无（**硬阻塞项**）。
+- 判据：① 1000 次循环 100% 可见；② 捕获后 replay 200 次 payload 全部正确。
+- 产物：`~/bench-rel/naiwa-v2/harness/`（10 行 kernel + 循环）。
+- 可行性：纯 harness，不碰引擎。
 
-**M2 — 双向通道 + CPU 结果回程（miss 进入 graph）**
-把 `deferred` 的 host function 换成 `wait_copy_ptr`：CPU 那部分未命中改为 graph 内自旋等 mapped
-结果 + D2D 拷回。目标：token 线程上零同步点；**miss 从这一刻起全程在 graph 内**。
+**M1 — 静态地址布局 + 描述符驱动 kernel（不做 graph）**
+- 内容：① load → 7-ring 预热（7 个 shape 的 staging ring + 所有 per-layer bank 一次建齐）；
+  ② `FlagBuf`/描述符全部 load 期分配，地址终身不变；③ `fused_moe_decode` 改为「读计数 →
+  grid-stride 处理描述符数组」（F4）。
+- 依赖：M0（原语）+ F4。
+- 判据：① 预热后整个 decode 无新分配、地址不变（断言）；② **eager 下**老几何发射 vs 描述符驱动
+  逐 token 数值一致，且命中集每步变化；③ 不引入 graph/PCIe 的任何东西。
+- 为什么可独立验证：**完全不碰捕获**，用现成 eager 路径就能测——把「最大的一块 kernel 工作」
+  （W101–W103 的延续）与 graph 机制解耦；失败就只是 kernel 回归，不牵连架构。
 
-**M3 — 全局 staging + PCIe 路（三路齐）**
-PCIe 那部分未命中进 graph：graph 内自旋等 DMA 完成再算。至此命中 / PCIe / CPU 三路与 gather 全部
-在图内，**任何 miss 组合都不触发重捕获或 eager**（§3.3.3 方案 A）。frac 仅作带宽旋钮，不再当
-TPOT 杠杆（X1/Q5）。
+**M2 — per-layer MoE graph 骨架（只跑驻留路径）**
+- 内容：MoE registry（`MoEGraphKey`，§6.2）+ F2 emitter + per-layer 捕获/launch。
+- 依赖：M1。
+- 判据：① 全驻留配置下 greedy 逐 token == eager；② 一层从 ~60 次发射 → **1 次 launch、0 次自旋**；
+  ③ 150 次 `begin_capture→instantiate→upload` 一次性成本已测并记录；④ pad rows 被 `real_rows` 排除。
+- 备注：这是**脚手架范围，不是目标行为**；miss 由 M3/M4 加进图，绝不回退 eager（§6.2）。
 
-**M4 — lookahead 进专用线程 + 验证派发假设**
-lookahead/预测进 1–2 个专用 **spin-then-park** 线程（不是无条件空转）；专家批保持 rayon（§6.3）。
-到 M4 才第一次具备公平评估条件：host 此时已从关键路径移除，用 STEP_DBG 测 (a) 专家派发是否真的在
-关键路径上、(b) 命中率是否因 lookahead 迟到跌破 W105 的 ~78% 拐点。这两项是**验证**既定配置，
-不是翻 A/B 开关（v2 不保留开关，§6.4）；若 (a) 反常成立，临时改代码单独评估。
+**M3 — CPU 结果回程进 graph（miss 进入 graph）**
+- 内容：`deferred` 的 `cudaLaunchHostFunc` → `wait_copy_ptr`（§3.2）。
+- 依赖：M2。
+- 判据：① 有 miss 时 greedy == eager；② **miss 全程在图内**（断言/计数证明未走 eager 路径）；
+  ③ token 线程零同步点（STEP_DBG 的 dry bucket 下降）；④ 失败注入：worker 出错仍 bump seq，GPU
+  不永久自旋（`Drop` 补 publish）。
 
-**M5 — PLE（若 Q2 选 b/c）+ 整步 graph**
+**M4 — PCIe 路进 graph（三路齐）**
+- 内容：55% 那路（真 H2D，graph 外由 token 线程发起；graph 内自旋等 DMA 完成）入图。
+- 依赖：M3。
+- 判据：① 命中/PCIe/CPU 三路求和 == eager；② **任何 miss 组合都不重捕获**（捕获计数不随
+  miss/hit 变化）；③ frac 只作带宽旋钮（X1/Q5）。
+
+**M5 — lookahead 专用 spin-then-park 线程 + 验证派发假设**
+- 内容：lookahead/预测进 1–2 个专用线程（§6.3）；专家批保持 rayon。
+- 依赖：**实现**只依赖 M2；**测量**依赖 M4（要 host 已从关键路径移除才公平）。
+- 判据：① 命中率不低于现状（不跌破 W105 ~78% 拐点）；② STEP_DBG 证明专家派发不在关键路径上；
+  ③ 无 A/B 开关（§6.4），以 commit 记录配置。
+- 备注：若 ② 反常成立，临时改代码单独评估，不加常备分叉。
+
+**M6 — PLE（Q2 定）+ 整步 graph**
+- 依赖：Q2 结论 + F1 + F5。
+- 判据：整步 **1 次 launch**；greedy == eager；捕获路径无 host 依赖控制流、无临时分配、无 H2D。
+
+**独立验证矩阵**（每步只新增一类机制）：
+
+| 步 | 新增机制 | 独立判据（不靠性能） |
+|---|---|---|
+| M0 | mapped 自旋原语 | 可见性 1000/1000；replay 200 次不丢 |
+| M1 | 静态布局 + 描述符 kernel | eager 数值一致；无新分配/地址不变 |
+| M2 | per-layer 捕获 | 发射 60→1；逐 token == eager |
+| M3 | CPU 回程进图 | miss 在图内（计数）；dry bucket 下降 |
+| M4 | PCIe 进图 | 三路 == eager；捕获计数与 miss 无关 |
+| M5 | lookahead 专用线程 | 命中率不破拐点；派发不在关键路径 |
+| M6 | PLE + 整步图 | 1 次 launch；逐 token == eager |
 
 ---
 
