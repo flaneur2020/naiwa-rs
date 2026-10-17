@@ -265,12 +265,18 @@ impl GpuCacheMoeProvider {
         if let Some(first) = layers.first() {
             let device = first.slot_device.clone();
             let max_n = CAPTURE_MAX_BATCH * first.hidden;
-            match crate::doorbell::ScheduleBuf::acquire(
-                &device,
-                WAITS_PER_LAYER,
-                layers.len(),
-                max_n,
-            ) {
+            // One slot past the highest decoder layer: the MTP head is a site of its own
+            // (`site.layer == layers.len()`), it is not a `CachedLayer` (its experts are host-resident),
+            // and yet it publishes and waits on the *same* schedule. Sizing the schedule by the decoder
+            // count alone put its `SYNC_CPU_EXPERTS`/payload slot past the end of the mapping, which
+            // surfaced as CUDA_ERROR_ILLEGAL_ADDRESS on the first draft step.
+            let slots = layers
+                .iter()
+                .map(|l| l.layer)
+                .max()
+                .map(|max| max + 2)
+                .unwrap_or(layers.len());
+            match crate::doorbell::ScheduleBuf::acquire(&device, WAITS_PER_LAYER, slots, max_n) {
                 Ok(Some(sched)) => {
                     let _ = SCHEDULE.set(Arc::new(sched));
                 }

@@ -49,11 +49,29 @@ Measured today:
 | **shards + `--mmproj` component, no `--mtp`** | **fine: 12.5 tok/s, 79.8 ms TPOT** (the component merges cleanly) |
 | shards + `--mmproj` + `--mtp` | **`CUDA_ERROR_ILLEGAL_ADDRESS`** in the first draft/verify step |
 
-So the blocker is no longer the artifact but the draft path itself, and there is already a pointer to
-where: the MTP site's experts are not in the engine's schedule - they go through the legacy global
-`CpuExperts` channel (`prefill_stream.rs:373` has an explicit `ctx.site.is_mtp` branch). An illegal
-address on the first MTP step is what an off-schedule expert site looks like when its buffers were never
-staged.
+So the blocker is no longer the artifact but the draft path itself.
+
+**Found and fixed while chasing it: the schedule was sized for the decoder only.** `ScheduleBuf` is
+`8 + k*4 + slots*max_n*4` with `k = slots * WAITS_PER_LAYER` and `slots = layers.len()`, and
+`sync_id(layer, kind) = layer * WAITS_PER_LAYER + kind`. The MTP head is a site of its own with
+`layer == layers.len()` (48), so its `SYNC_CPU_EXPERTS` id (144..146) and its payload slot (48) both sat
+past the end of the mapping - a guaranteed illegal access the first time the head published. The schedule
+now reserves one slot past the highest decoder layer (`slots = max_layer + 2`). That is a real bug fixed
+and it leaves the decoder byte-identical (oracle re-checked).
+
+It is not the only one: `--mtp` still faults with `CUDA_ERROR_ILLEGAL_ADDRESS`. Remaining suspects, in
+order:
+
+1. **the component's `nextn.eh_proj` slicing** - `repack.py` passes `blk.48.nextn.eh_proj.weight` through
+   whole and the fork binds `fc_embedding`/`fc_hidden` as two halves of it; a half-offset mismatch reads
+   past the tensor;
+2. **the MTP block's own attention/state** - `MtpAttentionInputs` takes its own KV/state path, and the
+   hybrid cache may not carry a slot for layer 48;
+3. **the legacy `CpuExperts` channel under MTP row counts** (the head's experts are host-resident by
+   design, `expert_cache.rs` `ctx.site.is_mtp` branch).
+
+`compute-sanitizer` is not usable here: it turns the 60 GB model load into an hours-long run (killed at
+900 s), so the next diagnostic has to be targeted logging in `mtp.rs` instead.
 
 With the draft path working, the same 86 ms pass carries ~2.5 tokens; minus the extra cost of the verify
 rows (2-3 rows instead of 1 - our per-layer *host* work barely moves, the GPU segments grow) that is
