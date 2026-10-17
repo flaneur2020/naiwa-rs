@@ -39,7 +39,7 @@ mapped:  epoch u32（device 每 pass 写一次）  ready[K] u32（每点一个�
 | M2 | per-layer MoE graph | ✅ 48 张捕获、1 launch/层；150 张捕获 11.6 ms |
 | M3 | CPU 结果经图内节点回 GPU | ✅ 门禁 5/5 |
 | M3.1 | doorbell 从 fork 移到引擎 | ✅ fork −1660 行 |
-| M4 | `PRELOAD`/`STAGING` 两个门铃点 | 🔄 原语已落（`wait_ready` + `publish_point_on_stream`），接线未做 |
+| M4 | PCIe 路进图（`STAGING`） | ✅ 5/5 + 2/2 逐字节；48 gate / 384 replay / 0 退化 |
 | M5 | lookahead 进专用 spin-then-park 线程 | ⬜ |
 | M6 | PLE（等 Q2）+ 整步图 | ⬜ |
 
@@ -78,13 +78,12 @@ mapped:  epoch u32（device 每 pass 写一次）  ready[K] u32（每点一个�
 | `bump_epoch` 传 host 指针 | 必须传 mapped 的 **device view**（UVA 下同址，单测看不出来） |
 | 同步/异步发布混用 | 必须全部走 worker FIFO |
 
-## 下一步（M4）
+## 下一步（M5）
 
-1. `stream_pcie` 的 DMA 入队后，在 **copy stream** 上 `publish_point_on_stream(id(layer,STAGING), pass)`；
-2. lookahead 预载 DMA 同理（要把 `pass` 传给 worker）；
-3. 每层图里加两个 `wait_ready` 节点（PRELOAD 在 compute cached 前，STAGING 在 compute DMA copied 前）；
-4. 删掉 host 侧 `done.wait_on`（`cudaStreamWaitEvent`）；
-5. 门禁：`--pcie-frac 0.55` + `NO_LOOKAHEAD` 与当前实现逐字节等价。
+1. lookahead 预载改成非阻塞（`queue_async`）+ 专用 spin-then-park 线程；
+2. 预载 DMA 入队后在 copy stream 上 `publish_point_on(id(layer,PRELOAD), pass)`，把该层 resident
+   capture 加一个 `wait_ready` 节点（capture 已是 per-layer，无需新的 keying）；
+3. 专家批保持 rayon；门禁：`frac 0` + `NO_LOOKAHEAD` 逐字节 + 命中率不破拐点 + 派发不在关键路径。
 
 ## 开着的
 

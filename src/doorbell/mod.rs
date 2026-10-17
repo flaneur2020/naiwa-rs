@@ -14,6 +14,7 @@
 
 use std::ffi::c_void;
 
+use candle_core::cuda::cudarc::driver::sys;
 use candle_core::{Result, Tensor};
 
 /// The doorbell kernels' `extern "C"` surface. Module-private: everything above it is safe.
@@ -1025,15 +1026,19 @@ impl ScheduleBuf {
         id: u32,
         pass: u32,
     ) -> Result<()> {
-        use candle_core::cuda_backend::cudarc::driver::sys;
-        assert!((id as usize) < self.k, "sync id {id} out of range");
         let dev = device.as_cuda_device()?;
-        let stream = dev.cuda_stream();
+        self.publish_point_on(dev.cuda_stream().cu_stream(), id, pass)
+    }
+
+    /// [`Self::publish_point_on_stream`] on a raw stream handle — for a producer that is not on
+    /// candle's stream (the copy stream's DMA path, M4).
+    pub fn publish_point_on(&self, stream: sys::CUstream, id: u32, pass: u32) -> Result<()> {
+        assert!((id as usize) < self.k, "sync id {id} out of range");
         let addr = self.dev_ready_ptr() as sys::CUdeviceptr + (id as usize * 4) as sys::CUdeviceptr;
         // SAFETY: the word is inside the mapped allocation; the write is ordered on the stream.
         let rc = unsafe {
             sys::cuStreamWriteValue32_v2(
-                stream.cu_stream(),
+                stream,
                 addr,
                 pass,
                 sys::CUstreamWriteValue_flags_enum::CU_STREAM_WRITE_VALUE_DEFAULT as u32,

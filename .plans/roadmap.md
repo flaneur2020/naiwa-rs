@@ -119,22 +119,22 @@ must already be off the critical path to make the comparison fair).
   on the token thread (STEP_DBG dry bucket drops); ④ failure injection — a worker error
   still bumps seq, so the GPU never spins forever (`Drop` publishes).
 
-### M4 — PCIe path into the graph (all three paths) — 🔄 primitives landed
+### M4 — PCIe path into the graph — ✅ done (the 55% leg; `PRELOAD` deferred to M5)
 
-> **M3.1 (done):** the doorbell moved out of the fork into `naiwa-rs/src/doorbell/` (own
-> `build.rs` via cudaforge). Fork −1660 lines; 5/5 doorbell tests and the frac-0 oracle gate pass
-> from the engine. See [`worklogs/m3-1.md`](worklogs/m3-1.md).
-
-- **Does**: the 55% leg — a real H2D issued outside the graph by the token thread
-  (workers make no CUDA calls), with the graph spinning for DMA completion.
-  **Primitives landed (fork `d6dae82c`):** `doorbell_wait_ready` (wait-only node) and
-  `ScheduleBuf::publish_point_on_stream` (`cuStreamWriteValue32` on the copy stream, no kernel,
-  no host wait). Both `SYNC_PRELOAD` and `SYNC_STAGING` will use them. Remaining: point the two
-  DMA sites at them and drop the host-enqueued `cudaStreamWaitEvent`.
-- **Depends on**: M3.
-- **Judged by**: ① hit + PCIe + CPU three-way sum == eager; ② **no recapture for any
-  miss combination** (capture count is independent of miss/hit counts); ③ `frac` is only
-  a bandwidth knob (X1/Q5).
+- **Did**: the 55% leg. A real H2D issued outside the graph by the token thread (workers make no
+  CUDA calls); the copy stream publishes `SYNC_STAGING` with `cuStreamWriteValue32`, and a
+  per-layer **DMA gate graph** (one `wait_ready` node) spins for it before the MoE segment. The
+  host-enqueued `cudaStreamWaitEvent` per streamed expert is gone; the copies record no event at
+  all (`CopyStream::queue_async`).
+- **Judged by**: ① hit + PCIe + CPU three-way sum == eager — 5/5 byte-identical at `frac 0.55`
+  (and 2/2 at `frac 0`) to the frozen oracle, and identical to the pre-change binary; ② capture
+  count independent of misses — all 48 gates captured in the warmup, ring set frozen across the
+  decode; ③ `frac` only a bandwidth knob — `frac 0` captures and replays nothing, same output.
+  Must-fail control: a stale stamp hangs (killed at 200 s), so the spin is load-bearing.
+- **Not done here**: `SYNC_PRELOAD`. Today's preload copy is synchronous on a worker, so the
+  ordering edge is the residency descriptor, not a spin point; it becomes one when M5 makes the
+  preload non-blocking (`queue_async`) — the gate above is the template.
+- See [`worklogs/m4.md`](worklogs/m4.md).
 
 ### M5 — lookahead on a dedicated spin-then-park thread + verify the dispatch assumption
 

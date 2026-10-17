@@ -338,6 +338,13 @@ pub async fn run_bench(
                 stats.pcie_bytes as f64 / (1024.0 * 1024.0),
             );
         }
+        if stats.gate_replays > 0 {
+            println!(
+                "  M4 DMA gate: {} captured at warmup, {} replayed; {} gate wait(s) \
+                 launched warm because the gate graph was missing (must be 0)",
+                stats.gate_captured, stats.gate_replays, stats.staging_eager_waits,
+            );
+        }
         if stats.capture_replays > 0 {
             println!(
                 "  M2 capture: {} MoE segment(s) replayed as 1 graph launch (eager: ~5 raw launches each)",

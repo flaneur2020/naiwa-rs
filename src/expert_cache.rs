@@ -46,7 +46,7 @@ use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::copy_stream::{self, CopyDone, CopyStream, CopyStreams, ReadFence, SlotMemory};
+use crate::copy_stream::{self, CopyStream, CopyStreams, ReadFence, SlotMemory};
 use crate::deferred;
 use crate::host_memory::{self, PinnedStack};
 use crate::offload::{attach_prefill, fused_decode as offload_fused_decode, CpuExperts};
@@ -111,6 +111,13 @@ struct Counters {
     /// v2 M2: decode-step MoE segments served by replaying a captured graph (1 `cuGraphLaunch`
     /// each) rather than ~5 raw launches.
     capture_replays: AtomicU64,
+    /// v2 M4: layer DMA gates captured at warmup (one per layer with staging in service).
+    gate_captured: AtomicU64,
+    /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
+    gate_replays: AtomicU64,
+    /// v2 M4: DMA-gate waits launched warm because the gate graph could not be captured. Must stay
+    /// 0 — a non-zero value means the graph route failed and only the fallback ran.
+    staging_eager_waits: AtomicU64,
 }
 
 #[cfg(feature = "cuda")]
@@ -137,6 +144,9 @@ static COUNTERS: Counters = Counters {
     pcie_misses: AtomicU64::new(0),
     pcie_bytes: AtomicU64::new(0),
     capture_replays: AtomicU64::new(0),
+    gate_captured: AtomicU64::new(0),
+    gate_replays: AtomicU64::new(0),
+    staging_eager_waits: AtomicU64::new(0),
 };
 
 /// Expert-cache counters since the last call to `take_stats`.
@@ -151,6 +161,12 @@ pub struct CacheStats {
     pub swaps: u64,
     /// Lookahead requests dropped because the worker was busy.
     pub lookahead_dropped: u64,
+    /// v2 M4: layer DMA gates captured at warmup.
+    pub gate_captured: u64,
+    /// v2 M4: layer DMA gates replayed.
+    pub gate_replays: u64,
+    /// v2 M4: DMA-gate waits launched warm (gate graph unavailable); 0 in the normal path.
+    pub staging_eager_waits: u64,
     /// Experts DMA'd into a scratch slot and run on the GPU instead of the CPU (`--pcie-frac`).
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
@@ -181,6 +197,9 @@ pub fn take_stats() -> Option<CacheStats> {
         pcie_misses: take(&c.pcie_misses),
         pcie_bytes: take(&c.pcie_bytes),
         capture_replays: take(&c.capture_replays),
+        gate_captured: take(&c.gate_captured),
+        gate_replays: take(&c.gate_replays),
+        staging_eager_waits: take(&c.staging_eager_waits),
     })
 }
 
@@ -583,6 +602,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             state: Mutex::new(CachedLayerState {
                 doorbell: None,
                 doorbell_seq: 0,
+                #[cfg(feature = "cuda")]
+                staging_gate: None,
                 slots: HashMap::new(),
                 resident: vec![None; num_slots],
                 hit_counts: vec![0u64; num_experts],
@@ -1025,10 +1046,7 @@ impl LayerRegistry {
         let per_slot: usize = bytes.iter().sum();
         let mut slots = Vec::with_capacity(len);
         for buf in bufs {
-            slots.push(ScratchSlot {
-                buf,
-                done: Arc::new(CopyDone::new(cs)?),
-            });
+            slots.push(ScratchSlot { buf });
         }
         let ring = Arc::new(Mutex::new(ScratchRing { slots, cursor: 0 }));
         info!(
@@ -1082,6 +1100,9 @@ struct CachedLayerState {
     doorbell: Option<Arc<crate::doorbell::DoorbellBuf>>,
     /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
     doorbell_seq: u32,
+    /// v2 M4: this layer's DMA gate, captured in the post-load warmup (PCIe staging only).
+    #[cfg(feature = "cuda")]
+    staging_gate: Option<StagingGate>,
     /// Published residents: expert id -> slot. Only experts whose weights are fully written
     /// appear here, and it is the only table readers consult.
     slots: HashMap<usize, usize>,
@@ -1131,6 +1152,29 @@ struct BankCapture {
 #[cfg(feature = "cuda")]
 unsafe impl Send for BankCapture {}
 
+/// v2 M4: the DMA gate of one layer — a captured single node that spins until the copy stream has
+/// published this layer's `SYNC_STAGING` point. Replayed before the layer's MoE segment.
+#[cfg(feature = "cuda")]
+struct StagingGate {
+    graph: candle_core::cuda::cudarc::driver::CudaGraph,
+}
+
+// SAFETY: as `BankCapture` — token-thread only, mutex-serialized. The graph handle is opaque and
+// only ever used to launch one wait node.
+#[cfg(feature = "cuda")]
+unsafe impl Send for StagingGate {}
+
+#[cfg(feature = "cuda")]
+impl StagingGate {
+    fn replay(&self) -> candle_core::Result<()> {
+        self.graph
+            .launch()
+            .map_err(|e| candle_core::Error::msg(format!("staging-gate launch: {e}")))?;
+        COUNTERS.gate_replays.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 struct Bank {
     first: usize,
     gate: Arc<QTensor>,
@@ -1162,8 +1206,6 @@ type SlotEntry = parking_lot::Mutex<Option<Arc<SlotBuf>>>;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct ScratchSlot {
     buf: Arc<SlotBuf>,
-    /// `Arc` so a step can hold its done-event after releasing the ring mutex.
-    done: Arc<CopyDone>,
 }
 
 /// The model-wide `--pcie-frac` staging ring (see `SCRATCH_RING_FIRST`): one bank of slots
@@ -1496,6 +1538,15 @@ struct CachedLayer {
 }
 
 impl CachedLayer {
+    /// v2 M4: is the PCIe staging path in service for this layer? One predicate for all three
+    /// sites — capture the DMA gate, publish the point, replay the gate — because they must agree:
+    /// a gate whose point is never published spins forever, and at `--pcie-frac 0` the copy stream
+    /// still exists (the cache banks use it) while nothing is ever staged.
+    #[cfg(feature = "cuda")]
+    fn staging_enabled(&self) -> bool {
+        self.pcie_frac > 0.0 && self.copy_stream.is_some()
+    }
+
     /// v2 M1/M2: create every resident bank's fixed-grid capture path. Runs after load and before
     /// the first decode, so all capture buffers have fixed addresses. Returns how many banks were
     /// newly given a capture. No-op without `cuda` or with no copy-stream banks.
@@ -1508,6 +1559,24 @@ impl CachedLayer {
             let _ = self.cpu_chan.set(chan);
         } else {
             warn!("expert cache: no CPU-return channel for layer {}", self.layer);
+        }
+        // M4: capture this layer's DMA gate. It belongs to the layer (not to a bank), because its
+        // one node bakes this layer's `SYNC_STAGING` id and the staging ring is shared by every
+        // layer of its shape — a ring-wide graph could not carry a per-layer id.
+        if self.staging_enabled() {
+            if let Some(sched) = schedule() {
+                match self.capture_staging_gate(sched) {
+                    Ok(Some(gate)) => {
+                        self.state.lock().unwrap().staging_gate = Some(gate);
+                        COUNTERS.gate_captured.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        "expert cache: layer {} DMA gate capture failed: {e}",
+                        self.layer
+                    ),
+                }
+            }
         }
         let mut banks: Vec<Arc<Bank>> = Vec::new();
         for entry in &self.slot_bufs {
@@ -1537,6 +1606,55 @@ impl CachedLayer {
             }
         }
         Ok(made)
+    }
+
+    /// M4: capture this layer's DMA gate — one wait node that spins until the copy stream has
+    /// published this layer's `SYNC_STAGING` point.
+    ///
+    /// Replaying it before the layer's MoE segment is what removes the host-side
+    /// `cudaStreamWaitEvent` per streamed expert: the wait becomes one graph launch that the GPU
+    /// resolves on its own, and the segment's kernels cannot read a staging slot still in flight.
+    #[cfg(feature = "cuda")]
+    fn capture_staging_gate(
+        &self,
+        sched: &Arc<crate::doorbell::ScheduleBuf>,
+    ) -> candle_core::Result<Option<StagingGate>> {
+        let dev = self.slot_device.as_cuda_device()?;
+        let stream = dev.cuda_stream();
+        let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
+        if stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .is_err()
+        {
+            warn!(
+                "expert cache: layer {} DMA-gate begin_capture failed",
+                self.layer
+            );
+            return Ok(None);
+        }
+        let launched = sched.wait_ready(&self.slot_device, id);
+        let ended = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+        match (launched, ended) {
+            (Ok(()), Ok(Some(graph))) => match graph.upload() {
+                Ok(()) => Ok(Some(StagingGate { graph })),
+                Err(e) => {
+                    warn!("expert cache: layer {} DMA-gate upload failed: {e}", self.layer);
+                    Ok(None)
+                }
+            },
+            (Err(e), _) => {
+                warn!("expert cache: layer {} DMA-gate launch failed: {e}", self.layer);
+                Ok(None)
+            }
+            (_, Err(e)) => {
+                warn!("expert cache: layer {} DMA-gate end_capture failed: {e}", self.layer);
+                Ok(None)
+            }
+            (_, Ok(None)) => {
+                warn!("expert cache: layer {} DMA gate produced no graph", self.layer);
+                Ok(None)
+            }
+        }
     }
 
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
@@ -1976,16 +2094,44 @@ impl CachedLayer {
     /// `deferred::start` untouched. The injected hits carry the scratch `SlotBuf`, so the caller's
     /// fence loop covers them and the next step's DMA waits on this step's readers.
     ///
-    /// `upload_async` returns as soon as the copy is queued; `done.wait_on` makes candle's stream
-    /// wait for it before the fused call reads the slot, so the host never blocks on the copy.
+    /// `upload_async` returns as soon as the copy is queued; the layer's DMA gate (a captured wait
+    /// node, M4) spins until the copy stream has published `SYNC_STAGING` for this pass, so candle's
+    /// stream never waits on the copy stream and the host enqueues nothing per streamed expert.
     fn stream_pcie(
         self: &Arc<Self>,
         misses: &mut [Vec<(u32, f32)>],
         hits: &mut [Vec<Hit>],
+        pass: u32,
     ) -> candle_core::Result<()> {
         let Some(cs) = &self.copy_stream else {
             return Ok(());
         };
+        let staged = self.stage_misses(cs, misses, hits);
+        // M4: release this layer's DMA gate on *every* path — nothing staged, staged, or failed.
+        // The gate is replayed for every layer of every pass, so a point left unpublished would
+        // spin forever. This is a stream memory op on the copy stream, ordered after the copies
+        // above it, so a node spinning on the word cannot see it before the data has landed.
+        #[cfg(feature = "cuda")]
+        if let Some(sched) = schedule() {
+            let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
+            sched.publish_point_on(cs.cu_stream(), id, pass)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = pass;
+        staged
+    }
+
+    /// The DMA half of [`Self::stream_pcie`]: pick this step's misses, queue their copies on the
+    /// copy stream, and turn them into hits.
+    ///
+    /// The copies record no completion event: the caller publishes this layer's `SYNC_STAGING`
+    /// point on this same stream right after them, and the layer's gate graph spins on that word.
+    fn stage_misses(
+        &self,
+        cs: &Arc<CopyStream>,
+        misses: &mut [Vec<(u32, f32)>],
+        hits: &mut [Vec<Hit>],
+    ) -> candle_core::Result<()> {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(());
         };
@@ -2037,17 +2183,18 @@ impl CachedLayer {
                     // SAFETY: the stacks are page-locked, and `self.cpu` keeps them alive and
                     // unmodified for the model's lifetime, well past `done`.
                     unsafe {
-                        cs.upload_async(
+                        cs.queue_async(
                             &buf.fence,
                             &[
                                 (&memory[0], &g[er]),
                                 (&memory[1], &u[expert_range(&up, e)?]),
                                 (&memory[2], &d[expert_range(&down, e)?]),
                             ],
-                            &scratch.done,
                         )?;
                     }
-                    scratch.done.wait_on(&self.slot_device)?;
+                    // M4: the completion is no longer a `cudaStreamWaitEvent` on candle's stream;
+                    // the copy stream publishes the layer's `SYNC_STAGING` point itself (below),
+                    // and this layer's gate graph spins on it.
                     COUNTERS.pcie_misses.fetch_add(1, Ordering::Relaxed);
                     COUNTERS.pcie_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
                     slot_of.insert(expert, (Arc::clone(buf), pos));
@@ -2274,17 +2421,9 @@ impl CachedLayer {
         let n_hits: usize = hits.iter().map(Vec::len).sum();
         COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
 
-        // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
-        // GPU with the hits, leaving the rest on the CPU. Every CUDA call stays on this thread.
-        if self.pcie_frac > 0.0 {
-            self.stream_pcie(&mut misses, &mut hits)?;
-        }
-
-        let n_cpu: usize = misses.iter().map(Vec::len).sum();
-        COUNTERS.misses.fetch_add(n_cpu as u64, Ordering::Relaxed);
-
-        // M3: this layer's pass index. Bumped once per pass at layer 0, together with the device
-        // epoch, and only once the schedule exists — so the two counters cannot drift.
+        // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
+        // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
+        // known before the DMA, because that is what publishes the staging point for this pass.
         #[cfg(feature = "cuda")]
         let pass = {
             static PASS: AtomicU32 = AtomicU32::new(0);
@@ -2303,6 +2442,17 @@ impl CachedLayer {
                 PASS.load(Ordering::Relaxed)
             }
         };
+        #[cfg(not(feature = "cuda"))]
+        let pass: u32 = 0;
+
+        // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
+        // GPU with the hits, leaving the rest on the CPU. Every CUDA call stays on this thread.
+        if self.pcie_frac > 0.0 {
+            self.stream_pcie(&mut misses, &mut hits, pass)?;
+        }
+
+        let n_cpu: usize = misses.iter().map(Vec::len).sum();
+        COUNTERS.misses.fetch_add(n_cpu as u64, Ordering::Relaxed);
 
         let compute: Option<Box<dyn FnOnce() -> candle_core::Result<Vec<f32>> + Send>> =
             if n_cpu == 0 {
@@ -2375,6 +2525,31 @@ impl CachedLayer {
         let cpu = compute
             .map(|f| deferred::start(&self.slot_device, None, rows, self.hidden, f))
             .transpose()?;
+
+        // M4: the copy stream published this layer's `SYNC_STAGING` point on its own stream, after
+        // this step's copies. Replaying the layer's gate spins here, inside a captured node, so
+        // nothing below can read a staging slot that is still in flight — and the host enqueues no
+        // per-expert stream wait to get that guarantee.
+        //
+        // When warmup could not capture the gate, the *same* node is launched warm: one host call
+        // per layer, like the `cudaStreamWaitEvent` it replaces, so the protocol stays one protocol.
+        #[cfg(feature = "cuda")]
+        if self.staging_enabled() {
+            if let Some(sched) = schedule() {
+                let gate = self.state.lock().unwrap().staging_gate.take();
+                match gate {
+                    Some(gate) => {
+                        gate.replay()?;
+                        self.state.lock().unwrap().staging_gate = Some(gate);
+                    }
+                    None => {
+                        COUNTERS.staging_eager_waits.fetch_add(1, Ordering::Relaxed);
+                        let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
+                        sched.wait_ready(&self.slot_device, id)?;
+                    }
+                }
+            }
+        }
 
         let acc = self.run_hits(&hits, &x2d, act);
         // Kernels reading these slots may be queued even if a later step failed: fence every
@@ -2640,6 +2815,8 @@ mod tests {
             state: Mutex::new(CachedLayerState {
                 doorbell: None,
                 doorbell_seq: 0,
+                #[cfg(feature = "cuda")]
+                staging_gate: None,
                 slots: HashMap::new(),
                 resident: vec![None; slots],
                 hit_counts: vec![0; e],

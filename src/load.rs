@@ -417,9 +417,11 @@ mod tests {
         assert!(ensure_flash_next_gguf(&[bad]).is_err());
     }
 
-    #[test]
-    fn rejects_gguf_tensors_candle_cannot_run() {
-        let path = temp_dir("gguf-iq").join("iq.gguf");
+    /// A one-shard GGUF holding a single Q4_0 `blk.0.ffn_down_exps.weight`, then retyped to the
+    /// GGUF dtype `id` in place. Q4_0's block layout (32 elements, 18 bytes) is shared with the IQ
+    /// types used below, so the file's byte count stays consistent.
+    fn retyped_gguf(name: &str, id: u32) -> PathBuf {
+        let path = temp_dir(name).join("iq.gguf");
         let architecture = gguf_file::Value::String(GGUF_ARCHITECTURE.to_string());
         let weights = Tensor::zeros((2, 32), candle_core::DType::F32, &Device::Cpu).unwrap();
         let q4_0 = QTensor::quantize(&weights, GgmlDType::Q4_0).unwrap();
@@ -431,18 +433,33 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        ensure_flash_next_gguf(std::slice::from_ref(&path)).unwrap();
 
-        // IQ4_NL blocks are as large as Q4_0's, so retyping the tensor keeps the file valid.
         let mut bytes = std::fs::read(&path).unwrap();
         let name = b"blk.0.ffn_down_exps.weight";
         let at = bytes.windows(name.len()).position(|w| w == name).unwrap();
         let dtype = at + name.len() + 4 + 2 * 8; // n_dims: u32, dims: 2 x u64
         assert_eq!(bytes[dtype..dtype + 4], 2u32.to_le_bytes()); // Q4_0
-        bytes[dtype..dtype + 4].copy_from_slice(&20u32.to_le_bytes()); // IQ4_NL
+        bytes[dtype..dtype + 4].copy_from_slice(&id.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
-        let err = ensure_flash_next_gguf(&[path]).unwrap_err().to_string();
-        assert!(err.contains("IQ4_NL x1"), "{err}");
+        path
+    }
+
+    #[test]
+    fn accepts_gguf_tensors_candle_can_run() {
+        // IQ4_NL: native since the fork's IQ formats landed, so the loader must accept it. (This
+        // test asserted the opposite until the engine's own test suite compiled again.)
+        ensure_flash_next_gguf(&[retyped_gguf("gguf-iq4nl", 20)]).unwrap();
+    }
+
+    #[test]
+    fn rejects_gguf_tensors_candle_cannot_run() {
+        // Dtype id 4 is a retired legacy type with no candle mapping: rejected, and the error names
+        // every offending type with its tensor count.
+        let err = ensure_flash_next_gguf(&[retyped_gguf("gguf-unknown", 4)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UNKNOWN x1"), "{err}");
+        assert!(err.contains("candle cannot run"), "{err}");
     }
 
     fn model_options(args: &[&str]) -> ModelOptions {

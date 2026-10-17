@@ -191,6 +191,12 @@ mod cuda {
             self.stream.synchronize().map_err(Error::wrap)
         }
 
+        /// The raw handle, so a producer here can order a stream memory op on it — M4 publishes a
+        /// sync point with `cuStreamWriteValue32` right after a batch of copies.
+        pub fn cu_stream(&self) -> sys::CUstream {
+            self.stream.cu_stream()
+        }
+
         /// Order this stream after everything already queued on candle's stream, i.e. the slot
         /// allocations and their zero-fill.
         pub fn after_device_work(&self) -> Result<()> {
@@ -215,6 +221,21 @@ mod cuda {
         ) -> Result<()> {
             self.queue_copies(fence, parts)?;
             done.event.record(&self.stream).map_err(Error::wrap)
+        }
+
+        /// Queue the copies and return at once, **without** recording a completion event — for a
+        /// producer whose completion signal is a doorbell point (`cuStreamWriteValue32` on this
+        /// stream, M4) rather than a CUDA event.
+        ///
+        /// # Safety
+        /// As [`Self::upload_async`], minus the event: the caller must order every consumer after
+        /// the copies some other way (the doorbell point, or a stream wait on the *reader* side).
+        pub unsafe fn queue_async(
+            &self,
+            fence: &ReadFence,
+            parts: &[(&SlotMemory, &[u8])],
+        ) -> Result<()> {
+            self.queue_copies(fence, parts)
         }
 
         /// Copy each `src` into its `dst` once the slot's readers are done (`fence`), and return
