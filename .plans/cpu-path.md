@@ -32,8 +32,20 @@ with a 20-80% hit rate that means 1.5-3 more experts per layer on the CPU plus t
    | 3.5 | `Invalid sampling probability ... NaN` (the flake below, not a hit-rate result) |
    | 4.5 | KV cache cannot be placed any more: "no usable token blocks after reserving block zero" |
 
-   So the lever exists but the ceiling is ~3 GB on a 12 GB card: the KV cache and staging rings need the
-   rest. **Note also that these `NO_LOOKAHEAD` numbers understate production**: with the prediction thread
+   Shrinking the KV cache (`--pa-context-len 4096` -> 118 MB instead of 2 626 MB) makes 4 GB fit, and the
+   answer is **negative**:
+
+   | cache | slots/layer | result |
+   |---|---|---|
+   | 2.0 GB | 21 | **12.4 tok/s (80.8 ms)** |
+   | 4.0 GB | 42 | 11.8 tok/s (84.7 ms) - *slower* |
+   | 5.5 GB | 58 | `Failed to create hybrid cache: CUDA_ERROR_OUT_OF_MEMORY` |
+
+   Doubling the slots costs ~4 ms a pass rather than saving any: the expert working set is
+   `48 x 256 x 2.1 MB = 25.9 GB`, i.e. 6-13x this card, so 2 -> 4 GB barely moves the miss count, while
+   every newly admitted slot is a 2.1 MB copy and the admission bookkeeping grows. **Cache size is not the
+   lever on this model; the cost per miss is.** (The KV cache itself is cheap: 118 MB at a 4 k context, and
+   it is not what limits a bigger cache - the weights plus the expert bank are.) **Note also that these `NO_LOOKAHEAD` numbers understate production**: with the prediction thread
    on, the hit rate is 81-84% instead of 19.7% (M5 measured 78.2-86.7 ms TPOT), because the preload fills
    the cache in the gap. `NO_LOOKAHEAD` is used for determinism, not because it is the shipping config.
 2. **Take the miss decision off the host.** Today the token thread, per layer: spins for the top-k, hashes
