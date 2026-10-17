@@ -877,10 +877,15 @@ impl ScheduleBuf {
             unsafe { ffi::doorbell_free_host(host) };
             return Ok(None);
         }
-        // SAFETY: zero epoch and every ready word, so the first bump is 0 -> 1 and no point looks
-        // ready before its producer ran.
+        // SAFETY: zero the whole mapping - epoch, every ready word (so the first bump is 0 -> 1 and no
+        // point looks ready before its producer ran) *and every payload slot*.
+        //
+        // The payload area matters: `cudaHostAlloc` does not hand out zeroed memory, and a consumer that
+        // passes its gate while the slot still holds garbage adds it to the layer's accumulator. Garbage
+        // bits read as f32 are frequently NaN/Inf, which is exactly how a rare `NaN logits` failure
+        // looked before this (non-deterministic, ~1 run in 3 at one point, never reproducible on demand).
         unsafe {
-            std::ptr::write_bytes(host, 0, 8 + k * 4);
+            std::ptr::write_bytes(host, 0, bytes);
         }
         Ok(Some(ScheduleBuf {
             host: host.cast(),

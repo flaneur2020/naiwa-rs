@@ -67,6 +67,26 @@ with a 20-80% hit rate that means 1.5-3 more experts per layer on the CPU plus t
 - Anything that makes the per-layer host path *wider* rather than *shorter*: the pass is host-bound, so
   only removing work (or moving it to the GPU) helps.
 
+## NaN logits: first fix landed (payload zeroing), rate down from ~2-3/5 to 1/5
+
+`ScheduleBuf`'s payload area was never initialised. `cudaHostAlloc` does not hand out zeroed memory, and a
+consumer that passes its gate while a slot still holds garbage adds it to the layer's accumulator - garbage
+f32 bits are frequently NaN/Inf. Zeroing the whole mapping (not just epoch + ready words) is correct
+regardless, and it moved the failure rate from **~2-3 runs in 5 to 1 in 5** (5 runs after the fix:
+85.1/82.7/82.2/83.9 ms clean, then one NaN).
+
+So that was *a* source, not *the* source. What is left to look at, in order:
+
+1. **`DoorbellBuf` and `FlagBuf`** - same `cudaHostAlloc` treatment; the top-k ring and the flag ring are
+   read by kernels, and a stale-but-valid-looking ring can hand the layer a garbage expert id (that path
+   has a sanity bail, so it would error rather than NaN - weaker suspect);
+2. **a genuine lost wakeup / level-vs-edge slip** in the per-layer points: a layer that reads the
+   *previous* pass's payload gives a wrong token, not a NaN, so this does not explain it either;
+3. **uninitialised KV blocks**: a slot mapping that lands on a block never written would feed NaN into
+   attention. This is the only remaining mechanism that produces a NaN directly, and it would be sensitive
+   to the cache/KV layout - consistent with the failure being more common when the KV cache or expert cache
+   size changes.
+
 ## Open risk seen today
 
 `Invalid sampling probability ... NaN` has now been seen **three times**, at `--expert-cache-gb 2` (twice,
