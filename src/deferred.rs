@@ -45,6 +45,20 @@ pub type CpuChannel = cuda::Channel;
 #[cfg(not(feature = "cuda"))]
 pub type CpuChannel = ();
 
+/// M3: submit a job that publishes into the shared [`mistralrs_core::doorbell::ScheduleBuf`] at
+/// `(layer, pass)` — the graph path. Publication order is the worker's FIFO order, which the
+/// single-buffered payload and the monotonic `ready` word require.
+#[cfg(feature = "cuda")]
+pub fn start_schedule(
+    schedule: std::sync::Arc<mistralrs_core::doorbell::ScheduleBuf>,
+    layer: u32,
+    pass: u32,
+    len: usize,
+    compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
+) -> Result<()> {
+    cuda::start_schedule(schedule, layer, pass, len, compute)
+}
+
 /// Start `compute()`, whose result is `rows * cols` F32 values for `device`. On CUDA with a
 /// per-layer `chan` it runs on the worker thread and publishes into that channel; otherwise it
 /// runs now.
@@ -303,6 +317,35 @@ mod cuda {
         fn drop(&mut self) {
             self.publish_raw(None);
         }
+    }
+
+    pub fn start_schedule(
+        schedule: Arc<mistralrs_core::doorbell::ScheduleBuf>,
+        layer: u32,
+        pass: u32,
+        len: usize,
+        compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
+    ) -> Result<()> {
+        take_error()?;
+        let id = schedule.sync_id(layer, mistralrs_core::doorbell::SYNC_CPU_EXPERTS);
+        let job: Job = Box::new(move || match compute() {
+            Ok(v) if v.len() >= len => schedule.publish_cpu(layer, pass, &v[..len]),
+            Ok(v) => {
+                *FAILED.lock().unwrap() =
+                    Some(format!("returned {} values, expected at least {len}", v.len()));
+                schedule.publish_point(id, pass);
+            }
+            Err(e) => {
+                *FAILED.lock().unwrap() = Some(e.to_string());
+                schedule.publish_point(id, pass);
+            }
+        });
+        worker()
+            .lock()
+            .unwrap()
+            .send(job)
+            .map_err(|e| Error::Msg(format!("the CPU experts thread is gone: {e}")))?;
+        Ok(())
     }
 
     pub fn upload(dev: &CudaDevice, running: Running, rows: usize, cols: usize) -> Result<Tensor> {
