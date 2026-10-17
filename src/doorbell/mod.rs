@@ -1126,6 +1126,210 @@ impl ScheduleBuf {
     }
 }
 
+/// M6 P2: the device-side dispatch buffers - a per-layer resident bitmap plus the three lists the
+/// dispatch kernel writes (resident, staged, CPU) and their counts. All of it is mapped host memory, so
+/// the host reads a count and one compact list instead of hashing every selected id itself.
+pub struct DispatchBuf {
+    host: *mut c_void,
+    dev_view: *mut c_void,
+    layers: usize,
+    max_hits: usize,
+}
+
+// SAFETY: a cudaHostAllocMapped allocation; the host side is plain memory and the device side is only
+// touched by the kernels launched on the calling stream.
+unsafe impl Send for DispatchBuf {}
+unsafe impl Sync for DispatchBuf {}
+
+impl DispatchBuf {
+    /// `layers` bitmaps of 256 experts each, and three lists of at most `max_hits` entries (one per
+    /// selected expert, so `rows * top_k` is the natural bound). `Ok(None)` off CUDA or on allocation
+    /// failure; the caller then keeps the host-side path.
+    pub fn acquire(device: &candle_core::Device, layers: usize, max_hits: usize) -> Result<Option<Self>> {
+        if !device.is_cuda() || layers == 0 || max_hits == 0 {
+            return Ok(None);
+        }
+        let bitmap_words = layers * 8;
+        // bitmap + three lists of max_hits + three counts
+        let bytes = (bitmap_words + 4 * max_hits + 3) * 4;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: fresh mapped allocation of `bytes`; freed in `Drop`.
+        let rc = unsafe { ffi::doorbell_alloc_mapped(&mut host, bytes) };
+        if rc != 0 || host.is_null() {
+            return Ok(None);
+        }
+        let mut dev_view: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` holds a live cudaHostAllocMapped allocation.
+        unsafe { ffi::doorbell_get_device_ptr(host, &mut dev_view) };
+        if dev_view.is_null() {
+            // SAFETY: allocated above, not freed elsewhere yet.
+            unsafe { ffi::doorbell_free_host(host) };
+            return Ok(None);
+        }
+        // Zero the whole mapping: the bitmap starts empty (nothing resident) and the counts at 0, so a
+        // reader that runs before the first dispatch sees "no lists", never garbage.
+        // SAFETY: inside the allocation.
+        unsafe { std::ptr::write_bytes(host, 0, bytes) };
+        Ok(Some(Self { host: host.cast(), dev_view, layers, max_hits }))
+    }
+
+    /// Word offsets from the mapping base, in one place so `dispatch`, `read` and `acquire` cannot drift:
+    /// `[bitmap_words, hits_slot, hits_w, hits_n, stream_ids, stream_n, cpu_ids, cpu_n, total]`.
+    fn offsets(&self) -> [usize; 9] {
+        let b = self.layers * 8;
+        let l = self.max_hits;
+        [
+            b,
+            b,
+            b + l,
+            b + 2 * l,
+            b + 2 * l + 1,
+            b + 3 * l + 1,
+            b + 3 * l + 2,
+            b + 4 * l + 2,
+            b + 4 * l + 3,
+        ]
+    }
+
+    fn fword(&self, off: usize) -> *mut f32 {
+        // SAFETY: same mapping, word-aligned; f32 and u32 share the alignment.
+        unsafe { self.host.cast::<f32>().add(off) }
+    }
+
+    fn word(&self, off: usize) -> *mut u32 {
+        // SAFETY: `off` is within the allocation by construction of `layout`.
+        unsafe { self.host.cast::<u32>().add(off) }
+    }
+
+    /// The host-side bitmap, one word per 32 experts per layer. Write it when a slot is published or
+    /// evicted, then launch with [`Self::dispatch`] on the same stream so the kernel sees the change.
+    pub fn bitmap_mut(&mut self, layer: usize) -> &mut [u32] {
+        assert!(layer < self.layers, "dispatch bitmap layer out of range");
+        // SAFETY: eight u32 words per layer inside the mapping.
+        unsafe { std::slice::from_raw_parts_mut(self.word(layer * 8), 8) }
+    }
+
+    /// Run the dispatch kernel for one layer. `ids`/`weights` are the layer's selection on the device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        layer: usize,
+        ids: &Tensor,
+        weights: &Tensor,
+        n: usize,
+        frac_num: i32,
+        frac_den: i32,
+    ) -> Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
+        let dev = ids.device().as_cuda_device()?;
+        let stream = dev.cuda_stream();
+        let ids32 = ids.to_dtype(candle_core::DType::U32)?.contiguous()?;
+        let w32 = weights.to_dtype(candle_core::DType::F32)?.contiguous()?;
+        let (ids_storage, ids_layout) = ids32.storage_and_layout();
+        let candle_core::Storage::Cuda(ids_s) = &*ids_storage else {
+            candle_core::bail!("dispatch: ids not on CUDA");
+        };
+        let ids_slice = ids_s.as_cuda_slice::<u32>()?;
+        let ids_view = ids_slice.slice(ids_layout.start_offset()..);
+        let (ids_ptr, _ids_guard) = ids_view.device_ptr(&stream);
+        let (w_storage, w_layout) = w32.storage_and_layout();
+        let candle_core::Storage::Cuda(w_s) = &*w_storage else {
+            candle_core::bail!("dispatch: weights not on CUDA");
+        };
+        let w_slice = w_s.as_cuda_slice::<f32>()?;
+        let w_view = w_slice.slice(w_layout.start_offset()..);
+        let (w_ptr, _w_guard) = w_view.device_ptr(&stream);
+        self.dispatch_ptrs(layer, ids_ptr as *const c_void, w_ptr as *const c_void, n, frac_num, frac_den, stream.cu_stream() as i64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_ptrs(
+        &self,
+        layer: usize,
+        ids: *const c_void,
+        weights: *const c_void,
+        n: usize,
+        frac_num: i32,
+        frac_den: i32,
+        stream: i64,
+    ) -> Result<()> {
+        assert!(layer < self.layers, "dispatch layer out of range");
+        let o = self.offsets();
+        let hits_slot = self.word(o[1]);
+        let hits_w = self.fword(o[2]);
+        let hits_n = self.word(o[3]);
+        let stream_ids = self.word(o[4]);
+        let stream_n = self.word(o[5]);
+        let cpu_ids = self.word(o[6]);
+        let cpu_n = self.word(o[7]);
+        let bitmap = self.word(layer * 8).cast::<c_void>();
+        // SAFETY: every pointer is inside this mapping except the caller's two device tensors, which the
+        // launch is stream-ordered after; `hits_n`/`stream_n`/`cpu_n` are the three count words.
+        unsafe {
+            ffi::doorbell_dispatch_topk(
+                ids,
+                weights,
+                n as i32,
+                bitmap,
+                frac_num,
+                frac_den,
+                hits_slot.cast(),
+                hits_w.cast::<c_void>(),
+                hits_n.cast(),
+                stream_ids.cast(),
+                stream_n.cast(),
+                cpu_ids.cast(),
+                cpu_n.cast(),
+                self.max_hits as i32,
+                stream,
+            );
+        }
+        Ok(())
+    }
+
+    /// The three lists of the last dispatch. Safe to call once the stream has passed the dispatch launch
+    /// (the launch already ends with a system fence).
+    pub fn read(&self) -> (Vec<(u32, f32)>, Vec<u32>, Vec<u32>) {
+        let o = self.offsets();
+        let count = |off: usize| {
+            // SAFETY: `off` is the count word of one list.
+            unsafe { *self.word(off) as usize }.min(self.max_hits)
+        };
+        let hits_n = count(o[3]);
+        let stream_n = count(o[5]);
+        let cpu_n = count(o[7]);
+        let hits = (0..hits_n)
+            .map(|i| {
+                // SAFETY: within `hits_slot` (ids) and `hits_w` (weights).
+                unsafe { (*self.word(o[1] + i), *self.fword(o[2] + i)) }
+            })
+            .collect::<Vec<_>>();
+        let stream = (0..stream_n)
+            .map(|i| {
+                // SAFETY: within `stream_ids`.
+                unsafe { *self.word(o[4] + i) }
+            })
+            .collect();
+        let cpu = (0..cpu_n)
+            .map(|i| {
+                // SAFETY: within `cpu_ids`.
+                unsafe { *self.word(o[6] + i) }
+            })
+            .collect();
+        (hits, stream, cpu)
+    }
+}
+
+impl Drop for DispatchBuf {
+    fn drop(&mut self) {
+        if !self.host.is_null() {
+            // SAFETY: allocated by doorbell_alloc_mapped, freed once.
+            unsafe { ffi::doorbell_free_host(self.host) };
+        }
+    }
+}
+
 impl Drop for ScheduleBuf {
     fn drop(&mut self) {
         if !self.host.is_null() {
@@ -1295,5 +1499,44 @@ mod ptr_wait_tests {
 
         let want: Vec<f32> = (0..max_n).map(|i| 11.0 + i as f32).collect();
         assert_eq!(acc.to_vec1::<f32>().unwrap(), want);
+    }
+
+    /// The dispatch kernel is the whole point of P2/S1: it must agree with a host reference exactly,
+    /// including the `frac` split of the misses.
+    #[test]
+    fn dispatch_matches_the_host_reference() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let Ok(Some(mut buf)) = DispatchBuf::acquire(&device, 2, 64) else {
+            return;
+        };
+        // Layer 0: experts 0..=3 resident.
+        buf.bitmap_mut(0)[0] = 0b1111;
+        let ids = Tensor::new(&[0u32, 5, 2, 7], &device).unwrap();
+        let w = Tensor::new(&[0.5f32, 0.25, 0.125, 0.0625], &device).unwrap();
+        // Half of the two misses staged, the other half to the CPU.
+        buf.dispatch(0, &ids, &w, 4, 1, 2).unwrap();
+        device.synchronize().unwrap();
+        let (hits, stream, cpu) = buf.read();
+        assert_eq!(hits.len(), 2, "two of the four are resident");
+        assert_eq!(hits[0].0, 0);
+        assert_eq!(hits[0].1, 0.5);
+        assert_eq!(hits[1].0, 2);
+        assert_eq!(hits[1].1, 0.125);
+        assert_eq!(stream, vec![5u32], "the first miss of the staged budget");
+        assert_eq!(cpu, vec![7u32], "the rest stays on the CPU");
+
+        // frac 0 -> nothing staged; frac 1/1 -> everything staged.
+        buf.dispatch(0, &ids, &w, 4, 0, 1).unwrap();
+        device.synchronize().unwrap();
+        let (_, stream0, cpu0) = buf.read();
+        assert!(stream0.is_empty());
+        assert_eq!(cpu0, vec![5u32, 7], "both misses on the CPU");
+        buf.dispatch(0, &ids, &w, 4, 1, 1).unwrap();
+        device.synchronize().unwrap();
+        let (_, stream1, cpu1) = buf.read();
+        assert_eq!(stream1, vec![5u32, 7]);
+        assert!(cpu1.is_empty());
     }
 }
