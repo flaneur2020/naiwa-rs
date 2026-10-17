@@ -70,6 +70,24 @@ mod ffi {
         stream: i64,
     );
     pub(crate) fn doorbell_epoch_bump(d_epoch: *mut c_void, stream: i64);
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn doorbell_dispatch_topk(
+        ids: *const c_void,
+        weights: *const c_void,
+        n: i32,
+        bitmap: *const c_void,
+        frac_num: i32,
+        frac_den: i32,
+        hits_slot: *mut c_void,
+        hits_w: *mut c_void,
+        hits_n: *mut c_void,
+        stream_ids: *mut c_void,
+        stream_n: *mut c_void,
+        cpu_ids: *mut c_void,
+        cpu_n: *mut c_void,
+        max_hits: i32,
+        stream: i64,
+    );
     pub(crate) fn doorbell_wait_ready(
         d_epoch: *mut c_void,
         d_ready: *mut c_void,
