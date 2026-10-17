@@ -101,6 +101,11 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0a. **M6 进度**:step 1 ✅(门图全删,−140 行,33/33,oracle 逐字节);step 2 ✅ 三个未知全部消除
+   (harness 证明固定缓冲+拷入+回放逐比特一致;审计证明解码区域零同步零 CPU 往返;每步变化输入只有
+   `res` 与 mask/metadata,后者用现有 `resident_input`)。**剩余是纯机械实现**,精确的编辑点、区域
+   边界(窗口内 = norm/mix/inject + mixer,产物只有 `inject`/`out`)、排除项(GDN/PLE 层)、捕获池
+   纪律、回退与四道门禁,全部写在 `worklogs/m6.md` 的 "M6 remaining work" 一节。
 0. **M6 已做实验(关键)**:`cuda_graphs_enabled()` 默认 true,唯一挡路的是 `supports_decode_graphs()`;
    探针强制开后 **hang**(300 s 杀掉)。原因结构性:`decode_forward` 中间有 **host 自旋等设备输出**
    (`db.wait_and_read`)——捕获时 ring kernel 只被记录不执行,自旋永不结束。而 staging 的 miss 集依赖
