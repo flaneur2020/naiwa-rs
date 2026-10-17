@@ -78,7 +78,22 @@ Ruled out in this round:
 - **the prefill-stream layer table** - `PrefillStream::register` resizes to `layer + 1`, and the MTP site
   returns before it anyway (`ctx.site.is_mtp`).
 
-Where the fault is now narrowed to, from reading the engine's draft path
+**Localised by experiment**: it is not steady-state drafting but the drafter's **prompt-chunk catch-up**.
+
+| config | result |
+|---|---|
+| prompt 8, `--mtp --mtp-n-predict 1` | **works**: 2-row draft pass, 106.2 ms TPOT, 9.4 tok/s |
+| prompt 8, gen 1 (prefill only) | works (no draft step runs) |
+| prompt 512, `--mtp` (any depth) | `CUDA_ERROR_ILLEGAL_ADDRESS`, and **zero `MTP-DBG` lines** - the fault happens *before* `drafter_forward`, i.e. in `drafter_prefill_chunk` |
+
+So `drafter_forward`'s sizing is fine at the lengths it reaches (`rows=2`, `kv_blocks=2520`,
+`blocks_needed=1`, `block_table_width=1`), and the crash is in the catch-up that runs a whole prompt chunk
+through the drafter with the *target's* attention inputs. Also measured while it worked: the 2-row pass
+costs 106 ms against 82 ms for a 1-row pass, i.e. **+29% per pass for one draft token**, so MTP only pays
+off if acceptance is well above one token in three - exactly what the host-bound pass cost makes harder
+than on Strata.
+
+From reading the engine's draft path
 (`speculative/builtin_mtp.rs:120-150`): the drafter builds its own paged metadata
 (`make_paged_rows_metadata(seq_ids, context_lens = position+1, ..)`) and passes `kv_cache.clone()` plus
 `AttentionMask::None` / `FlashParams::empty(false)`. Two concrete suspects, in order:
