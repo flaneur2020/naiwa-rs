@@ -136,16 +136,25 @@ must already be off the critical path to make the comparison fair).
   preload non-blocking (`queue_async`) — the gate above is the template.
 - See [`worklogs/m4.md`](worklogs/m4.md).
 
-### M5 — lookahead on a dedicated spin-then-park thread + verify the dispatch assumption
+### M5 — lookahead on its own thread, experts on rayon — ✅ done
 
-- **Does**: lookahead/prediction on 1–2 dedicated **spin-then-park** threads
-  (architecture-v2 §6.3); the expert batch stays on rayon.
-- **Depends on**: **implementation** needs only M2; **measurement** needs M4.
-- **Judged by**: ① hit rate does not drop below the standing level (does not fall through
-  the W105 ~78% knee); ② STEP_DBG shows expert dispatch is not on the critical path;
-  ③ no A/B switches (architecture-v2 §6.4) — configuration recorded by commit.
-- **Note**: if ② comes out backwards, evaluate it with a temporary code change; do not
-  add a permanent fork.
+- **Did**: reversed the W-era dispatch to the configuration §6.3 fixed: expert batches on the
+  fork's **rayon** default, predictions on **one dedicated thread**. `expert_pool.rs` is gone
+  (−700 lines) with its three A/B knobs (§6.4). The thread is woken by events — a submit, and an
+  expert batch ending (`deferred::BatchBusy` → `lookahead::wake`) — so predictions run in the gaps
+  after the CPU experts, never beside them, and nothing spins for work.
+- **M5b**: the prediction job used to *perform* its DMA (`upload` → `wait_for_readers` +
+  `stream.synchronize`, 81% of a 2.2 ms job). It now only decides and **issues**
+  (`queue_async`), claims the pass, and publishes `SYNC_PRELOAD` with a one-thread `atomicMax`
+  kernel; each layer replays a one-node preload gate before its segment, and only when that pass was
+  claimed. `atomicMax` is what makes a stale producer harmless — `ready[]` is a level, so an
+  unconditional write could move the word backwards and strand every later gate.
+- **Judged by**: ① hit rate **81.3–83.8%** (bar 78%; the pool baseline was 82.4%) — ② STEP_DBG dry
+  fell from 2.03–2.13 to 1.53–1.63 ms/layer and TPOT from 101.4 to **78.2–86.7 ms** (9.9 → 12.4–12.8
+  T/s), with the dispatch off the critical path — ③ no A/B switch: the configuration is in the code.
+- **Gates**: `frac 0.55` + `NO_LOOKAHEAD` 11/11 byte-identical to the frozen oracle, `frac 0` 2/2;
+  96 gates captured at warmup (48 preload + 48 staging), 0 launched warm, 0 predictions dropped.
+- See [`worklogs/m5.md`](worklogs/m5.md).
 
 ### M6 — PLE (per Q2) + whole-step graph
 
