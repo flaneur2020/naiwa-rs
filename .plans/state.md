@@ -101,7 +101,13 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
-1. **M6**：Q2 已定案（见下）——`SYNC_PLE` 作为第四个同步点（`WAITS_PER_LAYER = 4`, `K = 192`）
+1. **M6 第一发现**:fork 的 `supports_decode_graphs()`(`qwen4_exp/text.rs:789`)两个条件在 v2 里
+   **永久为假**——PLE 必须 `gathers_on_device`(我们刚否掉)+ 不能有 external experts(正是 CpuExperts)。
+   所以 `pipeline/cuda_graph.rs` 那套整步捕获**用不上**,M6 必须由引擎自己捕获整步。fork 的门禁本质是
+   "doorbell 之前的世界观";M6 = 把捕获窗口从 MoE 段扩到整步,四个同步点放在窗口内。首要待清障碍:
+   hybrid-cache 的 `gather_conv_state`/`gather_recurrent_state` 每步分配、`DeviceMappedMask` 每步构建、
+   paged attention 的 KV/layout。
+2. **M6**:Q2 已定案（见下）——`SYNC_PLE` 作为第四个同步点（`WAITS_PER_LAYER = 4`, `K = 192`）
    + host 侧纯函数算行号 + gather DMA + 整步图；判据 = 整步 1 次 launch + 逐 token == eager。
 2. **M5c（GPU predict）已降级**：M5b 之后预测线程有余量（job ~0.5 ms vs 1.6 ms 的层窗口，命中率
    已回到池基线），把 gemv 搬 GPU 换不来吞吐。等 M6 把 host 工作搬走、层窗口变窄之后再考虑——它
