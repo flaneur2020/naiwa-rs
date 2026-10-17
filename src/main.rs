@@ -6,6 +6,7 @@ mod args;
 mod commands;
 mod copy_stream;
 mod deferred;
+mod doorbell;
 mod expert_cache;
 mod expert_pool;
 mod host_memory;

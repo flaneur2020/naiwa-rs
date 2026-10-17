@@ -45,12 +45,12 @@ pub type CpuChannel = cuda::Channel;
 #[cfg(not(feature = "cuda"))]
 pub type CpuChannel = ();
 
-/// M3: submit a job that publishes into the shared [`mistralrs_core::doorbell::ScheduleBuf`] at
+/// M3: submit a job that publishes into the shared [`crate::doorbell::ScheduleBuf`] at
 /// `(layer, pass)` — the graph path. Publication order is the worker's FIFO order, which the
 /// single-buffered payload and the monotonic `ready` word require.
 #[cfg(feature = "cuda")]
 pub fn start_schedule(
-    schedule: std::sync::Arc<mistralrs_core::doorbell::ScheduleBuf>,
+    schedule: std::sync::Arc<crate::doorbell::ScheduleBuf>,
     layer: u32,
     pass: u32,
     len: usize,
@@ -119,7 +119,7 @@ mod cuda {
 
     use candle_core::cuda_backend::CudaDevice;
     use candle_core::{DType, Device, Error, Result, Tensor};
-    use mistralrs_core::doorbell::FlagBuf;
+    use crate::doorbell::FlagBuf;
 
     type Job = Box<dyn FnOnce() + Send>;
 
@@ -320,14 +320,14 @@ mod cuda {
     }
 
     pub fn start_schedule(
-        schedule: Arc<mistralrs_core::doorbell::ScheduleBuf>,
+        schedule: Arc<crate::doorbell::ScheduleBuf>,
         layer: u32,
         pass: u32,
         len: usize,
         compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
     ) -> Result<()> {
         take_error()?;
-        let id = schedule.sync_id(layer, mistralrs_core::doorbell::SYNC_CPU_EXPERTS);
+        let id = schedule.sync_id(layer, crate::doorbell::SYNC_CPU_EXPERTS);
         let job: Job = Box::new(move || match compute() {
             Ok(v) if v.len() >= len => schedule.publish_cpu(layer, pass, &v[..len]),
             Ok(v) => {

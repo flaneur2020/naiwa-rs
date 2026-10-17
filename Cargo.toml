@@ -54,3 +54,7 @@ debug = true
 [profile.dev]
 debug = true
 opt-level = 3
+
+[build-dependencies]
+# Same CUDA kernel build helper the fork's build.rs uses.
+cudaforge = "=0.1.6"

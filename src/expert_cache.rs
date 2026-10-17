@@ -114,10 +114,10 @@ struct Counters {
 }
 
 #[cfg(feature = "cuda")]
-static SCHEDULE: OnceLock<Arc<mistralrs_core::doorbell::ScheduleBuf>> = OnceLock::new();
+static SCHEDULE: OnceLock<Arc<crate::doorbell::ScheduleBuf>> = OnceLock::new();
 
 #[cfg(feature = "cuda")]
-fn schedule() -> Option<&'static Arc<mistralrs_core::doorbell::ScheduleBuf>> {
+fn schedule() -> Option<&'static Arc<crate::doorbell::ScheduleBuf>> {
     SCHEDULE.get()
 }
 
@@ -252,7 +252,7 @@ impl GpuCacheMoeProvider {
         if let Some(first) = layers.first() {
             let device = first.slot_device.clone();
             let max_n = CAPTURE_MAX_BATCH * first.hidden;
-            match mistralrs_core::doorbell::ScheduleBuf::acquire(
+            match crate::doorbell::ScheduleBuf::acquire(
                 &device,
                 WAITS_PER_LAYER,
                 layers.len(),
@@ -632,7 +632,7 @@ struct LookaheadChannel {
 /// Per-channel shared state. `next_seq` is touched only by the token thread;
 /// `consumed` is written by whichever worker job ran last for this channel.
 struct LookaheadShared {
-    chan: Arc<mistralrs_core::doorbell::FlagBuf>,
+    chan: Arc<crate::doorbell::FlagBuf>,
     /// The seq the last queued GPU publish will bump the counter to (0 before any):
     /// `last_seq + 1` is the value `wait_publish` waits for.
     next_seq: std::sync::atomic::AtomicU32,
@@ -654,7 +654,7 @@ impl LookaheadChannel {
     /// headroom over any current window (np4 verify = 5, observed verify = 7).
     fn new(device: &Device, max_rows: usize, hidden: usize) -> candle_core::Result<Option<Self>> {
         let max_rows = max_rows.max(16);
-        Ok(mistralrs_core::doorbell::FlagBuf::acquire(device, max_rows * hidden)
+        Ok(crate::doorbell::FlagBuf::acquire(device, max_rows * hidden)
             .ok()
             .flatten()
             .map(|chan| Self {
@@ -689,7 +689,7 @@ impl LookaheadChannel {
         let next = sh.next_seq.load(Ordering::Relaxed);
         let consumed = sh.consumed.load(Ordering::Relaxed);
         if next - consumed
-            >= (mistralrs_core::doorbell::FlagBuf::RING_DEPTH as u32).saturating_sub(1)
+            >= (crate::doorbell::FlagBuf::RING_DEPTH as u32).saturating_sub(1)
         {
             return Ok(None); // backpressure: an unread slot would be overwritten
         }
@@ -1079,7 +1079,7 @@ struct CachedLayerState {
     /// Acquired lazily at first decode; None on non-CUDA or alloc failure, where
     /// decode keeps the `to_vec2` path. In the state lock for interior mutability
     /// through the shared `Arc`.
-    doorbell: Option<Arc<mistralrs_core::doorbell::DoorbellBuf>>,
+    doorbell: Option<Arc<crate::doorbell::DoorbellBuf>>,
     /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
     doorbell_seq: u32,
     /// Published residents: expert id -> slot. Only experts whose weights are fully written
@@ -1244,7 +1244,7 @@ impl Bank {
         stage_dtype: DType,
         act_type: i32,
         layer: u32,
-        schedule: Option<&Arc<mistralrs_core::doorbell::ScheduleBuf>>,
+        schedule: Option<&Arc<crate::doorbell::ScheduleBuf>>,
     ) -> candle_core::Result<bool> {
         let mut slot = self.capture.lock().unwrap();
         if slot.is_some() {
@@ -2193,7 +2193,7 @@ impl CachedLayer {
             let mut st = self.state.lock().unwrap();
             if st.doorbell.is_none() {
                 let cap = n.max(8 * self.top_k).max(64);
-                st.doorbell = mistralrs_core::doorbell::DoorbellBuf::acquire(&self.slot_device, cap)
+                st.doorbell = crate::doorbell::DoorbellBuf::acquire(&self.slot_device, cap)
                     .ok()
                     .flatten()
                     .map(Arc::new);
@@ -2635,6 +2635,8 @@ mod tests {
             act: Activation::Silu,
             router: None,
             lookahead_chan: None,
+            #[cfg(feature = "cuda")]
+            cpu_chan: std::sync::OnceLock::new(),
             state: Mutex::new(CachedLayerState {
                 doorbell: None,
                 doorbell_seq: 0,
