@@ -106,10 +106,11 @@ must already be off the critical path to make the comparison fair).
 ### M3 — CPU result return path into the graph (misses enter the graph) — ✅ DONE 2026-10-16
 
 > Done via the device-epoch protocol: `epoch` (device) + one `ready` word per sync point + a
-> single-buffered payload. Each single-bank layer's graph carries a `wait_add_cpu` node, so the CPU
-> experts' contribution is accumulated by the graph. `--pcie-frac 0` is byte-identical to the
-> frozen oracle in 4/5 runs (the 5th is a fluent near-tie sibling — the known float-order
-> sensitivity). See [`worklogs/m3.md`](worklogs/m3.md).
+> single-buffered payload, with publication strictly FIFO per point. Each single-bank layer's graph
+> carries a `wait_add_cpu` node, so the CPU experts' contribution is accumulated by the graph.
+> **Gate: `--pcie-frac 0` + `NAIWA_NO_LOOKAHEAD=1` → 5/5 byte-identical to the frozen oracle.**
+> With the lookahead on the *split* varies per step (pre-existing), so those checks compare the
+> variant set, not a single reference. See [`worklogs/m3.md`](worklogs/m3.md).
 
 - **Does**: replace `deferred`'s `cudaLaunchHostFunc` with `wait_copy_ptr`.
 - **Depends on**: M2.
