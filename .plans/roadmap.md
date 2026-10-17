@@ -121,6 +121,10 @@ must already be off the critical path to make the comparison fair).
 
 ### M4 — PCIe path into the graph (all three paths) — 🔄 primitives landed
 
+> **M3.1 (done):** the doorbell moved out of the fork into `naiwa-rs/src/doorbell/` (own
+> `build.rs` via cudaforge). Fork −1660 lines; 5/5 doorbell tests and the frac-0 oracle gate pass
+> from the engine. See [`worklogs/m3-1.md`](worklogs/m3-1.md).
+
 - **Does**: the 55% leg — a real H2D issued outside the graph by the token thread
   (workers make no CUDA calls), with the graph spinning for DMA completion.
   **Primitives landed (fork `d6dae82c`):** `doorbell_wait_ready` (wait-only node) and

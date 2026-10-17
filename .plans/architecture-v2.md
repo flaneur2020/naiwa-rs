@@ -364,7 +364,7 @@ shape 的 staging ring 与所有 per-layer bank）→ 按 `MoEGraphKey` 捕获 �
 |---|---|---|---|
 | F1 | `supports_decode_graphs()`（`qwen4_exp/text.rs:789`） | 门 2 改成「provider 声明自己可捕获」而不是无条件 `!has_external_experts()` | 否则 graph 永远不启动 |
 | F2 | `RoutedExperts` / `RoutedExpertsProvider`（`mistralrs-core/src/moe_offload.rs`） | 从「提供 experts」扩展为「提供 **MoE 段的可捕获 emitter**」：emitter 发射 dispatch→wait→copy→decode→gather 的节点序列。**注意**：Q1=(c) 不做整步捕获，所以 emitter 是**每个 site 在自己的 per-layer 捕获会话里被调用一次**，而不是在一次整步捕获里被调用 48 次 | 现在 provider 只能在 eager 路径被调用 |
-| F3 | `cuda/doorbell.cu` + `doorbell.rs` | 加 `wait_ge_ptr` / `wait_copy_ptr`（指针版）；`FlagBuf` 的 target 描述符化管理 | §3.1 的零实参要求 |
+| F3 | ~~fork 的 `cuda/doorbell.cu` + `doorbell.rs`~~ → **已移到引擎**（M3.1） | 零实参 / epoch / `ready[]` 全部在 `naiwa-rs/src/doorbell/`；fork 里没有消费者，已整体删除（−1660 行） | §3.1/§3.2 的原语自持，fork 更小 |
 | F4 | **`mistralrs-quant` 的 `indexed_moe_fused_decode`**（GPU 路径，`gguf/cuda.rs:1586`）——**不是** CPU 的 `fused_moe_decode`（`fused_cpu.rs`，那是 `/par_tasks` 的 CPU 派发，跟捕获无关） | 描述符驱动 / 定长网格形态：`MoeDecodeCapture` 用自有的一次性缓冲 + 固定网格 `(⌈n/8⌉, max_topk, max_batch)`，计数由填好的 ids/weights 描述符表达 | §3.3.3 方案 A。已落地（M1.1，fork `729d2c64`） |
 | F5 | PLE（若走 §3.3.4 路线 2/3） | hash 所有权 / 预取接口 | 唯一能打开整步 graph 的路 |
 
