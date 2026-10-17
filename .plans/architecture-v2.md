@@ -173,58 +173,67 @@ __global__ void wait_ge_ptr(const volatile uint32_t* seq,   // mapped, device vi
 一块 mapped 内存，三个字段：
 
 ```
-epoch    u32         device 写（每 pass 一次，layer 0 的 prologue）；节点读
-progress u32         host 写（单调递增的同步点）；节点读
-payload  [R][max_n]  host 写；节点读
+epoch    u32               device 写（每 pass 一次，layer 0 的 prologue）
+ready    [K] u32           每个同步点一个字；值 = 该点的数据就绪到的 pass
+payload  [48][max_n] f32   CPU 专家的结果（host 写）；单块，无环、无双缓冲
 ```
 
-两条规则：
+节点（同构，只有 `kind` 不同）：
 
 ```
-host:    pass 计数自持（进入第 0 层时 +1），发布 p = pass * N + id
-device:  prologue 每 pass 令 epoch += 1
-         节点 p = epoch * N + id ；自旋 progress >= p ；读 payload[(p % R) * max_n]
-常量:    N = 48      id = sync_id(layer, SYNC_CPU_EXPERTS) = layer
-         R = 128     max_n = 16 * hidden
+e = *epoch
+spin while (ready[id(layer, kind)] < e)
+__threadfence_system()
+kind == CPU               → acc += payload[layer]
+kind == PRELOAD / STAGING → 继续（数据已由 DMA 写进 VRAM 槽，这里不读）
 ```
 
-**为什么安全**：`slot = p % R` 里 p 编码了 pass，而 p 里的 pass 来自设备的 epoch，所以节点
-永远读自己的槽；host 只推进单调的 `progress`。**没有 host 写的 per-step 值会被节点读到。**
+生产者（每个点每 pass 只写一次，普通 volatile store，无需 atomic）：
 
-**唯一的假设**：host 的点级领先 `< R`（`R = 128` ≈ 2.6 个 pass），否则会覆盖未读的槽。今天
-它自然成立 —— token 线程每层都要自旋等 router 的 doorbell，所以领先只有约一层。**但 v2 的
-目标恰恰是让 host 不再逐层等待**：一旦那一步做成，这条假设就失效，必须补回一台**设备写的
-`consumed`** 做背压（节点消费后写一次 + host 发布前读一次，两行代码）。
+```
+CPU worker            → ready[id(layer, CPU)]     = e
+copy stream (staging) → ready[id(layer, STAGING)] = e   // cuStreamWriteValue32
+copy stream (preload) → ready[id(layer, PRELOAD)] = e
+```
 
-> 不采用「host 写 pass 给 GPU 读」：那等于把「第几步」的生产权交回 host，host 领先一个 pass
-> 就会读错槽；要安全就得在 pass 边界握手（每 pass 排空一次）。设备 epoch 同时拿到安全与跨
-> pass 重叠。
+常量：`K = 48 × WAITS_PER_LAYER`（= 3 → 144）、`max_n = 16 × hidden`。
+**没有环、没有 R、没有领先界。**
+
+**为什么不需要双缓冲/环**：host 要进入 pass k+1，必须先消费一个 **GPU 产出**的信号（今天 =
+每层读 router 的 doorbell，它发生在 pass k 的全部层执行完之后）。所以 host 写 pass k+1 的
+payload 时，pass k 的消费者必然已经跑完。这是一条**不变量**，不是余量：
+
+> **host 的 pass 推进必须被一个 GPU 产出的信号门控。**
+> 若某个改动让 token 线程不经 GPU 产出就能进入下一个 pass（例如把 miss 列表的读取整个搬到
+> worker 上、token 线程只负责发射），这条就失效 —— 那时必须恢复双缓冲或 `consumed` 握手。
+
+**host 不读 epoch**：节点自己读 epoch 知道 pass；host 用自己的 pass 计数，两者对同一 pass 相等。
+host 若去读 epoch，会在 pass 边界阻塞甚至挂死（读到上一 pass → 发布旧点 → 节点永远等不到）。
+
+> 不采用「host 写 pass 给 GPU 读」：那等于把「第几步」的生产权交回 host。
 
 #### 一层的 CPU → GPU 通知点（命名与编号）
 
-按 **GPU 命中它们的先后顺序**编号（顺序很重要，见不变量 7）：
+按 **GPU 命中它们的先后顺序**：
 
-| # | 常量 | 内容 | 谁生产 | 今天怎么实现 | 需要自旋？ |
-|---|---|---|---|---|---|
-| 0 | `SYNC_RESIDENCY` | 本层 dispatch 用的驻留列表 | host | stream 序 H2D 写描述符 | **否**（stream 已排序） |
-| 1 | `SYNC_DMA_DONE` | 55% 那路 PCIe DMA 完成 | host 发起 / copy stream 执行 | copy-stream `CopyDone` + 主 stream 等待 | **否**（stream 序） |
-| 2 | `SYNC_CPU_EXPERTS` | 45% 那路 CPU 专家的贡献 `[rows,hidden] f32` | CPU worker | `deferred` 的 mapped payload + seq | **是** |
-
-**今天一层内真正需要 GPU 自旋的 CPU 通知只有一个：`SYNC_CPU_EXPERTS`。** 另两个是数据依赖，
-靠 stream 顺序保证 —— 描述符是 `cudaMemcpyAsync` 排在 launch 之前，DMA 完成是 copy-stream
-event；只有 host 直接写 mapped 才会出竞态（M1/M2 的描述符因此从未踩坑）。
-
-编号方案（今天 `WAITS_PER_LAYER = 1`，其余两个只以注释/文档预留，不烧进 N/R）：
+| # | 常量 | 内容 | 谁生产 | 需要自旋？ |
+|---|---|---|---|---|
+| 0 | `SYNC_RESIDENCY` | 本层命中/驻留描述符 | host | **否** —— stream 序 H2D，不是自旋点，不占 `ready` 槽 |
+| 1 | `SYNC_PRELOAD` | 上一层为本层预载的驻留槽就绪 | copy stream | **是**（M4） |
+| 2 | `SYNC_STAGING` | 本层 55% 暂存 DMA 完成 | copy stream | **是**（M4） |
+| 3 | `SYNC_CPU_EXPERTS` | CPU 专家的贡献 `[rows,hidden] f32` | CPU worker | **是**（M3，今天唯一实现的） |
 
 ```rust
-pub const SYNC_CPU_EXPERTS: u32 = 0;   // 今天唯一需要自旋的位置（层内第 0 位）
-pub const WAITS_PER_LAYER:   u32 = 1;  // 将来若把 RESIDENCY/DMA_DONE 改成 mapped 通知再改大
+pub const SYNC_PRELOAD:      u32 = 0;
+pub const SYNC_STAGING:      u32 = 1;
+pub const SYNC_CPU_EXPERTS:  u32 = 2;
+pub const WAITS_PER_LAYER:   u32 = 3;
 pub const fn sync_id(layer: u32, k: u32) -> u32 { layer * WAITS_PER_LAYER + k }
-pub const N: u32 = 48 * WAITS_PER_LAYER;   // 每 pass 的同步点总数
-// R >= N + host 在 pass 内的领先量：N=48 取 R=128
+pub const K: u32 = 48 * WAITS_PER_LAYER;   // 144
 ```
 
-节点烘入 `sync_id(layer, SYNC_CPU_EXPERTS)`，target = `epoch * N + sync_id(..)`。
+三个自旋点各自只等**自己那一个字**，所以它们**独立前进** —— 互不排序、无需全序假设。
+`ready[]` 可以直接 dump 出来看流程：哪一层哪个点卡住一眼可见。
 
 #### 不变量
 
@@ -240,10 +249,9 @@ pub const N: u32 = 48 * WAITS_PER_LAYER;   // 每 pass 的同步点总数
 5. **u32 回绕**：`2^32 / N ≈ 89M` passes，够用。
 6. **内存序**：设备写 epoch 用 `__threadfence_system()` 前后各一次；host 读 epoch 用 volatile
    + acquire；host 写 payload/progress 用 release fence；节点自旋后 `__threadfence_system()`。
-7. **单标量 `progress` ⇒ 同步点全序。** 把 `progress` 推到 `epoch*N+id` 等价于宣告同一 pass
-   内 id 更小的点全部就绪。所以 `sync_id` 的编号顺序必须同时等于 ① GPU 命中顺序 ② host 发布
-   顺序。若将来某个等待点需要独立于其它点，必须把 `progress` 从 1 个字换成「每个等待点一个
-   字」，否则会隐式跳过。
+7. **每个同步点独立**：一个点就绪不蕴含任何其它点就绪 —— 这正是「每点一个变量」的收益，也
+   移除了旧方案的全序约束。每个点每 pass 只有一个生产者、只写一次（普通 volatile 存）。
+8. **`payload` 单块的前提**是上面的门控不变量（host 的 pass 推进由 GPU 产出的信号门控）。
 
 > 注意：这条协议**取代**了 §3.1 里「`target` 放 mapped」的写法。§3.1 的 `wait_ge_ptr` /
 > `wait_copy_ptr` 仍然有用（它们只需要一个 host 写的目标值，适合 prefill 之类一次性路径），
