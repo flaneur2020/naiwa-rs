@@ -1178,12 +1178,19 @@ impl DispatchBuf {
     }
 
     /// `[bitmap_words, ...word offsets..., total]`. One place, so acquire/dispatch/read cannot drift.
-    /// Eleven slots per group of fields: bitmap, then three lists of `(ids, row, weights)` with a count
-    /// after each. `slot[0]` is the bitmap, `slot[10]` the total word count.
-    fn layout(layers: usize, l: usize) -> [usize; 14] {
-        let b = layers * 8;
+    /// Words one layer's list block needs: three lists of `(ids, row, weights)` plus three counts.
+    const fn block_words(l: usize) -> usize {
+        9 * l + 3
+    }
+
+    /// Absolute word offsets for `layer`'s block. The bitmap lives at the front, shared; **every list is
+    /// per layer**, because a shared list lets a layer read the previous layer's (larger) result - that is
+    /// what made the first flip read a stale count and index out of bounds.
+    fn offsets(&self, layer: usize) -> [usize; 14] {
+        let l = self.max_hits;
+        let b = self.layers * 8 + layer * Self::block_words(l);
         [
-            b,                          // [0]  bitmap words
+            layer * 8,                  // [0]  this layer's bitmap
             b,                          // [1]  hits ids
             b + l,                      // [2]  hits row
             b + 2 * l,                  // [3]  hits weights
@@ -1196,16 +1203,12 @@ impl DispatchBuf {
             b + 7 * l + 2,              // [10] cpu row
             b + 8 * l + 2,              // [11] cpu weights
             b + 9 * l + 2,              // [12] cpu count
-            b + 9 * l + 3,              // [13] total
+            b + 9 * l + 3,              // [13] end of this block
         ]
     }
 
     fn words(layers: usize, max_hits: usize) -> usize {
-        Self::layout(layers, max_hits)[13]
-    }
-
-    fn offsets(&self) -> [usize; 14] {
-        Self::layout(self.layers, self.max_hits)
+        layers * 8 + layers * Self::block_words(max_hits)
     }
 
     fn fword(&self, off: usize) -> *mut f32 {
@@ -1260,8 +1263,8 @@ impl DispatchBuf {
         let (w_ptr, _w_guard) = w_view.device_ptr(&stream);
 
         assert!(layer < self.layers, "dispatch layer out of range");
-        let o = self.offsets();
-        let bitmap = self.word(layer * 8).cast::<c_void>();
+        let o = self.offsets(layer);
+        let bitmap = self.word(o[0]).cast::<c_void>();
         // SAFETY: every pointer is inside this mapping except the caller's two device tensors, which the
         // launch is stream-ordered after.
         unsafe {
@@ -1295,8 +1298,11 @@ impl DispatchBuf {
     /// The last dispatch's decision: resident `(expert id, weight)`, staged ids with their weights, and the
     /// ids the CPU should compute. Safe once the stream passed the dispatch (the launch ends with a system
     /// fence).
-    pub fn read(&self) -> (Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>) {
-        let o = self.offsets();
+    pub fn read(
+        &self,
+        layer: usize,
+    ) -> (Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>) {
+        let o = self.offsets(layer);
         let count = |off: usize| {
             // SAFETY: `off` is the count word of one list.
             (unsafe { *self.word(off) } as usize).min(self.max_hits)
@@ -1514,7 +1520,7 @@ mod ptr_wait_tests {
         // Half of the two misses staged, the other half to the CPU.
         buf.dispatch(0, &ids, &w, 4, 4, 1, 2).unwrap();
         device.synchronize().unwrap();
-        let (hits, stream, cpu) = buf.read();
+        let (hits, stream, cpu) = buf.read(0);
         assert_eq!(hits.len(), 2, "two of the four are resident");
         assert_eq!(hits[0].0, 0);
         assert_eq!(hits[0].1, 0, "row 0");
@@ -1532,12 +1538,12 @@ mod ptr_wait_tests {
         // frac 0 -> nothing staged; frac 1/1 -> everything staged.
         buf.dispatch(0, &ids, &w, 4, 4, 0, 1).unwrap();
         device.synchronize().unwrap();
-        let (_, stream0, cpu0) = buf.read();
+        let (_, stream0, cpu0) = buf.read(0);
         assert!(stream0.is_empty());
         assert_eq!(cpu0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7], "both misses on the CPU");
         buf.dispatch(0, &ids, &w, 4, 4, 1, 1).unwrap();
         device.synchronize().unwrap();
-        let (_, stream1, cpu1) = buf.read();
+        let (_, stream1, cpu1) = buf.read(0);
         assert_eq!(stream1.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7]);
         assert!(cpu1.is_empty());
     }
