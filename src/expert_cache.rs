@@ -2692,6 +2692,10 @@ mod dispatch_probe {
             }
             let _ = device.synchronize();
             let (hits, stream, cpu) = b.read();
+            let miss_weights: f32 = stream.iter().chain(cpu.iter()).map(|e| e.1).sum();
+            if !miss_weights.is_finite() {
+                eprintln!("DISPATCH_DBG layer {layer} non-finite miss weights");
+            }
             if hits.len() != host_hits || stream.len() + cpu.len() != host_misses {
                 eprintln!(
                     "DISPATCH_DBG layer {layer} MISMATCH host hits {host_hits} misses {host_misses} \

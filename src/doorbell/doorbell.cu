@@ -455,8 +455,10 @@ __global__ void doorbell_dispatch_topk_kernel(
     float* hits_w,
     uint32_t* hits_n,
     uint32_t* stream_ids,
+    float* stream_w,
     uint32_t* stream_n,
     uint32_t* cpu_ids,
+    float* cpu_w,
     uint32_t* cpu_n,
     int max_hits)
 {
@@ -492,9 +494,14 @@ __global__ void doorbell_dispatch_topk_kernel(
             continue;
         }
         if ((int)ns < staged_budget) {
-            stream_ids[ns++] = id;
+            // Weights travel with the ids: the host must not have to look them up again.
+            stream_ids[ns] = id;
+            stream_w[ns] = weights[i];
+            ++ns;
         } else {
-            cpu_ids[nc++] = id;
+            cpu_ids[nc] = id;
+            cpu_w[nc] = weights[i];
+            ++nc;
         }
     }
     *hits_n = nh;
@@ -507,13 +514,15 @@ extern "C" void doorbell_dispatch_topk(
     const void* ids, const void* weights, int n, const void* bitmap,
     int frac_num, int frac_den,
     void* hits_slot, void* hits_w, void* hits_n,
-    void* stream_ids, void* stream_n, void* cpu_ids, void* cpu_n,
+    void* stream_ids, void* stream_w, void* stream_n,
+    void* cpu_ids, void* cpu_w, void* cpu_n,
     int max_hits, int64_t stream)
 {
     doorbell_dispatch_topk_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)ids, (const float*)weights, n, (const uint32_t*)bitmap,
         frac_num, frac_den,
         (uint32_t*)hits_slot, (float*)hits_w, (uint32_t*)hits_n,
-        (uint32_t*)stream_ids, (uint32_t*)stream_n, (uint32_t*)cpu_ids, (uint32_t*)cpu_n,
+        (uint32_t*)stream_ids, (float*)stream_w, (uint32_t*)stream_n,
+        (uint32_t*)cpu_ids, (float*)cpu_w, (uint32_t*)cpu_n,
         max_hits);
 }

@@ -82,8 +82,10 @@ mod ffi {
         hits_w: *mut c_void,
         hits_n: *mut c_void,
         stream_ids: *mut c_void,
+        stream_w: *mut c_void,
         stream_n: *mut c_void,
         cpu_ids: *mut c_void,
+        cpu_w: *mut c_void,
         cpu_n: *mut c_void,
         max_hits: i32,
         stream: i64,
@@ -1149,9 +1151,7 @@ impl DispatchBuf {
         if !device.is_cuda() || layers == 0 || max_hits == 0 {
             return Ok(None);
         }
-        let bitmap_words = layers * 8;
-        // bitmap + three lists of max_hits + three counts
-        let bytes = (bitmap_words + 4 * max_hits + 3) * 4;
+        let bytes = Self::words(layers, max_hits) * 4;
         let mut host: *mut c_void = std::ptr::null_mut();
         // SAFETY: fresh mapped allocation of `bytes`; freed in `Drop`.
         let rc = unsafe { ffi::doorbell_alloc_mapped(&mut host, bytes) };
@@ -1173,22 +1173,30 @@ impl DispatchBuf {
         Ok(Some(Self { host: host.cast(), dev_view, layers, max_hits }))
     }
 
-    /// Word offsets from the mapping base, in one place so `dispatch`, `read` and `acquire` cannot drift:
-    /// `[bitmap_words, hits_slot, hits_w, hits_n, stream_ids, stream_n, cpu_ids, cpu_n, total]`.
-    fn offsets(&self) -> [usize; 9] {
-        let b = self.layers * 8;
-        let l = self.max_hits;
+    /// `[bitmap_words, ...word offsets..., total]`. One place, so acquire/dispatch/read cannot drift.
+    fn layout(layers: usize, l: usize) -> [usize; 11] {
+        let b = layers * 8;
         [
-            b,
-            b,
-            b + l,
-            b + 2 * l,
-            b + 2 * l + 1,
-            b + 3 * l + 1,
-            b + 3 * l + 2,
-            b + 4 * l + 2,
-            b + 4 * l + 3,
+            b,                        // bitmap
+            b,                        // hits_slot
+            b + l,                    // hits_w
+            b + 2 * l,                // hits_n
+            b + 2 * l + 1,            // stream_ids
+            b + 3 * l + 1,            // stream_w
+            b + 4 * l + 1,            // stream_n
+            b + 4 * l + 2,            // cpu_ids
+            b + 5 * l + 2,            // cpu_w
+            b + 6 * l + 2,            // cpu_n
+            b + 6 * l + 3,            // total
         ]
+    }
+
+    fn words(layers: usize, max_hits: usize) -> usize {
+        Self::layout(layers, max_hits)[10]
+    }
+
+    fn offsets(&self) -> [usize; 11] {
+        Self::layout(self.layers, self.max_hits)
     }
 
     fn fword(&self, off: usize) -> *mut f32 {
@@ -1240,84 +1248,58 @@ impl DispatchBuf {
         let w_slice = w_s.as_cuda_slice::<f32>()?;
         let w_view = w_slice.slice(w_layout.start_offset()..);
         let (w_ptr, _w_guard) = w_view.device_ptr(&stream);
-        self.dispatch_ptrs(layer, ids_ptr as *const c_void, w_ptr as *const c_void, n, frac_num, frac_den, stream.cu_stream() as i64)
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_ptrs(
-        &self,
-        layer: usize,
-        ids: *const c_void,
-        weights: *const c_void,
-        n: usize,
-        frac_num: i32,
-        frac_den: i32,
-        stream: i64,
-    ) -> Result<()> {
         assert!(layer < self.layers, "dispatch layer out of range");
         let o = self.offsets();
-        let hits_slot = self.word(o[1]);
-        let hits_w = self.fword(o[2]);
-        let hits_n = self.word(o[3]);
-        let stream_ids = self.word(o[4]);
-        let stream_n = self.word(o[5]);
-        let cpu_ids = self.word(o[6]);
-        let cpu_n = self.word(o[7]);
         let bitmap = self.word(layer * 8).cast::<c_void>();
         // SAFETY: every pointer is inside this mapping except the caller's two device tensors, which the
-        // launch is stream-ordered after; `hits_n`/`stream_n`/`cpu_n` are the three count words.
+        // launch is stream-ordered after.
         unsafe {
             ffi::doorbell_dispatch_topk(
-                ids,
-                weights,
+                ids_ptr as *const c_void,
+                w_ptr as *const c_void,
                 n as i32,
                 bitmap,
                 frac_num,
                 frac_den,
-                hits_slot.cast(),
-                hits_w.cast::<c_void>(),
-                hits_n.cast(),
-                stream_ids.cast(),
-                stream_n.cast(),
-                cpu_ids.cast(),
-                cpu_n.cast(),
+                self.word(o[1]).cast(),
+                self.fword(o[2]).cast::<c_void>(),
+                self.word(o[3]).cast(),
+                self.word(o[4]).cast(),
+                self.fword(o[5]).cast(),
+                self.word(o[6]).cast(),
+                self.word(o[7]).cast(),
+                self.fword(o[8]).cast(),
+                self.word(o[9]).cast(),
                 self.max_hits as i32,
-                stream,
+                stream.cu_stream() as i64,
             );
         }
         Ok(())
     }
 
-    /// The three lists of the last dispatch. Safe to call once the stream has passed the dispatch launch
-    /// (the launch already ends with a system fence).
-    pub fn read(&self) -> (Vec<(u32, f32)>, Vec<u32>, Vec<u32>) {
+    /// The last dispatch's decision: resident `(expert id, weight)`, staged ids with their weights, and the
+    /// ids the CPU should compute. Safe once the stream passed the dispatch (the launch ends with a system
+    /// fence).
+    pub fn read(&self) -> (Vec<(u32, f32)>, Vec<(u32, f32)>, Vec<(u32, f32)>) {
         let o = self.offsets();
         let count = |off: usize| {
             // SAFETY: `off` is the count word of one list.
-            unsafe { *self.word(off) as usize }.min(self.max_hits)
+            (unsafe { *self.word(off) } as usize).min(self.max_hits)
         };
-        let hits_n = count(o[3]);
-        let stream_n = count(o[5]);
-        let cpu_n = count(o[7]);
-        let hits = (0..hits_n)
-            .map(|i| {
-                // SAFETY: within `hits_slot` (ids) and `hits_w` (weights).
-                unsafe { (*self.word(o[1] + i), *self.fword(o[2] + i)) }
-            })
-            .collect::<Vec<_>>();
-        let stream = (0..stream_n)
-            .map(|i| {
-                // SAFETY: within `stream_ids`.
-                unsafe { *self.word(o[4] + i) }
-            })
-            .collect();
-        let cpu = (0..cpu_n)
-            .map(|i| {
-                // SAFETY: within `cpu_ids`.
-                unsafe { *self.word(o[6] + i) }
-            })
-            .collect();
-        (hits, stream, cpu)
+        let list = |ids: usize, ws: usize, n: usize| {
+            (0..n)
+                .map(|i| {
+                    // SAFETY: within the id and weight lists of one list.
+                    unsafe { (*self.word(ids + i), *self.fword(ws + i)) }
+                })
+                .collect::<Vec<_>>()
+        };
+        (
+            list(o[1], o[2], count(o[3])),
+            list(o[4], o[5], count(o[6])),
+            list(o[7], o[8], count(o[9])),
+        )
     }
 }
 
@@ -1524,19 +1506,22 @@ mod ptr_wait_tests {
         assert_eq!(hits[0].1, 0.5);
         assert_eq!(hits[1].0, 2);
         assert_eq!(hits[1].1, 0.125);
-        assert_eq!(stream, vec![5u32], "the first miss of the staged budget");
-        assert_eq!(cpu, vec![7u32], "the rest stays on the CPU");
+        assert_eq!(stream.len(), 1, "the first miss of the staged budget");
+        assert_eq!(stream[0].0, 5);
+        assert_eq!(stream[0].1, 0.25, "weights travel with the ids");
+        assert_eq!(cpu.len(), 1, "the rest stays on the CPU");
+        assert_eq!(cpu[0].0, 7);
 
         // frac 0 -> nothing staged; frac 1/1 -> everything staged.
         buf.dispatch(0, &ids, &w, 4, 0, 1).unwrap();
         device.synchronize().unwrap();
         let (_, stream0, cpu0) = buf.read();
         assert!(stream0.is_empty());
-        assert_eq!(cpu0, vec![5u32, 7], "both misses on the CPU");
+        assert_eq!(cpu0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7], "both misses on the CPU");
         buf.dispatch(0, &ids, &w, 4, 1, 1).unwrap();
         device.synchronize().unwrap();
         let (_, stream1, cpu1) = buf.read();
-        assert_eq!(stream1, vec![5u32, 7]);
+        assert_eq!(stream1.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7]);
         assert!(cpu1.is_empty());
     }
 }
