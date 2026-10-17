@@ -70,8 +70,20 @@ order:
 3. **the legacy `CpuExperts` channel under MTP row counts** (the head's experts are host-resident by
    design, `expert_cache.rs` `ctx.site.is_mtp` branch).
 
-`compute-sanitizer` is not usable here: it turns the 60 GB model load into an hours-long run (killed at
-900 s), so the next diagnostic has to be targeted logging in `mtp.rs` instead.
+Ruled out in this round:
+
+- **the `nextn.eh_proj` slice** - the component stores it as **Q4_0, dims (5120, 2560)**, so the loader's
+  `shape()` reads `[2560, 5120]`, `half = 2560`, and 2560 rows of 2880 bytes is a whole number of 32-element
+  Q4_0 blocks: the slice offset is block-aligned, not a fractional-quant offset;
+- **the prefill-stream layer table** - `PrefillStream::register` resizes to `layer + 1`, and the MTP site
+  returns before it anyway (`ctx.site.is_mtp`).
+
+That leaves the head's own attention/state path as the place the fault must be: `MtpAttentionInputs` and the
+KV/state slot the head uses (the engine's own errors mention "release speculative sequence state" and
+"recurrent state for sequence 2, slot 0" right after the fault). `compute-sanitizer` is unusable here (it
+turns the 60 GB model load into an hours-long run; killed at 900 s), so the next diagnostic is targeted
+logging in `mtp.rs::forward` - print the shapes/devices it receives and the KV slot it resolves, then the
+kernel that faults is identified by the last log line before the error.
 
 With the draft path working, the same 86 ms pass carries ~2.5 tokens; minus the extra cost of the verify
 rows (2-3 rows instead of 1 - our per-layer *host* work barely moves, the GPU segments grow) that is
