@@ -2386,6 +2386,10 @@ impl CachedLayer {
 
         let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
+        // M6 P2 flip (`NAIWA_DISPATCH_USE`) is prepared but not armed: reaching `decode_forward` with a
+        // selection whose row count does not match `xs` (the startup dummy run) made `hits[row]` index out
+        // of bounds, so the flip must derive its row count from the selection (`ids.len() / top_k`) rather
+        // than from `xs`, or skip itself when the two disagree. See the worklog.
         {
             let mut st = self.state.lock().unwrap();
             st.tick += 1;
@@ -2660,6 +2664,16 @@ mod dispatch_probe {
     pub(super) fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("NAIWA_DISPATCH_DBG").is_some())
+    }
+
+    /// Flip: use the device lists as authoritative instead of the host's hashing loop.
+    pub(super) fn use_device() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("NAIWA_DISPATCH_USE").is_some())
+    }
+
+    pub(super) fn buf_for(device: &candle_core::Device) -> Option<Arc<Mutex<DispatchBuf>>> {
+        buf(device, 64, 64 * 8)
     }
 
     fn buf(device: &candle_core::Device, layers: usize, max_hits: usize) -> Option<Arc<Mutex<DispatchBuf>>> {
