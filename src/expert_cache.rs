@@ -2386,10 +2386,13 @@ impl CachedLayer {
 
         let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
-        // M6 P2 flip (`NAIWA_DISPATCH_USE`) is prepared but not armed: reaching `decode_forward` with a
-        // selection whose row count does not match `xs` (the startup dummy run) made `hits[row]` index out
-        // of bounds, so the flip must derive its row count from the selection (`ids.len() / top_k`) rather
-        // than from `xs`, or skip itself when the two disagree. See the worklog.
+        // M6 P2 flip (`NAIWA_DISPATCH_USE`) is still not armed. Two things it needs first:
+        //   1. the lists are shared across layers in one mapping, and the counts are read after a launch
+        //      the host does not wait on, so a layer can read the previous layer's larger list (the OOB
+        //      that killed the dummy run: len 1, index 210). The list area must be per layer and the count
+        //      published with a seq the host waits on - the same protocol the top-k ring uses today.
+        //   2. the row count must come from the selection, not from `xs` (already handled here, but it is
+        //      only safe once 1 is fixed).
         {
             let mut st = self.state.lock().unwrap();
             st.tick += 1;
