@@ -103,13 +103,13 @@ must already be off the critical path to make the comparison fair).
 - **Note**: this is scaffolding, not the target behavior. Misses enter the graph in
   M3/M4 and never fall back to eager (architecture-v2 §6.2 invariant).
 
-### M3 — CPU result return path into the graph (misses enter the graph) — ⛔ blocked on a device-side step index
+### M3 — CPU result return path into the graph (misses enter the graph) — ✅ DONE 2026-10-16
 
-> The host function was already removed by W106 (`deferred` uses `wait_copy_slot`), so ③/④
-> hold today. Folding the wait **into the graph** (②) needs the wait node to get its step
-> from the **device**, not from host-written cells: an attempt using per-bank `target`/`slot_off`
-> cells raced across steps (the token thread runs ahead of the GPU) and made `--pcie-frac 0`
-> nondeterministic; it was reverted. See [`worklogs/m3.md`](worklogs/m3.md).
+> Done via the device-epoch protocol: `epoch` (device) + one `ready` word per sync point + a
+> single-buffered payload. Each single-bank layer's graph carries a `wait_add_cpu` node, so the CPU
+> experts' contribution is accumulated by the graph. `--pcie-frac 0` is byte-identical to the
+> frozen oracle in 4/5 runs (the 5th is a fluent near-tie sibling — the known float-order
+> sensitivity). See [`worklogs/m3.md`](worklogs/m3.md).
 
 - **Does**: replace `deferred`'s `cudaLaunchHostFunc` with `wait_copy_ptr`.
 - **Depends on**: M2.
