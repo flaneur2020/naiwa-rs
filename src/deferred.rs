@@ -82,6 +82,41 @@ pub type CpuChannel = ();
 /// `(layer, pass)` — the graph path. Publication order is the worker's FIFO order, which the
 /// single-buffered payload and the monotonic `ready` word require.
 #[cfg(feature = "cuda")]
+
+/// RET_DBG: how long a miss expert's return takes, split into "waiting for the worker" and "the gemv".
+/// The GPU blocks on the publish point for exactly this long, so it is the number to shrink.
+mod retired_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static QUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    static COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record(t_submit: Instant, t_start: Instant) {
+        let on = *ON.get_or_init(|| std::env::var_os("NAIWA_RET_DBG").is_some());
+        if !on {
+            return;
+        }
+        let done = Instant::now();
+        QUEUE_NS.fetch_add(
+            t_start.saturating_duration_since(t_submit).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        COMPUTE_NS.fetch_add(
+            done.saturating_duration_since(t_start).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 48 == 0 {
+            let q = QUEUE_NS.swap(0, Ordering::Relaxed) as f64 / 48.0 / 1e3;
+            let c = COMPUTE_NS.swap(0, Ordering::Relaxed) as f64 / 48.0 / 1e3;
+            eprintln!("RET_DBG queue_us {q:.1} compute_us {c:.1} total_us {:.1}", q + c);
+        }
+    }
+}
+
 pub fn start_schedule(
     schedule: std::sync::Arc<crate::doorbell::ScheduleBuf>,
     layer: u32,
@@ -291,7 +326,11 @@ mod cuda {
             published: false,
         };
         let len_ok = len;
+        // RET_DBG (naiwa): the handoff latency the GPU pays per miss - submit -> the worker starting the
+        // compute (queue) and the compute + publish itself.
+        let t_submit = std::time::Instant::now();
         let job: Job = Box::new(move || {
+            let t_start = std::time::Instant::now();
             let mut done = done;
             match compute() {
                 Ok(v) if v.len() == len_ok => {
@@ -311,6 +350,7 @@ mod cuda {
                     done.publish_empty();
                 }
             }
+            super::retired_probe::record(t_submit, t_start);
         });
         worker()
             .lock()
@@ -364,17 +404,31 @@ mod cuda {
     ) -> Result<()> {
         take_error()?;
         let id = schedule.sync_id(layer, crate::doorbell::SYNC_CPU_EXPERTS);
-        let job: Job = Box::new(move || match compute() {
-            Ok(v) if v.len() >= len => schedule.publish_cpu(layer, pass, &v[..len]),
-            Ok(v) => {
-                *FAILED.lock().unwrap() =
-                    Some(format!("returned {} values, expected at least {len}", v.len()));
-                schedule.publish_point(id, pass);
-            }
-            Err(e) => {
-                *FAILED.lock().unwrap() = Some(e.to_string());
-                schedule.publish_point(id, pass);
-            }
+        // RET_DBG (naiwa): handoff latency per job. `queue` is submit -> the worker starting the compute,
+        // `compute` is the CPU gemv itself, and the remainder is the mapped publish. The GPU spins on that
+        // publish inside the layer's graph, so this chain is the latency it pays per miss.
+        let t_submit = std::time::Instant::now();
+        let job: Job = Box::new(move || {
+            let t_start = std::time::Instant::now();
+            let out = match compute() {
+                Ok(v) if v.len() >= len => {
+                    schedule.publish_cpu(layer, pass, &v[..len]);
+                    Ok(())
+                }
+                Ok(v) => {
+                    *FAILED.lock().unwrap() =
+                        Some(format!("returned {} values, expected at least {len}", v.len()));
+                    schedule.publish_point(id, pass);
+                    Ok(())
+                }
+                Err(e) => {
+                    *FAILED.lock().unwrap() = Some(e.to_string());
+                    schedule.publish_point(id, pass);
+                    Err(e)
+                }
+            };
+            let _ = out;
+            super::retired_probe::record(t_submit, t_start);
         });
         worker()
             .lock()
