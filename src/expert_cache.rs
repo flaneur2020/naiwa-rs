@@ -64,6 +64,19 @@ const PREFILL_THRESHOLD: usize = 16;
 /// turn every token into a full re-upload of every layer's top-k.
 const MAX_LOOKAHEAD_SWAPS: usize = 2;
 
+/// Replacement cap for one prediction pass, per row. `NAIWA_LH_SWAPS` overrides it for sweeps: more
+/// swaps means more predicted experts displace residents (more DMA) in exchange for fewer CPU experts
+/// on the critical path. The default is the shipped value; the env is a measurement knob only.
+fn max_lookahead_swaps() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NAIWA_LH_SWAPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(MAX_LOOKAHEAD_SWAPS)
+    })
+}
+
 /// With `--prefill-stream`, each layer keeps its last slots in a separate bank of about its
 /// share of the loan: two layers of experts, spread over the estimated 48 layers, plus a
 /// quarter for layers with smaller slots than the largest one. The loan lends whole banks.
@@ -1854,7 +1867,7 @@ impl CachedLayer {
         if self.copy_stream.is_none() {
             return Ok(());
         }
-        let max_swaps = MAX_LOOKAHEAD_SWAPS * rows;
+        let max_swaps = max_lookahead_swaps() * rows;
         let mut swaps = 0;
         for &e in &predicted {
             if e >= self.num_experts {
