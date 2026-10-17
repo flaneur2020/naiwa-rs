@@ -1,4 +1,4 @@
-# naiwa-rs v2 — state (2026-10-16)
+# naiwa-rs v2 — state (2026-10-17)
 
 Resume-here summary. Detail: `architecture-v2.md` (design), `roadmap.md` (plan),
 `worklogs/` (evidence per milestone), `fork-inventory.md` (fork delta).
@@ -16,7 +16,9 @@ mapped:  epoch u32（device 每 pass 写一次）  ready[K] u32（每点一个�
 
 节点:    e = *epoch ; spin while (ready[id] < e) ; __threadfence_system()
          CPU → acc += payload[layer] ; PRELOAD/STAGING → 直接继续
-发布:    ready[id] = pass ；一律走 worker 的单条 FIFO 队列（含"无 miss 发零"）
+发布:    ready[id] = pass。生产者有两种，都保证"数据先到":
+         ① CPU 结果：worker 单条 FIFO 队列（含"无 miss 发零"），host 写 payload 后写 ready
+         ② copy stream（M4）：cuStreamWriteValue32，排在 DMA 之后，host 不等待、不记事件
 常量:    id = layer*3 + kind , kind ∈ {PRELOAD=0, STAGING=1, CPU=2} , K = 144
 ```
 
@@ -77,6 +79,25 @@ mapped:  epoch u32（device 每 pass 写一次）  ready[K] u32（每点一个�
 | 捕获需要流空闲 | 捕获测试要 `--test-threads=1`/独占；引擎在 load 期捕获是安全的 |
 | `bump_epoch` 传 host 指针 | 必须传 mapped 的 **device view**（UVA 下同址，单测看不出来） |
 | 同步/异步发布混用 | 必须全部走 worker FIFO |
+| `copy_stream` 存在 ≠ staging 在服务 | `frac 0` 下 copy stream 仍存在（缓存槽靠它填），gate 若按 `copy_stream.is_some()` 判据就会等一个永不发布的点 → **挂死**。三处(捕获/发布/回放)必须同一个判据 `staging_enabled()` |
+| 用"输出正确"证明等待有效 | 必须故意发布**陈旧** stamp 看它挂死（M0 的陈旧目标对照，M4 复用：200 s 被杀才算过） |
+
+## 现在能跑什么
+
+```bash
+# 门禁（frac 0 / 0.55 都应与冻结 oracle 逐字节相同）
+cd ~/code/naiwa-rs
+BIN=$HOME/naiwa-rs/target/release/naiwa-rs TAG=X FRAC=0.55 NAIWA_NO_LOOKAHEAD=1 \
+  OUT=$HOME/bench-rel/naiwa-v2/m4 timeout 400 ./harness/m1/capture_oracle.sh
+diff ~/bench-rel/naiwa-v2/m4/reference.X.txt harness/m1/reference.oracle.txt   # 必须 IDENTICAL
+
+# 结构计数（48 gate 捕获、384=48×8 replay、0 退化、ring 冻结）
+NAIWA_NO_LOOKAHEAD=1 $BIN bench -m ~/models/qwen3-coder/requant \
+  -f '<shard1>;<shard2>' --cpu-moe --expert-cache-gb 2 --pcie-frac 0.55 \
+  --prompt-len 512 --gen-len 8 --depth 4 --iterations 1 --warmup 0
+
+cargo test --offline --release --features cuda          # 33/33
+```
 
 ## 下一步（M5）
 
