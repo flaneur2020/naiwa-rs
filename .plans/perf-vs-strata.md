@@ -78,7 +78,19 @@ Ruled out in this round:
 - **the prefill-stream layer table** - `PrefillStream::register` resizes to `layer + 1`, and the MTP site
   returns before it anyway (`ctx.site.is_mtp`).
 
-That leaves the head's own attention/state path as the place the fault must be: `MtpAttentionInputs` and the
+Where the fault is now narrowed to, from reading the engine's draft path
+(`speculative/builtin_mtp.rs:120-150`): the drafter builds its own paged metadata
+(`make_paged_rows_metadata(seq_ids, context_lens = position+1, ..)`) and passes `kv_cache.clone()` plus
+`AttentionMask::None` / `FlashParams::empty(false)`. Two concrete suspects, in order:
+
+1. **the drafter's KV cache against `context_lens`** - the block table is indexed by the *target's*
+   positions (hundreds of blocks during a 512-token prompt), while the drafter's own cache is sized for
+   draft rows; a write past its last block is exactly an illegal address;
+2. **our `CpuExperts` path under draft row counts** - the MTP site's experts are host-resident by design
+   and reach the GPU through the deferred queue at `layer = 48`, so its rows/top_k and the queue's device
+   buffer have to agree with the draft batch rather than the decoder batch.
+
+Everything else around the head is in the head's own attention/state path: `MtpAttentionInputs` and the
 KV/state slot the head uses (the engine's own errors mention "release speculative sequence state" and
 "recurrent state for sequence 2, slot 0" right after the fault). `compute-sanitizer` is unusable here (it
 turns the 60 GB model load into an hours-long run; killed at 900 s), so the next diagnostic is targeted
