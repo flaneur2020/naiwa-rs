@@ -166,36 +166,70 @@ __global__ void wait_ge_ptr(const volatile uint32_t* seq,   // mapped, device vi
 （`driver/sys/mod.rs:15992`）。它的 value 同样是 launch 期实参 → 捕获后固化，**不解决 graph 问题**，
 但它几乎不占 SM。若 PLE/其它 host 等待点需要省 SM，可作为非 graph 路径的替代。
 
-### 3.2 CPU → GPU 通知：从 host function 换成 stream 上的 spin
+### 3.2 CPU → GPU 通知：设备 epoch 协议（取代动态 seq）
 
-现状（`qflash-rs/src/deferred.rs`）：`cudaLaunchHostFunc(wait_for_worker)` 挡在 candle 流上，
-worker 用 Condvar 唤醒它，然后 H2D 拷贝。**host function 无法进 graph**，且它把 stream 钉在
-token 线程上——这是 R2b 的靶子。
+现状：`deferred` 已经不用 `cudaLaunchHostFunc`（W106 的 R2b 换成了 stream 上排队的 wait+copy
+kernel），所以「token 线程不被阻塞」已经成立。剩下的问题是**这个等待进不了 graph**，而且
+试过两种零实参写法都失败（详见 `worklogs/m3.md`）：
 
-v2 的形态（图上的 "notify GPU about the uncached result" + "GPU copy from mapped result"）：
+| 写法 | 失败方式 |
+|---|---|
+| `target`/`slot` 作 kernel 实参 | 捕获时被冻结 |
+| host 写 mapped cell | **跨步竞态**：token 线程领先 GPU，节点读到下一步的 cell |
+| 设备侧 `atomicAdd` 领号 | 原理成立，但要求「领到的号 = 发布者的 seq」严格 1:1；作业数浮动（只有有 miss 的层才发）就会漂移 |
+
+**根因：`target` 是「每步变化的值」，而由 host 生产它必然与「host 领先 GPU」矛盾。**
+
+#### 协议：把「第几步」的生产权交给设备
+
+一块 mapped 分配（全局一份）：
 
 ```
-worker 线程（无 CUDA 调用）:
-    write_slot(payload)          // mapped ring，普通写
-    fence(Release)
-    write_volatile(seq, +1)      // host -> GPU 发布
-
-token 线程（launch graph 前）:
-    把 target 写进该层的 mapped 描述符
-
-graph 内:
-    [node] wait_copy_ptr(seq, target, payload, slot_off, dst, n)
-           → 自旋到自己要的值，再从 mapped 拷进 device
+epoch    : u32        ← 设备写、host 读
+progress : u32        ← host 写、设备读
+payload  : [R][max_n] f32   ← host 写、设备读（环）
 ```
 
-要点：
-1. **token 线程不再等任何人**：它只写 target、launch graph。等待发生在 GPU 上。
-2. **可 graph 化**：节点实参全是捕获期固定的指针。
-3. **失败也必须 unblock**：worker 的计算失败时仍要 bump seq（`write_slot(None, ..)` 的语义），
-   否则 GPU 永久自旋。`Drop` 里补 publish（现有 `SetFlag::Drop` 的做法）。
-4. **ring depth ≥ 2**：慢 GPU 读 slot k 时 host 在写 k+1。
-5. **H2D 只在这里**，且是 device-to-device（mapped→device）拷贝，不触发
-   candle 的 `check_capture_copy`（`candle-core/.../device.rs:159`：捕获期禁止 host/device 拷贝）。
+- **设备生产 `epoch`**：`layer 0` 的图里有一个 prologue 节点，每 pass 执行一次
+  `*epoch += 1; __threadfence_system();`。
+- **host 生产 `progress`**：为同步点 `p` 写完 payload 后，普通写 → release fence →
+  `*progress = p`（单调，只增）。
+- **节点（图内）**：
+  ```
+  p = (*epoch) * N + L        // N = 每 pass 同步点数（常量），L = 层号（常量，烘在图里）
+  while (*progress < p) __nanosleep(200);
+  __threadfence_system();
+  acc[i] += payload[(p % R) * max_n + i]
+  ```
+  节点实参只有**指针 + 常量** → 捕获期冻结毫无影响。
+
+#### 为什么安全（唯一要记住的一条）
+
+**`epoch` 只由设备写，host 只读** → host 永远读不到未来的 epoch，所以在编号上**只能落后或
+持平，不可能领先**。落后是安全的：host 用旧 epoch 发布 `(k-1)*N+L` 时，设备的 target
+`k*N+L` 更大，节点只是多等一会儿。**「读到下一步数据」这一整类竞态因此消失。**
+
+层内重叠完全保留：host 在 pass k 开始时读到 `epoch=k`，就可以连续为 `L=1..48` 发布，比 GPU
+在层上跑得更快；它只是不能比设备更早开始下一个 pass。
+
+#### 不变量
+
+1. **同步点集合固定**：每层每 pass 都发布一次，即使 `n_cpu == 0` 也发布全零。这是静态排程的
+   前提，也恰好消掉「同步点数浮动」这个耦合源。
+2. **prologue 只在 layer 0 的图里**，每 pass 一次；stream 序保证它先于本 pass 其它层、后于
+   上一 pass。
+3. **`R ≥ N + 余量`**：`slot = p % R` 是按**点**算的，一个 pass 就有 N=48 个点。R=8 只够领先
+   8 个点（8 层）。取 **R = 64**；更稳的做法是 host 读一个 mapped 的 `consumed` 做背压
+   （发布 `p` 前要求 `consumed > p - R`），把「有界」从运气变成构造保证。
+4. **失败也必须推进 `progress`**：worker 失败时发布零/空并把 `progress` 推到 `p`，否则 GPU
+   永久自旋。
+5. **u32 回绕**：`2^32 / N ≈ 89M` passes，够用。
+6. **内存序**：设备写 epoch 用 `__threadfence_system()` 前后各一次；host 读 epoch 用 volatile
+   + acquire；host 写 payload/progress 用 release fence；节点自旋后 `__threadfence_system()`。
+
+> 注意：这条协议**取代**了 §3.1 里「`target` 放 mapped」的写法。§3.1 的 `wait_ge_ptr` /
+> `wait_copy_ptr` 仍然有用（它们只需要一个 host 写的目标值，适合 prefill 之类一次性路径），
+> 但**每步重放的图**必须用本节的 epoch 协议。
 
 ### 3.3 CUDA graph 机制
 
