@@ -2468,6 +2468,10 @@ impl CachedLayer {
 
         // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
         // GPU with the hits, leaving the rest on the CPU. Every CUDA call stays on this thread.
+        // `stage_misses` only *appends* to `hits`, so the resident prefix is exactly what was there
+        // before the call - which is what lets the split below run the residents without the ring.
+        #[cfg(feature = "cuda")]
+        let resident_prefix: Vec<usize> = hits.iter().map(Vec::len).collect();
         if self.pcie_frac > 0.0 {
             self.stream_pcie(&mut misses, &mut hits, pass)?;
         }
@@ -2561,12 +2565,68 @@ impl CachedLayer {
         if self.preload_claimed.load(Ordering::Acquire) == pass {
             self.replay_gate(crate::doorbell::SYNC_PRELOAD)?;
         }
+        // S2 (`NAIWA_STAGE_SPLIT`): run the resident experts *before* the staging wait, so the DMA lands
+        // under their compute instead of in front of it. The staged ones still need the ring, so they keep
+        // the gate. Off by default while it is validated.
+        #[cfg(feature = "cuda")]
+        let split = std::sync::OnceLock::<bool>::new();
+        #[cfg(feature = "cuda")]
+        let split = *split.get_or_init(|| {
+            std::env::var_os("NAIWA_STAGE_SPLIT").is_some() && self.staging_enabled()
+        });
+        #[cfg(not(feature = "cuda"))]
+        let split = false;
+
+        #[cfg(feature = "cuda")]
+        let resident_acc = if split {
+            let residents: Vec<Vec<Hit>> = hits
+                .iter()
+                .zip(&resident_prefix)
+                .map(|(row, &n)| row[..n].to_vec())
+                .collect();
+            let acc = self.run_hits(&residents, &x2d, act);
+            let mut fenced = Ok(());
+            for (buf, _, _) in residents.iter().flatten() {
+                if let Err(e) = buf.fence.record_reads(&self.slot_device) {
+                    fenced = fenced.and(Err(e));
+                }
+            }
+            if fenced.is_err() {
+                let _ = self.slot_device.synchronize();
+            }
+            fenced?;
+            Some(acc?)
+        } else {
+            None
+        };
+
         // M4: ... and the staging point, which every pass publishes.
         #[cfg(feature = "cuda")]
         if self.staging_enabled() {
             self.replay_gate(crate::doorbell::SYNC_STAGING)?;
         }
 
+        #[cfg(feature = "cuda")]
+        let hits_to_run: Vec<Vec<Hit>> = if split {
+            hits.iter()
+                .zip(&resident_prefix)
+                .map(|(row, &n)| row[n..].to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "cuda")]
+        let acc = if let Some((resident_out, resident_bank)) = resident_acc {
+            if hits_to_run.iter().all(|row| row.is_empty()) {
+                Ok((resident_out, resident_bank))
+            } else {
+                let (staged_out, staged_bank) = self.run_hits(&hits_to_run, &x2d, act)?;
+                Ok(((resident_out + staged_out)?, resident_bank.or(staged_bank)))
+            }
+        } else {
+            self.run_hits(&hits, &x2d, act)
+        };
+        #[cfg(not(feature = "cuda"))]
         let acc = self.run_hits(&hits, &x2d, act);
         // Kernels reading these slots may be queued even if a later step failed: fence every
         // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
