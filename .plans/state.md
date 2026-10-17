@@ -1,4 +1,4 @@
-# naiwa-rs v2 — state (2026-10-17)
+# naiwa-rs v2 — state (2026-10-17, M5 done)
 
 Resume-here summary. Detail: `architecture-v2.md` (design), `roadmap.md` (plan),
 `worklogs/` (evidence per milestone), `fork-inventory.md` (fork delta).
@@ -42,7 +42,7 @@ mapped:  epoch u32（device 每 pass 写一次）  ready[K] u32（每点一个�
 | M3 | CPU 结果经图内节点回 GPU | ✅ 门禁 5/5 |
 | M3.1 | doorbell 从 fork 移到引擎 | ✅ fork −1660 行 |
 | M4 | PCIe 路进图（`STAGING`） | ✅ 5/5 + 2/2 逐字节；48 gate / 384 replay / 0 退化 |
-| M5 | lookahead 进专用 spin-then-park 线程 | ⬜ |
+| M5 | 专家回 rayon + 预测单线程事件驱动 + 异步预载 | ✅ 命中 81–84%、TPOT 78–87 ms、11/11 逐字节 |
 | M6 | PLE（等 Q2）+ 整步图 | ⬜ |
 
 **M3 门禁**：`--pcie-frac 0` + `NAIWA_NO_LOOKAHEAD=1` → 5/5 逐字节等于冻结 oracle。
@@ -99,12 +99,14 @@ NAIWA_NO_LOOKAHEAD=1 $BIN bench -m ~/models/qwen3-coder/requant \
 cargo test --offline --release --features cuda          # 33/33
 ```
 
-## 下一步（M5）
+## 下一步（M5c / M6）
 
-1. lookahead 预载改成非阻塞（`queue_async`）+ 专用 spin-then-park 线程；
-2. 预载 DMA 入队后在 copy stream 上 `publish_point_on(id(layer,PRELOAD), pass)`，把该层 resident
-   capture 加一个 `wait_ready` 节点（capture 已是 per-layer，无需新的 keying）；
-3. 专家批保持 rayon；门禁：`frac 0` + `NO_LOOKAHEAD` 逐字节 + 命中率不破拐点 + 派发不在关键路径。
+1. **M5c（GPU predict）**：router gemv 进 GPU，只把 logits 写 mapped 内存，host 读 128 个数自己
+   top-k；可删掉激活 publish、`wait_publish` 自旋（0.42 ms/layer）和 CPU matmul。设计在
+   `worklogs/m5.md`。
+2. **M6**：Q2（PLE）定案 + 整步图；判据 = 整步 1 次 launch + 逐 token == eager。
+3. **旧账**：一次未复现的 `frac 0.55 + NO_LOOKAHEAD` 偏离（当前构建 11/11 干净），M6 前建议
+   `×50` 再逼一次。
 
 ## 开着的
 
