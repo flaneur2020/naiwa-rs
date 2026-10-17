@@ -106,8 +106,12 @@ cargo test --offline --release --features cuda          # 33/33
 2. **M5c（GPU predict）已降级**：M5b 之后预测线程有余量（job ~0.5 ms vs 1.6 ms 的层窗口，命中率
    已回到池基线），把 gemv 搬 GPU 换不来吞吐。等 M6 把 host 工作搬走、层窗口变窄之后再考虑——它
    能删掉整条激活通道，仍值得做，但排在 M6 之后。理由见 `worklogs/m5.md`。
-3. **旧账**：一次未复现的 `frac 0.55 + NO_LOOKAHEAD` 偏离（当前构建 11/11 干净），M6 前建议
-   `×50` 再逼一次。
+3. ~~旧账：一次未复现的 `frac 0.55` 偏离~~ **已定性**：故意复现 2/20，两次都是**同一段**错误输出
+   → 只有两个吸引子,不是数据损坏;`frac 0` 同条件 0/10。机制 = **decode 起点的驻留集**取决于 prefill
+   的 `spawn_fill` 进度,而"单 bank → M3 快路径(CPU 和累进 GPU 累加器)"与"双 bank → deferred(CPU
+   求和后一次 tensor add)"**舍入不同** → 偶尔翻一个 greedy token。
+   **门禁因此改为**:`frac 0`(+NO_LOOKAHEAD)= **逐字节**(数值 oracle);`frac 0.55` = **变体集合**
+   (当前恰好 2 个,都已记录)。出现**第三个**变体或参考缺席才是真信号。
 
 ## 开着的
 
