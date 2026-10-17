@@ -101,8 +101,8 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
-1. **M6 的闸门是 Q2（PLE 策略）**：读 `ple.rs` 的 n-gram hash/prefetch，判断每层 conv history 能否
-   在 host 复现；定案后才能排 PLE + 整步图（判据：整步 1 次 launch + 逐 token == eager）。
+1. **M6**：Q2 已定案（见下）——`SYNC_PLE` 作为第四个同步点（`WAITS_PER_LAYER = 4`, `K = 192`）
+   + host 侧纯函数算行号 + gather DMA + 整步图；判据 = 整步 1 次 launch + 逐 token == eager。
 2. **M5c（GPU predict）已降级**：M5b 之后预测线程有余量（job ~0.5 ms vs 1.6 ms 的层窗口，命中率
    已回到池基线），把 gemv 搬 GPU 换不来吞吐。等 M6 把 host 工作搬走、层窗口变窄之后再考虑——它
    能删掉整条激活通道，仍值得做，但排在 M6 之后。理由见 `worklogs/m5.md`。
@@ -111,5 +111,8 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 开着的
 
-- **Q2（PLE 策略）**：M6 唯一前置；约半天可判（`ple.rs` 的 hash/prefetch 能否在 host 复现）。
+- ~~**Q2（PLE 策略）**~~ **已定案**：`ple.rs` 的 `PleHash::rows` 是**纯函数**——只看最近
+  `ngram-1` 个 token id(host 本来就有)+ 素数取模,没有 conv/隐状态需要在 host 复现。所以 PLE 在
+  v2 里不是新机制,而是**第三个 host 产出的 DMA**:host 算 hashed 行号 → 在 copy stream 发 gather
+  拷贝 → 单调发布 `SYNC_PLE(layer, pass)` → 图内自旋等它。计划见 `worklogs/m6.md`。
 - fork 的 W 时代探针（`PLE_DBG`/`MOE_DBG`/`MTP_DBG`，~150 行）可删——hygiene，不急。
