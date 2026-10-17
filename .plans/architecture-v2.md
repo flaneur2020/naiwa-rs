@@ -212,6 +212,32 @@ payload  : [R][max_n] f32   ← host 写、设备读（环）
 层内重叠完全保留：host 在 pass k 开始时读到 `epoch=k`，就可以连续为 `L=1..48` 发布，比 GPU
 在层上跑得更快；它只是不能比设备更早开始下一个 pass。
 
+#### 一层的 CPU → GPU 通知点（命名与编号）
+
+按 **GPU 命中它们的先后顺序**编号（顺序很重要，见不变量 7）：
+
+| # | 常量 | 内容 | 谁生产 | 今天怎么实现 | 需要自旋？ |
+|---|---|---|---|---|---|
+| 0 | `SYNC_RESIDENCY` | 本层 dispatch 用的驻留列表 | host | stream 序 H2D 写描述符 | **否**（stream 已排序） |
+| 1 | `SYNC_DMA_DONE` | 55% 那路 PCIe DMA 完成 | host 发起 / copy stream 执行 | copy-stream `CopyDone` + 主 stream 等待 | **否**（stream 序） |
+| 2 | `SYNC_CPU_EXPERTS` | 45% 那路 CPU 专家的贡献 `[rows,hidden] f32` | CPU worker | `deferred` 的 mapped payload + seq | **是** |
+
+**今天一层内真正需要 GPU 自旋的 CPU 通知只有一个：`SYNC_CPU_EXPERTS`。** 另两个是数据依赖，
+靠 stream 顺序保证 —— 描述符是 `cudaMemcpyAsync` 排在 launch 之前，DMA 完成是 copy-stream
+event；只有 host 直接写 mapped 才会出竞态（M1/M2 的描述符因此从未踩坑）。
+
+编号方案（今天 `WAITS_PER_LAYER = 1`，其余两个只以注释/文档预留，不烧进 N/R）：
+
+```rust
+pub const SYNC_CPU_EXPERTS: u32 = 0;   // 今天唯一需要自旋的位置（层内第 0 位）
+pub const WAITS_PER_LAYER:   u32 = 1;  // 将来若把 RESIDENCY/DMA_DONE 改成 mapped 通知再改大
+pub const fn sync_id(layer: u32, k: u32) -> u32 { layer * WAITS_PER_LAYER + k }
+pub const N: u32 = 48 * WAITS_PER_LAYER;   // 每 pass 的同步点总数
+// R >= N + host 在 pass 内的领先量：N=48 取 R=128
+```
+
+节点烘入 `sync_id(layer, SYNC_CPU_EXPERTS)`，target = `epoch * N + sync_id(..)`。
+
 #### 不变量
 
 1. **同步点集合固定**：每层每 pass 都发布一次，即使 `n_cpu == 0` 也发布全零。这是静态排程的
@@ -226,6 +252,10 @@ payload  : [R][max_n] f32   ← host 写、设备读（环）
 5. **u32 回绕**：`2^32 / N ≈ 89M` passes，够用。
 6. **内存序**：设备写 epoch 用 `__threadfence_system()` 前后各一次；host 读 epoch 用 volatile
    + acquire；host 写 payload/progress 用 release fence；节点自旋后 `__threadfence_system()`。
+7. **单标量 `progress` ⇒ 同步点全序。** 把 `progress` 推到 `epoch*N+id` 等价于宣告同一 pass
+   内 id 更小的点全部就绪。所以 `sync_id` 的编号顺序必须同时等于 ① GPU 命中顺序 ② host 发布
+   顺序。若将来某个等待点需要独立于其它点，必须把 `progress` 从 1 个字换成「每个等待点一个
+   字」，否则会隐式跳过。
 
 > 注意：这条协议**取代**了 §3.1 里「`target` 放 mapped」的写法。§3.1 的 `wait_ge_ptr` /
 > `wait_copy_ptr` 仍然有用（它们只需要一个 host 写的目标值，适合 prefill 之类一次性路径），
