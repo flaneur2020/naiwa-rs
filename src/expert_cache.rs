@@ -953,7 +953,41 @@ mod step_probe {
 
     static ACC: Mutex<Acc> = Mutex::new(Acc::EMPTY);
 
-    pub(super) fn mark(device: &Device) {
+    // Per-round wall time (round = one pass, marked at layer 0), because with speculative decoding a round
+    // yields more than one token and TPOT stops describing it.
+    static ROUND: Mutex<(Option<Instant>, Vec<f64>)> = Mutex::new((None, Vec::new()));
+
+    pub(super) fn mark_round(layer: usize) {
+        if layer != 0 {
+            return;
+        }
+        let mut g = ROUND.lock().unwrap();
+        let now = Instant::now();
+        if let Some(prev) = g.0.replace(now) {
+            let ms = now.saturating_duration_since(prev).as_secs_f64() * 1e3;
+            // A round is tens of ms here (speculation makes it longer), so only filter real gaps:
+            // between requests the sampler and the bench take hundreds of ms, and a round is never < 5 ms.
+            if (5.0..500.0).contains(&ms) {
+                g.1.push(ms);
+                if g.1.len() == 8 {
+                    let mut v = g.1.clone();
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    eprintln!(
+                        "ROUND_DBG n={} min {:.2} p50 {:.2} max {:.2} mean {:.2}",
+                        v.len(),
+                        v[0],
+                        v[v.len() / 2],
+                        v[v.len() - 1],
+                        v.iter().sum::<f64>() / v.len() as f64
+                    );
+                    g.1.clear();
+                }
+            }
+        }
+    }
+
+    pub(super) fn mark(device: &Device, layer: usize) {
+        mark_round(layer);
         let on = *ON.get_or_init(|| std::env::var_os("NAIWA_STEP_DBG").is_some());
         if !on || !device.is_cuda() {
             return;
@@ -2201,7 +2235,7 @@ impl CachedLayer {
         let (batch, seq, hidden) = xs.dims3()?;
         let rows = batch * seq;
         let x2d = xs.reshape((rows, hidden))?;
-        step_probe::mark(&self.slot_device);
+        step_probe::mark(&self.slot_device, self.layer);
         // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
         // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
         // known before the DMA, because that is what publishes the staging point for this pass.
