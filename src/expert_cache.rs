@@ -546,6 +546,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             act: ctx.act,
             router,
             lookahead_chan,
+            #[cfg(feature = "cuda")]
+            cpu_chan: std::sync::OnceLock::new(),
             state: Mutex::new(CachedLayerState {
                 doorbell: None,
                 doorbell_seq: 0,
@@ -1370,6 +1372,11 @@ struct CachedLayer {
     /// R2a: the layer's GPU->host activation channel. `Some` only when the router exists
     /// and the slot device is CUDA.
     lookahead_chan: Option<LookaheadChannel>,
+    /// M3: this layer's CPU-return channel, with its own `(slot, seq)` numbering. Created at
+    /// warmup so a captured wait node is never stranded on a grown-and-retired channel, and so
+    /// the numbering is 1:1 with this layer's jobs by construction.
+    #[cfg(feature = "cuda")]
+    cpu_chan: std::sync::OnceLock<Arc<deferred::CpuChannel>>,
     state: Mutex<CachedLayerState>,
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     copy_stream: Option<Arc<CopyStream>>,
@@ -1393,6 +1400,14 @@ impl CachedLayer {
     /// newly given a capture. No-op without `cuda` or with no copy-stream banks.
     #[cfg(feature = "cuda")]
     fn warmup_captures(&self, stage_dtype: DType) -> candle_core::Result<usize> {
+        // M3: this layer's own CPU-return channel, sized for the largest decode batch.
+        if let Some(chan) =
+            deferred::CpuChannel::acquire(&self.slot_device, CAPTURE_MAX_BATCH * self.hidden)?
+        {
+            let _ = self.cpu_chan.set(chan);
+        } else {
+            warn!("expert cache: no CPU-return channel for layer {}", self.layer);
+        }
         let mut banks: Vec<Arc<Bank>> = Vec::new();
         for entry in &self.slot_bufs {
             let guard = entry.lock();
@@ -2149,8 +2164,13 @@ impl CachedLayer {
             }
             let xs_cpu = x2d.unsqueeze(0)?.to_device(&Device::Cpu)?;
             let this = Arc::clone(self);
+            #[cfg(feature = "cuda")]
+            let chan = self.cpu_chan.get();
+            #[cfg(not(feature = "cuda"))]
+            let chan: Option<&Arc<deferred::CpuChannel>> = None;
             Some(deferred::start(
                 &self.slot_device,
+                chan,
                 rows,
                 self.hidden,
                 move || {

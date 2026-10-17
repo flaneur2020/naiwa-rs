@@ -19,6 +19,8 @@
 //! A failed computation leaves the returned tensor unwritten; the error is returned by the next
 //! [`start`] (the next layer of the same step, or the next step's first).
 
+use std::sync::Arc;
+
 use candle_core::{Device, Result, Tensor};
 
 /// A CPU computation started by [`start`].
@@ -36,15 +38,34 @@ enum Inner {
     Running(cuda::Running),
 }
 
-/// Start `compute()`, whose result is `rows * cols` F32 values for `device`. On CUDA it runs on
-/// the worker thread; elsewhere it runs now.
-pub fn start<F>(device: &Device, rows: usize, cols: usize, compute: F) -> Result<Pending>
+/// A layer's CPU-return channel on CUDA; a unit placeholder elsewhere, so the call sites stay
+/// feature-agnostic.
+#[cfg(feature = "cuda")]
+pub type CpuChannel = cuda::Channel;
+#[cfg(not(feature = "cuda"))]
+pub type CpuChannel = ();
+
+/// Start `compute()`, whose result is `rows * cols` F32 values for `device`. On CUDA with a
+/// per-layer `chan` it runs on the worker thread and publishes into that channel; otherwise it
+/// runs now.
+pub fn start<F>(
+    device: &Device,
+    chan: Option<&std::sync::Arc<CpuChannel>>,
+    rows: usize,
+    cols: usize,
+    compute: F,
+) -> Result<Pending>
 where
     F: FnOnce() -> Result<Vec<f32>> + Send + 'static,
 {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(dev) = device {
-        let running = cuda::start(dev, rows * cols, Box::new(compute))?;
+        // Per-layer channel when the caller has one (the decode path), else the legacy global.
+        let chan = match chan {
+            Some(c) => Arc::clone(c),
+            None => cuda::global_channel(dev, rows * cols)?,
+        };
+        let running = cuda::start(dev, &chan, rows * cols, Box::new(compute))?;
         return Ok(Pending {
             device: device.clone(),
             rows,
@@ -52,6 +73,7 @@ where
             inner: Inner::Running(running),
         });
     }
+    let _ = chan;
     Ok(Pending {
         device: device.clone(),
         rows,
@@ -113,18 +135,63 @@ mod cuda {
         }
     }
 
-    /// The engine-wide mapped channel: the worker publishes each result into a payload slot
-    /// and bumps seq; the stream-ordered wait+copy kernel (queued by [`upload`]) waits on the
-    /// same counter. One channel serves the whole engine because steps are sequential — at
-    /// most one publish is unread per slot, and the ring has two slots.
+    /// A layer's CPU-return channel: its own mapped flag buffer and its own `(slot, seq)`
+    /// numbering.
     ///
-    /// The slot size is not known up front (it is `rows x hidden`, and rows vary with the
-    /// speculative depth), so the channel grows on demand: a `start` larger than the current
-    /// slot replaces the channel. A swapped-out channel is safe — each `Running` and its job
-    /// hold their own `Arc`, and the worker publishes the global monotonic `publish_seq`
-    /// (absolute, not incremental), so a fresh channel's counter simply jumps to it.
-    fn flag_channel(dev: &CudaDevice, min_n: usize) -> Result<Arc<FlagBuf>> {
-        static CHANNEL: Mutex<(Option<Arc<FlagBuf>>, Vec<Arc<FlagBuf>>)> = Mutex::new((None, Vec::new()));
+    /// **Per-layer, not engine-wide.** A shared channel has to share one `(slot, seq)`
+    /// counter, so any job that does not consume the channel (a layer with two banks, or a
+    /// step wider than the fast path allows) desynchronizes every later job from a device-side
+    /// consumer. Per-layer keeps the numbering 1:1 with the layer's own jobs *by construction*,
+    /// and it means a captured wait node is never stranded on a channel that grew and retired
+    /// its allocation. This is `architecture-v2` §3.4's `flag_host_to_gpu: per-layer`.
+    pub struct Channel {
+        chan: Arc<FlagBuf>,
+        next: Mutex<(usize, u32)>,
+    }
+
+    impl Channel {
+        /// Allocate a channel whose payload slot holds at least `min_n` f32. `Ok(None)` when the
+        /// device is not CUDA or the mapped allocation fails.
+        pub fn acquire(device: &Device, min_n: usize) -> Result<Option<Arc<Channel>>> {
+            if !device.is_cuda() {
+                return Ok(None);
+            }
+            // Headroom: a verify window a few rows larger must not need another allocation (a
+            // capture would otherwise be stranded on the retired one).
+            let want = min_n.max(1) * 2;
+            Ok(FlagBuf::acquire(device, want)?.map(|chan| {
+                Arc::new(Channel {
+                    chan: Arc::new(chan),
+                    next: Mutex::new((0, 0)),
+                })
+            }))
+        }
+
+        /// The flag buffer itself (mapped cells + payload ring).
+        pub fn flag(&self) -> &Arc<FlagBuf> {
+            &self.chan
+        }
+
+        pub fn max_n(&self) -> usize {
+            self.chan.max_n()
+        }
+
+        fn next_job(&self) -> (usize, u32) {
+            let mut p = self.next.lock().unwrap();
+            p.0 = p.0.wrapping_add(1);
+            p.1 = p.1.wrapping_add(1);
+            (p.0, p.1)
+        }
+    }
+
+    /// The legacy **global** channel, for call sites without a per-layer one (`CpuExperts`, the
+    /// `--cpu-moe` path with no expert cache). It keeps the old grow-and-retire behavior. Those
+    /// call sites never capture a wait node, so neither the 1:1 numbering requirement nor the
+    /// retirement hazard applies — and the decode path (the one that captures) always passes its
+    /// own per-layer channel.
+    pub fn global_channel(dev: &CudaDevice, min_n: usize) -> Result<Arc<Channel>> {
+        static CHANNEL: Mutex<(Option<Arc<Channel>>, Vec<Arc<Channel>>)> =
+            Mutex::new((None, Vec::new()));
         let mut guard = CHANNEL.lock().unwrap();
         let (chan, retired) = &mut *guard;
         if chan.as_ref().is_none_or(|c| c.max_n() < min_n) {
@@ -133,11 +200,15 @@ mod cuda {
             let next = FlagBuf::acquire(&Device::Cuda(dev.clone()), want)
                 .ok()
                 .flatten()
-                .map(Arc::new);
+                .map(|f| {
+                    Arc::new(Channel {
+                        chan: Arc::new(f),
+                        next: Mutex::new((0, 0)),
+                    })
+                });
             if let (Some(old), Some(_next)) = (chan.take(), &next) {
-                // The old channel's wait kernel may still be queued with raw mapped
-                // pointers; retired channels are kept alive forever (a few hundred KB
-                // each, growth bounded by the doubling) instead of freed under it.
+                // A queued wait kernel may still hold raw mapped pointers; keep retired channels
+                // alive forever (a few hundred KB each, growth bounded by the doubling).
                 retired.push(old);
             }
             *chan = next;
@@ -147,32 +218,24 @@ mod cuda {
         })?))
     }
 
-    /// Which slot and seq the next publish uses (monotonic; slot cycles mod RING_DEPTH).
-    static PUBLISH: Mutex<(usize, u32)> = Mutex::new((0, 0));
-
     /// A job handed to the worker: run `compute`, publish the result on the channel.
     pub struct Running {
-        chan: Arc<FlagBuf>,
+        chan: Arc<Channel>,
         slot: usize,
         publish_seq: u32,
         len: usize,
     }
 
     pub fn start(
-        dev: &CudaDevice,
+        _dev: &CudaDevice,
+        chan: &Arc<Channel>,
         len: usize,
         compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
     ) -> Result<Running> {
         take_error()?;
-        let chan = flag_channel(dev, len)?;
-        let (slot, publish_seq) = {
-            let mut p = PUBLISH.lock().unwrap();
-            p.0 = p.0.wrapping_add(1);
-            p.1 = p.1.wrapping_add(1);
-            (p.0, p.1)
-        };
+        let (slot, publish_seq) = chan.next_job();
         let done = SetFlag {
-            chan: Arc::clone(&chan),
+            chan: Arc::clone(chan.flag()),
             slot,
             publish_seq,
             published: false,
@@ -204,7 +267,7 @@ mod cuda {
             .unwrap()
             .send(job)
             .map_err(|_| Error::Msg("the CPU experts thread is gone".into()))?;
-        Ok(Running { chan, slot, publish_seq, len })
+        Ok(Running { chan: Arc::clone(chan), slot, publish_seq, len })
     }
 
     /// Publishes a payload slot (or just the seq bump on failure). Bumps seq exactly once per
@@ -247,7 +310,7 @@ mod cuda {
         debug_assert_eq!(len, rows * cols);
         // SAFETY: fully overwritten by the copy kernel before anything reads it.
         let out = unsafe { Tensor::empty((rows, cols), DType::F32, &Device::Cuda(dev.clone()))? };
-        chan.wait_copy_slot(slot, publish_seq, len, &out)?;
+        chan.flag().wait_copy_slot(slot, publish_seq, len, &out)?;
         Ok(out)
     }
 }
