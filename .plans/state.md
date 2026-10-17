@@ -101,10 +101,11 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
-1. **M5c（GPU predict）**：router gemv 进 GPU，只把 logits 写 mapped 内存，host 读 128 个数自己
-   top-k；可删掉激活 publish、`wait_publish` 自旋（0.42 ms/layer）和 CPU matmul。设计在
-   `worklogs/m5.md`。
-2. **M6**：Q2（PLE）定案 + 整步图；判据 = 整步 1 次 launch + 逐 token == eager。
+1. **M6 的闸门是 Q2（PLE 策略）**：读 `ple.rs` 的 n-gram hash/prefetch，判断每层 conv history 能否
+   在 host 复现；定案后才能排 PLE + 整步图（判据：整步 1 次 launch + 逐 token == eager）。
+2. **M5c（GPU predict）已降级**：M5b 之后预测线程有余量（job ~0.5 ms vs 1.6 ms 的层窗口，命中率
+   已回到池基线），把 gemv 搬 GPU 换不来吞吐。等 M6 把 host 工作搬走、层窗口变窄之后再考虑——它
+   能删掉整条激活通道，仍值得做，但排在 M6 之后。理由见 `worklogs/m5.md`。
 3. **旧账**：一次未复现的 `frac 0.55 + NO_LOOKAHEAD` 偏离（当前构建 11/11 干净），M6 前建议
    `×50` 再逼一次。
 
