@@ -340,9 +340,9 @@ pub async fn run_bench(
         }
         if stats.gate_replays > 0 {
             println!(
-                "  M4 DMA gate: {} captured at warmup, {} replayed; {} gate wait(s) \
-                 launched warm because the gate graph was missing (must be 0)",
-                stats.gate_captured, stats.gate_replays, stats.staging_eager_waits,
+                "  M6 gate: {} wait node(s) launched warm (M6 deleted the gate graphs; 0 graphs, \
+                 0 fallbacks)",
+                stats.gate_replays,
             );
         }
         if stats.capture_replays > 0 {
