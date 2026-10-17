@@ -87,6 +87,32 @@ So that was *a* source, not *the* source. What is left to look at, in order:
    to the cache/KV layout - consistent with the failure being more common when the KV cache or expert cache
    size changes.
 
+## NaN logits: fixed by zeroing the two uninitialised buffers
+
+Two sources, both "memory that was never written":
+
+1. **the schedule payload** (`src/doorbell/mod.rs`) - `cudaHostAlloc` does not hand out zeroed memory, so a
+   consumer that passed its gate could add garbage f32 bits into a layer's accumulator (commit `4044e8a`);
+2. **the paged-attention KV blocks** (`mistralrs-core/paged_attention/cache_engine.rs`) - allocated with
+   `Tensor::empty`, i.e. uninitialised device memory, while block zero is reserved and never written and a
+   stale slot mapping can reach a block that was never filled. Garbage BF16 there is NaN/Inf and poisons
+   the attention output directly.
+
+Measured, same command (`--prompt-len 512 --gen-len 32 --cpu-moe --pcie-frac 0 --pa-context-len 4096`):
+
+| build | failures |
+|---|---|
+| before | 2-3 in 5 |
+| payload zeroed | 1 in 5 |
+| + KV blocks zeroed | **0 in 6** (80.3 / 82.1 / 83.2 / 84.6 / 84.9 / 85.4 ms) |
+
+Hit rate over those runs: 19.7% at `frac 0` with `NO_LOOKAHEAD` (18.8% on one run, from admission order).
+
+That also reassesses the earlier "two-variant rounding" explanation of the one-off divergence in
+`worklogs/m5.md`: an occasional NaN **or** garbage payload does not need a rounding story at all, so those
+two findings probably share this cause. A larger sample (x20 with output checksums) is the right
+confirmation, and the oracle gates are byte-exact again now that the buffers start deterministic.
+
 ## Open risk seen today
 
 `Invalid sampling probability ... NaN` has now been seen **three times**, at `--expert-cache-gb 2` (twice,
