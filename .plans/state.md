@@ -101,7 +101,13 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
-0a. **M6 进度**:step 1 ✅(门图全删,−140 行,33/33,oracle 逐字节);step 2 ✅ 三个未知全部消除
+0. **M6 = 性能里程碑**(`worklogs/m6.md`;图形捕获那部分已改名 `m6-graph.md`)。当前:80-85 ms TPOT /
+   11.6-12.4 tok/s(`frac 0` + NO_LOOKAHEAD,**19.7% 命中**);出货配置 78-87 ms、**81-84% 命中**。
+   已划掉:更大缓存(实测更慢)、GPU kernel(GPU 98% 空闲)、整步图(不可行)、attention 捕获(1-4 ms)。
+   NaN 已修(两处未初始化内存:schedule payload + paged KV `Tensor::empty`,0/6)。顺序:P1 用
+   `NAIWA_FUSED_DBG` 拆开 1.6 ms/层 → P2 设备侧 miss 决策 → P3 MTP 端到端(唯一的 ×2.5)→ P4 rayon
+   饱和度 → P5 图形。
+0a. **M6 图形进度**:step 1 ✅(门图全删,−140 行,33/33,oracle 逐字节);step 2 ✅ 三个未知全部消除
    (harness 证明固定缓冲+拷入+回放逐比特一致;审计证明解码区域零同步零 CPU 往返;每步变化输入只有
    `res` 与 mask/metadata,后者用现有 `resident_input`)。**剩余是纯机械实现**,精确的编辑点、区域
    边界(窗口内 = norm/mix/inject + mixer,产物只有 `inject`/`out`)、排除项(GDN/PLE 层)、捕获池

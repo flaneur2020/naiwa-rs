@@ -1,0 +1,766 @@
+# M6 — Q2 answered, and what PLE costs the whole-step graph
+
+**Status: Q2 SETTLED** (2026-10-17). No PLE work written yet; this is the decision record that
+unblocks it.
+
+## Q2: can the per-layer PLE state be reproduced on the host?
+
+**Yes, and there is nothing to reproduce.** `qwen4_exp/ple.rs:168` (`PleHash::rows`) is a pure
+function of the token window:
+
+```rust
+ctx[0] = tokens[local];                             // this token
+ctx[s] = tokens[local - s] (s < local)              // the previous ngram-1 tokens,
+         else history[..]                            //   taken from `history` across chunk borders
+                                                      //   EOS cuts the window
+for n in 2..=ngram {
+    mixed = XOR over s<n of ctx[s].wrapping_mul(multipliers[s]);
+    row[h] = mixed % vocab_sizes[h] + offsets[h];    // per head h
+}
+```
+
+So a layer's PLE rows depend only on **the last `ngram_size - 1` token ids** — no conv state, no
+learned state, no hidden activations. The host already owns those ids (it samples them; the MTP
+drafts are host tokens too), so "PLE state on the host" is a ring of `ngram-1` u32 per sequence.
+There is no mystery and no half-day of investigation needed.
+
+What PLE *does* cost is the table: the hashed n-gram table is ~100 GB, never a weight tensor, and
+each step gathers `rows x head_dim` at hashed offsets (`iq4_nl_row_bytes`, `ResidentTable` /
+`quantize_shards`). That is a **random read on the host** plus an H2D — the same shape as the two DMA
+producers the engine already has.
+
+## Decision: the PLE weights never move to the GPU
+
+The fork *can* move them: `make_table_resident` -> `ResidentTable::make_resident` copies the whole
+hashed table into device memory (GGUF rows as-is, safetensors rows quantized to 8 or 4 bits) whenever
+`resident_bytes(rows, head_dim, bits) + RESIDENT_RESERVE_BYTES <= available`, and only falls back to
+the host gather when it does not fit. On this 12 GB card it never fits, but the mechanism is live.
+
+**v2 rules it out on principle: the table lives on the CPU only.** Consequences:
+
+- **VRAM is not spent on PLE at all.** The card is weights + expert cache + staging rings, and the
+  budget is card-size-independent: no `RESIDENT_BITS`/`RESIDENT_RESERVE_BYTES` planning, no
+  `planned_resident_table_bytes` in the memory math.
+- **One gather path to optimise**, the host one: `advise_random_access` (the default readahead reads
+  ~100x more than it uses at hashed offsets and evicts what matters), then a per-pass row read.
+- **The GPU only ever sees the per-pass rows** — a few KB — and those copies are what `SYNC_PLE`
+  gates. Nothing else of PLE crosses PCIe.
+- **The row read is a disk/page-cache read**, so it must be *issued early* (a pass ahead, like the
+  preload) and must never be performed on the token thread. Same "issue, do not perform" discipline
+  as M5b; a dedicated gather thread or the existing lookahead thread in its gap.
+
+**Fork side (a cut point, not a new feature)**: `make_table_resident` stops calling `make_resident`,
+so `ResidentTable`, `copy_iq4_nl`, `quantize_shards`, `resident_bytes`, `planned_resident_table_bytes`
+and the resident planning constants become dead and can be deleted (~300 lines), leaving
+`gathers_on_device() == false` permanently. That is the opposite of the usual story: the decision
+*shrinks* the fork.
+
+## Consequence for the whole-step graph
+
+PX1: PLE is **not** a new mechanism. It is the third host-produced DMA, and it fits the protocol the
+engine already implements:
+
+```
+host (token thread)  compute the hashed rows from the token window (pure, ~us)
+                     issue the row DMA on the copy stream
+                     publish SYNC_PLE(layer, pass) on that stream — monotonic, atomicMax
+layer graph          spin on that point before the PLE gather's consumer, exactly like
+                     SYNC_STAGING (M4) and SYNC_PRELOAD (M5b)
+```
+
+So the PLE work is: `SYNC_PLE` as a fourth point kind (`WAITS_PER_LAYER = 4`, `K = 192`), a per-layer
+gate capture (the `capture_gate(kind)` machinery is already generic over `kind`), the host-side row
+computation, and the gather DMA. No new protocol, no capture-window exceptions.
+
+Two details to keep straight:
+
+1. **The token window must be tracked per sequence**, including for draft/verify rows: the PLE rows
+   for a speculative row are the hash of *its* hypothetical token, which the host has as a draft. A
+   rejected draft only costs a stale gather.
+2. **The gather is on the decode path**, so it belongs in the same "issue, do not perform" discipline
+   as M5b: the host computes indices and queues copies; the graph waits. Never `stream.synchronize()`
+   on the token thread.
+
+## First finding: the fork's own decode-graph path cannot be reused (and why that is the point)
+
+`qwen4_exp/text.rs:789`:
+
+```rust
+/// The decode step is graph-capturable unless PLE rows must be gathered on the host.
+pub fn supports_decode_graphs(&self) -> bool {
+    self.layers.iter().filter_map(|l| l.ple.as_ref()).all(PleLayer::gathers_on_device)
+        && !self.has_external_experts()   // a RoutedExpertsProvider may run off-device
+}
+```
+
+Both clauses are **permanently false in v2, on purpose**:
+
+- `gathers_on_device` is exactly the resident-table path we have just ruled out (PLE weights stay on the
+  CPU), so the first clause can never hold again;
+- `has_external_experts()` is exactly our `CpuExperts`, i.e. the whole point of the engine.
+
+So `pipeline/cuda_graph.rs` — the fork's whole-step capture — will never engage for this model. M6 must
+**capture the step in the engine**, not inherit the fork's capture.
+
+That is not a loss, it is a statement of what changed: the fork's rule says "a captured graph cannot
+replay off-device work", and the two things it names (host-gathered PLE rows, CPU experts) are
+precisely the two things M2-M5b proved *are* replayable — through mapped flags and a spin, i.e. the
+doorbell. The fork's condition is the pre-doorbell world view. M6's job is to move the capture window
+out from the MoE segment to the whole step, with the sync points inside it.
+
+## The experiment: forcing the step graph on hangs, in one specific place
+
+`cuda_graphs_enabled()` defaults to **true** (`perf_flags.rs:24`), so the pipeline was always willing
+to capture a step — only `supports_decode_graphs()` stood in the way. Forced on with the probe
+(`NAIWA_STEP_CAPTURE=1`, now a permanent read-only diagnostic in the fork), the run **hangs** before
+the first token (bench with `--gen-len 4`, killed at 300 s).
+
+The cause is structural, not a bug: `decode_forward` contains a **host-side spin on device output**,
+in the middle of the model forward —
+
+```rust
+let ring = ...;                      // queue the top-k ring kernel on the stream
+let (_, ids, ws) = db.wait_and_read(seq, n);   // <- host spins until the kernel writes mapped memory
+```
+
+Under capture the ring kernel is only *recorded*, never executed, so `wait_and_read` spins forever and
+the capture never ends. **Every per-layer host decision in the engine is of this shape**: the top-k is
+read back, the miss set is computed, the DMAs are issued, the CPU payload is written — 48 times per
+step, in the middle of the forward.
+
+## Consequence: "one launch per step" is not reachable, and M6 must be re-scoped
+
+Device-initiated H2D DMA does not exist: only the **host** can issue the staging copies, and the
+staging decisions depend on that layer's freshly computed top-k. So the host is *irreducibly* in the
+loop once per layer, and the capture window must therefore **stop at every MoE segment**:
+
+- a single graph containing the whole step would have to bake 48 layers' miss sets at capture time —
+  it would be wrong on the next step;
+- re-capturing per step is absurd (11.6 ms per 150 captures, per step);
+- `cuGraphExecUpdate` per layer does not help: the staging copies are host-issued memcpys, not node
+  parameters.
+
+**So M6's target is not `1 launch/step`; it is `offload-granularity` launches/step**: the capture
+granularity has to end at the host-in-the-loop boundary, which is exactly the MoE segment. The honest
+formulation:
+
+> Per step: **48 MoE segments + 48 attention segments + O(1)**, where each segment is one graph
+> launch, and the only host work between them is the doorbell read + the staging DMA decisions.
+
+That is what remains of "whole-step": the *attention* segments get captured (they are hundreds of
+candle launches today, and they contain no host decision), while the MoE segments stay as they are.
+The structural criterion becomes `launches/step ~= 96 + c` instead of hundreds + 48.
+
+**Nothing here says the MoE segments stop being graphs.** They stay exactly as they are: one captured
+graph per (layer, shape) replayed with `cuGraphLaunch`, 48 per step. What is ruled out is only wrapping
+those launches in a *larger* step-level graph — because a parent graph replaying child graph nodes
+would contain no staging copies (the host issued them during the capture pass) and would carry a baked
+miss set.
+
+**One further launch reduction is available and worth taking in M6**: the per-layer gates (preload,
+staging) are separate one-node graphs *only because* `wait_ready`'s `sync_id` is baked into the kernel
+arguments, while a segment graph is shared by the 2-4 layers of its shape. But `sync_id` is a node
+*parameter*: `cuGraphExecKernelNodeSetParams` (tens of ns per step) lets the segment graph open with
+its own `wait_ready` node, deleting all 96 gate graphs and giving 48 MoE + 48 attention launches per
+step with no gates at all. Do this before adding attention graphs, so the launch-count criterion is
+measured once, cleanly.
+
+This also places PLE naturally: it runs before its layer's attention, so it belongs **inside the
+attention segment**, gated by `SYNC_PLE` — no separate mechanism, and no per-step host wait inside
+the window unless the rows are gathered a pass early (as planned).
+
+## M6 step 1 done: the per-layer gate graphs are gone
+
+The gates were separate one-node graphs, and for no gain: the same node was *already* launched warm
+whenever its capture failed (`replay_gate`'s `None` arm), and a plain launch is cheaper than replaying
+a one-node graph (measured 12.7 us for `cuGraphLaunch` vs 5.1-6.0 us for `cuLaunchKernel`). M6 deletes
+the machinery instead of making it bigger:
+
+- gone: ``struct StagingGate``, its `Send` impl, `replay` (with `COUNTERS.gate_replays`), `capture_gate`
+  (~45 lines), the two `CachedLayerState` fields, the warmup capture block (~30 lines), the
+  `gate_captured` counter triples;
+- `replay_gate` is now three lines: `sync_id(layer, kind)` then `wait_ready(...)` on the stream.
+
+Verification:
+
+| gate | result |
+|---|---|
+| `cargo test --offline --release --features cuda` | **33/33** (also fixed 4 test-only `admit(e)` calls that M5b's `sync: bool` left broken) |
+| oracle, `frac 0` + `NO_LOOKAHEAD` | **byte-identical** |
+| oracle, `frac 0.55` + `NO_LOOKAHEAD`, x4 | 4/4 oracle, **0 new variants** |
+| structural, `frac 0.55` | `warmup: 48 capture(s)` (was 48 + 96 gate captures), `M6 gate: 384 wait node(s) launched warm (0 graphs, 0 fallbacks)`, `M1: ring set frozen` |
+| launch mix (nsys, `frac 0.55`) | `cuGraphLaunch` 338 (segments only), `cuLaunchKernel`+`cudaLaunchKernel*` 26 602, HtoD 15 241 |
+
+Note what the accounting says: at `frac 0` the gates were always inert (`staging_enabled()` is false
+without a copy stream and a `pcie_frac > 0`, and `NO_LOOKAHEAD` kills the preload gate), which is why
+`cuGraphLaunch` there is unchanged at 678 in both builds. The 384 warm waits per run only exist at
+`frac > 0`, and the counter line is the evidence that they now run as plain launches.
+
+TPOT stays in the noise band either way (85.3 vs 86.8 ms at `frac 0`; 93.0 vs 92.4 ms at `frac 0.55`):
+the point of this step is one mechanism fewer, not a number.
+
+### The break-even rule this establishes (applies to M6 step 2)
+
+> A capture pays only when the segment contains **many** launches. A single-node segment is a pure
+> loss: same stream ordering, but `cuGraphLaunch` 12.7 us against `cuLaunchKernel` 5.1-6.0 us, plus
+> ~36 us of instantiation at warmup.
+
+Deleted the gates does **not** say anything about the MoE segment graphs, which sit at the other end of
+the range: one segment replaces ~5 raw launches per bank per layer, 48 times a step, and stays exactly
+as it is. It also sets the expectation for step 2: an attention segment is *hundreds* of candle
+launches per layer, i.e. the largest win available in the engine.
+
+## Step 2 sizing, measured before writing it
+
+One decode step at `frac 0` is **2 224 kernels**, and `nsys` names them well enough to split the step
+(`/tmp/g6.sqlite`, last 85 ms window):
+
+| count/step | kernel | attribution |
+|---|---|---|
+| 278 | `gemv_kernel_batched` | MoE expert GEMMs (in the segments) |
+| 263 + 102 + 49 | `mmvq_gguf_quantize_q8_1_bf16`, `mmvq_gguf_q6_k/q4_k_bf16` | MoE matvec (in the segments) |
+| 97 x2, 96 | `q4_hc_mix_kernel`, `q4_hc_combine_kernel` | attention block, ~2/layer |
+| 97 each | `cutlass::Kernel2`, `usilu_bf16`, `affine_bf16` | norm/mixer, ~2/layer |
+| 66 / 60 / 60 / 52 | `cast_f32_bf16`, `bmul_bf16`, `usigmoid_bf16`, `bmul_f32` | elementwise, ~1-1.5/layer |
+| 48 | `doorbell_ring_kernel` | the engine's top-k readback, 1/layer |
+
+So the non-MoE part of a step is **~770 kernels (~16 per layer)** and the MoE part is the remaining
+~1 450. Capturing the attention region per layer would turn ~720 host launches into 48 graph launches:
+
+```
+720 launches x ~6 us  ~= 4.3 ms/step     (5% of an 85 ms TPOT)
+```
+
+That is a real but modest win — and note what it is *not*: attention is **16 kernels per layer**, not
+the "hundreds" the plan assumed. The capture is comfortably above break-even (>=5 nodes), but it will
+not transform step time. Worth doing; worth doing after, not before, the cheaper work if any appears.
+
+**Exact pieces to reuse** (all already in the fork, `pipeline/cuda_graph.rs`):
+
+| need | existing thing |
+|---|---|
+| capture window + persistent pool memory | `MemoryPoolScope::start/finish` (64/74/96) - the same discipline the step graph uses, so region allocations survive replay |
+| graph handle | `CudaGraph::begin_capture` / `end_capture` / `upload` / `launch` (868-918) |
+| rows bucketing | `cuda_graph_batch_bucket` (405) |
+| capture diagnostics | `CudaGraphEventGuard` (371), `record_cuda_graph_dispatch` (232) |
+| cost check of the region | `CudaPhaseTimer` (73) - one env flag, gives the region's ms |
+
+Insertion point: `qwen4_exp/text.rs` layer loop, from `let xn = ... layer.attn_hc.norm(&res)` through the
+`Mixer` match arm (lines ~1035-1100). Everything before it (mapper, layout, PLE) stays outside; the
+engine's `RoutedExperts` call stays outside and keeps its own segment graph.
+
+**Implementation shape** (for a session with room to do it):
+
+1. In the fork's layer loop, the region is `attn_hc.norm/mix/inject` + `mixer.forward` (PLE excluded —
+   its `gather_conv_state` allocates; GDN layers excluded — same reason). Key `(layer, rows_bucket)`.
+2. Per-layer capture needs **fixed buffers**: copy `res` into a static input tensor each step, and hand
+   out the region's outputs from the capture-time memory pool (`MemoryPoolScope`, see the table above).
+   The copy-in is one extra kernel per layer, so the region becomes **1 graph launch + 1 copy instead of
+   ~16 launches** - the win survives it. The MoE segment then reads the pool-resident output directly,
+   so nothing has to be copied back out.
+3. Fallback must be structural: capture fails -> run the region eagerly and remember the failure, never
+   retry per step.
+4. Criterion: `cuGraphLaunch` per step rises from ~48 to ~96 while the step's eager kernel count drops
+   by ~720; `frac 0` stays byte-identical.
+
+## Stream/sync audit of the region (done - it is capturable)
+
+The region is `attn_hc.norm/mix/inject` (`hyper.rs`) plus `Mixer::Attention` -> `qsa.rs::forward`, which
+splits into `forward_paged` (decode) and `forward_unpaged` (prefill):
+
+| path | host syncs / CPU round-trips |
+|---|---|
+| `hyper.rs` (`norm`, `mix`, `inject`) | none - the only `to_vec()` calls are `dims().to_vec()` (a Vec of dims, not a host read) |
+| `qsa.rs::forward` (shared) | `cos_sin.to_device(x.device())` - a no-op when the device matches; reshapes/narrows are views |
+| `qsa.rs::forward_paged` (**decode**) | **none** - no `synchronize`, no `to_vec`, no `Device::Cpu`; the only `clone()` calls are cache-handle clones |
+| `qsa.rs::forward_unpaged` (**prefill**) | builds a host mask: `scores.to_device(&Device::Cpu)?.to_vec3::<f32>()` (line 630) |
+
+So the **decode** region has no host synchronisation in it and no CPU round-trip: capture will not be
+invalidated by a sync. The unpaged path's host mask only runs in prefill, which never enters this
+window.
+
+What remains per-step, and must therefore live at **stable addresses** for a captured region:
+
+1. `res` - the region's input, changes every step -> copy into a fixed buffer (the harness proves this
+   is bit-exact, and it costs one launch while replacing ~16);
+2. the paged-attention metadata and the attention mask - built once per *forward*, i.e. outside the
+   layer loop and outside the capture window, but at a **new address each step**; the fork already has
+   the machinery for that (`CudaDecodeGraphStep::step_inputs` / `resident_input` in `cuda_graph.rs`),
+   which is what the whole-step path feeds its graph with.
+
+## M6 step 2a: **done and verified** - mix/inject capture live in the real model
+
+The mechanism is proven end to end in the model, on the part of the region whose inputs are already
+resident: `attn_hc.mix` + `attn_hc.inject` are pure functions of `xn` and the layer's static weights, so
+their window contains no paged metadata, no mask and no layout. The attention mixer stays eager.
+
+| check | result |
+|---|---|
+| `cargo test -p mistralrs-core qwen4_exp::attn_capture` | 2/2 |
+| oracle, **probe off** | **byte-identical** (the shipped path is untouched) |
+| oracle, **probe on** (`NAIWA_ATTN_CAPTURE=1`) | **byte-identical** |
+| engagement, `--gen-len 4` | **12 captures** (the 12 attention layers, once), **0 failures**, no further `begin_capture` on later steps -> every later step replays |
+
+What it buys is small and should be stated as such: 12 layers x ~3 kernels = **~36 launches/step
+(~0.2 ms)**, because only the attention layers are capturable this way. What it *proves* is the part
+that was actually risky: a per-layer region capture inside the real layer loop, fed by a resident `Var`
+input and replayed from capture-time pool memory, is bit-exact.
+
+The big part of the region - the attention mixer itself (~16 kernels/layer x 12 layers = ~190
+launches/step, ~1.1 ms) - needs the resident-input set, which is the remaining work below.
+
+## Is paged attention capturable? Yes - it already is, wholesale, in this fork
+
+Judgement asked before committing to step 2c, answered from the code:
+
+**The kernels are graph-safe, and the fork already proves the whole thing works.** `pipeline/cuda_graph.rs`
+captures a full paged decode step (`capture_cuda_decode_graph`) and refreshes it per step
+(`metadata_buffers.copy_from(...)`, line 2028). `supports_decode_graphs()` refuses *our* model for two
+reasons - device-resident PLE and external experts - neither of which is paged attention. The decode path
+is also audited sync-free (no `to_vec`, no `Device::Cpu`, no `synchronize`); the only host-mask path is
+prefill, which is never captured.
+
+**What it costs is metadata plumbing**, and the fork's inventory shows the general case: ~20 field groups
+(`slot_mappings`, `block_tables`, `context_lens`, `full_*` variants, `paged_kv_indptr/indices/
+last_page_len`, request/tile/o_indptr/chunk_size/block_valid_mask, flashinfer temp buffers, FA3 decode
+state, `rope_positions`), each a resident buffer plus a per-step copy, plus `install_hybrid_graph_state_
+indices` and `prepare_fa3_decode_schedules` (FA3 schedules are prepared *inside* the window).
+
+**Our case is the easy end of that range**: batch 1, one sequence, rectangular layout, no flashinfer and
+no FA3. The QSA aux cache is already stable (`aux_cache` reuses the buffers whenever
+`raw.dim(0) == num_blocks * block_size`), so `aux.raw`/`aux.block_keys` need no work. What is left is
+five resident groups:
+
+1. `slot_mapping` (1 int),
+2. `paged` block tables + context lens (1 x n_blocks, pad to the full context width),
+3. `TokenLayout` buffers (rectangular -> shape-deterministic),
+4. `cos_sin` (1 x head_dim x 2),
+5. the attention mask.
+
+Difficulty, in the order it will bite: **width/shape buckets** (unpadded block tables mean a new graph
+per context length), **pool retention** (measured: >12 graphs OOMs), then the mechanical Var+copy work,
+then the failure mode - any per-step tensor we fail to list gets baked in and shows up as a wrong token
+or a hang, not a compile error.
+
+**Verdict**: technically straightforward, plumbing-heavy, ~300-500 lines, and worth ~1.1 ms/step (1.3%).
+Do 2b (one shared pool with bounded retention) first: without it, *any* plan that captures per layer
+scales into OOM.
+
+## 2c status: residents verified, the mixer window still hangs (third per-step tensor found)
+
+Implemented and verified: `attn_capture::refresh(&cos_sin, md)` arms, once per forward, the resident set -
+`cos_sin` as two `Var`s plus **every** metadata tensors map (`slot_mappings`, `block_tables`,
+`context_lens`, `full_*`, `mm_prefix_ranges`, `full_mm_prefix_ranges`, `rope_positions`), substituted into a
+cloned `PagedAttentionInputMetadata` whose device tensors are those Vars. Two facts learned on the way:
+
+- the attention "mask" is `AttentionMask` (host-side, `&AttentionMask` in the mixer signature), **not** a
+  device tensor - one fewer resident group than the plan assumed;
+- with the residents armed and the mixer still eager the model runs fine (12 captures, no OOM, 75.2 ms
+  TPOT, 4 tokens), so the resident path itself costs nothing.
+
+Folding the mixer into the same window then **hangs on the first replay** again, which is the same signal as
+before: one more per-step tensor is still baked. The remaining candidate is `FlashParams`
+(`ctx.flash_params()`): it carries `cumulative_seqlens_q: HashMap<DeviceLocation, Tensor>` and `FlashKMeta`
+(logical/sliding) built per step, and it is passed into `paged_attn.forward`. The alternative candidate is a
+`AttentionMask::Custom(Tensor)` in some decode configuration.
+
+That is the next experiment, and it is cheap: make `FlashParams` resident the same way (it is `Clone`), or
+assert its tensors' stability by checking whether the mixer's sparse path reads it at all. Until then the
+window stays at mix+inject and the shipped path is unchanged.
+
+## 2c is now fully enumerated - zero unknowns, ~150 lines
+
+Everything the mixer window needs exists and is reachable. The recipe, with the exact APIs (all verified by
+reading the code, `new`/`copy_from`/`CudaGraphHostStaging::new` opened up to `pub(crate)` for this):
+
+```rust
+// once, on the first decode forward of a (layer, rows) key:
+let kv_pairs: Vec<(Tensor, Tensor)> = /* the model's attention layers' (k, v) from hybrid_cache */;
+let (mut buffers, resident_md) = CudaDecodeGraphMetadataBuffers::new(CudaDecodeGraphMetadataInput {
+    metadata: live_md, seqlen_offsets, position_ids, seq_len,
+    block_size, kv_cache: &kv_pairs, model_metadata: None, activation_dtype,
+})?;
+let mut staging = CudaGraphHostStaging::new(stream.clone())?;
+
+// every forward, before the layer loop:
+buffers.copy_from(live_md, position_ids, seq_len, &mut staging)?;   // no model_metadata needed here
+cos_sin_buf.0.set(&cos_sin.0)?; cos_sin_buf.1.set(&cos_sin.1)?;
+mask_buf.set(attention_mask.get(device))?;
+
+// in the mixer call:
+attn.forward(&h, mask_buf.as_tensor(), &(cos_sin_buf.0.as_tensor().clone(),
+                                        cos_sin_buf.1.as_tensor().clone()),
+             Some(kv_cache), Some((k0.clone(), k1.clone())), &resident_md, flash_params, &step)?
+```
+
+Two facts that make this safe to attempt in one go:
+
+- `copy_from(metadata, position_ids, seq_len, staging)` takes **no `model_metadata`** - only `new` does, and
+  QSA decode does not consult it (it is for FA3/flashinfer scheduling), so `None` is correct for us;
+- `CudaGraphHostStaging::new(stream)` is a two-line constructor, and the whole-step path already proves the
+  refresh discipline works (it is the same code, called once per step instead of once per layer).
+
+The failure mode to watch is the one already learned: any tensor the window reads that is *not* in the
+resident set is baked, and the symptom is a wrong token or a hang, not a compile error. `frac 0` byte-exact
+is the gate.
+
+## 2c inventory, narrowed again: the rectangular layout is tensor-free
+
+`cuda/qwen4_exp.rs:299`:
+
+```rust
+pub(crate) struct TokenLayout {
+    pub tok_seq: Option<Tensor>, pub tok_local: Option<Tensor>,
+    pub seq_start: Option<Tensor>, pub seq_len: Option<Tensor>, pub kv_lens: Option<Tensor>,
+    // Tokens per sequence of the rectangular (tensor-free) layout
+    pub q_len: usize, ...
+}
+```
+
+Decode uses `TokenLayout::rectangular(batch, seq_len)`, whose tensor fields are **`None`** - so the layout
+carries no device pointer and needs no resident buffer. One of the five groups is free.
+
+That leaves, for the attention mixer window:
+
+| input | resident work |
+|---|---|
+| `h` | none - it becomes an intermediate if pair+mixer share one window |
+| `cos_sin` (2 tensors, per forward) | 2 `Var`s + `set` per step |
+| attention mask (per forward) | 1 `Var` + `set` per step |
+| `TokenLayout` | **none** (tensor-free for decode) |
+| paged metadata (`slot_mapping`, `block_tables`, `context_lens`, ...) | the real work: substitute each `HashMap<DeviceLocation, Tensor>` field with a resident `Var` and rebuild `PagedAttentionInputMetadata` per step |
+| `FlashParams` | to check next |
+
+So 2c is "two easy Vars plus one structural substitution" - the substitution is mechanical (clone the
+metadata per step, swap the device entries for Vars) but it touches ~10 map fields, and it is the piece
+that can only be verified by running, since a missed field bakes an address and hangs or corrupts rather
+than failing to compile.
+
+## 2b done: the bound is a count, and the fork already pads the context width
+
+Two results.
+
+**The bound must be a count.** A free-memory gate does not work: a capture only *records* the region, so
+the pool does not grow until the graph is launched. Measured - with a 700 MB headroom check the run still
+captured all 60 regions and then died on the first replay with `CUDA_ERROR_OUT_OF_MEMORY`. The cap is now
+`NAIWA_ATTN_CAPTURE_MAX` (default **12**, the measured-safe count on this 12 GB card), and the shipped
+configuration behaves exactly as before:
+
+```
+captured=12  count-cap-hit=48  OOM=0  failures=0
+oracle with the probe on: IDENTICAL
+TPOT 81.2 ms (4 tokens, probe on; the 12-graph band)
+```
+
+**The context-width blocker is already solved upstream** (the user's reminder): the fork buckets context
+lengths and pads block tables explicitly -
+
+```rust
+fn cuda_graph_context_bucket_tokens(required, max_context_len)  // next_pow2, capped by the max
+fn cuda_graph_block_table_len_with_cap(blocks, block_size, enable_cuda_graph_padding, live_len)
+```
+
+so a captured paged-attention graph serves a whole *range* of context lengths, and with padding enabled
+the table is written at the cap (one width). `max_paged_context_len` comes from the configured maximum
+context (`--pa-context-len` on our runs), which is why that flag mattered for the harness in the first
+place. Consequence for 2c: the number of distinct widths is O(log) at worst and 1 with padding - not a
+blocker.
+
+## Extending the capture to every layer: OOM at 60 graphs, and why
+
+The obvious next move - capture the *mlp* side's `mix`/`inject` too, since they are pure functions of
+`xn` for all 48 layers - was tried and reverses cleanly. Result: **60 captures, 0 failures, then
+`CUDA_ERROR_OUT_OF_MEMORY` on the first replay**.
+
+Cause: each `RegionEntry` holds a `CudaGraphMemoryPoolGuard`, and while any guard is alive the pool's
+release threshold stays at its capture-time value, so the process **never releases anything** from that
+pool again. 12 guards survive; 60 do not. This is the cost of keeping the graph's intermediates alive
+and it does not scale to "one graph per layer", which is what M6 2b would want.
+
+So M6 2b has a prerequisite that was not visible before: **the captured regions must share one pool with
+a bounded retention** - i.e. capture all region graphs inside a single pool scope, trim once afterwards,
+and keep only the graphs' own tensors. Whether that is safe depends on whether the trimmed blocks can be
+handed to later allocations while the graphs still write them; the honest answer needs an experiment
+(capture, trim, poison the pool with unrelated allocations, replay, compare) - which is exactly the
+shape of the M0/M6-harness methodology.
+
+Until then the capture stays at the 12 attention layers, which is verified.
+
+## M6 step 2 (the mixer): first replay hangs, diagnosed
+
+The module is wired into the layer loop behind `NAIWA_ATTN_CAPTURE`. State of the evidence:
+
+| check | result |
+|---|---|
+| `cargo check` / build | clean |
+| oracle, **probe off** (shipped config) | **byte-identical** - the wiring changes nothing when off |
+| oracle, probe on | **hangs** (500 s, no reference emitted) |
+| instrumented run (`--gen-len 2`) | capture *succeeds*: layer 3, 7, 11, ... (the attention layers, every 4th) each log `begin_capture -> ran -> end_capture returned` |
+
+So the capture works and the hang is on the **first replay**, and the cause is the gap the plan already
+named but the wiring does not yet implement: **the paged-attention metadata and mask are rebuilt every
+step at new addresses**, so the captured kernels read the *previous* step's metadata pointers, which the
+allocator has since freed or reused. Stale/garbage block tables or masks then wedge the attention
+kernel (or corrupt the KV write) on replay.
+
+Two things were fixed on the way and are worth keeping:
+
+- the memory-pool guard must live in the entry, not in the capture closure: `CudaGraphMemoryPoolGuard`'s
+  `Drop` restores the release threshold and lets the allocator reclaim the region's intermediates, which
+  the graph still writes to. It is now a field of `RegionEntry`.
+- the region's `x_buf` is a `Var` (candle has no in-place `Tensor` copy); `Var::set` is the write path,
+  same as the whole-step graph's `input_ids`.
+
+**Remaining work, precisely** - the region's *complete* set of per-step tensor inputs that must live at
+fixed addresses (audited by reading `qsa.rs`):
+
+1. `xn` - done (`Var`, `Var::set` per step);
+2. **`TokenLayout` device buffers** - built per layer-iteration inside the loop
+   (`TokenLayout::rectangular(batch, seq_len)` or `TokenLayout::from_host(...)`) at a new address each
+   step, and consumed through `step.layout` by the mixer. Needs a resident variant: the rectangular
+   layout is shape-deterministic, so it can be written into fixed buffers once;
+3. **the attention mask tensors** - `DeviceMappedMask::new(...)` per forward, `attention_mask.get(device)`
+   per mixer call;
+4. **`PagedAttentionInputMetadata`'s device tensors** - whatever `paged_attn.forward` reads
+   (`materialize_decode_tensors()`); in the whole-step path these are exactly what
+   `CudaDecodeGraphMetadataBuffers::new(...)` copies into fixed buffers every step, so that type is the
+   template for 3 and 4.
+
+`qsa.rs::forward_paged` itself touches no `metadata.` field directly (only `step.mode`): the metadata is
+handed straight to `paged_attn.forward`, which is why the resident set has to be built by whoever owns
+the capture window - i.e. this layer loop, not the mixer.
+
+Until 2-4 are resident the probe stays **off**, and the shipped configuration is unchanged and verified
+(`frac 0` byte-identical with the wiring in place).
+
+## M6 remaining work: the exact edit (no open questions left)
+
+Region boundaries in `text.rs`, read off the loop (lines ~1035-1145):
+
+```
+IN  (capture window):      xn = pending_norm.take() | layer.attn_hc.norm(&res)
+                           h  = layer.attn_hc.mix(&xn)
+                           inject = layer.attn_hc.inject(&xn)
+                           out = match &layer.mixer { Attention => attn.forward(...), Linear => SKIP }
+OUT (kept eager):          attn_hc.combine(&res, &out, &inject, mlp_hc) -> next_res, xn
+                           mlp_hc.norm/mix/inject, layer.moe.forward(&h)   <- the engine's hook
+```
+
+- the region's **outputs are exactly two tensors** (`inject`, `out`) plus the side effects on the KV
+  cache; `h` is consumed inside the window and `res` is an input, not an output;
+- **exclude** layers whose `mixer` is `Linear` (GDN: `gather_conv_state` allocates and `commit` writes
+  host-derived state) and the PLE layer (`ple.forward` allocates); decode is always the paged path, so
+  the unpaged host mask never enters;
+- the capture closure needs `&layer`, `&ctx`, `&mut hybrid_cache` at once, which is available at that
+  point (`hybrid_cache` is already mutably borrowed for the mixer) - make it `FnOnce() -> Result<(Tensor,
+  Tensor)>` and call it once eagerly, once inside the window, and never again;
+- per key `(layer, cuda_graph_batch_bucket(rows))` store `{ graph, res_buf: Tensor, inject: Tensor,
+  out: Tensor }`; per step `res_buf.copy_(&res)` (one launch) then `graph.launch()`, and hand back the
+  stored `inject`/`out` handles - their memory is the capture-time pool's, which is why
+  `MemoryPoolScope::start/finish` around the capture is not optional;
+- the mask/metadata tensors are built per forward **outside** the loop, so their addresses change each
+  step; feed them through `step_inputs`/`resident_input` exactly as the whole-step path does;
+- fallback is structural: any capture error -> run the region eagerly, record the key as uncapturable,
+  never retry; a `COUNTERS`-style line reports captured/replayed/fallback so the gate is a log line.
+
+Gates, in order: (1) `frac 0` + `NO_LOOKAHEAD` byte-identical, (2) `warmup: 48 attention capture(s)` and
+`cuGraphLaunch`/step ~96 while the step's eager kernel count drops by ~720, (3) `frac 0.55` against the
+two-variant set, (4) `CudaPhaseTimer` on the region to check the predicted ~4.3 ms/step.
+
+## M6 harness: `harness/m6/region_capture.cu` (PASS)
+
+Before touching the fork, the assumption step 2 rests on was tested on its own: *a region captured once,
+replayed with fresh host-written inputs into the same fixed buffer, is bit-exact against a fresh eager
+run.* Three kernels shaped like an attention region (gemv-like matvec, scale+add, elementwise square),
+one capture, four replays with different inputs, plus a control.
+
+```
+captured nodes: 3 (expected 3)
+replays: 4/4 bit-exact
+control: stale replay == last trial: yes; re-armed replay == trial 0: yes; differs from last: yes
+M6 region-capture harness: PASS
+```
+
+Two things it taught, both directly applicable to the fork change:
+
+1. **Every launch inside the region must go to the stream being captured.** The first version used
+   `<<<grid, block>>>` (legacy default stream) and capture failed with `operation failed due to a
+   previous error during capture`. Any candle op that internally launches on the default stream, or on
+   a stream of its own, will break a per-layer capture the same way - so the region must be audited for
+   default-stream launches before it is captured, not after.
+2. **The control has to be designed, not assumed.** The first "must-fail" control replayed the last
+   trial's own input and therefore *matched*, proving nothing. The working control is two-sided: a
+   replay with the buffer untouched must reproduce the last trial, and a replay after re-arming the
+   buffer with trial 0 must reproduce trial 0 **and differ from** the last trial. Only then does the
+   bit-exactness say the graph reads the buffer we write.
+
+## Measurement harness for M6 (works, use it)
+
+`nsys` is installed (`/usr/local/cuda/bin/nsys`, not on `PATH`). It gives exact per-API counts, which
+is what M6 needs structurally:
+
+```bash
+nsys profile --trace=cuda -o /tmp/p $BIN bench -m $MODEL -f "$SHARDS" --cpu-moe \
+  --expert-cache-gb 2 --pcie-frac 0 --prompt-len 512 --gen-len 8 --depth 4 \
+  --iterations 1 --warmup 0
+rm -f /tmp/p.sqlite && nsys stats --force-export=true --report cuda_api_sum /tmp/p.nsys-rep
+```
+
+Baseline (canonical config, `NO_LOOKAHEAD`, `frac 0`):
+
+| | count | share of API time | avg |
+|---|---|---|---|
+| `cuGraphLaunch` | 678 | 0.4% | 15.4 µs |
+| `cuLaunchKernel` + `cudaLaunchKernel*` | ~25 300 | 6.8% | 6-15 µs |
+| `cuMemcpyHtoDAsync` | 7 260 | **22.9%** | **87.3 µs** |
+| `cuGraphInstantiateWithFlags` | 144 | - | 36.0 µs |
+
+Two things to note:
+
+1. **The kernel-launch totals are dominated by prefill** (512 tokens in one chunk), so `kernels/step`
+   cannot be read off a raw count: the same config must be compared before/after a change. For an
+   absolute per-step figure, either profile decode-only or window the trace.
+2. **HtoD is the single largest API cost: 22.9% of API time at 87 µs per call.** That average is far
+   too high for the small copies the design intends (a staged expert row is ~2 MB, but the PLE/gather
+   and `upload_in_place` paths may be copying from **pageable** host memory, which makes
+   `cuMemcpyHtoDAsync` fall back to an internal staging copy and blocks the caller). Pinning those
+   sources is a candidate for a cheap win, independent of M6 — and it must be settled *before* M6,
+   because the attention-segment capture will re-time everything.
+
+### The HtoD 87 µs is measured, intrinsic, and not worth chasing
+
+`CopyStream::queue_copies` copies straight out of the GGUF **mmap** (`src: &[u8]`), which is pageable
+host memory. CUDA documents that `cuMemcpyHtoDAsync` from pageable memory is *synchronous with respect
+to the host* and stages internally — so the 87 µs average and the 79 ms worst case are the driver doing
+exactly the copy a manual pinned bounce would do, plus returning early.
+
+A bounce (`mmap -> pinned -> async`) would not reduce the work: reading 2 MB out of pageable memory
+costs a host memcpy (~100-200 µs) whether we or the driver perform it; pinning the originals is
+impossible at 100 GB. It would only move the block off the calling thread, and that thread is the copy
+stream's own during the pass gap, where a block is affordable. **Recorded so it is not re-chased**: the
+number is real, the cause is understood, and the fix has no upside at this scale of copy.
+
+## What M6 therefore has to capture, and the hazards
+
+Capture window = one decode step of `text.forward`, so that attention and PLE come along with the MoE
+segments (a parent graph of MoE segments alone is impossible: MoE feeds the next layer's attention, so
+the launches must interleave). Nothing in the window may allocate, synchronise, or use a foreign
+stream — the three constraints M1 established. Known hazards to clear, in the order they will bite:
+
+1. **Hybrid-cache gathers allocate**: `gather_conv_state` / `gather_recurrent_state` (the PLE stash) and
+   `state_indices_for_layer` build new tensors per step. Under capture these must come from
+   pre-allocated staging buffers.
+2. **Paged attention** writes KV and indexes per sequence (`--pa-context-len`), and the mask/layout is
+   built per step (`DeviceMappedMask::new`).
+3. **The sampler** runs after the graph, which is fine — it stays eager and outside the window.
+4. **Our own three points + M6's `SYNC_PLE`** must be inside the window; they are capture-safe by
+   construction (one-node spin kernels, no allocation).
+
+The first experiment is therefore not code: run the engine with the fork's decode-graph path forced on
+(a probe) and record *which* allocation/sync inside `text.forward` aborts the capture first.
+
+## PLE has nothing to do with the per-layer MoE graph
+
+To be explicit, because it is easy to conflate: the graphs M1-M5 capture are **one layer's MoE
+segment**, entered from `RoutedExperts::forward`. PLE runs *before that layer's attention*, in the
+fork's layer loop, i.e. before our hook is ever called. It shares no buffer with the MoE segment and
+needs no sync point of its own there — the MoE graph is unchanged by PLE, and PLE is unchanged by it.
+
+The only place they meet is **M6's whole-step graph**: once the captured region covers attention and
+PLE for every layer, PLE's gathered rows become a host-produced input *inside* that graph, and that is
+the one and only reason `SYNC_PLE` exists. No per-layer graph will ever contain it.
+
+## Correction: where PLE actually sits (and what it changes)
+
+`text.rs:985` applies it at the **top of one specific layer, before that layer's attention**:
+
+```rust
+if let Some(ple) = &layer.ple {           // only cfg.ple().layer_idx has one — a SINGLE layer
+    res = ple.forward(&res, &input_ids, &state, &batch, ...)?;   // adds into the residual
+    pending_norm = None;
+}
+let xn = layer.attn_hc.norm(&res)?;       // ... then the pre-attention norm
+let out = layer.mixer.forward(...)        // attention
+```
+
+Three consequences that change the plan:
+
+1. **There is one PLE layer, not one per layer.** So `SYNC_PLE` is **one word for the pass**, not a
+   per-layer grid: `WAITS_PER_LAYER` stays 3 and `K = 144 + 1`. Likewise **one gate capture**, not 48.
+2. **PLE is before attention, outside the engine's hook.** The engine only implements
+   `RoutedExperts` (the MoE); `ple.forward` runs in the fork's layer loop. So the engine cannot place
+   a wait node there as things stand.
+3. **PLE carries its own recurrent state** (`pool.conv_state`, `pool.recurrent_state`,
+   `history`, `conv_state_len()`), i.e. a small conv/recurrent layer over the token window. That state
+   is decode state in the hybrid cache — normal, and not something the host has to reproduce. The
+   *hash rows* are still the pure function of the token window (see above); the conv state is PLE's
+   own computation, already device-resident.
+
+**The ownership question M6 must answer**: the table read + hash + gather belong to whoever owns the
+copy stream and the sync protocol — that is the engine. So the cut is: **the engine gathers the rows
+(port `PleHash::rows`, read the mmap table, queue the H2D, publish `SYNC_PLE`) and hands the fork a
+device row buffer; the fork keeps only the row-apply kernel.** That is the same inversion the expert
+path already took, and it lets `make_table_resident`/`ResidentTable` die.
+
+**Sizing, so the decision is proportionate**: PLE is one layer, a few KB of rows, one host read per
+pass — on the order of 0.1-0.3% of a 78 ms pass. If M6's calendar is tight, PLE can stay as it is
+(synchronous gather in the fork) for the first whole-step graph and be pulled in afterwards; the
+whole-step graph is worth more than PLE's 0.2%.
+
+## How PLE is done in v2
+
+Key asymmetry against the expert preload: **the PLE row indices do not depend on any GPU output.**
+They are a pure function of the last `ngram-1` token ids, which the host sampled itself. So the whole
+pass's PLE gathers can be issued **before the pass starts** and overlap it entirely — no per-layer
+race, no spinning in the steady state.
+
+**Host, per pass (token thread, once at layer 0):**
+
+1. Keep one token window per sequence (a ring of `ngram-1` u32, plus the draft/verify tokens — their
+   rows are just more indices).
+2. Port `PleHash::rows` verbatim (pure, ~1 us; **one** PLE layer): per head
+   `h`, `row[h] = (XOR_{s<n} ctx[s].wrapping_mul(mult[s])) % vocab_sizes[h] + offsets[h]`.
+3. Turn the indices into `(offset, len)` into the memory-mapped table (one layer's worth), read them into a
+   **pinned** staging buffer, and queue one `memcpy_htod_async` per layer on the copy stream into that
+   layer's fixed device row buffer (allocated at warmup).
+   The pinned hop matters: the table is `mmap`ed, so a direct `cudaMemcpyAsync` from it is pageable
+   source memory and would serialize on the copy stream. Read (`mmap` + memcpy) -> pinned -> async
+   H2D keeps the tail asynchronous. The read itself is a page-cache/SSD read: it is why the gather
+   happens a pass early, off the token thread, and never with a `synchronize` on the token path.
+4. After the copies, publish `SYNC_PLE(layer, pass)` on the copy stream with the monotonic
+   `atomicMax` publish (fourth point kind: `WAITS_PER_LAYER = 4`, `K = 192`).
+
+**GPU, per layer:** the device row buffer + the existing row-apply kernel; the layer's graph gets one
+`wait_ready(SYNC_PLE)` gate before the consumer — the same one-node gate as `STAGING`/`PRELOAD`
+(`capture_gate(kind)` is already generic over `kind`).
+
+**Where it can go wrong, and the check:**
+
+| risk | check |
+|---|---|
+| hash port drifts from the fork's | a unit test asserting the port equals `PleHash::rows` over random windows (EOS cut, chunk borders, drafts) |
+| wrong row bytes (offset math on IQ4_NL rows) | one-shot: compare a layer's gathered device rows against a host read of the same indices |
+| pageable-source stall on the copy stream | the gather thread's own timing probe; the token thread must never `synchronize` |
+| a layer waiting in the steady state | `SYNC_PLE` gate replay vs wait counts — the publish is a pass early, so waits should be ~0 |
+
+**Cost:** device ~48 x `num_heads x iq4_nl_row_bytes(head_dim)` (a few hundred KB total), host one
+pinned staging buffer per pass. VRAM for PLE: none beyond those row buffers.
+
+## M6 plan (sketch)
+
+1. `SYNC_PLE` as a fourth point + its gate (mechanical, mirrors M5b; ~1 hour).
+2. Host-side PLE row computation (pure function; a direct port of `PleHash::rows`, unit-tested
+   against the fork's implementation).
+3. The gather: mmap read -> pinned -> async H2D on the copy stream, one batch per pass, published
+   monotonically; fork's resident-table path deleted.
+4. Whole-step graph: capture the whole layer sweep (fork's `cuda_graph.rs` or the engine's own
+   emitter) with the four points already in it — the graph then has one launch per step.
+5. Gate: `launches/step ~= 48 MoE + 48 attention + O(1)` (structural count), and `greedy == eager`
+   byte-exact at `frac 0`; then `frac 0.55` + `NO_LOOKAHEAD` against the two-variant set.
+
+## The open risk carried in
+
+One unexplained `frac 0.55 + NO_LOOKAHEAD` divergence, seen once on an intermediate M5 build
+(the final build is 11/11 clean, 27 consecutive clean runs across M4 and M5b). Before the whole-step
+graph multiplies the number of points, it is worth `x50` runs: a wrong token once in ~30 runs would be
+a serious bug at `frac > 0`, and a whole-step graph makes it harder to localise.
