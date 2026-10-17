@@ -24,10 +24,18 @@ with a 20-80% hit rate that means 1.5-3 more experts per layer on the CPU plus t
 
 ## The options, ranked by (gain x certainty) / effort
 
-1. **Bigger expert cache.** 2 GB gives 19.7% at `frac 0`; the card has headroom because IQ1_M is small.
-   Each 10 points of hit rate removes roughly 1.5-3 experts/layer from the CPU leg. This is the cheapest
-   experiment on the list (a flag), and it also *unlocks MTP*, whose break-even needs >65% acceptance at
-   depth 1 given the +29%/row cost.
+1. **Bigger expert cache - measured, and capped by the card.** At `frac 0` (no lookahead):
+
+   | `--expert-cache-gb` | result |
+   |---|---|
+   | 2.0 | 12.3 tok/s (81.2 ms), **19.7% hit** |
+   | 3.5 | `Invalid sampling probability ... NaN` (the flake below, not a hit-rate result) |
+   | 4.5 | KV cache cannot be placed any more: "no usable token blocks after reserving block zero" |
+
+   So the lever exists but the ceiling is ~3 GB on a 12 GB card: the KV cache and staging rings need the
+   rest. **Note also that these `NO_LOOKAHEAD` numbers understate production**: with the prediction thread
+   on, the hit rate is 81-84% instead of 19.7% (M5 measured 78.2-86.7 ms TPOT), because the preload fills
+   the cache in the gap. `NO_LOOKAHEAD` is used for determinism, not because it is the shipping config.
 2. **Take the miss decision off the host.** Today the token thread, per layer: spins for the top-k, hashes
    the ids into a resident map, builds the copy list, then writes the payload. A small device kernel could
    turn top-k into a *compact miss list + count* in mapped memory; the host would then only read that list
@@ -49,9 +57,10 @@ with a 20-80% hit rate that means 1.5-3 more experts per layer on the CPU plus t
 
 ## Open risk seen today
 
-Two consecutive runs at `--prompt-len 512 --gen-len 32` died with `Invalid sampling probability ... NaN`
-and two immediate re-runs of the identical command were clean (12.1 and 11.9 tok/s). That is a *new*
-failure mode - a NaN in the logits rather than a different token - and it may be the same underlying
+`Invalid sampling probability ... NaN` has now been seen **three times**, at `--expert-cache-gb 2` (twice,
+consecutively) and at `3.5` (once), always at `--prompt-len 512 --gen-len 32`, and every following re-run of
+the same command was clean (12.1 / 11.9 / 12.3 tok/s). So it is rare, not cache-size-dependent, and it is a
+*new* failure mode - a NaN in the logits rather than a different token - and it may be the same underlying
 timing hazard as the one-off divergence recorded in `worklogs/m5.md` (which was characterised as a
 two-variant rounding difference; a NaN does not fit that explanation). Treat it as an open correctness
 risk and probe it with an output checksum over many runs before trusting long generations.
