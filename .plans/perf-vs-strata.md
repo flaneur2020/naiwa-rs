@@ -24,19 +24,42 @@ Strata's figures are from `~/code/strata/bench/results/2026-10-05-community-rtx-
              x2.6 (pass latency: 86 ms -> 33 ms)         = 76 tok/s   <- strata
 ```
 
-**1. Tokens per pass: ~2.5x, and it is blocked by the artifact, not by code.** `--mtp` refuses on this
-checkpoint:
+**1. Tokens per pass: ~2.5x. The artifact problem is solved; a crash is not.**
+
+The MTP head exists locally - it was downloaded and repacked separately:
 
 ```
-Error: `--mtp` requested but the checkpoint has no built-in MTP head (`mtp.fc_embedding.weight`).
+~/bench-rel/mtp/mtp-component.gguf      1.47 GB, 32 tensors: blk.48.* (the head block, nextn.*)
+~/bench-rel/mtp/mtp-Q4_0.gguf           2.20 GB, the published source
+~/bench-rel/mtp/repack.py                rewrites names/metadata, drops token_embd/output,
+                                         keeps blk.48.* (the fork binds those) - no tensor bytes touched
 ```
 
-The engine has the path (`args.rs --mtp`, `qwen4_exp/mtp.rs`), and the requant shards simply do not carry
-the head. With the head present, the same 86 ms pass would carry ~2.5 tokens - and the number would rise
-by that factor minus the extra work the verify rows cost (2-3 rows instead of 1: our per-layer host work
-barely moves, the GPU segments grow) - i.e. roughly **20-29 tok/s** without touching anything else. That is
-also why "mtp2 -> 40 tok/s" is remembered: speculation is worth more than every kernel optimisation on this
-list put together.
+and it loads through the mmproj channel:
+
+```bash
+--mmproj ~/bench-rel/mtp/mtp-component.gguf --mtp --mtp-n-predict 2
+```
+
+Measured today:
+
+| configuration | result |
+|---|---|
+| the two shards alone, `--mtp` | `Error: checkpoint has no built-in MTP head (mtp.fc_embedding.weight)` |
+| **shards + `--mmproj` component, no `--mtp`** | **fine: 12.5 tok/s, 79.8 ms TPOT** (the component merges cleanly) |
+| shards + `--mmproj` + `--mtp` | **`CUDA_ERROR_ILLEGAL_ADDRESS`** in the first draft/verify step |
+
+So the blocker is no longer the artifact but the draft path itself, and there is already a pointer to
+where: the MTP site's experts are not in the engine's schedule - they go through the legacy global
+`CpuExperts` channel (`prefill_stream.rs:373` has an explicit `ctx.site.is_mtp` branch). An illegal
+address on the first MTP step is what an off-schedule expert site looks like when its buffers were never
+staged.
+
+With the draft path working, the same 86 ms pass carries ~2.5 tokens; minus the extra cost of the verify
+rows (2-3 rows instead of 1 - our per-layer *host* work barely moves, the GPU segments grow) that is
+roughly **20-29 tok/s** without touching anything else, and one more rung of draft depth gets near 40. That
+is also why "mtp2 -> 40 tok/s" is remembered: speculation is worth more than every kernel optimisation on
+this list put together.
 
 **2. Pass latency: 86 ms against ~33 ms, ~2.6x.** And we know exactly where ours goes, because it was
 measured: `NAIWA_STEP_DBG` dry time is **1.53-1.63 ms per layer x 48 = 74-78 ms**, and the GPU is idle 98%
@@ -54,7 +77,7 @@ CPU, and that CPU leg is what the 1.6 ms/layer is made of. Its card also fits IQ
 
 | lever | expected | cost | verdict |
 |---|---|---|---|
-| **MTP/spec decoding** | x2.5 tokens/pass (~20-29 tok/s) | needs a checkpoint with the MTP head (`mtp.fc_embedding.weight`), then accept-verify plumbing for the MTP site | **by far the biggest**; also the only one that gets us near 40 |
+| **MTP/spec decoding** | x2.5 tokens/pass (~20-29 tok/s) | head is **local and loads** (`~/bench-rel/mtp/mtp-component.gguf`, mmproj channel); fix the `ILLEGAL_ADDRESS` in the draft path - the MTP site's experts are outside the engine's schedule | **by far the biggest**; also the only one that gets us near 40 |
 | **host-loop pipelining** (batch the staging DMAs, prefetch the top-k a layer ahead, cut the doorbell readback) | 86 -> ~50-60 ms/pass (x1.4-1.7) | medium: the doorbell protocol already supports "issue, don't perform" | second |
 | **bigger expert cache / better hit rate** | fewer CPU experts -> less host work | VRAM-limited at 12 GB; IQ1_M leaves headroom | third |
 | **M6 2c (attention capture)** | 1-4 ms/pass (5%) | ~150 lines, residents half-done | last |
