@@ -23,6 +23,39 @@ use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
+/// How many CPU-expert batches are running right now.
+///
+/// The lookahead scheduler reads this to run its router matmuls and slot uploads in the **gaps**
+/// between batches rather than beside them (W106: beside them measured 10 ms/step slower — the
+/// matmul is 2–3 cores and the batch, on rayon, wants every core). It is set by the thread that
+/// runs the batches, whichever pool the parallel passes inside them use.
+static BATCH_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// No CPU-expert batch is running.
+pub fn expert_batch_idle() -> bool {
+    BATCH_DEPTH.load(std::sync::atomic::Ordering::Acquire) == 0
+}
+
+/// Marks a CPU-expert batch as running for as long as it is alive.
+struct BatchBusy;
+
+impl BatchBusy {
+    fn enter() -> Self {
+        BATCH_DEPTH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for BatchBusy {
+    fn drop(&mut self) {
+        if BATCH_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            // The gap opened: predictions may run now. This is the wake-up that replaces polling
+            // for `expert_batch_idle` from inside a prediction.
+            crate::lookahead::wake();
+        }
+    }
+}
+
 /// A CPU computation started by [`start`].
 pub struct Pending {
     device: Device,
@@ -117,6 +150,8 @@ mod cuda {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::{Arc, Mutex};
 
+    use super::BatchBusy;
+
     use candle_core::cuda_backend::CudaDevice;
     use candle_core::{DType, Device, Error, Result, Tensor};
     use crate::doorbell::FlagBuf;
@@ -132,6 +167,7 @@ mod cuda {
                 .name("cpu-experts".into())
                 .spawn(move || {
                     for job in rx {
+                        let _busy = BatchBusy::enter();
                         job();
                     }
                 })

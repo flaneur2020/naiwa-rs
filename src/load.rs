@@ -228,11 +228,9 @@ pub fn base_builder(
     )?;
     let device_layers = device_layers(model);
     if model.cpu_moe {
-        // Wire the fused CPU MoE decode's parallel passes onto the pinned spin
-        // pool before any expert runs: `par_tasks` in the fork then dispatches
-        // through `ExpertPool::dispatch`, whose workers stay hot between the
-        // once-per-layer calls (`NAIWA_SPIN_POOL=0` keeps the rayon pool, for A/B).
-        // This also brings up the pool's lookahead path (`submit_lookahead_job`).
+        // The fused CPU MoE decode's parallel passes use the fork's rayon default: the v2
+        // configuration is experts-on-rayon, predictions-on-dedicated-threads (§6.3), fixed here
+        // rather than switched by an environment variable (§6.4).
         install_cpu_moe(
             model.expert_cache_gb,
             model
@@ -240,7 +238,6 @@ pub fn base_builder(
                 .then_some(model.prefill_stream_min_tokens.get()),
             model.pcie_frac,
         )?;
-        crate::expert_pool::install();
     }
     let paged = &model.paged_attn;
     let mut builder = MistralRsForServerBuilder::new()

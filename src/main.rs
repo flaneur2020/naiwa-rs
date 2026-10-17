@@ -8,7 +8,7 @@ mod copy_stream;
 mod deferred;
 mod doorbell;
 mod expert_cache;
-mod expert_pool;
+mod lookahead;
 mod host_memory;
 mod load;
 mod offload;

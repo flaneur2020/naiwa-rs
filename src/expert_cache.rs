@@ -105,7 +105,6 @@ struct Counters {
     misses: AtomicU64,
     lookahead_loads: AtomicU64,
     swaps: AtomicU64,
-    lookahead_dropped: AtomicU64,
     pcie_misses: AtomicU64,
     pcie_bytes: AtomicU64,
     /// v2 M2: decode-step MoE segments served by replaying a captured graph (1 `cuGraphLaunch`
@@ -140,7 +139,6 @@ static COUNTERS: Counters = Counters {
     misses: AtomicU64::new(0),
     lookahead_loads: AtomicU64::new(0),
     swaps: AtomicU64::new(0),
-    lookahead_dropped: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
     pcie_bytes: AtomicU64::new(0),
     capture_replays: AtomicU64::new(0),
@@ -193,7 +191,7 @@ pub fn take_stats() -> Option<CacheStats> {
         misses: take(&c.misses),
         lookahead_loads: take(&c.lookahead_loads),
         swaps: take(&c.swaps),
-        lookahead_dropped: take(&c.lookahead_dropped),
+        lookahead_dropped: crate::lookahead::dropped(),
         pcie_misses: take(&c.pcie_misses),
         pcie_bytes: take(&c.pcie_bytes),
         capture_replays: take(&c.capture_replays),
@@ -2251,7 +2249,7 @@ impl CachedLayer {
                     let x = x.flatten_all()?.to_vec1::<f32>()?;
                     if queued {
                         let next = Arc::clone(&next);
-                        crate::expert_pool::submit_lookahead_job(Box::new(move || {
+                        crate::lookahead::submit(Box::new(move || {
                             let r = x.len() / next.hidden.max(1);
                             let x = Tensor::from_vec(x, (r, next.hidden), &Device::Cpu);
                             if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
@@ -2267,18 +2265,14 @@ impl CachedLayer {
                     let pub_res = chan.publish(&x2d, n);
                     lookahead_probe::record_publish(t0.elapsed().as_secs_f64() * 1e3);
                     if let Some((sh, last_seq, slot)) = pub_res? {
-                        crate::expert_pool::submit_lookahead_job(Box::new(move || {
+                        crate::lookahead::submit(Box::new(move || {
                             let t0 = std::time::Instant::now();
-                            // W106 ordering fix: the prediction must run in the
-                            // expert batches' GAPS, not beside them. Wait for the
-                            // pool's batches to drain before the matmul and any
-                            // copy-stream uploads — the router matmul (~3ms × 48
-                            // layers ≈ 2-3 cores) plus upload contention in the
-                            // same window as the expert compute measured 10ms/step
-                            // slower than the W105 run-in-the-gaps behavior.
-                            while !crate::expert_pool::expert_batch_idle() {
-                                std::thread::sleep(std::time::Duration::from_micros(100));
-                            }
+                            // The GAP is the scheduler's business, not this
+                            // closure's: the lookahead thread only drains its queue
+                            // while no expert batch is running, and a batch's
+                            // completion wakes it (W106: the router matmul is 2-3
+                            // cores and running it beside a batch measured 10
+                            // ms/step slower).
                             // Stale check: this layer queued a NEWER prediction
                             // while this job waited — the newer publish carries a
                             // fresher activation (its `wait_publish` job will do
@@ -2319,7 +2313,7 @@ impl CachedLayer {
                         .to_vec1::<f32>()?;
                     let d2h = t0.elapsed().as_secs_f64() * 1e3;
                     let next = Arc::clone(&next);
-                    crate::expert_pool::submit_lookahead_job(Box::new(move || {
+                    crate::lookahead::submit(Box::new(move || {
                         let x = Tensor::from_vec(x_clone, (rows, next.hidden), &Device::Cpu);
                         if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
                             debug!("expert cache: layer {} lookahead failed: {e}", next.layer);
