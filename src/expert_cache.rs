@@ -2436,6 +2436,7 @@ impl CachedLayer {
                 topk_ids,
                 topk_weights,
                 rows * self.top_k,
+                self.top_k,
                 frac_num,
                 1000,
                 resident,
@@ -2677,6 +2678,7 @@ mod dispatch_probe {
         ids: &Tensor,
         weights: &Tensor,
         n: usize,
+        top_k: usize,
         frac_num: i32,
         frac_den: i32,
         resident: [u32; 8],
@@ -2687,12 +2689,12 @@ mod dispatch_probe {
         let Ok(mut b) = buf.try_lock() else { return };
         {
             b.bitmap_mut(layer).copy_from_slice(&resident);
-            if b.dispatch(layer, ids, weights, n, frac_num, frac_den).is_err() {
+            if b.dispatch(layer, ids, weights, n, top_k, frac_num, frac_den).is_err() {
                 return;
             }
             let _ = device.synchronize();
             let (hits, stream, cpu) = b.read();
-            let miss_weights: f32 = stream.iter().chain(cpu.iter()).map(|e| e.1).sum();
+            let miss_weights: f32 = stream.iter().chain(cpu.iter()).map(|e| e.2).sum();
             if !miss_weights.is_finite() {
                 eprintln!("DISPATCH_DBG layer {layer} non-finite miss weights");
             }

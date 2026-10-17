@@ -76,15 +76,19 @@ mod ffi {
         weights: *const c_void,
         n: i32,
         bitmap: *const c_void,
+        top_k: i32,
         frac_num: i32,
         frac_den: i32,
         hits_slot: *mut c_void,
+        hits_row: *mut c_void,
         hits_w: *mut c_void,
         hits_n: *mut c_void,
         stream_ids: *mut c_void,
+        stream_row: *mut c_void,
         stream_w: *mut c_void,
         stream_n: *mut c_void,
         cpu_ids: *mut c_void,
+        cpu_row: *mut c_void,
         cpu_w: *mut c_void,
         cpu_n: *mut c_void,
         max_hits: i32,
@@ -1174,28 +1178,33 @@ impl DispatchBuf {
     }
 
     /// `[bitmap_words, ...word offsets..., total]`. One place, so acquire/dispatch/read cannot drift.
-    fn layout(layers: usize, l: usize) -> [usize; 11] {
+    /// Eleven slots per group of fields: bitmap, then three lists of `(ids, row, weights)` with a count
+    /// after each. `slot[0]` is the bitmap, `slot[10]` the total word count.
+    fn layout(layers: usize, l: usize) -> [usize; 14] {
         let b = layers * 8;
         [
-            b,                        // bitmap
-            b,                        // hits_slot
-            b + l,                    // hits_w
-            b + 2 * l,                // hits_n
-            b + 2 * l + 1,            // stream_ids
-            b + 3 * l + 1,            // stream_w
-            b + 4 * l + 1,            // stream_n
-            b + 4 * l + 2,            // cpu_ids
-            b + 5 * l + 2,            // cpu_w
-            b + 6 * l + 2,            // cpu_n
-            b + 6 * l + 3,            // total
+            b,                          // [0]  bitmap words
+            b,                          // [1]  hits ids
+            b + l,                      // [2]  hits row
+            b + 2 * l,                  // [3]  hits weights
+            b + 3 * l,                  // [4]  hits count
+            b + 3 * l + 1,              // [5]  stream ids
+            b + 4 * l + 1,              // [6]  stream row
+            b + 5 * l + 1,              // [7]  stream weights
+            b + 6 * l + 1,              // [8]  stream count
+            b + 6 * l + 2,              // [9]  cpu ids
+            b + 7 * l + 2,              // [10] cpu row
+            b + 8 * l + 2,              // [11] cpu weights
+            b + 9 * l + 2,              // [12] cpu count
+            b + 9 * l + 3,              // [13] total
         ]
     }
 
     fn words(layers: usize, max_hits: usize) -> usize {
-        Self::layout(layers, max_hits)[10]
+        Self::layout(layers, max_hits)[13]
     }
 
-    fn offsets(&self) -> [usize; 11] {
+    fn offsets(&self) -> [usize; 14] {
         Self::layout(self.layers, self.max_hits)
     }
 
@@ -1225,6 +1234,7 @@ impl DispatchBuf {
         ids: &Tensor,
         weights: &Tensor,
         n: usize,
+        top_k: usize,
         frac_num: i32,
         frac_den: i32,
     ) -> Result<()> {
@@ -1260,17 +1270,21 @@ impl DispatchBuf {
                 w_ptr as *const c_void,
                 n as i32,
                 bitmap,
+                top_k as i32,
                 frac_num,
                 frac_den,
                 self.word(o[1]).cast(),
-                self.fword(o[2]).cast::<c_void>(),
-                self.word(o[3]).cast(),
+                self.word(o[2]).cast(),
+                self.fword(o[3]).cast(),
                 self.word(o[4]).cast(),
-                self.fword(o[5]).cast(),
+                self.word(o[5]).cast(),
                 self.word(o[6]).cast(),
-                self.word(o[7]).cast(),
-                self.fword(o[8]).cast(),
+                self.fword(o[7]).cast(),
+                self.word(o[8]).cast(),
                 self.word(o[9]).cast(),
+                self.word(o[10]).cast(),
+                self.fword(o[11]).cast(),
+                self.word(o[12]).cast(),
                 self.max_hits as i32,
                 stream.cu_stream() as i64,
             );
@@ -1281,24 +1295,24 @@ impl DispatchBuf {
     /// The last dispatch's decision: resident `(expert id, weight)`, staged ids with their weights, and the
     /// ids the CPU should compute. Safe once the stream passed the dispatch (the launch ends with a system
     /// fence).
-    pub fn read(&self) -> (Vec<(u32, f32)>, Vec<(u32, f32)>, Vec<(u32, f32)>) {
+    pub fn read(&self) -> (Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>) {
         let o = self.offsets();
         let count = |off: usize| {
             // SAFETY: `off` is the count word of one list.
             (unsafe { *self.word(off) } as usize).min(self.max_hits)
         };
-        let list = |ids: usize, ws: usize, n: usize| {
+        let list = |ids: usize, row: usize, ws: usize, n: usize| {
             (0..n)
                 .map(|i| {
-                    // SAFETY: within the id and weight lists of one list.
-                    unsafe { (*self.word(ids + i), *self.fword(ws + i)) }
+                    // SAFETY: within the id, row and weight lists of one list.
+                    unsafe { (*self.word(ids + i), *self.word(row + i), *self.fword(ws + i)) }
                 })
                 .collect::<Vec<_>>()
         };
         (
-            list(o[1], o[2], count(o[3])),
-            list(o[4], o[5], count(o[6])),
-            list(o[7], o[8], count(o[9])),
+            list(o[1], o[2], o[3], count(o[4])),
+            list(o[5], o[6], o[7], count(o[8])),
+            list(o[9], o[10], o[11], count(o[12])),
         )
     }
 }
@@ -1498,27 +1512,30 @@ mod ptr_wait_tests {
         let ids = Tensor::new(&[0u32, 5, 2, 7], &device).unwrap();
         let w = Tensor::new(&[0.5f32, 0.25, 0.125, 0.0625], &device).unwrap();
         // Half of the two misses staged, the other half to the CPU.
-        buf.dispatch(0, &ids, &w, 4, 1, 2).unwrap();
+        buf.dispatch(0, &ids, &w, 4, 4, 1, 2).unwrap();
         device.synchronize().unwrap();
         let (hits, stream, cpu) = buf.read();
         assert_eq!(hits.len(), 2, "two of the four are resident");
         assert_eq!(hits[0].0, 0);
-        assert_eq!(hits[0].1, 0.5);
+        assert_eq!(hits[0].1, 0, "row 0");
+        assert_eq!(hits[0].2, 0.5);
         assert_eq!(hits[1].0, 2);
-        assert_eq!(hits[1].1, 0.125);
+        assert_eq!(hits[1].1, 0, "row 0");
+        assert_eq!(hits[1].2, 0.125);
         assert_eq!(stream.len(), 1, "the first miss of the staged budget");
         assert_eq!(stream[0].0, 5);
-        assert_eq!(stream[0].1, 0.25, "weights travel with the ids");
+        assert_eq!(stream[0].1, 0, "row 0");
+        assert_eq!(stream[0].2, 0.25, "weights travel with the ids");
         assert_eq!(cpu.len(), 1, "the rest stays on the CPU");
         assert_eq!(cpu[0].0, 7);
 
         // frac 0 -> nothing staged; frac 1/1 -> everything staged.
-        buf.dispatch(0, &ids, &w, 4, 0, 1).unwrap();
+        buf.dispatch(0, &ids, &w, 4, 4, 0, 1).unwrap();
         device.synchronize().unwrap();
         let (_, stream0, cpu0) = buf.read();
         assert!(stream0.is_empty());
         assert_eq!(cpu0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7], "both misses on the CPU");
-        buf.dispatch(0, &ids, &w, 4, 1, 1).unwrap();
+        buf.dispatch(0, &ids, &w, 4, 4, 1, 1).unwrap();
         device.synchronize().unwrap();
         let (_, stream1, cpu1) = buf.read();
         assert_eq!(stream1.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7]);

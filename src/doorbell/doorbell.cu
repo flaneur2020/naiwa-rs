@@ -449,15 +449,19 @@ __global__ void doorbell_dispatch_topk_kernel(
     const float* __restrict__ weights,
     int n,
     const uint32_t* __restrict__ bitmap,
+    int top_k,
     int frac_num,
     int frac_den,
     uint32_t* hits_slot,
+    uint32_t* hits_row,
     float* hits_w,
     uint32_t* hits_n,
     uint32_t* stream_ids,
+    uint32_t* stream_row,
     float* stream_w,
     uint32_t* stream_n,
     uint32_t* cpu_ids,
+    uint32_t* cpu_row,
     float* cpu_w,
     uint32_t* cpu_n,
     int max_hits)
@@ -472,6 +476,7 @@ __global__ void doorbell_dispatch_topk_kernel(
         if ((bitmap[id >> 5] >> (id & 31)) & 1u) {
             if ((int)nh < max_hits) {
                 hits_slot[nh] = id;   // resolved to a slot by the caller's table
+                hits_row[nh] = (uint32_t)(i / top_k);
                 hits_w[nh] = weights[i];
                 ++nh;
             }
@@ -496,10 +501,12 @@ __global__ void doorbell_dispatch_topk_kernel(
         if ((int)ns < staged_budget) {
             // Weights travel with the ids: the host must not have to look them up again.
             stream_ids[ns] = id;
+            stream_row[ns] = (uint32_t)(i / top_k);
             stream_w[ns] = weights[i];
             ++ns;
         } else {
             cpu_ids[nc] = id;
+            cpu_row[nc] = (uint32_t)(i / top_k);
             cpu_w[nc] = weights[i];
             ++nc;
         }
@@ -513,16 +520,18 @@ __global__ void doorbell_dispatch_topk_kernel(
 extern "C" void doorbell_dispatch_topk(
     const void* ids, const void* weights, int n, const void* bitmap,
     int frac_num, int frac_den,
-    void* hits_slot, void* hits_w, void* hits_n,
-    void* stream_ids, void* stream_w, void* stream_n,
-    void* cpu_ids, void* cpu_w, void* cpu_n,
+    int top_k,
+    void* hits_slot, void* hits_row, void* hits_w, void* hits_n,
+    void* stream_ids, void* stream_row, void* stream_w, void* stream_n,
+    void* cpu_ids, void* cpu_row, void* cpu_w, void* cpu_n,
     int max_hits, int64_t stream)
 {
     doorbell_dispatch_topk_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)ids, (const float*)weights, n, (const uint32_t*)bitmap,
         frac_num, frac_den,
-        (uint32_t*)hits_slot, (float*)hits_w, (uint32_t*)hits_n,
-        (uint32_t*)stream_ids, (float*)stream_w, (uint32_t*)stream_n,
-        (uint32_t*)cpu_ids, (float*)cpu_w, (uint32_t*)cpu_n,
+        top_k,
+        (uint32_t*)hits_slot, (uint32_t*)hits_row, (float*)hits_w, (uint32_t*)hits_n,
+        (uint32_t*)stream_ids, (uint32_t*)stream_row, (float*)stream_w, (uint32_t*)stream_n,
+        (uint32_t*)cpu_ids, (uint32_t*)cpu_row, (float*)cpu_w, (uint32_t*)cpu_n,
         max_hits);
 }
