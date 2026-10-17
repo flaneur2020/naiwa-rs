@@ -92,6 +92,8 @@ mod ffi {
         cpu_w: *mut c_void,
         cpu_n: *mut c_void,
         max_hits: i32,
+        seq: u32,
+        done: *mut c_void,
         stream: i64,
     );
     pub(crate) fn doorbell_wait_ready(
@@ -1180,13 +1182,14 @@ impl DispatchBuf {
     /// `[bitmap_words, ...word offsets..., total]`. One place, so acquire/dispatch/read cannot drift.
     /// Words one layer's list block needs: three lists of `(ids, row, weights)` plus three counts.
     const fn block_words(l: usize) -> usize {
-        9 * l + 3
+        // three lists of (ids, row, weights) + three counts + seq/done
+        9 * l + 5
     }
 
     /// Absolute word offsets for `layer`'s block. The bitmap lives at the front, shared; **every list is
     /// per layer**, because a shared list lets a layer read the previous layer's (larger) result - that is
     /// what made the first flip read a stale count and index out of bounds.
-    fn offsets(&self, layer: usize) -> [usize; 14] {
+    fn offsets(&self, layer: usize) -> [usize; 16] {
         let l = self.max_hits;
         let b = self.layers * 8 + layer * Self::block_words(l);
         [
@@ -1203,7 +1206,9 @@ impl DispatchBuf {
             b + 7 * l + 2,              // [10] cpu row
             b + 8 * l + 2,              // [11] cpu weights
             b + 9 * l + 2,              // [12] cpu count
-            b + 9 * l + 3,              // [13] end of this block
+            b + 9 * l + 3,              // [13] seq (host writes before the launch)
+            b + 9 * l + 4,              // [14] done (the kernel publishes it last)
+            b + 9 * l + 5,              // [15] end of this block
         ]
     }
 
@@ -1264,6 +1269,11 @@ impl DispatchBuf {
 
         assert!(layer < self.layers, "dispatch layer out of range");
         let o = self.offsets(layer);
+        // Host-written seq for this launch; the kernel publishes it into `done` after its last store, so
+        // `wait` can spin on one word instead of synchronising the device.
+        let seq = self.next_seq(layer);
+        // SAFETY: mapped word inside the allocation; the host owns it.
+        unsafe { self.word(o[13]).write(seq) };
         let bitmap = self.word(o[0]).cast::<c_void>();
         // SAFETY: every pointer is inside this mapping except the caller's two device tensors, which the
         // launch is stream-ordered after.
@@ -1289,10 +1299,32 @@ impl DispatchBuf {
                 self.fword(o[11]).cast(),
                 self.word(o[12]).cast(),
                 self.max_hits as i32,
+                seq,
+                self.word(o[14]).cast(),
                 stream.cu_stream() as i64,
             );
         }
         Ok(())
+    }
+
+    /// Monotonic per-layer seq, so `wait` can tell this launch's `done` from the previous one.
+    fn next_seq(&self, layer: usize) -> u32 {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let _ = layer;
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Spin (host) until the layer's dispatch has published its lists. This replaces `device.synchronize()`
+    /// in the flip path: one mapped word, the same protocol the top-k ring uses.
+    pub fn wait(&self, layer: usize) {
+        let o = self.offsets(layer);
+        let want = unsafe { *self.word(o[13]) };
+        let done = self.word(o[14]);
+        // SAFETY: a mapped u32 the kernel published behind a system fence.
+        while unsafe { std::ptr::read_volatile(done) } != want {
+            std::hint::spin_loop();
+        }
+        // Ordering: the lists were written before `done`, and the kernel fenced before publishing it.
     }
 
     /// The last dispatch's decision: resident `(expert id, weight)`, staged ids with their weights, and the

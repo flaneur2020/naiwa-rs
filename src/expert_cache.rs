@@ -2324,10 +2324,24 @@ impl CachedLayer {
         }
 
         let n = rows * self.top_k;
+        // M6 P2: with the device dispatch armed the host does not need the selection itself - the kernel
+        // emits hits/misses with rows and weights - so the per-layer top-k readback (a host spin of a few
+        // hundred microseconds) is skipped entirely. That readback is the latency the flip is meant to
+        // remove; keeping it made the flip slower than the baseline.
+        #[cfg(feature = "cuda")]
+        let device_flip = dispatch_probe::use_device()
+            && self.top_k > 0
+            && topk_ids.elem_count() % self.top_k == 0
+            && topk_ids.elem_count() / self.top_k == rows;
+        #[cfg(not(feature = "cuda"))]
+        let device_flip = false;
+
         // Step 5 doorbell: lazily acquire (first decode), queue the ring on the same
         // stream the top-k kernels ran on, then spin host-side for the payload — no
         // stream sync, no D2H launch. Falls back to `to_vec2` when unavailable.
-        let ring = {
+        let ring = if device_flip {
+            None
+        } else {
             let mut st = self.state.lock().unwrap();
             if st.doorbell.is_none() {
                 let cap = n.max(8 * self.top_k).max(64);
