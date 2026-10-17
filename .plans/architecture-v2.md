@@ -170,79 +170,35 @@ __global__ void wait_ge_ptr(const volatile uint32_t* seq,   // mapped, device vi
 
 #### 定稿（精简）
 
-一块 mapped 内存，四个字段：
+一块 mapped 内存，三个字段：
 
 ```
 epoch    u32         device 写（每 pass 一次，layer 0 的 prologue）；节点读
-progress u32         host 写（单调同步点）；节点读
-consumed u32         device 写（节点消费后）；host 读，用于背压
+progress u32         host 写（单调递增的同步点）；节点读
 payload  [R][max_n]  host 写；节点读
 ```
 
-三条规则：
+两条规则：
 
 ```
-host:    pass 计数自持（进入第 0 层时 +1）
-         发布 p = pass * N + id；发布前背压：p - consumed < R
+host:    pass 计数自持（进入第 0 层时 +1），发布 p = pass * N + id
 device:  prologue 每 pass 令 epoch += 1
-         节点：p = epoch * N + id ；自旋 progress >= p ；读 payload[(p % R) * max_n]
-         消费后写 consumed = p（stream 序，故单调）
-常量:    N = 48（每 pass 同步点数）  id = sync_id(layer, SYNC_CPU_EXPERTS) = layer
-         R = 128            max_n = 16 * hidden
+         节点 p = epoch * N + id ；自旋 progress >= p ；读 payload[(p % R) * max_n]
+常量:    N = 48      id = sync_id(layer, SYNC_CPU_EXPERTS) = layer
+         R = 128     max_n = 16 * hidden
 ```
 
-**为什么安全（一句话）**：`epoch` 由设备产生，所以节点永远从**它自己的** pass 取槽
-（`slot = p % R` 里 p 编码了 pass）；host 只推进单调的 `progress`，并用 `consumed` 显式限制
-领先量。**没有任何 host 写的 per-step 值会被节点读到。**
+**为什么安全**：`slot = p % R` 里 p 编码了 pass，而 p 里的 pass 来自设备的 epoch，所以节点
+永远读自己的槽；host 只推进单调的 `progress`。**没有 host 写的 per-step 值会被节点读到。**
+
+**唯一的假设**：host 的点级领先 `< R`（`R = 128` ≈ 2.6 个 pass），否则会覆盖未读的槽。今天
+它自然成立 —— token 线程每层都要自旋等 router 的 doorbell，所以领先只有约一层。**但 v2 的
+目标恰恰是让 host 不再逐层等待**：一旦那一步做成，这条假设就失效，必须补回一台**设备写的
+`consumed`** 做背压（节点消费后写一次 + host 发布前读一次，两行代码）。
 
 > 不采用「host 写 pass 给 GPU 读」：那等于把「第几步」的生产权交回 host，host 领先一个 pass
-> 就会让节点读错槽；要安全就得在 pass 边界握手（每 pass 排空一次）。设备 epoch 同时拿到安全
-> 和跨 pass 重叠。
-
-
-现状：`deferred` 已经不用 `cudaLaunchHostFunc`（W106 的 R2b 换成了 stream 上排队的 wait+copy
-kernel），所以「token 线程不被阻塞」已经成立。剩下的问题是**这个等待进不了 graph**，而且
-试过两种零实参写法都失败（详见 `worklogs/m3.md`）：
-
-| 写法 | 失败方式 |
-|---|---|
-| `target`/`slot` 作 kernel 实参 | 捕获时被冻结 |
-| host 写 mapped cell | **跨步竞态**：token 线程领先 GPU，节点读到下一步的 cell |
-| 设备侧 `atomicAdd` 领号 | 原理成立，但要求「领到的号 = 发布者的 seq」严格 1:1；作业数浮动（只有有 miss 的层才发）就会漂移 |
-
-**根因：`target` 是「每步变化的值」，而由 host 生产它必然与「host 领先 GPU」矛盾。**
-
-#### 协议：把「第几步」的生产权交给设备
-
-一块 mapped 分配（全局一份）：
-
-```
-epoch    : u32        ← 设备写、host 读
-progress : u32        ← host 写、设备读
-payload  : [R][max_n] f32   ← host 写、设备读（环）
-```
-
-- **设备生产 `epoch`**：`layer 0` 的图里有一个 prologue 节点，每 pass 执行一次
-  `*epoch += 1; __threadfence_system();`。
-- **host 生产 `progress`**：为同步点 `p` 写完 payload 后，普通写 → release fence →
-  `*progress = p`（单调，只增）。
-- **节点（图内）**：
-  ```
-  p = (*epoch) * N + L        // N = 每 pass 同步点数（常量），L = 层号（常量，烘在图里）
-  while (*progress < p) __nanosleep(200);
-  __threadfence_system();
-  acc[i] += payload[(p % R) * max_n + i]
-  ```
-  节点实参只有**指针 + 常量** → 捕获期冻结毫无影响。
-
-#### 为什么安全（唯一要记住的一条）
-
-**`epoch` 只由设备写，host 只读** → host 永远读不到未来的 epoch，所以在编号上**只能落后或
-持平，不可能领先**。落后是安全的：host 用旧 epoch 发布 `(k-1)*N+L` 时，设备的 target
-`k*N+L` 更大，节点只是多等一会儿。**「读到下一步数据」这一整类竞态因此消失。**
-
-层内重叠完全保留：host 在 pass k 开始时读到 `epoch=k`，就可以连续为 `L=1..48` 发布，比 GPU
-在层上跑得更快；它只是不能比设备更早开始下一个 pass。
+> 就会读错槽；要安全就得在 pass 边界握手（每 pass 排空一次）。设备 epoch 同时拿到安全与跨
+> pass 重叠。
 
 #### 一层的 CPU → GPU 通知点（命名与编号）
 
