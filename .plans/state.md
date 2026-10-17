@@ -101,6 +101,13 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0. **M6 已做实验(关键)**:`cuda_graphs_enabled()` 默认 true,唯一挡路的是 `supports_decode_graphs()`;
+   探针强制开后 **hang**(300 s 杀掉)。原因结构性:`decode_forward` 中间有 **host 自旋等设备输出**
+   (`db.wait_and_read`)——捕获时 ring kernel 只被记录不执行,自旋永不结束。而 staging 的 miss 集依赖
+   刚算出的 top-k,且 **设备无法自己发起 H2D**,所以 host 必然每层在环内 ⇒ **捕获粒度必须止于 MoE 段**。
+   因此 **"整步 1 次 launch" 不可达**,M6 重定为:**每步 48 MoE 段 + 48 attention 段 + O(1)**,即把
+   *attention 段*捕获起来(今天几百个 candle launch),MoE 段维持现状;PLE 属于 attention 段内,由
+   `SYNC_PLE` 门控。判据随之改成 launch 计数 ~96+c。
 1. **M6 第一发现**:fork 的 `supports_decode_graphs()`(`qwen4_exp/text.rs:789`)两个条件在 v2 里
    **永久为假**——PLE 必须 `gathers_on_device`(我们刚否掉)+ 不能有 external experts(正是 CpuExperts)。
    所以 `pipeline/cuda_graph.rs` 那套整步捕获**用不上**,M6 必须由引擎自己捕获整步。fork 的门禁本质是
