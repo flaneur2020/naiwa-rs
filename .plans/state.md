@@ -114,5 +114,8 @@ cargo test --offline --release --features cuda          # 33/33
 - ~~**Q2（PLE 策略）**~~ **已定案**：`ple.rs` 的 `PleHash::rows` 是**纯函数**——只看最近
   `ngram-1` 个 token id(host 本来就有)+ 素数取模,没有 conv/隐状态需要在 host 复现。所以 PLE 在
   v2 里不是新机制,而是**第三个 host 产出的 DMA**:host 算 hashed 行号 → 在 copy stream 发 gather
-  拷贝 → 单调发布 `SYNC_PLE(layer, pass)` → 图内自旋等它。计划见 `worklogs/m6.md`。
+  拷贝 → 单调发布 `SYNC_PLE(layer, pass)` → 图内自旋等它。
+- **PLE 权重只在 CPU,永不进显存**(定案):fork 里的 `make_table_resident`/`ResidentTable`
+  (整表搬显存,按 `RESIDENT_RESERVE_BYTES` 预算)在 v2 不用 → 12 GB 全部留给权重/专家缓存/暂存环,
+  显存预算与卡大小无关;GPU 只收本 pass 的 gather 行。同一决定让 fork **再瘦 ~300 行**。
 - fork 的 W 时代探针（`PLE_DBG`/`MOE_DBG`/`MTP_DBG`，~150 行）可删——hygiene，不急。
