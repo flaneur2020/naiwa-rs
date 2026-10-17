@@ -123,7 +123,7 @@ must already be off the critical path to make the comparison fair).
 
 - **Does**: the 55% leg — a real H2D issued outside the graph by the token thread
   (workers make no CUDA calls), with the graph spinning for DMA completion.
-  **Primitives landed (fork `f7...`):** `doorbell_wait_ready` (wait-only node) and
+  **Primitives landed (fork `d6dae82c`):** `doorbell_wait_ready` (wait-only node) and
   `ScheduleBuf::publish_point_on_stream` (`cuStreamWriteValue32` on the copy stream, no kernel,
   no host wait). Both `SYNC_PRELOAD` and `SYNC_STAGING` will use them. Remaining: point the two
   DMA sites at them and drop the host-enqueued `cudaStreamWaitEvent`.
