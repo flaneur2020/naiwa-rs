@@ -168,6 +168,38 @@ __global__ void wait_ge_ptr(const volatile uint32_t* seq,   // mapped, device vi
 
 ### 3.2 CPU → GPU 通知：设备 epoch 协议（取代动态 seq）
 
+#### 定稿（精简）
+
+一块 mapped 内存，四个字段：
+
+```
+epoch    u32         device 写（每 pass 一次，layer 0 的 prologue）；节点读
+progress u32         host 写（单调同步点）；节点读
+consumed u32         device 写（节点消费后）；host 读，用于背压
+payload  [R][max_n]  host 写；节点读
+```
+
+三条规则：
+
+```
+host:    pass 计数自持（进入第 0 层时 +1）
+         发布 p = pass * N + id；发布前背压：p - consumed < R
+device:  prologue 每 pass 令 epoch += 1
+         节点：p = epoch * N + id ；自旋 progress >= p ；读 payload[(p % R) * max_n]
+         消费后写 consumed = p（stream 序，故单调）
+常量:    N = 48（每 pass 同步点数）  id = sync_id(layer, SYNC_CPU_EXPERTS) = layer
+         R = 128            max_n = 16 * hidden
+```
+
+**为什么安全（一句话）**：`epoch` 由设备产生，所以节点永远从**它自己的** pass 取槽
+（`slot = p % R` 里 p 编码了 pass）；host 只推进单调的 `progress`，并用 `consumed` 显式限制
+领先量。**没有任何 host 写的 per-step 值会被节点读到。**
+
+> 不采用「host 写 pass 给 GPU 读」：那等于把「第几步」的生产权交回 host，host 领先一个 pass
+> 就会让节点读错槽；要安全就得在 pass 边界握手（每 pass 排空一次）。设备 epoch 同时拿到安全
+> 和跨 pass 重叠。
+
+
 现状：`deferred` 已经不用 `cudaLaunchHostFunc`（W106 的 R2b 换成了 stream 上排队的 wait+copy
 kernel），所以「token 线程不被阻塞」已经成立。剩下的问题是**这个等待进不了 graph**，而且
 试过两种零实参写法都失败（详见 `worklogs/m3.md`）：
