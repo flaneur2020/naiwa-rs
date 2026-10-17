@@ -350,6 +350,24 @@ extern "C" void doorbell_epoch_bump(void* d_epoch, int64_t stream) {
     doorbell_epoch_bump_kernel<<<1, 1, 0, (cudaStream_t)stream>>>((uint32_t*)d_epoch);
 }
 
+// v2 M5b: publish a sync point so that the word only ever moves forward.
+//
+// `cuStreamWriteValue32` writes unconditionally, and `ready[]` is a *level*: a job from an older
+// pass that is still queued would write a smaller value, moving the word backwards and leaving every
+// later gate on that point waiting forever. `atomicMax` makes a stale, duplicated or racing publish
+// harmless, which is what lets the producer be a thread other than the one that advances the pass.
+__global__ void doorbell_publish_max_kernel(uint32_t* d_ready, uint32_t id, uint32_t pass) {
+    if (threadIdx.x == 0) {
+        atomicMax(&d_ready[id], pass);
+        __threadfence_system();
+    }
+}
+
+extern "C" void doorbell_publish_max(void* d_ready, int32_t id, uint32_t pass, int64_t stream) {
+    doorbell_publish_max_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
+        (uint32_t*)d_ready, (uint32_t)id, pass);
+}
+
 __global__ void doorbell_wait_add_ready_kernel(
     const volatile uint32_t* d_epoch,    // device-written, one bump per pass
     const volatile uint32_t* d_ready,    // [K] one word per sync point; value = ready pass

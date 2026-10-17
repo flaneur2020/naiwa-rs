@@ -602,6 +602,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 doorbell_seq: 0,
                 #[cfg(feature = "cuda")]
                 staging_gate: None,
+                #[cfg(feature = "cuda")]
+                preload_gate: None,
                 slots: HashMap::new(),
                 resident: vec![None; num_slots],
                 hit_counts: vec![0u64; num_experts],
@@ -616,6 +618,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             pcie_frac: self.pcie_frac,
             prefill,
             filling: AtomicBool::new(false),
+            preload_claimed: AtomicU32::new(0),
         });
         self.registry.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))
@@ -1101,6 +1104,9 @@ struct CachedLayerState {
     /// v2 M4: this layer's DMA gate, captured in the post-load warmup (PCIe staging only).
     #[cfg(feature = "cuda")]
     staging_gate: Option<StagingGate>,
+    /// v2 M5b: the preload gate — same one-node wait, for the asynchronous preload copies.
+    #[cfg(feature = "cuda")]
+    preload_gate: Option<StagingGate>,
     /// Published residents: expert id -> slot. Only experts whose weights are fully written
     /// appear here, and it is the only table readers consult.
     slots: HashMap<usize, usize>,
@@ -1533,6 +1539,10 @@ struct CachedLayer {
     prefill: Option<Arc<PrefillStream>>,
     /// A background fill of this layer is running; at most one at a time.
     filling: AtomicBool,
+    /// v2 M5b: the pass whose preload copies the prediction thread has claimed (0 = none). Claimed
+    /// before the copies are queued and before the point is published, so the token thread replays
+    /// the preload gate exactly when a publish is guaranteed to arrive for its pass.
+    preload_claimed: AtomicU32,
 }
 
 impl CachedLayer {
@@ -1561,19 +1571,30 @@ impl CachedLayer {
         // M4: capture this layer's DMA gate. It belongs to the layer (not to a bank), because its
         // one node bakes this layer's `SYNC_STAGING` id and the staging ring is shared by every
         // layer of its shape — a ring-wide graph could not carry a per-layer id.
-        if self.staging_enabled() {
-            if let Some(sched) = schedule() {
-                match self.capture_staging_gate(sched) {
+        if let Some(sched) = schedule() {
+            let mut gate_for = |kind: u32, which: &str| {
+                match self.capture_gate(sched, kind) {
                     Ok(Some(gate)) => {
-                        self.state.lock().unwrap().staging_gate = Some(gate);
+                        let mut st = self.state.lock().unwrap();
+                        match kind {
+                            crate::doorbell::SYNC_PRELOAD => st.preload_gate = Some(gate),
+                            _ => st.staging_gate = Some(gate),
+                        }
+                        drop(st);
                         COUNTERS.gate_captured.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(None) => {}
                     Err(e) => warn!(
-                        "expert cache: layer {} DMA gate capture failed: {e}",
+                        "expert cache: layer {} {which} gate capture failed: {e}",
                         self.layer
                     ),
                 }
+            };
+            if self.copy_stream.is_some() {
+                gate_for(crate::doorbell::SYNC_PRELOAD, "preload");
+            }
+            if self.staging_enabled() {
+                gate_for(crate::doorbell::SYNC_STAGING, "DMA");
             }
         }
         let mut banks: Vec<Arc<Bank>> = Vec::new();
@@ -1613,13 +1634,47 @@ impl CachedLayer {
     /// `cudaStreamWaitEvent` per streamed expert: the wait becomes one graph launch that the GPU
     /// resolves on its own, and the segment's kernels cannot read a staging slot still in flight.
     #[cfg(feature = "cuda")]
-    fn capture_staging_gate(
+    /// M4/M5b: replay this layer's gate for `kind` — the captured one-node graph, or the same node
+    /// launched warm when warmup could not capture it (one host call per layer, the price the
+    /// replaced `cudaStreamWaitEvent` had).
+    #[cfg(feature = "cuda")]
+    fn replay_gate(&self, kind: u32) -> candle_core::Result<()> {
+        let Some(sched) = schedule() else {
+            return Ok(());
+        };
+        let gate = {
+            let mut st = self.state.lock().unwrap();
+            match kind {
+                crate::doorbell::SYNC_PRELOAD => st.preload_gate.take(),
+                _ => st.staging_gate.take(),
+            }
+        };
+        match gate {
+            Some(gate) => {
+                gate.replay()?;
+                let mut st = self.state.lock().unwrap();
+                match kind {
+                    crate::doorbell::SYNC_PRELOAD => st.preload_gate = Some(gate),
+                    _ => st.staging_gate = Some(gate),
+                }
+            }
+            None => {
+                COUNTERS.staging_eager_waits.fetch_add(1, Ordering::Relaxed);
+                let id = sched.sync_id(self.layer as u32, kind);
+                sched.wait_ready(&self.slot_device, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_gate(
         &self,
         sched: &Arc<crate::doorbell::ScheduleBuf>,
+        kind: u32,
     ) -> candle_core::Result<Option<StagingGate>> {
         let dev = self.slot_device.as_cuda_device()?;
         let stream = dev.cuda_stream();
-        let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
+        let id = sched.sync_id(self.layer as u32, kind);
         if stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .is_err()
@@ -1692,7 +1747,7 @@ impl CachedLayer {
     /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the
     /// (slow) copy and published only after it, so concurrent admitters never share a slot
     /// and readers never see a half-written one. `None`: already resident or no empty slot.
-    fn admit(&self, expert_id: usize) -> candle_core::Result<Option<usize>> {
+    fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
             if st.resident.contains(&Some(expert_id)) {
@@ -1705,14 +1760,19 @@ impl CachedLayer {
             st.resident[slot] = Some(expert_id);
             slot
         };
-        self.load_reserved(expert_id, slot)
+        self.load_reserved(expert_id, slot, sync)
     }
 
     /// Replace the least-recently-used resident outside `protect` with `expert_id`. The victim
     /// is unpublished and the slot reserved in one critical section. Tokens already holding the
     /// victim keep computing with it: a fresh upload leaves the old buffer alone, and an
     /// in-place one waits for them (`upload_in_place`).
-    fn replace(&self, expert_id: usize, protect: &[usize]) -> candle_core::Result<Option<usize>> {
+    fn replace(
+        &self,
+        expert_id: usize,
+        protect: &[usize],
+        sync: bool,
+    ) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
             if st.resident.contains(&Some(expert_id)) {
@@ -1726,14 +1786,19 @@ impl CachedLayer {
             st.resident[slot] = Some(expert_id);
             slot
         };
-        self.load_reserved(expert_id, slot)
+        self.load_reserved(expert_id, slot, sync)
     }
 
     /// Copy `expert_id` into `slot`, which the caller has reserved, then publish it. A failed
     /// copy frees the slot.
-    fn load_reserved(&self, expert_id: usize, slot: usize) -> candle_core::Result<Option<usize>> {
+    fn load_reserved(
+        &self,
+        expert_id: usize,
+        slot: usize,
+        sync: bool,
+    ) -> candle_core::Result<Option<usize>> {
         let loaded = match &self.copy_stream {
-            Some(cs) => self.upload_in_place(cs, expert_id, slot),
+            Some(cs) => self.upload_in_place(cs, expert_id, slot, sync),
             None => self.expert_weights(expert_id).map(|w| {
                 w.map(|weights| {
                     Arc::new(SlotBuf {
@@ -1777,6 +1842,7 @@ impl CachedLayer {
         cs: &CopyStream,
         expert_id: usize,
         slot: usize,
+        sync: bool,
     ) -> candle_core::Result<Option<Arc<SlotBuf>>> {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(None);
@@ -1791,14 +1857,21 @@ impl CachedLayer {
         };
         copy_stream::wait_for_readers(buf);
         let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
-        cs.upload(
-            &buf.fence,
-            &[
-                (&memory[0], &g[expert_range(&gate, expert_id)?]),
-                (&memory[1], &u[expert_range(&up, expert_id)?]),
-                (&memory[2], &d[expert_range(&down, expert_id)?]),
-            ],
-        )?;
+        let parts = [
+            (&memory[0], &g[expert_range(&gate, expert_id)?]),
+            (&memory[1], &u[expert_range(&up, expert_id)?]),
+            (&memory[2], &d[expert_range(&down, expert_id)?]),
+        ];
+        if sync {
+            cs.upload(&buf.fence, &parts)?;
+        } else {
+            // M5b: the caller claims this pass and publishes `SYNC_PRELOAD` on this same stream right
+            // after the copies, so the layer's gate — not a host wait — orders the reader. Blocking
+            // here was 81% of a prediction job.
+            // SAFETY: the sources are page-locked stacks that outlive the copies, and the caller
+            // publishes the completion point on the same stream.
+            unsafe { cs.queue_async(&buf.fence, &parts)? };
+        }
         Ok(Some(Arc::clone(buf)))
     }
 
@@ -1895,25 +1968,39 @@ impl CachedLayer {
         ))
     }
 
-    /// Load the experts predicted for `x`: into empty slots freely, and over LRU residents at
-    /// most `MAX_LOOKAHEAD_SWAPS` times per row. A wrong prediction only costs a slot.
-    fn prefetch_predicted(&self, x: &Tensor) -> candle_core::Result<()> {
+    /// M5b: turn the prediction for `x` into **asynchronous** copies on the copy stream, then claim
+    /// this pass and publish `SYNC_PRELOAD` for it — all from the prediction thread, in the gap after
+    /// the CPU-expert batch, so the DMA hides in the host's work for the next layer.
+    ///
+    /// The copies are queued *before* the claim is published, and the publish is monotonic
+    /// (`publish_point_on_max`), so the token thread either sees no claim (nothing to wait for) or
+    /// sees one whose point is already on its way and can only move the word forward.
+    fn prefetch_predicted(&self, x: &Tensor, pass: u32) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
+        if self.copy_stream.is_none() {
+            return Ok(());
+        }
         let max_swaps = MAX_LOOKAHEAD_SWAPS * rows;
         let mut swaps = 0;
         for &e in &predicted {
             if e >= self.num_experts {
                 continue;
             }
-            if self.admit(e)?.is_some() {
+            if self.admit(e, false)?.is_some() {
                 COUNTERS.lookahead_loads.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if swaps < max_swaps && self.replace(e, &predicted)?.is_some() {
+            if swaps < max_swaps && self.replace(e, &predicted, false)?.is_some() {
                 swaps += 1;
                 COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // Claim then publish: a reader that sees `pass` knows the point is coming.
+        if let Some(sched) = schedule() {
+            self.preload_claimed.store(pass, Ordering::Release);
+            let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_PRELOAD);
+            sched.publish_point_on_max(&self.slot_device, id, pass)?;
         }
         Ok(())
     }
@@ -1940,7 +2027,8 @@ impl CachedLayer {
         let this = Arc::clone(self);
         std::thread::spawn(move || {
             while let Some(e) = this.next_fill_candidate() {
-                match this.admit(e) {
+                // Background fill: synchronous copies, no per-pass gate protects these slots.
+                match this.admit(e, true) {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(err) => {
@@ -2228,6 +2316,29 @@ impl CachedLayer {
         let rows = batch * seq;
         let x2d = xs.reshape((rows, hidden))?;
         step_probe::mark(&self.slot_device);
+        // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
+        // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
+        // known before the DMA, because that is what publishes the staging point for this pass.
+        #[cfg(feature = "cuda")]
+        let pass = {
+            static PASS: AtomicU32 = AtomicU32::new(0);
+            if self.layer == 0 {
+                match schedule() {
+                    Some(sched) => {
+                        let p = PASS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Err(e) = sched.bump_epoch(&self.slot_device) {
+                            warn!("expert cache: epoch bump failed: {e}");
+                        }
+                        p
+                    }
+                    None => 0,
+                }
+            } else {
+                PASS.load(Ordering::Relaxed)
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let pass: u32 = 0;
         // Start predicting the next layer's experts now, off the token path; whatever is not
         // resident by the time that layer runs goes to the CPU.
         //
@@ -2252,7 +2363,7 @@ impl CachedLayer {
                         crate::lookahead::submit(Box::new(move || {
                             let r = x.len() / next.hidden.max(1);
                             let x = Tensor::from_vec(x, (r, next.hidden), &Device::Cpu);
-                            if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
+                            if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                                 debug!("expert cache: layer {} lookahead failed: {e}", next.layer);
                             }
                         }));
@@ -2285,7 +2396,7 @@ impl CachedLayer {
                             }
                             if let Some(v) = sh.chan.wait_publish(last_seq, n, slot) {
                                 let x = Tensor::from_vec(v, (rows, next.hidden), &Device::Cpu);
-                                if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
+                                if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                                     debug!(
                                         "expert cache: layer {} lookahead failed: {e}",
                                         next.layer
@@ -2315,7 +2426,7 @@ impl CachedLayer {
                     let next = Arc::clone(&next);
                     crate::lookahead::submit(Box::new(move || {
                         let x = Tensor::from_vec(x_clone, (rows, next.hidden), &Device::Cpu);
-                        if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
+                        if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                             debug!("expert cache: layer {} lookahead failed: {e}", next.layer);
                         }
                     }));
@@ -2415,29 +2526,7 @@ impl CachedLayer {
         let n_hits: usize = hits.iter().map(Vec::len).sum();
         COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
 
-        // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
-        // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
-        // known before the DMA, because that is what publishes the staging point for this pass.
-        #[cfg(feature = "cuda")]
-        let pass = {
-            static PASS: AtomicU32 = AtomicU32::new(0);
-            if self.layer == 0 {
-                match schedule() {
-                    Some(sched) => {
-                        let p = PASS.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Err(e) = sched.bump_epoch(&self.slot_device) {
-                            warn!("expert cache: epoch bump failed: {e}");
-                        }
-                        p
-                    }
-                    None => 0,
-                }
-            } else {
-                PASS.load(Ordering::Relaxed)
-            }
-        };
-        #[cfg(not(feature = "cuda"))]
-        let pass: u32 = 0;
+
 
         // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
         // GPU with the hits, leaving the rest on the CPU. Every CUDA call stays on this thread.
@@ -2527,22 +2616,17 @@ impl CachedLayer {
         //
         // When warmup could not capture the gate, the *same* node is launched warm: one host call
         // per layer, like the `cudaStreamWaitEvent` it replaces, so the protocol stays one protocol.
+        // M5b: same for the preload point, but only when this pass was actually claimed — a layer
+        // with no preload this pass has nothing to wait for, and replaying its gate would wait for a
+        // publish that nobody owes (`NAIWA_NO_LOOKAHEAD` makes that the normal case).
+        #[cfg(feature = "cuda")]
+        if self.preload_claimed.load(Ordering::Acquire) == pass {
+            self.replay_gate(crate::doorbell::SYNC_PRELOAD)?;
+        }
+        // M4: ... and the staging point, which every pass publishes.
         #[cfg(feature = "cuda")]
         if self.staging_enabled() {
-            if let Some(sched) = schedule() {
-                let gate = self.state.lock().unwrap().staging_gate.take();
-                match gate {
-                    Some(gate) => {
-                        gate.replay()?;
-                        self.state.lock().unwrap().staging_gate = Some(gate);
-                    }
-                    None => {
-                        COUNTERS.staging_eager_waits.fetch_add(1, Ordering::Relaxed);
-                        let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
-                        sched.wait_ready(&self.slot_device, id)?;
-                    }
-                }
-            }
+            self.replay_gate(crate::doorbell::SYNC_STAGING)?;
         }
 
         let acc = self.run_hits(&hits, &x2d, act);
@@ -2811,6 +2895,8 @@ mod tests {
                 doorbell_seq: 0,
                 #[cfg(feature = "cuda")]
                 staging_gate: None,
+                #[cfg(feature = "cuda")]
+                preload_gate: None,
                 slots: HashMap::new(),
                 resident: vec![None; slots],
                 hit_counts: vec![0; e],
@@ -2825,6 +2911,7 @@ mod tests {
             pcie_frac: 0.0,
             prefill: None,
             filling: AtomicBool::new(false),
+            preload_claimed: AtomicU32::new(0),
         })
     }
 

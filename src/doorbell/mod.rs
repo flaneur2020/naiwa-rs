@@ -63,6 +63,12 @@ mod ffi {
         d_target: *mut c_void, // mapped u32 cell: the seq value that means "complete"
         stream: i64,
     );
+    pub(crate) fn doorbell_publish_max(
+        d_ready: *mut c_void,
+        id: i32,
+        pass: u32,
+        stream: i64,
+    );
     pub(crate) fn doorbell_epoch_bump(d_epoch: *mut c_void, stream: i64);
     pub(crate) fn doorbell_wait_ready(
         d_epoch: *mut c_void,
@@ -1046,6 +1052,30 @@ impl ScheduleBuf {
         };
         if rc != sys::CUresult::CUDA_SUCCESS {
             candle_core::bail!("cuStreamWriteValue32 failed: {rc:?}");
+        }
+        Ok(())
+    }
+
+    /// M5b: [`Self::publish_point_on`], but **monotonic** — a one-thread kernel doing
+    /// `atomicMax(ready[id], pass)` on the stream, ordered after whatever was queued before it.
+    ///
+    /// `ready[]` is a level, not an edge, so an unconditional stream write lets a stale producer move
+    /// the word *backwards* and strand every later gate on that point. With `atomicMax` a stale,
+    /// duplicated or racing publish is harmless — which is what allows the producer to be the
+    /// lookahead thread, a pass behind the token thread's counter.
+    pub fn publish_point_on_max(
+        &self,
+        device: &candle_core::Device,
+        id: u32,
+        pass: u32,
+    ) -> Result<()> {
+        assert!((id as usize) < self.k, "sync id {id} out of range");
+        let dev = device.as_cuda_device()?;
+        let stream = dev.cuda_stream();
+        let ready = self.dev_ready_ptr();
+        // SAFETY: the word is inside the mapped allocation; the launch is stream-ordered.
+        unsafe {
+            ffi::doorbell_publish_max(ready, id as i32, pass, stream.cu_stream() as i64);
         }
         Ok(())
     }
