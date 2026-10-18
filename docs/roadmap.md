@@ -4,7 +4,7 @@ Plan of record: what is built, what was measured, what is judged, and what comes
 Design and current-state detail live in [`design.md`](design.md); per-milestone evidence
 lives in [`worklogs/`](worklogs/).
 
-Recorded 2026-10-16; last updated 2026-10-18 after M9.1.
+Recorded 2026-10-16; last updated 2026-10-18 after M9.2 progress.
 
 ---
 
@@ -14,10 +14,10 @@ Every step must be **feasible on its own** and **independently verifiable**:
 
 1. **Numeric oracle** — a frozen eager reference: fixed prompt set, greedy decode.
    - `--pcie-frac 0` is bit-reproducible (8/8 across two dispatcher configs).
-   - `frac 0` + `NAIWA_NO_LOOKAHEAD=1` is **byte-identical** to
+   - `frac 0` + `--no-lookahead` is **byte-identical** to
      `harness/m1/reference.oracle.txt`. This is the gate that means “no bug”.
    - `frac > 0` is not byte-exact: the lookahead changes the resident/miss split, hence the
-     `atomicAdd` term set, so near-ties flip. `frac 0.55` + `NO_LOOKAHEAD` has exactly **two
+     `atomicAdd` term set, so near-ties flip. `frac 0.55` + `--no-lookahead` has exactly **two
      recorded variants** (2/20 diverge to the same alternative text; `frac 0` is 0/10). A
      third variant, or the reference missing, is the regression signal.
 2. **Structural criteria** — launch/capture/allocation counts, spin/`waited` counts, dry
@@ -42,14 +42,14 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |
-| **M3** | CPU return path into the graph | ✅ 2026-10-16 | device epoch protocol; `frac 0` + `NO_LOOKAHEAD` 5/5 |
+| **M3** | CPU return path into the graph | ✅ 2026-10-16 | device epoch protocol; `frac 0` + `--no-lookahead` 5/5 |
 | **M3.1** | move doorbell out of the fork | ✅ 2026-10-16 | fork −1660 lines; 5/5 oracle |
 | **M4** | PCIe staging leg into the graph | ✅ 2026-10-17 | 5/5 at `frac 0.55`, 2/2 at `frac 0`; stale stamp hangs |
 | **M5** | lookahead thread + async preload | ✅ 2026-10-17 | 81.3–83.8% hit, 78.2–86.7 ms TPOT; 11/11 oracle |
 | **M6** | PLE decision + attention capture | ✅ re-scoped | Q2 settled; whole-step graph impossible; attention capture neutral |
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
-| **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` 38 → 11 |
+| **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -135,7 +135,7 @@ M9 depends on all measurements above it: it deletes what M6–M8 proved worthles
 - **Judged by**: ① with misses, greedy == eager; ② misses handled **inside the graph** (a
   counter proves no eager path); ③ zero sync points on the token thread; ④ failure injection
   — a worker error still advances the point.
-- **Result**: `--pcie-frac 0` + `NAIWA_NO_LOOKAHEAD=1` → **5/5 byte-identical** to the frozen
+- **Result**: `--pcie-frac 0` + `--no-lookahead` → **5/5 byte-identical** to the frozen
   oracle. With lookahead on, the split itself varies per step, so checks compare the variant
   set. Three earlier variants (per-bank host cells, global dynamic seq, per-layer dynamic seq)
   all raced or hung; the epoch protocol removes the class.
@@ -148,7 +148,7 @@ M9 depends on all measurements above it: it deletes what M6–M8 proved worthles
 
 - **Did**: `src/doorbell/{mod.rs,doorbell.cu}` + own `build.rs` (`cudaforge`); 14 consumers
   switched; fork deleted `cuda/doorbell.{rs,cu}`, the FFI decls, and the re-export.
-- **Result**: doorbell tests 5/5 here; `frac 0` + `NO_LOOKAHEAD` 5/5 byte-identical; fork
+- **Result**: doorbell tests 5/5 here; `frac 0` + `--no-lookahead` 5/5 byte-identical; fork
   builds without the module; **−1660 lines**. Capture is per stream, not per crate, so this is
   safe even if a future fork-driven capture needs a doorbell node.
 - **Evidence**: [`worklogs/m3-1.md`](worklogs/m3-1.md).
@@ -186,7 +186,7 @@ M9 depends on all measurements above it: it deletes what M6–M8 proved worthles
 - **Judged by**: ① hit rate **81.3–83.8%** (bar 78%; old pool 82.4%); ② STEP_DBG dry fell
   2.03–2.13 → **1.53–1.63 ms/layer** and TPOT 101.4 → **78.2–86.7 ms** (9.9 → 12.4–12.8 T/s);
   ③ no A/B switch — the configuration is in the code.
-- **Gates**: `frac 0.55` + `NO_LOOKAHEAD` 11/11 byte-identical; `frac 0` 2/2; 96 gates captured
+- **Gates**: `frac 0.55` + `--no-lookahead` 11/11 byte-identical; `frac 0` 2/2; 96 gates captured
   at warmup (48 preload + 48 staging), 0 launched warm, 0 predictions dropped.
 - **Open risk carried forward**: one unexplained divergence in ~12 runs on an intermediate
   build; the final build was 11/11 clean and 27 consecutive clean runs across M4/M5b. Later
@@ -285,7 +285,7 @@ mentions**. The rule: a switch still in the tree is a decision that has not been
 | mechanism | flag | measured effect | verdict |
 |---|---|---|---|
 | **S2: residents launch before the staging gate** | `NAIWA_STAGE_SPLIT` | **78.9 → 62.8 ms/pass (−20%)** | **keep, unconditional** |
-| predictive preload / lookahead | `NO_LOOKAHEAD` to disable | hit 85% → 20%, −25% throughput | keep, unconditional |
+| predictive preload / lookahead | `--no-lookahead` to disable | hit 85% → 20%, −25% throughput | keep, unconditional |
 | `--lookahead-swaps 1` at deep draft | `--lookahead-swaps` | −11% round at np8 (165.5 vs 185.8 ms) | keep as a real flag |
 | per-layer MoE segment graphs | `NAIWA_NO_CAPTURE` | **neutral** (44.1 vs 43.5 tok/s) | **deleted** |
 | attention region capture | `NAIWA_ATTN_REGION` | **neutral** (43.9 vs 43.0) | **deleted** (~450 lines) |
@@ -307,23 +307,31 @@ mentions**. The rule: a switch still in the tree is a decision that has not been
 | segment graphs | disengaged: 0 warmup captures, `fused_decode_capture` returns `None`; np8 44.6/43.1 vs 44.0, oracle identical |
 | `attn_capture.rs` + M6 mix/inject region | deleted (~450 lines); eager mix/inject and mixer restored; np8 39.7/43.6 vs 44.0 (noise), oracle identical |
 | capture code | `fused_decode_capture`, `capture_will_serve`, `Bank::create_capture`, `warmup_captures`, `waitadd_replay`, `fast`/`capture_bank` deleted; `expert_cache.rs` 3282 → 2989 lines; np8 43.0/43.4 vs 44.0, oracle identical |
-| `NAIWA_*` env names | **38 → 11** (target < 12 met) |
+| `NAIWA_*` env names | **38 → 7** unique names in `src/` + `harness/` (target < 12 met; M9 wrote 11 before the last deletions) |
 
-**Acceptance for M9.1**: `cargo test` green; `frac 0` + `NO_LOOKAHEAD` byte-exact; np8 round
+**Acceptance for M9.1**: `cargo test` green; `frac 0` + `--no-lookahead` byte-exact; np8 round
 p50 within 2% of 170 ms; < 12 `NAIWA_*` mentions. Met.
 
-### M9.2 — collapse the two sync protocols (open)
+### M9.2 — one decision point, one CPU-return protocol (open)
 
-Two CPU-return paths remain:
+Already landed:
 
-- the schedule path (`ScheduleBuf`, `wait_add`), used by decoder layers;
-- the legacy per-layer `Channel`, still used by the MTP site.
+- **device dispatch is the only path** (`c6578b0`): the GPU emits resident/staged/CPU lists into
+  `DispatchBuf`; the host reads three lists and never hashes ids. The `NAIWA_DISPATCH_USE` probe
+  is gone; the startup dummy run keeps the shape-check fallback.
+- **S2 and the fused CPU path are unconditional** (`bbd1485`): `NAIWA_STAGE_SPLIT` and
+  `NAIWA_CPU_MOE_GENERIC` are gone.
+- **`--no-lookahead` is a CLI flag** (`b70ca7b`), not `NAIWA_NO_LOOKAHEAD`.
 
-Decide which is canonical:
+Remaining: two CPU-return paths still coexist — `ScheduleBuf`'s `CPU_EXPERTS` point (unused
+since capture was deleted) and the live per-layer `Channel` + `wait_copy_slot` used by both the
+decoder and the MTP site. Decide which is canonical:
 
-- if the MTP site can move to `ScheduleBuf` (it already publishes there), delete `Channel`
-  (~200 lines) and the `NAIWA_*_CHANNEL` fallbacks;
-- otherwise document *why* at each entry point.
+- move decoder/MTP CPU return onto `ScheduleBuf`, delete `Channel` (~200 lines) and its
+  fallbacks; or
+- document *why* `Channel` stays.
+
+Do not add a third path.
 
 ### M9.3 — one measurement harness, not eleven (open)
 
@@ -357,7 +365,7 @@ A mechanism within the ~5% run-to-run spread is deleted; the pair of numbers goe
 table. A mechanism that pays is made unconditional and its flag removed. “Keep the flag in
 case” is not an acceptable outcome.
 
-Gates for every commit: `frac 0` + `NO_LOOKAHEAD` byte-exact; `cargo test` green; np8 round
+Gates for every commit: `frac 0` + `--no-lookahead` byte-exact; `cargo test` green; np8 round
 p50 recorded.
 
 ### M9 baseline
@@ -433,7 +441,7 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 - **The MTP head's schedule sizing** was an out-of-bounds bug and is fixed, but the same class
   (a site past the decoder layers) should be asserted at warmup.
 - **`frac > 0` is never byte-exact**; only the variant set is. Any new protocol must keep the
-  `frac 0` + `NO_LOOKAHEAD` gate byte-exact or it is unverifiable.
+  `frac 0` + `--no-lookahead` gate byte-exact or it is unverifiable.
 
 ---
 
