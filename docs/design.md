@@ -53,11 +53,10 @@ wait CPU payload   ────────→  wait_copy_slot, add to acc
                               next layer's attention (eager)
 ```
 
-**Dispatch (in progress) is moving to the device:** `dispatch_topk` / `DispatchBuf` write a
-per-layer resident bitmap plus three compact lists (resident, staged, CPU) with rows and weights
-into mapped memory. The host waits on one `done` word and reads the lists; it does not hash ids.
-The only host-side guard is the shape check (the startup dummy run takes the old path). One fixed
-CPU path: fused when the activation/format is supported, generic otherwise.
+**Dispatch is host-side:** the M6 P2 device dispatch (`dispatch_topk` / `DispatchBuf`) measured
+neutral and was deleted in M9.1. The host builds the resident/staged/CPU lists from the doorbell
+top-k; the only host-side guard is the shape check. One fixed CPU path: fused when the
+activation/format is supported, generic otherwise.
 
 Stream order inside one layer:
 
@@ -207,9 +206,8 @@ sizing bug (MTP site = layer 48) is fixed.
 - **Measurement:** medians of ≥ 3 runs; report round p50 + tokens/round + hit rate + flags;
   liveness ≥ 6 runs; no mean where a median exists.
 - **One fixed configuration per decision.** Env vars are probes/overrides, not A/B arms. Current
-  surface (7): `NAIWA_STEP_DBG`, `NAIWA_ROUND_STATS`, `NAIWA_RET_DBG`, `NAIWA_FUSED_DBG`,
-  `NAIWA_LOOKAHEAD_DBG`, `NAIWA_LH_SWAPS` (sweep override), `NAIWA_GPU_ONLY_EXPERTS` (lossy
-  bound). The oracle switch is the `--no-lookahead` flag.
+  surface (6): `NAIWA_STEP_DBG`, `NAIWA_ROUND_STATS`, `NAIWA_RET_DBG`, `NAIWA_FUSED_DBG`,
+  `NAIWA_LOOKAHEAD_DBG`, `NAIWA_GPU_ONLY_EXPERTS` (lossy bound). The oracle switch is the `--no-lookahead` flag.
 - **Pitfalls:** host-written per-step targets race (use device epoch); publish FIFO; `bump_epoch`
   needs the mapped **device view**; publish/gate replay must share `staging_enabled()` (a copy
   stream exists at `frac 0`).
@@ -235,8 +233,8 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 
 ```
 ~/code/naiwa-rs            engine + docs/ + harness/
-  src/doorbell/            Doorbell/FlagBuf/ScheduleBuf/DispatchBuf + kernels
-    mod.rs ffi, topk.rs, flag.rs, schedule.rs, dispatch.rs, ptr_wait_tests.rs
+  src/doorbell/            Doorbell/FlagBuf/ScheduleBuf + kernels
+    mod.rs ffi, topk.rs, flag.rs, schedule.rs, ptr_wait_tests.rs
   src/expert_cache/        GPU expert cache
     mod.rs                 module docs, constants, slot/bank/layer types
     provider.rs            RoutedExpertsProvider + layer construction
@@ -266,7 +264,7 @@ BIN=$HOME/naiwa-rs/target/release/naiwa-rs TAG=X FRAC=0 NO_LOOKAHEAD=1 \
   OUT=$HOME/bench-rel/naiwa-v2/m4 timeout 400 ./harness/m1/capture_oracle.sh
 diff ~/bench-rel/naiwa-v2/m4/reference.X.txt harness/m1/reference.oracle.txt
 
-cargo test --offline --release --features cuda     # 34/34
+cargo test --offline --release --features cuda     # 33/33
 ```
 
 Reference bench (np8):

@@ -199,23 +199,6 @@ mod cuda {
     }
 
     impl Channel {
-        /// Allocate a channel whose payload slot holds at least `min_n` f32. `Ok(None)` when the
-        /// device is not CUDA or the mapped allocation fails.
-        pub fn acquire(device: &Device, min_n: usize) -> Result<Option<Arc<Channel>>> {
-            if !device.is_cuda() {
-                return Ok(None);
-            }
-            // Headroom: a verify window a few rows larger must not need another allocation (a
-            // capture would otherwise be stranded on the retired one).
-            let want = min_n.max(1) * 2;
-            Ok(FlagBuf::acquire(device, want)?.map(|chan| {
-                Arc::new(Channel {
-                    chan: Arc::new(chan),
-                    next: Mutex::new((0, 0)),
-                })
-            }))
-        }
-
         /// The flag buffer itself (mapped cells + payload ring).
         pub fn flag(&self) -> &Arc<FlagBuf> {
             &self.chan

@@ -37,11 +37,6 @@ mod ffi {
         n: i32,               // float count
         stream: i64,
     );
-    pub(crate) fn doorbell_wait_seq_ge(
-        d_seq: *mut c_void,   // mapped seq counter the host bumps
-        target: u32,          // the seq value that means "payload complete"
-        stream: i64,
-    );
     pub(crate) fn doorbell_wait_copy_f32(
         d_seq: *mut c_void,     // mapped seq counter the host bumps
         target: u32,            // seq value that means "payload slot complete"
@@ -65,32 +60,6 @@ mod ffi {
         stream: i64,
     );
     pub(crate) fn doorbell_epoch_bump(d_epoch: *mut c_void, stream: i64);
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn doorbell_dispatch_topk(
-        ids: *const c_void,
-        weights: *const c_void,
-        n: i32,
-        bitmap: *const c_void,
-        top_k: i32,
-        frac_num: i32,
-        frac_den: i32,
-        hits_slot: *mut c_void,
-        hits_row: *mut c_void,
-        hits_w: *mut c_void,
-        hits_n: *mut c_void,
-        stream_ids: *mut c_void,
-        stream_row: *mut c_void,
-        stream_w: *mut c_void,
-        stream_n: *mut c_void,
-        cpu_ids: *mut c_void,
-        cpu_row: *mut c_void,
-        cpu_w: *mut c_void,
-        cpu_n: *mut c_void,
-        max_hits: i32,
-        seq: u32,
-        done: *mut c_void,
-        stream: i64,
-    );
     pub(crate) fn doorbell_wait_ready(
         d_epoch: *mut c_void,
         d_ready: *mut c_void,
@@ -139,7 +108,6 @@ mod ffi {
     }
 }
 
-mod dispatch;
 mod flag;
 mod schedule;
 mod topk;

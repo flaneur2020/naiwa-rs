@@ -14,11 +14,10 @@ use super::ffi;
 /// copies a device tensor into the payload and bumps seq; the host spins in
 /// [`FlagBuf::wait_publish`] — no stream sync, no D2H launch.
 ///
-/// host -> GPU: the host writes the payload (plain stores, in publish order),
-/// bumps seq with a release store, and queues [`FlagBuf::wait_seq_ge`] on the
-/// stream: a 1-thread kernel spinning on the mapped seq. Whatever the stream
-/// runs afterwards sees the payload; the host never blocks the stream with a
-/// host function (graph-capturable, unlike `cudaLaunchHostFunc`).
+/// host -> GPU: [`FlagBuf::write_slot`] writes the payload (plain stores, in
+/// publish order) and bumps seq with a release store; [`FlagBuf::wait_copy_slot`]
+/// queues the stream-ordered wait+copy kernel. The host never blocks the stream
+/// with a host function (graph-capturable, unlike `cudaLaunchHostFunc`).
 pub struct FlagBuf {
     host: *mut u8,
     dev_view: *mut c_void,
@@ -93,11 +92,13 @@ impl FlagBuf {
     }
 
     /// F3/v2: offset of the mapped `target` cell (a u32), past the payload ring.
+    #[cfg(all(test, feature = "cuda"))]
     fn target_off(&self) -> usize {
         8 + self.max_n * Self::RING_DEPTH * 4
     }
 
     /// F3/v2: offset of the mapped `slot_off` cell (an i64), after `target` + padding.
+    #[cfg(all(test, feature = "cuda"))]
     fn slot_off_off(&self) -> usize {
         self.target_off() + 8
     }
@@ -105,6 +106,7 @@ impl FlagBuf {
     /// F3/v2: record the seq value this channel's stream-side wait targets. The wait kernels read
     /// it from mapped memory rather than taking it as a kernel argument, so a captured graph can
     /// be replayed with a fresh target each step (a kernel argument is frozen at capture).
+    #[cfg(all(test, feature = "cuda"))]
     pub fn set_target(&self, target: u32) {
         // SAFETY: the cell lies inside the mapped allocation; a plain volatile store suffices for
         // the device to read it (the stream-ordered kernel is launched after this call).
@@ -115,6 +117,7 @@ impl FlagBuf {
 
     /// F3/v2: record which payload slot the stream-side copy reads, as a float offset into the
     /// ring. Written before queueing [`Self::wait_copy_slot_ptr`].
+    #[cfg(all(test, feature = "cuda"))]
     pub fn set_slot_off(&self, slot: usize) {
         let off = (slot % Self::RING_DEPTH) as i64 * self.max_n as i64;
         // SAFETY: as `set_target`.
@@ -123,8 +126,9 @@ impl FlagBuf {
         }
     }
 
-    /// F3/v2: like [`Self::wait_seq_ge`], but the target comes from the mapped cell
-    /// ([`Self::set_target`]) instead of a kernel argument — capture-safe.
+    /// F3/v2: zero-argument wait: the target comes from the mapped cell ([`Self::set_target`])
+    /// instead of a kernel argument — capture-safe.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_seq_ge_ptr(&self, device: &candle_core::Device) -> Result<()> {
         let dev = device.as_cuda_device()?;
         let stream = dev.cuda_stream();
@@ -138,6 +142,7 @@ impl FlagBuf {
 
     /// F3/v2: like [`Self::wait_copy_slot`], but the target and slot offset come from the mapped
     /// cells ([`Self::set_target`] / [`Self::set_slot_off`]) instead of kernel arguments.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_copy_slot_ptr(&self, len: usize, dst: &Tensor) -> Result<()> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 
@@ -177,6 +182,7 @@ impl FlagBuf {
     /// `acc` (read-modify-write) instead of overwriting. `acc` is typically the MoE graph's
     /// output buffer, which already holds the GPU hits' sum, so one node folds the CPU experts'
     /// contribution in and the graph's output is the completed MoE result.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_add_slot_ptr(&self, len: usize, acc: &Tensor) -> Result<()> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 
@@ -212,49 +218,8 @@ impl FlagBuf {
         Ok(())
     }
 
-    /// M3: wait for `src`'s published seq and accumulate `src`'s payload slot into the device
-    /// buffer at `acc`.
-    ///
-    /// `self` supplies the mapped `target` / `slot_off` **cells**, `src` supplies the seq and
-    /// payload. The cells must be per-bank: the CPU-return channel is global, so two layers
-    /// sharing one set of cells would overwrite them before the earlier layer's wait node runs
-    /// (the graph node reads the cells at *execution* time, while the token thread runs ahead).
-    ///
-    /// `acc` is a raw device pointer because a captured call must resolve it *outside* the
-    /// capture window (a guarded `device_ptr` records an event, which capture forbids).
-    pub fn wait_add_from(
-        &self,
-        device: &candle_core::Device,
-        src: &FlagBuf,
-        len: usize,
-        acc: u64,
-    ) -> Result<()> {
-        if len > src.max_n {
-            candle_core::bail!(
-                "flag add of {len} f32 exceeds the channel capacity ({})",
-                src.max_n
-            );
-        }
-        let dev = device.as_cuda_device()?;
-        let stream = dev.cuda_stream();
-        let target = self.dev_ptr(self.target_off());
-        let slot_off = self.dev_ptr(self.slot_off_off());
-        // SAFETY: seq/payload come from `src`; cells from `self`; all inside mapped allocations.
-        unsafe {
-            ffi::doorbell_wait_add_f32_ptr(
-                src.dev_ptr(0),
-                target,
-                src.dev_ptr(8),
-                slot_off,
-                acc as *mut c_void,
-                len as i32,
-                stream.cu_stream() as i64,
-            );
-        }
-        Ok(())
-    }
-
-    /// M3: like [`Self::wait_add_from`], but the **job number is claimed on the device** from
+    /// M3: accumulate `src`'s published payload slot into `acc`, with the **job number
+    /// claimed on the device** from
     /// `counter` (`atomicAdd`, 1-based so it matches the publisher's `publish_seq`) and both the
     /// target seq and the payload slot are derived from it: `target = n`,
     /// `slot = n % RING_DEPTH`.
@@ -267,6 +232,7 @@ impl FlagBuf {
     ///
     /// The publisher's obligation is unchanged from `wait_copy_slot`: it must not publish more
     /// than `RING_DEPTH` jobs ahead of the device, or a slot is overwritten before it is read.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_add_indexed_from(
         &self,
         device: &candle_core::Device,
@@ -368,12 +334,6 @@ impl FlagBuf {
         Ok(())
     }
 
-    /// The seq the host should wait for after `publish_f32` (call before it).
-    pub fn next_seq(&self) -> u32 {
-        // SAFETY: mapped memory the device bumps; a single u32 read.
-        unsafe { std::ptr::read_volatile(self.seq_ptr()) }.wrapping_add(1)
-    }
-
     /// Wait until seq advances past `last_seq`, then copy `n` values out of payload
     /// slot `slot`. No CUDA calls — safe from any host thread.
     ///
@@ -418,34 +378,6 @@ impl FlagBuf {
         Some((0..n)
             .map(|i| unsafe { std::ptr::read_volatile(p.add(slot_off + i)) })
             .collect())
-    }
-
-    /// Host -> GPU: write `values` into the payload and publish, returning the
-    /// seq value the GPU must see. The caller must have waited for any earlier
-    /// GPU publishes first (one channel, one direction at a time).
-    pub fn write_payload(&self, values: &[f32], publish_seq: u32) -> u32 {
-        let p = self.payload_ptr();
-        // SAFETY: `values` fits (caller checks `max_n`); plain stores, then the
-        // release seq store publishes them.
-        unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), p, values.len());
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            std::ptr::write_volatile(self.seq_ptr(), publish_seq);
-        }
-        publish_seq
-    }
-
-    /// Queue the GPU-side wait on `device`'s current stream: a 1-thread kernel
-    /// spinning until the mapped seq reaches `target`. Everything queued after
-    /// this on the stream runs behind the host's payload.
-    pub fn wait_seq_ge(&self, device: &candle_core::Device, target: u32) -> Result<()> {
-        let dev = device.as_cuda_device()?;
-        let stream = dev.cuda_stream();
-        // SAFETY: the launch is ordered on the current stream.
-        unsafe {
-            ffi::doorbell_wait_seq_ge(self.dev_ptr(0), target, stream.cu_stream() as i64);
-        }
-        Ok(())
     }
 
     /// Host -> GPU result leg (R2b), publish side (worker thread): write

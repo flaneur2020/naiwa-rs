@@ -21,9 +21,6 @@ pub(crate) struct CacheStats {
     pub lookahead_dropped: u64,
     /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
     pub gate_replays: u64,
-    /// v2 M4: DMA-gate waits launched warm because the gate graph could not be captured. Must stay
-    /// 0 — a non-zero value means the graph route failed and only the fallback ran.
-    pub staging_eager_waits: u64,
     /// Experts DMA'd into a scratch slot and run on the GPU instead of the CPU (`--pcie-frac`).
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
@@ -39,7 +36,6 @@ static CACHE_STATS: Mutex<CacheStats> = Mutex::new(CacheStats {
     swaps: 0,
     lookahead_dropped: 0,
     gate_replays: 0,
-    staging_eager_waits: 0,
     pcie_misses: 0,
     pcie_bytes: 0,
 });

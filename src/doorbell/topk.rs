@@ -158,12 +158,6 @@ impl DoorbellBuf {
         (want, ids, ws)
     }
 
-    /// Read seq without spinning (the value `wait_and_read` last returned).
-    pub fn seq(&self) -> u32 {
-        // SAFETY: first 4 bytes of the allocation.
-        unsafe { std::ptr::read_volatile(self.seq_ptr()) }
-    }
-
     pub fn max_n(&self) -> usize {
         self.max_n
     }

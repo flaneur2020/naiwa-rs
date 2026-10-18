@@ -29,8 +29,8 @@
 //!   call stays on the calling thread.
 //! - Misses are never loaded on the token path. Instead, each layer submits its activation to a
 //!   lookahead thread that runs the next layer's router on it and loads the predicted experts:
-//!   into empty slots freely, over least-recently-used residents at most `MAX_LOOKAHEAD_SWAPS`
-//!   times. Whatever is not resident when the next layer runs goes to the CPU.
+//!   into empty slots freely, over least-recently-used residents at most `--lookahead-swaps`
+//!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
 mod decode;
@@ -71,25 +71,6 @@ use layer::LookaheadChannel;
 // needs (the target runs the n drafts plus one token in one forward).
 const PREFILL_THRESHOLD: usize = 16;
 
-/// Upper bound on resident experts the decode lookahead replaces per layer per token (per row of
-/// a verify step). Each swap
-/// copies one expert's three projections host-to-device; without a cap a poor prediction would
-/// turn every token into a full re-upload of every layer's top-k.
-const MAX_LOOKAHEAD_SWAPS: usize = 2;
-
-/// Replacement cap for one prediction pass, per row. `NAIWA_LH_SWAPS` overrides it for sweeps: more
-/// swaps means more predicted experts displace residents (more DMA) in exchange for fewer CPU experts
-/// on the critical path. The default is the shipped value; the env is a measurement knob only.
-fn max_lookahead_swaps() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("NAIWA_LH_SWAPS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(MAX_LOOKAHEAD_SWAPS)
-    })
-}
-
 /// With `--prefill-stream`, each layer keeps its last slots in a separate bank of about its
 /// share of the loan: two layers of experts, spread over the estimated 48 layers, plus a
 /// quarter for layers with smaller slots than the largest one. The loan lends whole banks.
@@ -121,12 +102,6 @@ static SCHEDULE: OnceLock<Arc<crate::doorbell::ScheduleBuf>> = OnceLock::new();
 #[cfg(feature = "cuda")]
 fn schedule() -> Option<&'static Arc<crate::doorbell::ScheduleBuf>> {
     SCHEDULE.get()
-}
-
-#[cfg(feature = "cuda")]
-fn zero_buf(max_len: usize) -> &'static [f32] {
-    static ZEROS: OnceLock<Vec<f32>> = OnceLock::new();
-    ZEROS.get_or_init(|| vec![0f32; max_len])
 }
 
 /// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling

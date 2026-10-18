@@ -87,6 +87,7 @@ impl ScheduleBuf {
         }))
     }
 
+    #[cfg(all(test, feature = "cuda"))]
     fn epoch_ptr(&self) -> *mut u32 {
         self.host.cast()
     }
@@ -106,6 +107,7 @@ impl ScheduleBuf {
         unsafe { self.dev_view.cast::<u8>().add(8) as *mut c_void }
     }
 
+    #[cfg(all(test, feature = "cuda"))]
     fn dev_payload_ptr(&self) -> *mut c_void {
         // SAFETY: as above.
         unsafe {
@@ -115,10 +117,6 @@ impl ScheduleBuf {
         }
     }
 
-    pub fn max_n(&self) -> usize {
-        self.max_n
-    }
-
     /// The static id of `(layer, kind)` — the word this sync point owns.
     pub fn sync_id(&self, layer: u32, kind: u32) -> u32 {
         layer * self.waits_per_layer + kind
@@ -126,6 +124,7 @@ impl ScheduleBuf {
 
     /// The last pass the **device** announced. The host normally does *not* read this: it keeps its
     /// own pass counter, which equals the device's for the same pass.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn epoch(&self) -> u32 {
         // SAFETY: mapped word, written by the device behind a system fence.
         unsafe { std::ptr::read_volatile(self.epoch_ptr()) }
@@ -181,6 +180,7 @@ impl ScheduleBuf {
     ///
     /// `acc` is a raw device pointer because a *captured* call must resolve it outside the capture
     /// window (a guarded `device_ptr` records an event, which capture forbids).
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_add(&self, device: &candle_core::Device, n: usize, id: u32, slot: u32, acc: u64) -> Result<()> {
         if n > self.max_n {
             candle_core::bail!(
@@ -209,6 +209,7 @@ impl ScheduleBuf {
     }
 
     /// Read a point's ready word (diagnostics / tests).
+    #[cfg(all(test, feature = "cuda"))]
     pub fn ready(&self, id: u32) -> u32 {
         assert!((id as usize) < self.k, "sync id {id} out of range");
         // SAFETY: mapped word.
@@ -221,6 +222,7 @@ impl ScheduleBuf {
     /// This is what lets a DMA completion be a graph-visible doorbell: the copy stream publishes the
     /// point itself (`cuStreamWriteValue32`, a stream memory op: no kernel, no host involvement),
     /// and the node in the main-stream graph spins on it.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn publish_point_on_stream(
         &self,
         device: &candle_core::Device,
@@ -293,6 +295,7 @@ impl ScheduleBuf {
     }
 
     /// The common case: the CPU-experts point of `layer`.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn wait_add_cpu(&self, device: &candle_core::Device, n: usize, layer: u32, acc: u64) -> Result<()> {
         self.wait_add(device, n, self.sync_id(layer, SYNC_CPU_EXPERTS), layer, acc)
     }

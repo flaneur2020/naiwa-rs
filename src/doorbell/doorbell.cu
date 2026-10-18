@@ -86,19 +86,6 @@ __global__ void doorbell_copy_f32_kernel(
     }
 }
 
-__global__ void doorbell_wait_seq_ge_kernel(
-    const volatile uint32_t* d_seq,  // mapped, host bumps it after writing payload
-    uint32_t target)
-{
-    if (threadIdx.x == 0) {
-        while (*d_seq < target) {
-#if __CUDA_ARCH__ >= 700
-            __nanosleep(200);
-#endif
-        }
-    }
-}
-
 extern "C" void doorbell_copy_f32(
     void* d_seq,          // mapped seq counter, device view
     void* d_dst,          // mapped payload, device view (float*)
@@ -108,15 +95,6 @@ extern "C" void doorbell_copy_f32(
 {
     doorbell_copy_f32_kernel<<<1, 128, 0, (cudaStream_t)stream>>>(
         (volatile uint32_t*)d_seq, (volatile float*)d_dst, (const float*)src, n);
-}
-
-extern "C" void doorbell_wait_seq_ge(
-    void* d_seq,          // mapped seq counter, device view
-    uint32_t target,      // the host's seq value once its payload is complete
-    int64_t stream)
-{
-    doorbell_wait_seq_ge_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
-        (const volatile uint32_t*)d_seq, target);
 }
 
 // Host -> GPU result leg (R2b): the host writes a payload slot of a mapped
@@ -434,106 +412,4 @@ extern "C" void doorbell_wait_ready(
 {
     doorbell_wait_ready_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
         (const volatile uint32_t*)d_epoch, (const volatile uint32_t*)d_ready, id);
-}
-
-// M6 P2/S1: decide, on the device, which of a layer's selected experts are already resident, which go to
-// the staging ring (the `frac` share) and which go to the CPU. One thread, because the lists must be
-// deterministic and ordered exactly as the selection was - the host then reads the three counts and one
-// compact list instead of hashing every id itself.
-//
-// `bitmap` is one u32 per 32 experts of the layer (256 experts -> 8 words). `hits_slot` receives the
-// *global* slot of the resident expert, so the host can resolve it through its own slot table with an
-// array index rather than a map lookup.
-__global__ void doorbell_dispatch_topk_kernel(
-    const uint32_t* __restrict__ ids,
-    const float* __restrict__ weights,
-    int n,
-    const uint32_t* __restrict__ bitmap,
-    int top_k,
-    int frac_num,
-    int frac_den,
-    uint32_t* hits_slot,
-    uint32_t* hits_row,
-    float* hits_w,
-    uint32_t* hits_n,
-    uint32_t* stream_ids,
-    uint32_t* stream_row,
-    float* stream_w,
-    uint32_t* stream_n,
-    uint32_t* cpu_ids,
-    uint32_t* cpu_row,
-    float* cpu_w,
-    uint32_t* cpu_n,
-    int max_hits,
-    uint32_t seq,
-    uint32_t* done)
-{
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
-    }
-    uint32_t nh = 0, ns = 0, nc = 0;
-    // Pass 1: residents, in selection order.
-    for (int i = 0; i < n; ++i) {
-        uint32_t id = ids[i];
-        if ((bitmap[id >> 5] >> (id & 31)) & 1u) {
-            if ((int)nh < max_hits) {
-                hits_slot[nh] = id;   // resolved to a slot by the caller's table
-                hits_row[nh] = (uint32_t)(i / top_k);
-                hits_w[nh] = weights[i];
-                ++nh;
-            }
-        }
-    }
-    // Pass 2: misses. The first `frac` share is staged, the rest stays on the CPU. `frac_num == 0`
-    // keeps everything on the CPU, `frac_num == frac_den` stages everything - the same split the host
-    // used to make.
-    int miss_total = 0;
-    for (int i = 0; i < n; ++i) {
-        uint32_t id = ids[i];
-        if (!((bitmap[id >> 5] >> (id & 31)) & 1u)) {
-            ++miss_total;
-        }
-    }
-    int staged_budget = frac_den > 0 ? (miss_total * frac_num) / frac_den : 0;
-    for (int i = 0; i < n; ++i) {
-        uint32_t id = ids[i];
-        if ((bitmap[id >> 5] >> (id & 31)) & 1u) {
-            continue;
-        }
-        if ((int)ns < staged_budget) {
-            // Weights travel with the ids: the host must not have to look them up again.
-            stream_ids[ns] = id;
-            stream_row[ns] = (uint32_t)(i / top_k);
-            stream_w[ns] = weights[i];
-            ++ns;
-        } else {
-            cpu_ids[nc] = id;
-            cpu_row[nc] = (uint32_t)(i / top_k);
-            cpu_w[nc] = weights[i];
-            ++nc;
-        }
-    }
-    *hits_n = nh;
-    *stream_n = ns;
-    *cpu_n = nc;
-    __threadfence_system();
-    // Publish last: the host spins on this word instead of synchronising the device per layer.
-    *done = seq;
-}
-
-extern "C" void doorbell_dispatch_topk(
-    const void* ids, const void* weights, int n, const void* bitmap,
-    int top_k, int frac_num, int frac_den,
-    void* hits_slot, void* hits_row, void* hits_w, void* hits_n,
-    void* stream_ids, void* stream_row, void* stream_w, void* stream_n,
-    void* cpu_ids, void* cpu_row, void* cpu_w, void* cpu_n,
-    int max_hits, unsigned int seq, void* done, int64_t stream)
-{
-    doorbell_dispatch_topk_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
-        (const uint32_t*)ids, (const float*)weights, n, (const uint32_t*)bitmap,
-        top_k, frac_num, frac_den,
-        (uint32_t*)hits_slot, (uint32_t*)hits_row, (float*)hits_w, (uint32_t*)hits_n,
-        (uint32_t*)stream_ids, (uint32_t*)stream_row, (float*)stream_w, (uint32_t*)stream_n,
-        (uint32_t*)cpu_ids, (uint32_t*)cpu_row, (float*)cpu_w, (uint32_t*)cpu_n,
-        max_hits, seq, (uint32_t*)done);
 }

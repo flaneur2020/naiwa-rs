@@ -1,6 +1,5 @@
 //! Mapped-memory wait/copy kernel tests (see `super`).
 
-use super::dispatch::DispatchBuf;
 use super::*;
 use candle_core::{DType, Device, Tensor};
 
@@ -159,49 +158,4 @@ fn wait_add_slot_ptr_accumulates_into_the_output_buffer() {
 
     let want: Vec<f32> = (0..max_n).map(|i| 11.0 + i as f32).collect();
     assert_eq!(acc.to_vec1::<f32>().unwrap(), want);
-}
-
-/// The dispatch kernel is the whole point of P2/S1: it must agree with a host reference exactly,
-/// including the `frac` split of the misses.
-#[test]
-fn dispatch_matches_the_host_reference() {
-    let Ok(device) = Device::new_cuda(0) else {
-        return;
-    };
-    let Ok(Some(mut buf)) = DispatchBuf::acquire(&device, 2, 64) else {
-        return;
-    };
-    // Layer 0: experts 0..=3 resident.
-    buf.bitmap_mut(0)[0] = 0b1111;
-    let ids = Tensor::new(&[0u32, 5, 2, 7], &device).unwrap();
-    let w = Tensor::new(&[0.5f32, 0.25, 0.125, 0.0625], &device).unwrap();
-    // Half of the two misses staged, the other half to the CPU.
-    buf.dispatch(0, &ids, &w, 4, 4, 1, 2).unwrap();
-    device.synchronize().unwrap();
-    let (hits, stream, cpu) = buf.read(0);
-    assert_eq!(hits.len(), 2, "two of the four are resident");
-    assert_eq!(hits[0].0, 0);
-    assert_eq!(hits[0].1, 0, "row 0");
-    assert_eq!(hits[0].2, 0.5);
-    assert_eq!(hits[1].0, 2);
-    assert_eq!(hits[1].1, 0, "row 0");
-    assert_eq!(hits[1].2, 0.125);
-    assert_eq!(stream.len(), 1, "the first miss of the staged budget");
-    assert_eq!(stream[0].0, 5);
-    assert_eq!(stream[0].1, 0, "row 0");
-    assert_eq!(stream[0].2, 0.25, "weights travel with the ids");
-    assert_eq!(cpu.len(), 1, "the rest stays on the CPU");
-    assert_eq!(cpu[0].0, 7);
-
-    // frac 0 -> nothing staged; frac 1/1 -> everything staged.
-    buf.dispatch(0, &ids, &w, 4, 4, 0, 1).unwrap();
-    device.synchronize().unwrap();
-    let (_, stream0, cpu0) = buf.read(0);
-    assert!(stream0.is_empty());
-    assert_eq!(cpu0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7], "both misses on the CPU");
-    buf.dispatch(0, &ids, &w, 4, 4, 1, 1).unwrap();
-    device.synchronize().unwrap();
-    let (_, stream1, cpu1) = buf.read(0);
-    assert_eq!(stream1.iter().map(|e| e.0).collect::<Vec<_>>(), vec![5u32, 7]);
-    assert!(cpu1.is_empty());
 }
