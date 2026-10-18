@@ -95,7 +95,7 @@ const SCRATCH_RING_FIRST: usize = 1 << 30;
 
 /// Ring capacity: enough that consecutive layers' steps rarely collide on one slot, small
 /// enough to be a rounding error next to the cache. Strata uses 16 (`kStagingBlobs`).
-/// `NAIWA_SCRATCH_SLOTS` overrides.
+/// Fixed: 16 measured the same as 64, and a bigger ring only costs VRAM.
 /// Staging-ring slots per quant shape. Measured: 16 and 64 perform identically (the ring has no id -> slot
 /// lookup, so a staged expert is copied again either way), so this is a constant, not a knob.
 const fn scratch_ring_slots() -> usize {
@@ -303,7 +303,7 @@ impl GpuCacheMoeProvider {
         }
         #[allow(unused_mut)]
         let mut captures = 0usize;
-        // M9: no segment captures. Measured (`NAIWA_NO_CAPTURE=1` before the deletion): graphs on 43.5 tok/s,
+        // M9: no segment captures. Measured before the deletion (graphs on/off): 43.5 vs 44.1 tok/s,
         // graphs off 44.1 - identical, so the eager segment is the one fixed configuration and the capture
         // machinery below is dead code kept only until the deletion commit.
         #[cfg(feature = "cuda")]
@@ -661,7 +661,7 @@ fn load_router(
 /// the CPU (the router weights moved back to the host, `[128, 2048]` F32 ~ 1 MiB/layer).
 /// The token thread never waits — no `to_vec1` D2H (W105b: 0.30-0.34 ms/layer of blocking
 /// wait) and no way for the prediction to queue late on the stream (the W99 failure that
-/// made `NAIWA_LH_MODE=new` regress hit 74% -> 38-45%).
+/// made an earlier mode switch regress hit 74% -> 38-45%).
 struct LookaheadChannel {
     /// The channel's shared half: the mapped FlagBuf plus the publish/consume
     /// counters the token thread (publish) and lookahead worker (consume) share.
@@ -2100,7 +2100,7 @@ impl CachedLayer {
         // never touches the GPU stream. This removes the W105b 0.30-0.34 ms/layer
         // blocking `to_vec1` D2H from the token thread AND the W99 late-prediction
         // hazard (the publish is stream-ordered right after this layer's last kernel,
-        // so the worker can never run before the data exists); `NAIWA_LH_MODE` is
+        // so the worker can never run before the data exists); the old mode switch is
         // obsolete with the channel path.
         if let Some(next) = self.registry.get(self.layer + 1) {
             if next.router.is_some() {
@@ -2263,7 +2263,7 @@ impl CachedLayer {
 
         let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
-        // M6 P2 flip (`NAIWA_DISPATCH_USE`) is still not armed. Two things it needs first:
+        // (removed) notes on the old host-side flip:
         //   1. the lists are shared across layers in one mapping, and the counts are read after a launch
         //      the host does not wait on, so a layer can read the previous layer's larger list (the OOB
         //      that killed the dummy run: len 1, index 210). The list area must be per layer and the count
@@ -2421,15 +2421,12 @@ impl CachedLayer {
         if self.preload_claimed.load(Ordering::Acquire) == pass {
             self.replay_gate(crate::doorbell::SYNC_PRELOAD)?;
         }
-        // S2 (`NAIWA_STAGE_SPLIT`): run the resident experts *before* the staging wait, so the DMA lands
-        // under their compute instead of in front of it. The staged ones still need the ring, so they keep
-        // the gate. Off by default while it is validated.
+        // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
+        // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the gate's p50 wait drops
+        // from 858 us to 11 us). The staged experts still need the ring, so they keep the gate. This is the
+        // one fixed behaviour - there is no switch.
         #[cfg(feature = "cuda")]
-        let split = std::sync::OnceLock::<bool>::new();
-        #[cfg(feature = "cuda")]
-        let split = *split.get_or_init(|| {
-            std::env::var_os("NAIWA_STAGE_SPLIT").is_some() && self.staging_enabled()
-        });
+        let split = self.staging_enabled();
         #[cfg(not(feature = "cuda"))]
         let split = false;
 

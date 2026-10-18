@@ -142,7 +142,6 @@ pub(crate) const FUSED_MAX_TOKENS: usize = 16;
 /// `xs` is `rows x hidden` F32; `ids` and `weights` are row-major `[rows, topk]`, weight-0 slots
 /// skipped. `None` when the generic path must run instead: an activation other than SiLU, experts
 /// that are not GGUF stacks, a dtype or shape the fused path does not serve, or
-/// `NAIWA_CPU_MOE_GENERIC` set (kept for A/B runs).
 pub(crate) fn fused_decode(
     experts: &MoEExperts,
     act: Activation,
@@ -152,9 +151,9 @@ pub(crate) fn fused_decode(
     topk: usize,
 ) -> candle_core::Result<Option<Vec<f32>>> {
     static GENERIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *GENERIC.get_or_init(|| std::env::var_os("NAIWA_CPU_MOE_GENERIC").is_some())
-        || !matches!(act, Activation::Silu | Activation::Swish)
-    {
+    // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
+    let _ = &GENERIC;
+    if !matches!(act, Activation::Silu | Activation::Swish) {
         return Ok(None);
     }
     let Some((gate, up, down)) = experts.expert_qtensors() else {
