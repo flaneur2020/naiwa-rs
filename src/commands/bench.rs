@@ -345,12 +345,6 @@ pub async fn run_bench(
                 stats.gate_replays,
             );
         }
-        if stats.capture_replays > 0 {
-            println!(
-                "  M2 capture: {} MoE segment(s) replayed as 1 graph launch (eager: ~5 raw launches each)",
-                stats.capture_replays,
-            );
-        }
         println!();
     }
 

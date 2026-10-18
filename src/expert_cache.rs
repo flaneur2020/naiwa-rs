@@ -119,7 +119,6 @@ struct Counters {
     pcie_bytes: AtomicU64,
     /// v2 M2: decode-step MoE segments served by replaying a captured graph (1 `cuGraphLaunch`
     /// each) rather than ~5 raw launches.
-    capture_replays: AtomicU64,
     /// v2 M4: layer DMA gates captured at warmup (one per layer with staging in service).
     /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
     gate_replays: AtomicU64,
@@ -151,7 +150,6 @@ static COUNTERS: Counters = Counters {
     swaps: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
     pcie_bytes: AtomicU64::new(0),
-    capture_replays: AtomicU64::new(0),
     gate_replays: AtomicU64::new(0),
     staging_eager_waits: AtomicU64::new(0),
 };
@@ -179,8 +177,6 @@ pub struct CacheStats {
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
     pub pcie_bytes: u64,
-    /// v2 M2: MoE segments replayed from a captured graph.
-    pub capture_replays: u64,
 }
 
 impl CacheStats {
@@ -205,7 +201,6 @@ pub fn take_stats() -> Option<CacheStats> {
         lookahead_dropped: crate::lookahead::dropped(),
         pcie_misses: take(&c.pcie_misses),
         pcie_bytes: take(&c.pcie_bytes),
-        capture_replays: take(&c.capture_replays),
         gate_replays: take(&c.gate_replays),
         staging_eager_waits: take(&c.staging_eager_waits),
     })
@@ -1260,34 +1255,11 @@ struct SlotWeights {
 /// Slots `[first, first + len)` of a layer in copy-stream mode: one `[len, N, K]` device
 /// allocation per projection, which the fused decode kernel indexes by `slot - first`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-/// v2 M1/M2: the fixed-grid capture path for one bank. `cap` owns every fixed buffer and (from
-/// M2) the captured graph; `ids`/`weights` are its persistent `[max_batch, max_topk]`
-/// descriptors, written per step with a stream-ordered H2D. Created once, after load.
-#[cfg(feature = "cuda")]
-struct BankCapture {
-    cap: mistralrs_quant::MoeDecodeCapture,
-    ids: candle_core::cuda::cudarc::driver::CudaSlice<u32>,
-    weights: candle_core::cuda::cudarc::driver::CudaSlice<f32>,
-    /// M3: the CPU-return node, captured with the segment (single-bank layers only).
-    waitadd: Option<candle_core::cuda::cudarc::driver::CudaGraph>,
-}
-
-// SAFETY: `CudaGraph` is `!Send` because CUDA graph handles are not internally thread-safe, not
-// because this use is unsound. The capture is only ever touched from the token thread and the
-// `Mutex` serializes access; the fork's own graph handle asserts the same
-// (`unsafe impl Send for CudaGraphHandle`).
-#[cfg(feature = "cuda")]
-unsafe impl Send for BankCapture {}
-
-
 struct Bank {
     first: usize,
     gate: Arc<QTensor>,
     up: Arc<QTensor>,
     down: Arc<QTensor>,
-    /// Lazily created once in the post-load warmup; `None` until then and for the staging ring.
-    #[cfg(feature = "cuda")]
-    capture: Mutex<Option<BankCapture>>,
 }
 
 /// One slot's contents. In copy-stream mode `memory` is the slot's view of its bank, overwritten
@@ -1362,8 +1334,6 @@ fn alloc_bank(
         gate,
         up,
         down,
-        #[cfg(feature = "cuda")]
-        capture: Mutex::new(None),
     });
     gate_views
         .into_iter()
@@ -1380,15 +1350,7 @@ fn alloc_bank(
         .collect()
 }
 
-impl Bank {
-    /// M3: whether this bank has a captured CPU-return node.
-    #[cfg(feature = "cuda")]
-    fn has_waitadd(&self) -> bool {
-        let guard = self.capture.lock().unwrap();
-        guard.as_ref().is_some_and(|c| c.waitadd.is_some())
-    }
-
-}
+impl Bank {}
 
 /// The v2 M1/M2 fixed-grid batch bound, matching the lookahead channel's policy
 /// (`LookaheadChannel::new`): it must cover the largest decode batch, with 16 rows of headroom
