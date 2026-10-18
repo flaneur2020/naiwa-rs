@@ -51,6 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
+| **M10** | chat workload parity with Strata | ⬜ proposed | harness first; side-by-side TTFT/ITL/tok/s on a fixed chat corpus |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -64,11 +65,12 @@ capture** — both were measured neutral and deleted in M9.1.
 M0 ── M1 ── M2 ── M3 ── M4 ── M5        M6 (originally: Q2 + F1 + F5)
                     └────── M5 measurement
 
-M6 (re-scoped) ── M7 ── M8 ── M9
+M6 (re-scoped) ── M7 ── M8 ── M9 ── M10
 ```
 
 M5's implementation only needed M2; its measurement needed M4 (host off the critical path).
 M9 depends on all measurements above it: it deletes what M6–M8 proved worthless.
+M10 needs the MTP fix and the long-context measurement (M10.4) before a parity claim is meaningful.
 
 ---
 
@@ -264,8 +266,8 @@ Evidence: [`worklogs/m6-graph.md`](worklogs/m6-graph.md) and
   - M8.2 (fold one-node gates into segments) **dropped** — same refuted reasoning.
   - The host term must be found by profiling the host thread (candle per-op overhead,
     sampler, handshake work), not by counting CUDA calls.
-  - M8.4 (re-measure at `--depth 2048/4096`) remains **open**: every M6/M7/M8 number is at a
-    4-token context.
+  - The long-context re-measurement originally tracked as M8.4 is now covered by M10.4: every
+    M6/M7/M8 number is at a 4-token context.
 - **Target table withdrawn**: “30–40 → 1–2 calls/layer, 185 → ~125 ms, 23.1 → 15.6 ms/token”
   assumed the launch chain was the round; the measurement refutes that assumption. Do not
   plan against it until the host profile exists.
@@ -398,6 +400,94 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ---
 
+## M10 — chat workload parity with Strata — ⬜ PROPOSED
+
+### Why
+
+The current numbers are decode microbenchmarks at `--depth 4` (MoE-dominated, trivial
+attention). They do not answer the product question: **does this engine serve a real chat
+workload at Strata's performance?** M10 builds the measurement first, then closes the gap.
+
+### Method: a chat harness, not another microbenchmark
+
+Build `harness/chat/` around the OpenAI-compatible streaming endpoint, usable against both
+engines:
+
+- **Fixed corpus** (`corpus.jsonl`), replayed turn by turn with the full conversation history:
+  short chat, multi-turn, long-context (≥2k), and code continuation. Each record fixes the
+  messages, max tokens, temperature, seed, and stop conditions. The corpus is committed; the
+  results are not.
+- **Streaming timestamps** per request: first token (TTFT), every subsequent token (ITL/TPOT),
+  final token, finish reason, usage. Tokens are counted from the stream, not from the prompt.
+- **Same driver for both engines**: start the server, wait for readiness, warm up out of the
+  measurement window, replay the corpus, repeat ≥3 times. Store one JSON result per run and a
+  side-by-side summary.
+- **Comparability record**: model artifact, quantization, card, driver, context length, cache
+  size, `frac`, MTP depth, sampling, concurrency, prefix-cache state. A parity claim requires
+  the same model and card; if Strata needs more VRAM, report the difference and do not call it
+  parity.
+
+Primary metrics, per workload class and aggregate:
+
+| metric | definition |
+|---|---|
+| TTFT p50 / p90 | request start → first streamed token (prefill + scheduling) |
+| ITL p50 / p90 | inter-token latency during decode |
+| output tok/s | generated tokens / decode window (per request and aggregate) |
+| end-to-end | request start → final token |
+| MTP acceptance | accepted drafts / proposed drafts, when enabled |
+| memory | peak VRAM and host RSS |
+
+Concurrency: at least 1, 2, 4; report request throughput separately from per-request latency.
+Correctness is not measured here: the `frac 0` + `--no-lookahead` oracle remains the gate.
+Performance runs use temperature 0 and the same seed so the compared text is stable.
+
+### Judging
+
+1. **M10.1 — harness exists and is reproducible.** The same command produces the same schema
+   for naiwa-rs and Strata; the corpus is fixed; warmup is excluded; results include the
+   comparability record.
+2. **M10.2 — baseline both engines.** Record the side-by-side table. Do not tune during this
+   step; the point is an honest gap, per class and per metric.
+3. **M10.3 — align.** Close the gap on the primary metrics. Initial parity band: naiwa-rs
+   within **10%** of Strata on TTFT p50, ITL p50, and output tok/s at concurrency 1, and within
+   **15%** at concurrency 4, with no unexplained per-class regression. If the first baseline
+   shows the band is unrealistic, revise it **before** tuning, not after.
+4. **M10.4 — long context.** The corpus includes ≥2k-token turns; this subsumes M8.4 and
+   replaces the 4-token extrapolation with measured chat behaviour.
+
+### Work items
+
+- `harness/chat/corpus.jsonl` + `harness/chat/run.py` (or an equivalent Rust driver) and
+  `harness/chat/README.md` with the exact protocol.
+- A server wrapper that pins the configuration (model, cache, `frac`, MTP, context) and emits
+  the comparability record.
+- A results schema and summary table: per class × concurrency × engine, p50/p90, tokens,
+  acceptance, memory.
+- Strata adapter: same corpus, same sampling; record its build/commit and flags.
+- Bottleneck pass only after M10.2: TTFT → prefill/attention; ITL → decode/MoE/host term;
+  throughput → batching/concurrency. Do not propose a mechanism before the per-class baseline
+  says which term is short.
+
+### Gates
+
+- Harness reproducibility: same corpus + config → same schema; ≥3 runs; medians reported.
+- Correctness unaffected: `frac 0` + `--no-lookahead` stays byte-exact.
+- Alignment: the parity band above, or a documented, measured reason why the remaining gap is
+  outside this engine's control (card, model, Strata-only kernel).
+
+### Risks
+
+- **Comparability:** different cards/models/flags can make a “parity” claim meaningless; the
+  comparability record is mandatory.
+- **Prefix cache:** multi-turn chat changes the prefill/cache state between turns; reset it per
+  conversation and report it.
+- **MTP:** the long-prompt drafter fault must be fixed before MTP-on chat parity is claimed.
+- **Concurrency:** the current engine is tuned for batch 1; c=2/4 may expose a different
+  bottleneck than c=1. Report both, never aggregate them into one number.
+
+---
+
 ## Next actions, in order
 
 1. **Finish M9.2/M9.3/M9.4** — one sync protocol, three probes, fork probe/dead-PLE deletion.
@@ -408,16 +498,18 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
    `mtp.rs::forward` (shapes/devices, KV slot), then the drafter KV cache vs `context_lens`
    and the MTP `CpuExperts` path under draft row counts. `compute-sanitizer` is unusable on
    the 60 GB load.
-3. **M8.4 — re-measure at a real context** (`--depth 2048` and `4096`). Every number in
-   M6/M7/M8 is at a 4-token context, so attention is absent and the host/MoE conclusions are
-   short-context specific. Record round p50, tokens/round, hit rate side by side.
+3. **M10 — chat workload parity with Strata.** Build the harness (M10.1), baseline both
+   engines without tuning (M10.2), then close the gap (M10.3). M10.4's ≥2k-token turns replace
+   the short-context extrapolation, so there is no separate long-context task; start M10.1
+   after M9.1, and claim parity only after the MTP fix.
 4. **Root-cause the host term by profiling the token thread.** M8 showed it is not CUDA
-   launch count. Candidates: candle per-op overhead outside captured windows (allocation,
-   shape/layout bookkeeping as attention/PLE walk op by op), the sampler, per-layer handshake
-   work. Do not propose another launch-reduction mechanism until this profile exists.
+   launch count. Candidates: candle per-op overhead (allocation, shape/layout bookkeeping as
+   attention/PLE walk op by op), the sampler, per-layer handshake work. This profile is an
+   input to M10.3 if ITL is the shortfall.
 5. **Adaptive draft depth** — acceptance is workload-dependent: counting prompt peaks at
    np8 (43.3 tok/s), code continuation at np2–np3 (25–26 tok/s). Choose a policy that is
-   within ~5% of the better fixed depth per prompt class, so depth is not a user knob.
+   within ~5% of the better fixed depth per prompt class, so depth is not a user knob; fold
+   the result into M10.3.
 6. **Optional / deferred**:
    - PLE host gather + `SYNC_PLE` (one word/pass, ~0.1–0.3% of a pass) — only after the
      larger items; not needed for correctness or the current throughput.
@@ -436,13 +528,16 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
   rounding variant, but the MTP/whole-step path would multiply sync points and make such a
   bug harder to localise. A ×50-run soak at `frac 0.55` is still the right guard before any
   large protocol change.
-- **All performance numbers are short-context** (`--depth 4`); M8.4 is the correction.
+- **All performance numbers are short-context** (`--depth 4`); M10.4's long-context chat
+  corpus is the correction.
 - **The ~70 ms host term is unlocated.** M8 refuted the launch-count explanation; the next
   step is a host profile, not another mechanism.
 - **The MTP head's schedule sizing** was an out-of-bounds bug and is fixed, but the same class
   (a site past the decoder layers) should be asserted at warmup.
 - **`frac > 0` is never byte-exact**; only the variant set is. Any new protocol must keep the
   `frac 0` + `--no-lookahead` gate byte-exact or it is unverifiable.
+- **Chat parity is unmeasured.** All current numbers are short-context decode microbenchmarks;
+  M10 is the first workload-level comparison and its comparability record is mandatory.
 
 ---
 
@@ -460,3 +555,4 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 | M7 | memory/per-token | round p50 + tokens/round; never a single tok/s number |
 | M8 | cut host launch chain | **refuted** — capture on/off identical |
 | M9 | ablation | before/after round p50 per deletion; oracle byte-exact |
+| M10 | chat harness | fixed corpus; reproducible schema; side-by-side TTFT/ITL/tok/s; parity band |
