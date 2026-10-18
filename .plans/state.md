@@ -101,6 +101,11 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0. **M9 = 清理/简化/消融**(`worklogs/m9.md`)。依据:M6–M8 测出多项机制**无收益或负收益**,但代码和 38 处
+   `NAIWA_*` 环境变量全留着。消融表已列:保留的只有 S2(78.9→62.8 ms,-20%)、预测预载(命中 85% vs 20%)、
+   `--lookahead-swaps`(深草稿 -11%)、MTP;应删除:段图捕获(中性)、attention 区域捕获(中性)、
+   dispatch_topk 翻转(中性)、L3 预热(-7%)、`NAIWA_SCRATCH_SLOTS`。目标:`NAIWA_*` 从 38 处降到 <12 处,
+   探针只留 3 个(STEP_DBG / ROUND_STATS / RET_DBG)。每删一项都必须用 flag 记录删前删后的轮 p50。
 0. **M8 = 削减 host 发射链**(`worklogs/m8.md`)。依据:M7 的完美缓存探针只给 +8%,所以 92% 的轮时间是
    GPU 计算(40 ms)+ host 发射链(~70 ms)。M8.1 捕获 attention 区域(常驻输入与 `dispatch_topk` 列表已就绪,
    只差 mixer 窗口接线)→ M8.2 把单节点门并入段图(捕获按层,可直接烘 sync id)→ M8.3 捕获 MTP 块 →
