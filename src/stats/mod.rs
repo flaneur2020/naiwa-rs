@@ -34,6 +34,14 @@ pub(crate) use round::{
 };
 pub(crate) use step::{dump_step_stats, record_step_layer};
 
+// The `*Stats` types are part of the API: every `dump_*` returns one. Most callers use them by
+// inference, so the names are not always referenced by path; keep the re-export anyway.
+#[allow(unused_imports)]
+pub(crate) use self::{
+    cache::CacheStats, fused::FusedStats, lookahead::LookaheadStats, retired::RetiredStats,
+    round::RoundStats, step::StepStats,
+};
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
