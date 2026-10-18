@@ -308,15 +308,11 @@ impl GpuCacheMoeProvider {
         }
         #[allow(unused_mut)]
         let mut captures = 0usize;
-        // Probe `NAIWA_NO_CAPTURE`: skip every segment capture, so decode runs the eager segment path. Used to
-        // price what the per-layer graphs are worth (they cost ~36 us each to instantiate and 12-15 us per
-        // replay, against ~5-6 us per raw launch).
+        // M9: no segment captures. Measured (`NAIWA_NO_CAPTURE=1` before the deletion): graphs on 43.5 tok/s,
+        // graphs off 44.1 - identical, so the eager segment is the one fixed configuration and the capture
+        // machinery below is dead code kept only until the deletion commit.
         #[cfg(feature = "cuda")]
-        if std::env::var_os("NAIWA_NO_CAPTURE").is_none() {
-            for layer in &layers {
-                captures += layer.warmup_captures(DType::BF16)?;
-            }
-        }
+        let _ = &layers;
         let mut rings = 0usize;
         if self.pcie_frac > 0.0 {
             for layer in &layers {
@@ -1499,7 +1495,14 @@ impl Bank {
         rows: usize,
         act_type: i32,
     ) -> candle_core::Result<Option<Tensor>> {
+        // M9: always decline - see `warmup`: the per-layer segment graphs were measured neutral, so this
+        // never engages. Deleting the capture machinery is the next commit; until then this keeps the
+        // shipped configuration unambiguous (one path, no flag).
+        let _ = (x2d, per_row, rows, act_type);
+        return Ok(None);
+        #[allow(unreachable_code)]
         let mut guard = self.capture.lock().unwrap();
+        #[allow(unreachable_code)]
         let Some(c) = guard.as_mut() else {
             return Ok(None);
         };
