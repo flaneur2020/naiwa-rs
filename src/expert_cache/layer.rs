@@ -22,7 +22,7 @@ use super::{schedule, CachedLayer, SlotBuf, SlotWeights};
 /// wait) and no way for the prediction to queue late on the stream (the W99 failure that
 /// made an earlier mode switch regress hit 74% -> 38-45%).
 pub(super) struct LookaheadChannel {
-    /// The channel's shared half: the mapped FlagBuf plus the publish/consume
+    /// The channel's shared half: the mapped activation doorbell plus the publish/consume
     /// counters the token thread (publish) and lookahead worker (consume) share.
     inner: std::sync::Arc<LookaheadShared>,
 }
@@ -30,13 +30,13 @@ pub(super) struct LookaheadChannel {
 /// Per-channel shared state. `next_seq` is touched only by the token thread;
 /// `consumed` is written by whichever worker job ran last for this channel.
 pub(super) struct LookaheadShared {
-    pub(super) chan: Arc<crate::doorbell::FlagBuf>,
+    pub(super) chan: Arc<crate::doorbell::ActivationDoorbell>,
     /// The seq the last queued GPU publish will bump the counter to (0 before any):
     /// `last_seq + 1` is the value `wait_publish` waits for.
     pub(super) next_seq: std::sync::atomic::AtomicU32,
     /// How many queued publishes the worker has consumed (`wait_publish` returned).
     /// The difference to `next_seq` is the queue depth; publish backpressure keeps
-    /// it below `RING_DEPTH` so a lagging job's slot is never overwritten.
+    /// it below the doorbell's ring depth so a lagging job's slot is never overwritten.
     pub(super) consumed: std::sync::atomic::AtomicU32,
 }
 
@@ -52,7 +52,7 @@ impl LookaheadChannel {
     /// headroom over any current window (np4 verify = 5, observed verify = 7).
     pub(super) fn new(device: &Device, max_rows: usize, hidden: usize) -> candle_core::Result<Option<Self>> {
         let max_rows = max_rows.max(16);
-        Ok(crate::doorbell::FlagBuf::acquire(device, max_rows * hidden)
+        Ok(crate::doorbell::ActivationDoorbell::acquire(device, max_rows * hidden)
             .ok()
             .flatten()
             .map(|chan| Self {
@@ -66,18 +66,17 @@ impl LookaheadChannel {
 
     /// Queue the publish on the stream (token thread): one kernel writes the `[rows,
     /// hidden]` activation into a slot and bumps seq. Returns the `LookaheadShared`
-    /// handle plus the `(last_seq, slot)` the worker job needs to wait and read, or
-    /// `None` when the worker is more than `RING_DEPTH - 1` publishes behind — the
-    /// prediction is advisory, so skipping this publish is cheaper than overwriting
-    /// an unread slot.
+    /// handle plus the `last_seq` the worker job needs to wait and read, or `None` when
+    /// the worker is more than `depth - 1` publishes behind — the prediction is advisory,
+    /// so skipping this publish is cheaper than overwriting an unread slot.
     pub(super) fn publish(
         &self,
         x: &Tensor,
         n: usize,
-    ) -> candle_core::Result<Option<(std::sync::Arc<LookaheadShared>, u32, usize)>> {
+    ) -> candle_core::Result<Option<(std::sync::Arc<LookaheadShared>, u32)>> {
         let sh = &self.inner;
         // Hard error, not a skip: an oversized publish would overflow the slot
-        // (the FlagBuf checks too, but fail before queueing anything).
+        // (the doorbell checks too, but fail before queueing anything).
         if n > sh.chan.max_n() {
             candle_core::bail!(
                 "lookahead publish of {n} f32 exceeds the channel slot ({})",
@@ -86,15 +85,12 @@ impl LookaheadChannel {
         }
         let next = sh.next_seq.load(Ordering::Relaxed);
         let consumed = sh.consumed.load(Ordering::Relaxed);
-        if next - consumed
-            >= (crate::doorbell::FlagBuf::RING_DEPTH as u32).saturating_sub(1)
-        {
+        if next - consumed >= (sh.chan.depth() as u32).saturating_sub(1) {
             return Ok(None); // backpressure: an unread slot would be overwritten
         }
-        let slot = next as usize; // % RING_DEPTH inside publish_f32/wait_publish
-        sh.chan.publish_f32(x, n, slot)?;
+        sh.chan.publish(x, n, next)?;
         sh.next_seq.store(next + 1, Ordering::Relaxed);
-        Ok(Some((std::sync::Arc::clone(sh), next, slot)))
+        Ok(Some((std::sync::Arc::clone(sh), next)))
     }
 }
 
@@ -196,7 +192,8 @@ impl CachedLayer {
         };
         stats::record_cache_gate_replay();
         let id = sched.sync_id(self.layer as u32, kind);
-        sched.wait_ready(&self.slot_device, id)
+        let gate: crate::doorbell::Gate<'_> = sched.gate(id);
+        gate.wait(&self.slot_device)
     }
 
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
@@ -462,7 +459,7 @@ impl CachedLayer {
     /// the CPU-expert batch, so the DMA hides in the host's work for the next layer.
     ///
     /// The copies are queued *before* the claim is published, and the publish is monotonic
-    /// (`publish_point_on_max`), so the token thread either sees no claim (nothing to wait for) or
+    /// (`Gate::publish_stream_max`), so the token thread either sees no claim (nothing to wait for) or
     /// sees one whose point is already on its way and can only move the word forward.
     pub(super) fn prefetch_predicted(&self, x: &Tensor, pass: u32) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
@@ -489,7 +486,7 @@ impl CachedLayer {
         if let Some(sched) = schedule() {
             self.preload_claimed.store(pass, Ordering::Release);
             let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_PRELOAD);
-            sched.publish_point_on_max(&self.slot_device, id, pass)?;
+            sched.gate(id).publish_stream_max(&self.slot_device, pass)?;
         }
         Ok(())
     }

@@ -240,7 +240,7 @@ impl RoutedExperts for CpuExperts {
         if seq == 1 && self.layer_device.is_cuda() {
             // Decode: return before the CPU experts finish; the next layer's launches overlap
             // them (`deferred`).
-            let ys = crate::deferred::start(&self.layer_device, None, batch, hidden, run)?.upload()?;
+            let ys = crate::deferred::start(&self.layer_device, batch, hidden, run)?.upload()?;
             return ys.reshape((batch, seq, hidden))?.to_dtype(xs.dtype());
         }
         Tensor::from_vec(run()?, (batch, seq, hidden), &Device::Cpu)?

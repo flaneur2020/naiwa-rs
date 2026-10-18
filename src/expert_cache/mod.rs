@@ -58,8 +58,6 @@ use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
 
 use crate::copy_stream::{CopyStream, ReadFence, SlotMemory};
-#[cfg(feature = "cuda")]
-use crate::deferred;
 use crate::host_memory::PinnedStack;
 use crate::prefill_stream::PrefillStream;
 
@@ -97,10 +95,10 @@ const fn scratch_ring_slots() -> usize {
 }
 
 #[cfg(feature = "cuda")]
-static SCHEDULE: OnceLock<Arc<crate::doorbell::ScheduleBuf>> = OnceLock::new();
+static SCHEDULE: OnceLock<Arc<crate::doorbell::GateSet>> = OnceLock::new();
 
 #[cfg(feature = "cuda")]
-fn schedule() -> Option<&'static Arc<crate::doorbell::ScheduleBuf>> {
+fn schedule() -> Option<&'static Arc<crate::doorbell::GateSet>> {
     SCHEDULE.get()
 }
 
@@ -132,7 +130,7 @@ struct CachedLayerState {
     /// Acquired lazily at first decode; None on non-CUDA or alloc failure, where
     /// decode keeps the `to_vec2` path. In the state lock for interior mutability
     /// through the shared `Arc`.
-    doorbell: Option<Arc<crate::doorbell::DoorbellBuf>>,
+    doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
     /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
     doorbell_seq: u32,
     /// Published residents: expert id -> slot. Only experts whose weights are fully written
@@ -210,15 +208,8 @@ struct ScratchRing {
     cursor: usize,
 }
 
-/// The v2 M1/M2 fixed-grid batch bound, matching the lookahead channel's policy
-/// (`LookaheadChannel::new`): it must cover the largest decode batch, with 16 rows of headroom
-/// over any current window (np4 verify = 5, observed verify = 7). Calls above it use the old
-/// host-geometry path — the allowed row-bucket fallback.
 #[cfg(feature = "cuda")]
-const CAPTURE_MAX_BATCH: usize = 16;
-
-#[cfg(feature = "cuda")]
-const WAITS_PER_LAYER: u32 = 3;
+const WAITS_PER_LAYER: u32 = 2;
 
 struct CachedLayer {
     /// Page-locked registrations of `cpu`'s stacks; each holds its stack, so it stays valid
@@ -237,11 +228,6 @@ struct CachedLayer {
     /// R2a: the layer's GPU->host activation channel. `Some` only when the router exists
     /// and the slot device is CUDA.
     lookahead_chan: Option<LookaheadChannel>,
-    /// M3: this layer's CPU-return channel, with its own `(slot, seq)` numbering. Created at
-    /// warmup so a captured wait node is never stranded on a grown-and-retired channel, and so
-    /// the numbering is 1:1 with this layer's jobs by construction.
-    #[cfg(feature = "cuda")]
-    cpu_chan: std::sync::OnceLock<Arc<deferred::CpuChannel>>,
     state: Mutex<CachedLayerState>,
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     copy_stream: Option<Arc<CopyStream>>,

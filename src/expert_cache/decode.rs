@@ -254,7 +254,7 @@ impl CachedLayer {
                     let t0 = std::time::Instant::now();
                     let pub_res = chan.publish(&x2d, n);
                     stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
-                    if let Some((sh, last_seq, slot)) = pub_res? {
+                    if let Some((sh, last_seq)) = pub_res? {
                         crate::lookahead::submit(Box::new(move || {
                             let t0 = std::time::Instant::now();
                             // The GAP is the scheduler's business, not this
@@ -273,7 +273,7 @@ impl CachedLayer {
                                 sh.consumed.fetch_max(last_seq + 1, Ordering::Relaxed);
                                 return;
                             }
-                            if let Some(v) = sh.chan.wait_publish(last_seq, n, slot) {
+                            if let Some(v) = sh.chan.wait_publish(last_seq, n) {
                                 let x = Tensor::from_vec(v, (rows, next.hidden), &Device::Cpu);
                                 if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                                     debug!(
@@ -336,14 +336,14 @@ impl CachedLayer {
             let mut st = self.state.lock().unwrap();
             if st.doorbell.is_none() {
                 let cap = n.max(8 * self.top_k).max(64);
-                st.doorbell = crate::doorbell::DoorbellBuf::acquire(&self.slot_device, cap)
+                st.doorbell = crate::doorbell::TopkDoorbell::acquire(&self.slot_device, cap)
                     .ok()
                     .flatten()
                     .map(Arc::new);
             }
             let db = st.doorbell.clone().filter(|db| db.max_n() >= n);
             match db {
-                Some(db) => match db.ring(topk_ids, topk_weights, n) {
+                Some(db) => match db.publish(topk_ids, topk_weights, n) {
                     Ok(()) => {
                         let seq = st.doorbell_seq;
                         st.doorbell_seq = seq.wrapping_add(1);
@@ -500,39 +500,9 @@ impl CachedLayer {
             };
 
         // M9: there are no segment captures, so no captured CPU-return node can consume this layer's
-        // result - the deferred channel always carries it.
-        let fast = false;
-
-        // Publication must stay strictly FIFO per point: the payload slot is single-buffered and
-        // `ready` must not go backwards. So *every* point for this layer goes through the worker,
-        // including the "no misses, publish zeros" case — a synchronous publish from the token
-        // thread could overtake a slower job for the previous pass and invert them.
-        #[cfg(feature = "cuda")]
-        let cpu = if fast {
-            let sched = schedule().expect("checked above");
-            let len = rows * self.hidden;
-            let job: Box<dyn FnOnce() -> candle_core::Result<Vec<f32>> + Send> = match compute {
-                Some(f) => f,
-                None => Box::new(move || Ok(vec![0f32; len])),
-            };
-            deferred::start_schedule(
-                Arc::clone(sched),
-                self.layer as u32,
-                pass,
-                len,
-                job,
-            )?;
-            None
-        } else {
-            let chan = self.cpu_chan.get();
-            compute
-                .map(|f| deferred::start(&self.slot_device, chan, rows, self.hidden, f))
-                .transpose()?
-        };
-        #[cfg(not(feature = "cuda"))]
-        #[allow(unused_variables)]
+        // result - the deferred result doorbell always carries it.
         let cpu = compute
-            .map(|f| deferred::start(&self.slot_device, None, rows, self.hidden, f))
+            .map(|f| deferred::start(&self.slot_device, rows, self.hidden, f))
             .transpose()?;
 
         // M4: the copy stream published this layer's `SYNC_STAGING` point on its own stream, after

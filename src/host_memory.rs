@@ -196,6 +196,7 @@ fn pin_stack(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "cuda"))]
     use std::sync::Arc;
 
     use super::*;

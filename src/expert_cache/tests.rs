@@ -156,8 +156,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         act: Activation::Silu,
         router: None,
         lookahead_chan: None,
-        #[cfg(feature = "cuda")]
-        cpu_chan: std::sync::OnceLock::new(),
         state: Mutex::new(CachedLayerState {
             doorbell: None,
             doorbell_seq: 0,

@@ -13,13 +13,11 @@
 //! There is no host function and no H2D memcpy launch: the worker's stores become visible to
 //! the copy kernel through the mapped seq counter, so the stream never hosts a host callback
 //! and the pattern stays graph-capturable (the R2b prerequisite for R5). Steps are sequential,
-//! so one channel serves the whole engine: the worker publishes slot `k % RING_DEPTH`, and a
-//! slow GPU reading slot `k` never races the worker writing slot `k + 1`.
+//! so one channel serves the whole engine: the worker publishes seq `k`, whose slot is
+//! `k % DEPTH`, and a slow GPU reading slot `k` never races the worker writing slot `k + 1`.
 //!
 //! A failed computation leaves the returned tensor unwritten; the error is returned by the next
 //! [`start`] (the next layer of the same step, or the next step's first).
-
-use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -71,32 +69,10 @@ enum Inner {
     Running(cuda::Running),
 }
 
-/// A layer's CPU-return channel on CUDA; a unit placeholder elsewhere, so the call sites stay
-/// feature-agnostic.
-#[cfg(feature = "cuda")]
-pub type CpuChannel = cuda::Channel;
-#[cfg(not(feature = "cuda"))]
-pub type CpuChannel = ();
-
-/// M3: submit a job that publishes into the shared [`crate::doorbell::ScheduleBuf`] at
-/// `(layer, pass)` — the graph path. Publication order is the worker's FIFO order, which the
-/// single-buffered payload and the monotonic `ready` word require.
-pub fn start_schedule(
-    schedule: std::sync::Arc<crate::doorbell::ScheduleBuf>,
-    layer: u32,
-    pass: u32,
-    len: usize,
-    compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
-) -> Result<()> {
-    cuda::start_schedule(schedule, layer, pass, len, compute)
-}
-
-/// Start `compute()`, whose result is `rows * cols` F32 values for `device`. On CUDA with a
-/// per-layer `chan` it runs on the worker thread and publishes into that channel; otherwise it
-/// runs now.
+/// Start `compute()`, whose result is `rows * cols` F32 values for `device`. On CUDA it runs on
+/// the worker thread and publishes into the global result doorbell; otherwise it runs now.
 pub fn start<F>(
     device: &Device,
-    chan: Option<&std::sync::Arc<CpuChannel>>,
     rows: usize,
     cols: usize,
     compute: F,
@@ -106,11 +82,7 @@ where
 {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(dev) = device {
-        // Per-layer channel when the caller has one (the decode path), else the legacy global.
-        let chan = match chan {
-            Some(c) => Arc::clone(c),
-            None => cuda::global_channel(dev, rows * cols)?,
-        };
+        let chan = cuda::global_channel(dev, rows * cols)?;
         let running = cuda::start(dev, &chan, rows * cols, Box::new(compute))?;
         return Ok(Pending {
             device: device.clone(),
@@ -119,7 +91,6 @@ where
             inner: Inner::Running(running),
         });
     }
-    let _ = chan;
     Ok(Pending {
         device: device.clone(),
         rows,
@@ -153,7 +124,7 @@ mod cuda {
 
     use candle_core::cuda_backend::CudaDevice;
     use candle_core::{DType, Device, Error, Result, Tensor};
-    use crate::doorbell::FlagBuf;
+    use crate::doorbell::ResultDoorbell;
 
     type Job = Box<dyn FnOnce() + Send>;
 
@@ -184,43 +155,35 @@ mod cuda {
         }
     }
 
-    /// A layer's CPU-return channel: its own mapped flag buffer and its own `(slot, seq)`
-    /// numbering.
+    /// The engine-wide CPU-return channel: one result doorbell plus its seq allocator.
     ///
-    /// **Per-layer, not engine-wide.** A shared channel has to share one `(slot, seq)`
-    /// counter, so any job that does not consume the channel (a layer with two banks, or a
-    /// step wider than the fast path allows) desynchronizes every later job from a device-side
-    /// consumer. Per-layer keeps the numbering 1:1 with the layer's own jobs *by construction*,
-    /// and it means a captured wait node is never stranded on a channel that grew and retired
-    /// its allocation. This is `architecture-v2` §3.4's `flag_host_to_gpu: per-layer`.
+    /// Steps are sequential and the worker's FIFO order is the stream's consumption order, so one
+    /// channel is enough. `seq` is allocated here; the doorbell derives the ring slot as
+    /// `seq % DEPTH`.
     pub struct Channel {
-        chan: Arc<FlagBuf>,
-        next: Mutex<(usize, u32)>,
+        doorbell: Arc<ResultDoorbell>,
+        next: Mutex<u32>,
     }
 
     impl Channel {
-        /// The flag buffer itself (mapped cells + payload ring).
-        pub fn flag(&self) -> &Arc<FlagBuf> {
-            &self.chan
+        pub fn doorbell(&self) -> &Arc<ResultDoorbell> {
+            &self.doorbell
         }
 
         pub fn max_n(&self) -> usize {
-            self.chan.max_n()
+            self.doorbell.max_n()
         }
 
-        fn next_job(&self) -> (usize, u32) {
-            let mut p = self.next.lock().unwrap();
-            p.0 = p.0.wrapping_add(1);
-            p.1 = p.1.wrapping_add(1);
-            (p.0, p.1)
+        fn next_job(&self) -> u32 {
+            let mut seq = self.next.lock().unwrap();
+            *seq = seq.wrapping_add(1);
+            *seq
         }
     }
 
-    /// The legacy **global** channel, for call sites without a per-layer one (`CpuExperts`, the
-    /// `--cpu-moe` path with no expert cache). It keeps the old grow-and-retire behavior. Those
-    /// call sites never capture a wait node, so neither the 1:1 numbering requirement nor the
-    /// retirement hazard applies — and the decode path (the one that captures) always passes its
-    /// own per-layer channel.
+    /// The **global** channel. It grows and retires the mapped allocation when a larger result
+    /// window arrives; retired channels are kept alive because a queued wait kernel may still hold
+    /// their raw mapped pointers.
     pub fn global_channel(dev: &CudaDevice, min_n: usize) -> Result<Arc<Channel>> {
         static CHANNEL: Mutex<(Option<Arc<Channel>>, Vec<Arc<Channel>>)> =
             Mutex::new((None, Vec::new()));
@@ -229,32 +192,29 @@ mod cuda {
         if chan.as_ref().is_none_or(|c| c.max_n() < min_n) {
             // Grow with headroom so verify windows a few rows larger do not realloc again.
             let want = min_n.max(chan.as_ref().map_or(0, |c| 2 * c.max_n()));
-            let next = FlagBuf::acquire(&Device::Cuda(dev.clone()), want)
+            let next = ResultDoorbell::acquire(&Device::Cuda(dev.clone()), want)
                 .ok()
                 .flatten()
-                .map(|f| {
+                .map(|doorbell| {
                     Arc::new(Channel {
-                        chan: Arc::new(f),
-                        next: Mutex::new((0, 0)),
+                        doorbell: Arc::new(doorbell),
+                        next: Mutex::new(0),
                     })
                 });
             if let (Some(old), Some(_next)) = (chan.take(), &next) {
-                // A queued wait kernel may still hold raw mapped pointers; keep retired channels
-                // alive forever (a few hundred KB each, growth bounded by the doubling).
                 retired.push(old);
             }
             *chan = next;
         }
         Ok(Arc::clone(chan.as_ref().ok_or_else(|| {
-            Error::Msg("the mapped flag channel is unavailable".into())
+            Error::Msg("the mapped result doorbell is unavailable".into())
         })?))
     }
 
     /// A job handed to the worker: run `compute`, publish the result on the channel.
     pub struct Running {
         chan: Arc<Channel>,
-        slot: usize,
-        publish_seq: u32,
+        seq: u32,
         len: usize,
     }
 
@@ -265,11 +225,10 @@ mod cuda {
         compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
     ) -> Result<Running> {
         take_error()?;
-        let (slot, publish_seq) = chan.next_job();
+        let seq = chan.next_job();
         let done = SetFlag {
-            chan: Arc::clone(chan.flag()),
-            slot,
-            publish_seq,
+            bell: Arc::clone(chan.doorbell()),
+            seq,
             published: false,
         };
         let len_ok = len;
@@ -304,7 +263,7 @@ mod cuda {
             .unwrap()
             .send(job)
             .map_err(|_| Error::Msg("the CPU experts thread is gone".into()))?;
-        Ok(Running { chan: Arc::clone(chan), slot, publish_seq, len })
+        Ok(Running { chan: Arc::clone(chan), seq, len })
     }
 
     /// Publishes a payload slot (or just the seq bump on failure). Bumps seq exactly once per
@@ -312,9 +271,8 @@ mod cuda {
     /// reaches its target and a panicking job must not leave the GPU stuck (the failure is
     /// reported by the next `start` instead).
     struct SetFlag {
-        chan: Arc<FlagBuf>,
-        slot: usize,
-        publish_seq: u32,
+        bell: Arc<ResultDoorbell>,
+        seq: u32,
         published: bool,
     }
 
@@ -323,7 +281,7 @@ mod cuda {
             if self.published {
                 return;
             }
-            self.chan.write_slot(values, self.slot, self.publish_seq);
+            self.bell.publish(values, self.seq);
             self.published = true;
         }
 
@@ -342,55 +300,12 @@ mod cuda {
         }
     }
 
-    pub fn start_schedule(
-        schedule: Arc<crate::doorbell::ScheduleBuf>,
-        layer: u32,
-        pass: u32,
-        len: usize,
-        compute: Box<dyn FnOnce() -> Result<Vec<f32>> + Send>,
-    ) -> Result<()> {
-        take_error()?;
-        let id = schedule.sync_id(layer, crate::doorbell::SYNC_CPU_EXPERTS);
-        // RET_DBG (naiwa): handoff latency per job. `queue` is submit -> the worker starting the compute,
-        // `compute` is the CPU gemv itself, and the remainder is the mapped publish. The GPU spins on that
-        // publish inside the layer's graph, so this chain is the latency it pays per miss.
-        let t_submit = std::time::Instant::now();
-        let job: Job = Box::new(move || {
-            let t_start = std::time::Instant::now();
-            let out = match compute() {
-                Ok(v) if v.len() >= len => {
-                    schedule.publish_cpu(layer, pass, &v[..len]);
-                    Ok(())
-                }
-                Ok(v) => {
-                    *FAILED.lock().unwrap() =
-                        Some(format!("returned {} values, expected at least {len}", v.len()));
-                    schedule.publish_point(id, pass);
-                    Ok(())
-                }
-                Err(e) => {
-                    *FAILED.lock().unwrap() = Some(e.to_string());
-                    schedule.publish_point(id, pass);
-                    Err(e)
-                }
-            };
-            let _ = out;
-            crate::stats::record_retired(t_submit, t_start);
-        });
-        worker()
-            .lock()
-            .unwrap()
-            .send(job)
-            .map_err(|e| Error::Msg(format!("the CPU experts thread is gone: {e}")))?;
-        Ok(())
-    }
-
     pub fn upload(dev: &CudaDevice, running: Running, rows: usize, cols: usize) -> Result<Tensor> {
-        let Running { chan, slot, publish_seq, len } = running;
+        let Running { chan, seq, len } = running;
         debug_assert_eq!(len, rows * cols);
         // SAFETY: fully overwritten by the copy kernel before anything reads it.
         let out = unsafe { Tensor::empty((rows, cols), DType::F32, &Device::Cuda(dev.clone()))? };
-        chan.flag().wait_copy_slot(slot, publish_seq, len, &out)?;
+        chan.doorbell().wait_copy(seq, len, &out)?;
         Ok(out)
     }
 }

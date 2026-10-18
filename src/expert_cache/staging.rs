@@ -128,7 +128,7 @@ impl CachedLayer {
         #[cfg(feature = "cuda")]
         if let Some(sched) = schedule() {
             let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_STAGING);
-            sched.publish_point_on(cs.cu_stream(), id, pass)?;
+            sched.gate(id).publish_stream(cs.cu_stream(), pass)?;
         }
         #[cfg(not(feature = "cuda"))]
         let _ = pass;

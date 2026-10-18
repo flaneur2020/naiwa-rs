@@ -78,17 +78,16 @@ collapses the hit rate (measured 74% → 38%).
 
 ## 3. Synchronisation
 
-### Schedule (staging and preload)
+### Gates (staging and preload)
 
 ```
-epoch    u32                 device-written once per pass (layer 0 prologue)
-ready    [K] u32             one word per sync point; value = pass whose data is ready
-payload  [slots][max_n] f32  single CPU-result block (see CPU return)
+epoch    u32        device-written once per pass (layer 0 prologue)
+ready    [K] u32    one word per sync point; value = pass whose data is ready
 
-PRELOAD = 0, STAGING = 1, CPU_EXPERTS = 2
-sync_id(layer, kind) = layer * 3 + kind
-slots = max_decoder_layer + 2 = 49     // includes the MTP site at layer 48
-K = 49 * 3 = 147
+PRELOAD = 0, STAGING = 1
+sync_id(layer, kind) = layer * 2 + kind
+slots = max_decoder_layer + 1
+K = slots * 2
 ```
 
 Node:
@@ -97,36 +96,30 @@ Node:
 e = *epoch
 spin while (ready[id] < e)
 __threadfence_system()
-CPU_EXPERTS -> acc += payload[layer]
-PRELOAD / STAGING -> continue    // the DMA already wrote VRAM
 ```
 
-`epoch` is **device-written only**, so the host can lag or match, never lead. The single payload
-is safe because the host's pass advance is gated by a GPU-produced signal (the per-layer router
-doorbell, after all layers of pass k). If that stops holding, add double buffering or a `consumed`
-handshake.
+`epoch` is **device-written only**, so the host can lag or match, never lead. Gates carry no
+payload; CPU results use `ResultDoorbell` (see below).
 
 Rules:
 
-1. **FIFO per point.** CPU publications, including “no misses → zeros”, go through the single
-   worker queue; a synchronous publish can overtake the previous pass and move `ready` backwards.
+1. **FIFO per point.** Stream publications are ordered on their stream; a host producer (tests
+   today) uses the release store. A stale publish must not move `ready` backwards for preload.
 2. **`ready` is a level.** Preload uses one-thread `atomicMax(ready[id], pass)`; staging uses
    `cuStreamWriteValue32` after the copies. A stale publish must be harmless.
 3. **Every staging path publishes** (nothing / staged / failed); its gate is replayed every pass.
    Preload's gate is replayed only when `inflight == pass`.
-4. **Failure advances the point** (publish zeros), or the GPU spins forever.
+4. **Failure must still publish the gate**, or the GPU spins forever.
 5. `u32` wrap is ~4.29B passes; no handling needed.
-6. Device epoch is fenced before/after; host payload/ready uses release; the node fences after
-   the spin. Ada did not need the fences here, but they stay for RDNA.
+6. Device epoch is fenced before/after; host ready uses release; the node fences after the spin.
+   Ada did not need the fences here, but they stay for RDNA.
 
-### CPU return (open)
+### CPU return
 
-The schedule's `CPU_EXPERTS` point is currently unused. The live path is the per-layer `Channel`
-(`FlagBuf`: seq + payload ring) with `wait_copy_slot` on the stream; the MTP site uses the same
-path.
-
-The intended end state is **one** protocol: move decoder/MTP CPU return onto `ScheduleBuf` and
-delete `Channel` (~200 lines), or document why `Channel` stays. Do not add a third path.
+One path: `ResultDoorbell` (`doorbell/h2d/result.rs`) — a seq plus a slot ring. The worker
+publishes seq; the stream queues a wait+copy kernel. `ScheduleBuf` no longer carries payload: it
+is a gate grid only (epoch + ready words). The schedule `CPU_EXPERTS` point, `wait_add`,
+`publish_cpu`, `deferred::start_schedule` and the per-layer `Channel` were deleted in M9.2.
 
 ### PLE
 
@@ -143,8 +136,9 @@ stream, publish `SYNC_PLE` a pass early. It is ~0.1–0.3% of a pass and not nee
 [VRAM]
   expert_banks      per-layer; mixed quant (7 expert shapes in IQ1_M)
   staging_ring      global, shape-keyed (16 slots; 64 measured identical)
-  flag_host_to_gpu  per-layer ring depth 8 (descriptors, DMA lists, CPU results)
-  schedule          epoch, ready[147], payload[49][max_n]
+  result_ring       global ring depth 8 (host -> device CPU results)
+  activation_rings  per-layer ring depth 8 (device -> host activations)
+  gates             epoch, ready[2 * slots]
 [host pinned]
   expert stacks     per-layer, three projections, cuMemHostRegister(PORTABLE)
 ```
@@ -188,8 +182,8 @@ hit rate to 26.5%.
 Head is local (`~/bench-rel/mtp/mtp-component.gguf`, `--mmproj`). Steady-state speculation is the
 biggest lever (×2.5 tokens/pass). Open fault: prompt 512 faults with
 `CUDA_ERROR_ILLEGAL_ADDRESS` in `drafter_prefill_chunk` before `drafter_forward`; prompt 8 works.
-Suspects: drafter KV cache vs `context_lens`, and the MTP site's CPU-expert rows. The schedule
-sizing bug (MTP site = layer 48) is fixed.
+Suspects: drafter KV cache vs `context_lens`, and the MTP site's CPU-expert rows. The MTP site
+now uses the global result doorbell, so the old schedule sizing bug (MTP site = layer 48) is gone.
 
 ---
 
@@ -201,8 +195,9 @@ sizing bug (MTP site = layer 48) is fixed.
   both to the same text); `frac 0` is 0/10. A third variant is the regression signal.
 - **Structural checks** and a must-fail control for every wait (a stale stamp must hang). Correct
   values alone are not evidence.
-- **NaN fix:** two uninitialised buffers — schedule payload (`cudaHostAlloc` does not zero) and
-  paged-attention KV blocks (`Tensor::empty`). Zeroing both: 2–3/5 → **0/6**.
+- **NaN fix:** two uninitialised buffers — the old schedule payload (`cudaHostAlloc` does not zero;
+  `MappedBuf` now zeroes every mapping) and paged-attention KV blocks (`Tensor::empty`). Zeroing
+  both: 2–3/5 → **0/6**.
 - **Measurement:** medians of ≥ 3 runs; report round p50 + tokens/round + hit rate + flags;
   liveness ≥ 6 runs; no mean where a median exists.
 - **One fixed configuration per decision.** Env vars are probes/overrides, not A/B arms. Current
@@ -233,8 +228,15 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 
 ```
 ~/code/naiwa-rs            engine + docs/ + harness/
-  src/doorbell/            Doorbell/FlagBuf/ScheduleBuf + kernels
-    mod.rs ffi, topk.rs, flag.rs, schedule.rs, tests.rs
+  src/doorbell/            mapped doorbells + kernels
+    mod.rs                 ffi + re-exports
+    mapped.rs              single mapped-allocation owner
+    payload_ring.rs        seq + slot-ring layout
+    d2h/topk.rs            TopkDoorbell (device -> host)
+    d2h/activation.rs      ActivationDoorbell (device -> host)
+    h2d/result.rs          ResultDoorbell (host -> device)
+    gate.rs                GateSet/Gate (device-side pass gates)
+    tests.rs
   src/expert_cache/        GPU expert cache
     mod.rs                 module docs, constants, slot/bank/layer types
     provider.rs            RoutedExpertsProvider + layer construction

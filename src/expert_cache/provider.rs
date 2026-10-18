@@ -19,7 +19,7 @@ use super::registry::CacheLoan;
 use super::staging::alloc_bank;
 use super::{
     loan_bank_slots, CachedExperts, CachedLayer, CachedLayerState, LayerRegistry, SlotEntry,
-    CAPTURE_MAX_BATCH, SCHEDULE, WAITS_PER_LAYER,
+    SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,24 +101,18 @@ impl GpuCacheMoeProvider {
         #[cfg(feature = "cuda")]
         if let Some(first) = layers.first() {
             let device = first.slot_device.clone();
-            let max_n = CAPTURE_MAX_BATCH * first.hidden;
-            // One slot past the highest decoder layer: the MTP head is a site of its own
-            // (`site.layer == layers.len()`), it is not a `CachedLayer` (its experts are host-resident),
-            // and yet it publishes and waits on the *same* schedule. Sizing the schedule by the decoder
-            // count alone put its `SYNC_CPU_EXPERTS`/payload slot past the end of the mapping, which
-            // surfaced as CUDA_ERROR_ILLEGAL_ADDRESS on the first draft step.
             let slots = layers
                 .iter()
                 .map(|l| l.layer)
                 .max()
-                .map(|max| max + 2)
+                .map(|max| max + 1)
                 .unwrap_or(layers.len());
-            match crate::doorbell::ScheduleBuf::acquire(&device, WAITS_PER_LAYER, slots, max_n) {
-                Ok(Some(sched)) => {
-                    let _ = SCHEDULE.set(Arc::new(sched));
+            match crate::doorbell::GateSet::acquire(&device, WAITS_PER_LAYER, slots) {
+                Ok(Some(gates)) => {
+                    let _ = SCHEDULE.set(Arc::new(gates));
                 }
-                Ok(None) => warn!("expert cache: no schedule buffer; CPU-return node unbuilt"),
-                Err(e) => warn!("expert cache: schedule allocation failed: {e}"),
+                Ok(None) => warn!("expert cache: no gate buffer; DMA/preload gates disabled"),
+                Err(e) => warn!("expert cache: gate allocation failed: {e}"),
             }
         }
         #[allow(unused_mut)]
@@ -370,7 +364,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             router,
             lookahead_chan,
             #[cfg(feature = "cuda")]
-            cpu_chan: std::sync::OnceLock::new(),
             state: Mutex::new(CachedLayerState {
                 doorbell: None,
                 doorbell_seq: 0,
