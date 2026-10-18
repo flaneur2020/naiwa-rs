@@ -235,8 +235,17 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 
 ```
 ~/code/naiwa-rs            engine + docs/ + harness/
-  src/doorbell/            Doorbell/FlagBuf/ScheduleBuf + kernels
-  src/expert_cache.rs      banks, run_hits, decode_forward
+  src/doorbell/            Doorbell/FlagBuf/ScheduleBuf/DispatchBuf + kernels
+    mod.rs ffi, topk.rs, flag.rs, schedule.rs, dispatch.rs, ptr_wait_tests.rs
+  src/expert_cache/        GPU expert cache
+    mod.rs                 module docs, constants, counters, slot/bank/layer types
+    provider.rs            RoutedExpertsProvider + layer construction
+    layer.rs               slots, fills, LRU replacement, lookahead prediction
+    decode.rs              run_hits, decode_forward
+    staging.rs             --pcie-frac ring + DMA of misses
+    registry.rs            layer lookups + prefill loan
+    expert_bytes.rs        per-expert byte slicing
+    probe.rs               NAIWA_* measurement probes
   src/deferred.rs          CPU worker + CPU-return channel
   harness/                  primitives, oracle, bandwidth harnesses
 ~/code/mistral.rs-iq4xs    fork
