@@ -2189,10 +2189,22 @@ impl CachedLayer {
         }
 
         let n = rows * self.top_k;
+        // The dispatch decision is made **on the GPU**: the kernel emits the resident / staged / CPU lists
+        // with rows and weights, so the host never hashes an id. The only host-side guard is the shape check
+        // (the startup dummy run reaches here with a selection that does not match `xs`).
+        #[cfg(feature = "cuda")]
+        let device_flip = self.top_k > 0
+            && topk_ids.elem_count() % self.top_k == 0
+            && topk_ids.elem_count() / self.top_k == rows;
+        #[cfg(not(feature = "cuda"))]
+        let device_flip = false;
+
         // Step 5 doorbell: lazily acquire (first decode), queue the ring on the same
         // stream the top-k kernels ran on, then spin host-side for the payload — no
         // stream sync, no D2H launch. Falls back to `to_vec2` when unavailable.
-        let ring = {
+        let ring = if device_flip {
+            None
+        } else {
             let mut st = self.state.lock().unwrap();
             if st.doorbell.is_none() {
                 let cap = n.max(8 * self.top_k).max(64);
