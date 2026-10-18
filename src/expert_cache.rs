@@ -1381,101 +1381,6 @@ fn alloc_bank(
 }
 
 impl Bank {
-    /// v2 M1/M2: create this bank's fixed-grid capture path. Idempotent; called once per bank in
-    /// the post-load warmup, so every buffer address is fixed before the first decode.
-    #[cfg(feature = "cuda")]
-    fn create_capture(
-        &self,
-        max_batch: usize,
-        max_topk: usize,
-        stage_dtype: DType,
-        act_type: i32,
-        layer: u32,
-        schedule: Option<&Arc<crate::doorbell::ScheduleBuf>>,
-    ) -> candle_core::Result<bool> {
-        let mut slot = self.capture.lock().unwrap();
-        if slot.is_some() {
-            return Ok(false);
-        }
-        let gate_device = self.gate.device();
-        let dev = gate_device.as_cuda_device()?;
-        let cap = mistralrs_quant::MoeDecodeCapture::new(
-            &self.gate,
-            &self.up,
-            &self.down,
-            max_batch,
-            max_topk,
-            stage_dtype,
-            dev,
-        )?;
-        let n = max_batch * max_topk;
-        let ids = dev.alloc_zeros::<u32>(n)?;
-        let weights = dev.alloc_zeros::<f32>(n)?;
-        // M2: capture the segment here, at load, so a decode step replays one graph instead of
-        // issuing ~5 raw launches. If capture fails, keep the eager segment (`is_captured` false).
-        let mut cap = cap;
-        if let Err(e) = cap.capture(&self.gate, &self.up, &self.down, &ids, &weights, act_type) {
-            warn!("expert cache: bank capture failed, staying on the eager segment: {e}");
-        }
-        let waitadd = match schedule {
-            Some(sched) => {
-                use candle_core::cuda::cudarc::driver::DevicePtr;
-                let (mb, _, hidden, _) = cap.dims();
-                let acc = {
-                    let out = cap.output()?;
-                    let (st, _) = out.storage_and_layout();
-                    let candle_core::Storage::Cuda(st) = &*st else {
-                        candle_core::bail!("MoeDecodeCapture output is not on CUDA");
-                    };
-                    let slice = st.as_cuda_slice::<f32>()?;
-                    let (ptr, _guard) = slice.device_ptr(slice.stream());
-                    ptr
-                };
-                let stream = dev.cuda_stream();
-                let mut captured = None;
-                if stream
-                    .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                    .is_ok()
-                {
-                    let launched = sched.wait_add_cpu(&gate_device, mb * hidden, layer, acc);
-                    let ended = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                    match (launched, ended) {
-                        (Ok(()), Ok(Some(graph))) => match graph.upload() {
-                            Ok(()) => captured = Some(graph),
-                            Err(e) => warn!("expert cache: CPU-return upload failed: {e}"),
-                        },
-                        (Err(e), _) => warn!("expert cache: CPU-return launch failed: {e}"),
-                        (_, Err(e)) => warn!("expert cache: CPU-return end_capture failed: {e}"),
-                        (_, Ok(None)) => warn!("expert cache: CPU-return produced no graph"),
-                    }
-                } else {
-                    warn!("expert cache: CPU-return begin_capture failed");
-                }
-                captured
-            }
-            None => None,
-        };
-        *slot = Some(BankCapture { cap, ids, weights, waitadd });
-        Ok(true)
-    }
-
-    /// M3: replay this bank's captured CPU-return node. `false` when it has none.
-    #[cfg(feature = "cuda")]
-    fn waitadd_replay(&self) -> candle_core::Result<bool> {
-        let guard = self.capture.lock().unwrap();
-        let Some(c) = guard.as_ref() else {
-            return Ok(false);
-        };
-        let Some(graph) = c.waitadd.as_ref() else {
-            return Ok(false);
-        };
-        graph
-            .launch()
-            .map_err(|e| candle_core::Error::msg(format!("CPU-return graph launch: {e}")))?;
-        COUNTERS.capture_replays.fetch_add(1, Ordering::Relaxed);
-        Ok(true)
-    }
-
     /// M3: whether this bank has a captured CPU-return node.
     #[cfg(feature = "cuda")]
     fn has_waitadd(&self) -> bool {
@@ -1483,63 +1388,6 @@ impl Bank {
         guard.as_ref().is_some_and(|c| c.waitadd.is_some())
     }
 
-    /// Run this bank's hits through the fixed-grid path, or `None` when it cannot serve the call
-    /// (no capture yet, too many rows, or an activation dtype/size it was not built for) — the
-    /// caller then uses the old host-geometry path. `rows` may not exceed the capture's
-    /// `max_batch`; that is the allowed row-bucket fallback, unrelated to misses.
-    #[cfg(feature = "cuda")]
-    fn fused_decode_capture(
-        &self,
-        x2d: &Tensor,
-        per_row: &[Vec<(u32, f32)>],
-        rows: usize,
-        act_type: i32,
-    ) -> candle_core::Result<Option<Tensor>> {
-        // M9: always decline - see `warmup`: the per-layer segment graphs were measured neutral, so this
-        // never engages. Deleting the capture machinery is the next commit; until then this keeps the
-        // shipped configuration unambiguous (one path, no flag).
-        let _ = (x2d, per_row, rows, act_type);
-        return Ok(None);
-        #[allow(unreachable_code)]
-        let mut guard = self.capture.lock().unwrap();
-        #[allow(unreachable_code)]
-        let Some(c) = guard.as_mut() else {
-            return Ok(None);
-        };
-        let (max_batch, max_topk, hidden, _) = c.cap.dims();
-        if rows > max_batch || x2d.dim(1)? != hidden {
-            return Ok(None);
-        }
-        if x2d.dtype() != DType::BF16 {
-            // Built for BF16 activations; fall back rather than mis-stage.
-            return Ok(None);
-        }
-
-        // Padded `[max_batch, max_topk]` descriptors: unused slots repeat a valid local slot
-        // index with weight 0 (the fused gate+up kernel has no `expert_id` bound check).
-        let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
-        let mut ids = vec![pad; max_batch * max_topk];
-        let mut ws = vec![0f32; max_batch * max_topk];
-        for (t, row) in per_row.iter().enumerate().take(rows) {
-            for (j, &(local, w)) in row.iter().enumerate().take(max_topk) {
-                ids[t * max_topk + j] = local;
-                ws[t * max_topk + j] = w;
-            }
-        }
-        let dev = x2d.device().as_cuda_device()?;
-        dev.memcpy_htod(ids.as_slice(), &mut c.ids)?;
-        dev.memcpy_htod(ws.as_slice(), &mut c.weights)?;
-        c.cap.stage(x2d)?;
-        if c.cap.is_captured() {
-            c.cap.replay()?;
-            COUNTERS.capture_replays.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // Capture failed at warmup; stay on the eager segment rather than lose the bank.
-            c.cap
-                .run(&self.gate, &self.up, &self.down, x2d, &c.ids, &c.weights, act_type)?;
-        }
-        Ok(Some(c.cap.output()?.narrow(0, 0, rows)?))
-    }
 }
 
 /// The v2 M1/M2 fixed-grid batch bound, matching the lookahead channel's policy
@@ -1664,49 +1512,6 @@ impl CachedLayer {
     #[cfg(feature = "cuda")]
     fn staging_enabled(&self) -> bool {
         self.pcie_frac > 0.0 && self.copy_stream.is_some()
-    }
-
-    /// v2 M1/M2: create every resident bank's fixed-grid capture path. Runs after load and before
-    /// the first decode, so all capture buffers have fixed addresses. Returns how many banks were
-    /// newly given a capture. No-op without `cuda` or with no copy-stream banks.
-    #[cfg(feature = "cuda")]
-    fn warmup_captures(&self, stage_dtype: DType) -> candle_core::Result<usize> {
-        // M3: this layer's own CPU-return channel, sized for the largest decode batch.
-        if let Some(chan) =
-            deferred::CpuChannel::acquire(&self.slot_device, CAPTURE_MAX_BATCH * self.hidden)?
-        {
-            let _ = self.cpu_chan.set(chan);
-        } else {
-            warn!("expert cache: no CPU-return channel for layer {}", self.layer);
-        }
-        let mut banks: Vec<Arc<Bank>> = Vec::new();
-        for entry in &self.slot_bufs {
-            let guard = entry.lock();
-            let Some(buf) = guard.as_ref() else { continue };
-            let Some(bank) = buf.bank.as_ref() else { continue };
-            if banks.iter().any(|b| Arc::ptr_eq(b, bank)) {
-                continue;
-            }
-            banks.push(Arc::clone(bank));
-        }
-        let mut made = 0;
-        let Some(act_type) = fused_act(self.act) else {
-            return Ok(0);
-        };
-        let sched = if banks.len() == 1 { schedule() } else { None };
-        for bank in banks {
-            if bank.create_capture(
-                CAPTURE_MAX_BATCH,
-                self.top_k,
-                stage_dtype,
-                act_type,
-                self.layer as u32,
-                sched,
-            )? {
-                made += 1;
-            }
-        }
-        Ok(made)
     }
 
     /// M4/M5b/M6: gate this layer's segment on `kind` by launching the wait node on the stream.
@@ -2066,7 +1871,8 @@ impl CachedLayer {
         act: Activation,
     ) -> candle_core::Result<(Tensor, Option<Arc<Bank>>)> {
         let rows = hits.len();
-        let mut capture_bank: Option<Arc<Bank>> = None;
+        // M9: no captures, so nothing to remember for the CPU-return node.
+        let capture_bank: Option<Arc<Bank>> = None;
         let mut acc: Option<Tensor> = None;
         let mut add = |y: Tensor| -> candle_core::Result<()> {
             acc = Some(match acc.take() {
@@ -2098,18 +1904,7 @@ impl CachedLayer {
                     groups[i].1[t].push((local, *w));
                 }
             }
-            let n_banks = groups.len();
             for (bank, per_row) in groups {
-                // v2 M1/M2: the fixed-grid path, when the bank has a capture that can serve this
-                // call. `None` (no capture, too many rows, wrong activation shape/graph build) is
-                // the allowed row-bucket fallback, not a miss fallback.
-                if let Some(y) = bank.fused_decode_capture(x2d, &per_row, rows, act_type)? {
-                    if n_banks == 1 {
-                        capture_bank = Some(Arc::clone(bank));
-                    }
-                    add(y)?;
-                    continue;
-                }
                 let width = per_row.iter().map(Vec::len).max().unwrap_or(0);
                 let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
                 let mut ids = Vec::with_capacity(rows * width);
@@ -2155,27 +1950,6 @@ impl CachedLayer {
         let u = QMatMul::QTensor(w.up.clone()).forward(x2d)?;
         let h = (act.forward(&g)? * u)?;
         QMatMul::QTensor(w.down.clone()).forward(&h)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn capture_will_serve(&self, hits: &[Vec<Hit>], rows: usize, x2d: &Tensor) -> bool {
-        if rows > CAPTURE_MAX_BATCH
-            || x2d.dtype() != DType::BF16
-            || fused_act(self.act).is_none()
-            || x2d.dim(1).map(|d| d != self.hidden).unwrap_or(true)
-        {
-            return false;
-        }
-        let mut banks: Vec<&Arc<Bank>> = Vec::new();
-        for (buf, _, _) in hits.iter().flatten() {
-            let Some(bank) = buf.bank.as_ref() else {
-                return false;
-            };
-            if !banks.iter().any(|b| Arc::ptr_eq(b, bank)) {
-                banks.push(bank);
-            }
-        }
-        banks.len() == 1 && banks[0].has_waitadd()
     }
 
     /// Decode path (one token, or the few rows of a speculative verify step): split each row's
@@ -2668,10 +2442,8 @@ impl CachedLayer {
                 }))
             };
 
-        // M3: will a captured CPU-return node consume this layer's result this pass?
-        #[cfg(feature = "cuda")]
-        let fast = schedule().is_some() && self.capture_will_serve(&hits, rows, &x2d);
-        #[cfg(not(feature = "cuda"))]
+        // M9: there are no segment captures, so no captured CPU-return node can consume this layer's
+        // result - the deferred channel always carries it.
         let fast = false;
 
         // Publication must stay strictly FIFO per point: the payload slot is single-buffered and
@@ -2800,20 +2572,6 @@ impl CachedLayer {
         let (gpu_out, capture_bank) = acc?;
         fenced?;
 
-        #[cfg(feature = "cuda")]
-        if fast {
-            let bank = capture_bank.as_ref().ok_or_else(|| {
-                candle_core::Error::msg(
-                    "expert cache: expected the capture path but no single bank served it",
-                )
-            })?;
-            if !bank.waitadd_replay()? {
-                candle_core::bail!("expert cache: no captured CPU-return node");
-            }
-            return gpu_out.to_dtype(xs.dtype())?.reshape((batch, seq, hidden));
-        }
-        #[cfg(not(feature = "cuda"))]
-        let _ = (fast, capture_bank);
 
         // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
         let cpu_out = cpu.map(deferred::Pending::upload).transpose();
