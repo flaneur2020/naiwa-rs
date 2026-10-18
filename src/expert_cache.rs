@@ -118,6 +118,8 @@ struct Counters {
     misses: AtomicU64,
     /// Experts served from the staging ring (PCIe), counted apart from cache hits.
     staged: AtomicU64,
+    /// Predicted CPU-only experts whose stacks were warmed into L3 (`NAIWA_CPU_PREFETCH`).
+    cpu_prefetched: AtomicU64,
     lookahead_loads: AtomicU64,
     swaps: AtomicU64,
     pcie_misses: AtomicU64,
@@ -152,6 +154,7 @@ static COUNTERS: Counters = Counters {
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
     staged: AtomicU64::new(0),
+    cpu_prefetched: AtomicU64::new(0),
     lookahead_loads: AtomicU64::new(0),
     swaps: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
@@ -169,6 +172,7 @@ pub struct CacheStats {
     pub misses: u64,
     /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
     pub staged: u64,
+    pub cpu_prefetched: u64,
     /// Experts the lookahead loaded into empty slots.
     pub lookahead_loads: u64,
     /// Experts the lookahead loaded over a least-recently-used resident.
@@ -205,6 +209,7 @@ pub fn take_stats() -> Option<CacheStats> {
         hits: take(&c.hits),
         misses: take(&c.misses),
         staged: take(&c.staged),
+        cpu_prefetched: take(&c.cpu_prefetched),
         lookahead_loads: take(&c.lookahead_loads),
         swaps: take(&c.swaps),
         lookahead_dropped: crate::lookahead::dropped(),
@@ -2005,6 +2010,40 @@ impl CachedLayer {
             if swaps < max_swaps && self.replace(e, &predicted, false)?.is_some() {
                 swaps += 1;
                 COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Warm the experts that will stay on the CPU (`NAIWA_CPU_PREFETCH`): the prediction gives their ids a
+        // layer early, and the machine has 32 MB of L3 while three experts are ~6.3 MB - so reading their
+        // three stacks here makes the later gemv come out of cache instead of DRAM. One byte per cache line
+        // pulls the whole line, so the sweep costs a DRAM read, not a copy.
+        if std::env::var_os("NAIWA_CPU_PREFETCH").is_some() {
+            let stay: Vec<usize> = predicted
+                .iter()
+                .copied()
+                .filter(|&e| e < self.num_experts)
+                .filter(|e| {
+                    let st = self.state.lock().unwrap();
+                    st.slots.get(e).is_none()
+                })
+                .collect();
+            if !stay.is_empty() {
+                if let Some((gate, up, down)) = self.cpu.expert_qtensors() {
+                    for &e in &stay {
+                        for stack in [&gate, &up, &down] {
+                            if let Ok(Some(bytes)) = host_memory::stack_bytes(stack, e, self.num_experts) {
+                                let mut sink = 0u64;
+                                let mut i = 0;
+                                while i < bytes.len() {
+                                    // SAFETY: `i` is inside the stack's bytes.
+                                    sink ^= unsafe { std::ptr::read_volatile(bytes.as_ptr().add(i)) } as u64;
+                                    i += 64;
+                                }
+                                std::hint::black_box(sink);
+                            }
+                        }
+                    }
+                    COUNTERS.cpu_prefetched.fetch_add(stay.len() as u64, Ordering::Relaxed);
+                }
             }
         }
         // Claim then publish: a reader that sees `pass` knows the point is coming.
