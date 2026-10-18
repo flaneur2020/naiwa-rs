@@ -101,7 +101,12 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
-0. **M7 = 降低 MTP 单 token 成本**(`worklogs/m7.md`)。指标 = 轮时间 / token 数;当前 np2/frac 0.2/cache 4 =
+0. **M7 = 内存吞吐优化**(`worklogs/m7.md`;单 token 成本那部分改为 `m7-per-token.md`)。三条链实测:
+   DRAM 纯读 28.6 GB/s、CPU 点积仅 8.2 GB/s(8 线程,单核 2.5)、PCIe 12.8 繁忙 / 6.4 平均(上限 25)、
+   VRAM 几乎闲置。np8 一轮搬 **2.68 GB**(CPU 745MB + staged 1000MB + 预载 935MB)= 14.5 GB/s,
+   已达 DRAM 实际上限的 51%。杠杆排序:①砍预载(935MB/轮,`--lookahead-swaps 1` 可省一半)②staged 走
+   第二条 stream 把读搬到 VRAM ③点积内核(指令受限)④其它已否证。
+0a. **M7 单 token 成本**(`worklogs/m7-per-token.md`)。指标 = 轮时间 / token 数;当前 np2/frac 0.2/cache 4 =
    47 ms/token(21.0 tok/s),目标 ≤35 ms/token(≥28 tok/s)。五步:M7.1 copy stream 优先级(staging 先于预载)
    → M7.2 藏住 CPU payload(20% 轮时间,用预测复用做 CPU 侧预载)→ M7.3 预载过度替换(2380 次 over residents
    vs 470 次进空槽)→ M7.4 attention 区域捕获(host 发射链 20 ms)→ M7.5 接受率策略化。
