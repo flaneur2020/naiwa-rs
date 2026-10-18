@@ -1,8 +1,9 @@
-# naiwa-rs v2 — roadmap
+# naiwa-rs — roadmap
 
 Plan of record: what is built, what was measured, what is judged, and what comes next.
-Design and current-state detail live in [`design.md`](design.md); per-milestone evidence
-lives in [`worklogs/`](worklogs/).
+Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity hardware.
+Design and current-state detail live in [`design.md`](design.md); per-milestone evidence lives in
+[`worklogs/`](worklogs/).
 
 Recorded 2026-10-16; last updated 2026-10-18 after M9.2 progress.
 

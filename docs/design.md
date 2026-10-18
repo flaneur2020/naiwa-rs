@@ -1,22 +1,19 @@
-# naiwa-rs v2 — design
+# naiwa-rs — design
 
-Canonical **current** design. History, gates, and evidence: [`roadmap.md`](roadmap.md),
-[`worklogs/`](worklogs/). Updated 2026-10-18 after M9.2 progress.
+**Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity hardware.**
 
----
+Reference target: RTX 4070 12 GB, Ryzen 5 3600X 6C/12T, Qwen3.8-Next-Flash IQ1_M (60 GB,
+48 decoder layers + MTP head). The hard constraint is memory: the expert working set is ~26 GB
+against a 12 GB card, so the engine must stream experts without putting the host on the critical
+path.
 
-## 1. Goal
-
-The old engine was **host-bound**, not kernel-bound: `STEP_DBG` measured
-`busy 0.000 ms/layer, dry 0.9–1.3 ms/layer`. Every layer the GPU had drained the stream and was
-waiting for the host; 48 × ~1 ms ≈ TPOT.
-
-The design changes the control model, not the kernels:
+Design principle:
 
 > **The GPU spins on mapped flags; the host publishes data and never leads the device by a
 > pass.**
 
-The shipped path is eager MoE and eager attention.
+The shipped path is eager MoE and eager attention. Plan and evidence:
+[`roadmap.md`](roadmap.md), [`worklogs/`](worklogs/).
 
 ### Shipped configuration
 
@@ -27,7 +24,7 @@ The shipped path is eager MoE and eager attention.
 | `--pcie-frac` | 0.2 optimum at np3/np8; bandwidth knob, not a TPOT lever |
 | experts | fork rayon pool, 8 threads |
 | prediction | one dedicated event-driven thread; issue-only, never performs the DMA |
-| staging | `S2`: residents run **before** the staging gate; staged experts after it |
+| staging | residents run **before** the staging gate; staged experts after it |
 | MoE / attention | eager; no capture |
 | PLE | host-only table; not implemented on decode |
 | MTP | works in steady state on short/benchmark prompts; long-prompt drafter prefill is an open fault |
@@ -36,7 +33,7 @@ The shipped path is eager MoE and eager attention.
 
 `--depth N` is decode context length (`4` in all current numbers); `--mtp-n-predict N` is draft
 depth (np8 = 8 drafts, 9 verify rows). All performance numbers are short-context and
-MoE-dominated; M8.4 re-measures at 2k/4k.
+MoE-dominated; long-context runs at 2k/4k are still required.
 
 ---
 
@@ -56,7 +53,7 @@ wait CPU payload   ────────→  wait_copy_slot, add to acc
                               next layer's attention (eager)
 ```
 
-**Dispatch (M9.2, in progress) is moving to the device:** `dispatch_topk` / `DispatchBuf` write a
+**Dispatch (in progress) is moving to the device:** `dispatch_topk` / `DispatchBuf` write a
 per-layer resident bitmap plus three compact lists (resident, staged, CPU) with rows and weights
 into mapped memory. The host waits on one `done` word and reads the lists; it does not hash ids.
 The only host-side guard is the shape check (the startup dummy run takes the old path). One fixed
@@ -71,11 +68,12 @@ wait_ready(layer, SYNC_STAGING)   DMA lands under the resident compute
 wait CPU payload, add             completes the MoE output
 ```
 
-`S2` is unconditional: **78.9 → 62.8 ms/pass (−20%)**, staging-gate p50 858 → 11 µs. The CPU add
+Resident-first staging is unconditional: **78.9 → 62.8 ms/pass (−20%)**, staging-gate p50 858 → 11 µs. The CPU add
 stays last because its result belongs to this layer's output, which the next layer consumes.
 
 The prediction thread runs only in the gap **after** a CPU-expert batch (beside it cost
-10 ms/step). Workers make **no CUDA calls** (W99: late predictions, hit rate 74% → 38%).
+10 ms/step). Workers make **no CUDA calls**; a CUDA call from a worker delays predictions and
+collapses the hit rate (measured 74% → 38%).
 
 ---
 
@@ -86,7 +84,7 @@ The prediction thread runs only in the gap **after** a CPU-expert batch (beside 
 ```
 epoch    u32                 device-written once per pass (layer 0 prologue)
 ready    [K] u32             one word per sync point; value = pass whose data is ready
-payload  [slots][max_n] f32  single CPU-result block (legacy; see below)
+payload  [slots][max_n] f32  single CPU-result block (see CPU return)
 
 PRELOAD = 0, STAGING = 1, CPU_EXPERTS = 2
 sync_id(layer, kind) = layer * 3 + kind
@@ -122,14 +120,14 @@ Rules:
 6. Device epoch is fenced before/after; host payload/ready uses release; the node fences after
    the spin. Ada did not need the fences here, but they stay for RDNA.
 
-### CPU return (M9.2 open)
+### CPU return (open)
 
-The schedule's `CPU_EXPERTS` point is currently unused. The live path is the legacy per-layer
-`Channel` (`FlagBuf`: seq + payload ring) with `wait_copy_slot` on the stream; the MTP site uses
-the same path.
+The schedule's `CPU_EXPERTS` point is currently unused. The live path is the per-layer `Channel`
+(`FlagBuf`: seq + payload ring) with `wait_copy_slot` on the stream; the MTP site uses the same
+path.
 
-**M9.2** must collapse this to **one** protocol: move decoder/MTP CPU return onto `ScheduleBuf`
-and delete `Channel` (~200 lines), or document why `Channel` stays. Do not add a third path.
+The intended end state is **one** protocol: move decoder/MTP CPU return onto `ScheduleBuf` and
+delete `Channel` (~200 lines), or document why `Channel` stays. Do not add a third path.
 
 ### PLE
 
@@ -165,15 +163,13 @@ counts/offsets/pointers only.
 | configuration | round p50 | tok/s | tokens/round |
 |---|---|---|---|
 | np8, counting prompt, best | 184.7 ms | 43.3 | 8.00 (23.1 ms/token) |
-| np8, M9 baseline | **170.0 ms** | **44.0** | 8.0 |
+| np8, reference build | **170.0 ms** | **44.0** | 8.0 |
 | np3 | 98.1 ms | 40.0 | 3.92 |
 | np2 | 82–90 ms | 33.8 | 2.77 |
 | no MTP | 63.2 ms | 15.8 | 1.0 |
 | code continuation | - | 25–26 | 2.5–2.9 |
-| Strata, 4070 Ti SUPER 16 GB, spec 4 + MTP | ~33 ms | 76.0 | ~2.5 |
 
-M7's target (≤ 35 ms/token) is met on the counting prompt; acceptance decides tokens/round. The
-gap to Strata is ~×2.5 speculation and ~×2.6 pass latency.
+Target ≤ 35 ms/token is met on the counting prompt; acceptance decides tokens/round.
 
 np8 round (~185 ms): GPU 40 ms (22%), host launch chain + sampler ~70 ms (38%, **not** CUDA
 launches; profile needed), CPU-payload wait 47 ms (25%), staging wait 27 ms (15%), copy stream
@@ -206,7 +202,7 @@ sizing bug (MTP site = layer 48) is fixed.
   both to the same text); `frac 0` is 0/10. A third variant is the regression signal.
 - **Structural checks** and a must-fail control for every wait (a stale stamp must hang). Correct
   values alone are not evidence.
-- **NaN history:** two uninitialised buffers — schedule payload (`cudaHostAlloc` does not zero) and
+- **NaN fix:** two uninitialised buffers — schedule payload (`cudaHostAlloc` does not zero) and
   paged-attention KV blocks (`Tensor::empty`). Zeroing both: 2–3/5 → **0/6**.
 - **Measurement:** medians of ≥ 3 runs; report round p50 + tokens/round + hit rate + flags;
   liveness ≥ 6 runs; no mean where a median exists.
@@ -242,11 +238,10 @@ The doorbell was the only clean extraction; everything else is a kernel or model
   src/doorbell/            Doorbell/FlagBuf/ScheduleBuf + kernels
   src/expert_cache.rs      banks, run_hits, decode_forward
   src/deferred.rs          CPU worker + CPU-return channel
-  harness/m0..m7/          primitives, oracle, bandwidth harnesses
+  harness/                  primitives, oracle, bandwidth harnesses
 ~/code/mistral.rs-iq4xs    fork
-~/code/qflash-rs           old eager oracle (read-only)
 ~/naiwa-rs/target          crate target
-~/bench-rel/naiwa-v2/      binaries/logs; m9-baseline is the ablation reference
+~/bench-rel/naiwa-v2/      binaries/logs
 ```
 
 ```bash
@@ -270,8 +265,5 @@ $BIN bench -m ~/models/qwen3-coder/requant -f '<shard1>;<shard2>' --cpu-moe \
 
 ## 9. Pointers
 
-- Plan, gates, milestone history: [`roadmap.md`](roadmap.md)
-- Latest cleanup/ablation: [`worklogs/m9.md`](worklogs/m9.md),
-  [`worklogs/m9-baseline.md`](worklogs/m9-baseline.md)
-- Evidence: [`worklogs/`](worklogs/)
-- Historical architecture sketch: [`architecture.png`](architecture.png)
+- Plan and gates: [`roadmap.md`](roadmap.md)
+- Measurements and per-milestone evidence: [`worklogs/`](worklogs/)
