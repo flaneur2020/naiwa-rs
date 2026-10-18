@@ -101,6 +101,11 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0. **M7 已收尾**:完美缓存(`NAIWA_GPU_ONLY_EXPERTS`)只值 **+8%**(47.4 vs 43.9 tok/s),即
+   **miss 路径整体不到一轮的 1/10**;92% 是 GPU 计算(~40 ms/轮)+ host 发射链(~70 ms/轮)。带宽/缓存这条线
+   到顶,已否证:交错重排、L3 预热、环加大(16→64 无变化)、第二条 stream(只值 3 ms)、更大缓存(更慢)。
+   kernel 实测(单核 16.7 GB/s / 106 µs/专家,cache 命中下)说明 CPU 腿 60% 是访存停顿而非指令 → AVX2 无可挖。
+   下一步看 `worklogs/m8.md`(削减 host 发射链)。
 0. **M7 = 内存吞吐优化**(`worklogs/m7.md`;单 token 成本那部分改为 `m7-per-token.md`)。三条链实测:
    DRAM 纯读 28.6 GB/s、CPU 点积仅 8.2 GB/s(8 线程,单核 2.5)、PCIe 12.8 繁忙 / 6.4 平均(上限 25)、
    VRAM 几乎闲置。np8 一轮搬 **2.68 GB**(CPU 745MB + staged 1000MB + 预载 935MB)= 14.5 GB/s,
