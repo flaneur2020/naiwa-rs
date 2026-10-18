@@ -10,14 +10,14 @@ use candle_core::Device;
 use tracing::info;
 
 use crate::copy_stream::{self, CopyStream, ReadFence};
+use crate::stats;
 
 use super::decode::Hit;
 use super::expert_bytes::expert_range;
 use super::layer::streamed_misses;
-use super::probe::round_stats;
 use super::{
     schedule, scratch_ring_slots, Bank, CachedLayer, LayerRegistry, ScratchKey, ScratchRing,
-    ScratchSlot, SlotBuf, COUNTERS, SCRATCH_RING_FIRST,
+    ScratchSlot, SlotBuf, SCRATCH_RING_FIRST,
 };
 
 impl LayerRegistry {
@@ -197,7 +197,7 @@ impl CachedLayer {
                     // SAFETY: the stacks are page-locked, and `self.cpu` keeps them alive and
                     // unmodified for the model's lifetime, well past `done`.
                     unsafe {
-                        round_stats::record_staged_bytes(bytes as u64);
+                        stats::record_round_staged_bytes(bytes as u64);
                         cs.queue_async(
                             &buf.fence,
                             &[
@@ -210,8 +210,7 @@ impl CachedLayer {
                     // M4: the completion is no longer a `cudaStreamWaitEvent` on candle's stream;
                     // the copy stream publishes the layer's `SYNC_STAGING` point itself (below),
                     // and this layer's gate graph spins on it.
-                    COUNTERS.pcie_misses.fetch_add(1, Ordering::Relaxed);
-                    COUNTERS.pcie_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                    stats::record_cache_pcie(bytes as u64);
                     slot_of.insert(expert, (Arc::clone(buf), pos));
                 }
                 slot_of

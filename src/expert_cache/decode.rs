@@ -10,9 +10,9 @@ use tracing::{debug, warn};
 
 use crate::deferred;
 use crate::offload::fused_decode as offload_fused_decode;
+use crate::stats;
 
-use super::probe::{lookahead_probe, round_stats, step_probe};
-use super::{schedule, Bank, CachedLayer, SlotBuf, SlotWeights, COUNTERS};
+use super::{schedule, Bank, CachedLayer, SlotBuf, SlotWeights};
 
 /// The fused MoE decode kernel's activation id, if it has one for `act`.
 #[cfg(feature = "cuda")]
@@ -194,7 +194,7 @@ impl CachedLayer {
         let (batch, seq, hidden) = xs.dims3()?;
         let rows = batch * seq;
         let x2d = xs.reshape((rows, hidden))?;
-        step_probe::mark(&self.slot_device, self.layer);
+        stats::record_step_layer(&self.slot_device, self.layer);
         // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
         // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
         // known before the DMA, because that is what publishes the staging point for this pass.
@@ -247,13 +247,13 @@ impl CachedLayer {
                             }
                         }));
                     }
-                    lookahead_probe::record(0.0, queued);
+                    stats::record_lookahead_step(0.0, queued);
                 } else if let (true, Some(chan)) = (queued, &self.lookahead_chan) {
                     let n = rows * hidden;
                     let next = Arc::clone(&next);
                     let t0 = std::time::Instant::now();
                     let pub_res = chan.publish(&x2d, n);
-                    lookahead_probe::record_publish(t0.elapsed().as_secs_f64() * 1e3);
+                    stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
                     if let Some((sh, last_seq, slot)) = pub_res? {
                         crate::lookahead::submit(Box::new(move || {
                             let t0 = std::time::Instant::now();
@@ -269,7 +269,7 @@ impl CachedLayer {
                             // the prefetch), so drop this one. Every layer
                             // resubmits every step; dropping old ones is free.
                             if sh.next_seq.load(Ordering::Relaxed) > last_seq.wrapping_add(1) {
-                                lookahead_probe::record_job(t0.elapsed().as_secs_f64() * 1e3);
+                                stats::record_lookahead_job(t0.elapsed().as_secs_f64() * 1e3);
                                 sh.consumed.fetch_max(last_seq + 1, Ordering::Relaxed);
                                 return;
                             }
@@ -282,7 +282,7 @@ impl CachedLayer {
                                     );
                                 }
                             }
-                            lookahead_probe::record_job(t0.elapsed().as_secs_f64() * 1e3);
+                            stats::record_lookahead_job(t0.elapsed().as_secs_f64() * 1e3);
                             // Paid back either way: a timed-out publish's slot must
                             // stop counting against the backpressure budget.
                             // `fetch_max`: team threads finish out of order — a
@@ -291,7 +291,7 @@ impl CachedLayer {
                             sh.consumed.fetch_max(last_seq + 1, Ordering::Relaxed);
                         }));
                     }
-                    lookahead_probe::record(0.0, true);
+                    stats::record_lookahead_step(0.0, true);
                 } else if queued {
                     // CUDA without the channel (the mapped allocation failed): fall
                     // back to the W105 blocking `to_vec1` on the token thread rather
@@ -309,9 +309,9 @@ impl CachedLayer {
                             debug!("expert cache: layer {} lookahead failed: {e}", next.layer);
                         }
                     }));
-                    lookahead_probe::record(d2h, true);
+                    stats::record_lookahead_step(d2h, true);
                 } else {
-                    lookahead_probe::record(0.0, false);
+                    stats::record_lookahead_step(0.0, false);
                 }
             }
         }
@@ -441,7 +441,7 @@ impl CachedLayer {
             }
         }
         let n_hits: usize = hits.iter().map(Vec::len).sum();
-        COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
+        stats::record_cache_hits(n_hits);
 
 
 
@@ -456,13 +456,13 @@ impl CachedLayer {
         }
 
         let n_cpu: usize = misses.iter().map(Vec::len).sum();
-        COUNTERS.misses.fetch_add(n_cpu as u64, Ordering::Relaxed);
+        stats::record_cache_misses(n_cpu);
         // Experts that went to the staging ring: counted apart from both hits and CPU misses.
         #[cfg(feature = "cuda")]
         {
             let staged_n: usize = hits.iter().map(Vec::len).sum::<usize>() - n_hits;
-            COUNTERS.staged.fetch_add(staged_n as u64, Ordering::Relaxed);
-            round_stats::record_plan(n_hits, staged_n, n_cpu);
+            stats::record_cache_staged(staged_n);
+            stats::record_round_plan(n_hits, staged_n, n_cpu);
         }
 
         let compute: Option<Box<dyn FnOnce() -> candle_core::Result<Vec<f32>> + Send>> =

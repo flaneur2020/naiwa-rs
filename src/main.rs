@@ -8,11 +8,12 @@ mod copy_stream;
 mod deferred;
 mod doorbell;
 mod expert_cache;
-mod lookahead;
 mod host_memory;
 mod load;
+mod lookahead;
 mod offload;
 mod prefill_stream;
+mod stats;
 
 use anyhow::Result;
 use clap::Parser;

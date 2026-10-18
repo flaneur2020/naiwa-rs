@@ -11,6 +11,7 @@ use crate::copy_stream::CopyStreams;
 use crate::host_memory::{self, PinnedStack};
 use crate::offload::{attach_prefill, CpuExperts};
 use crate::prefill_stream::PrefillStreams;
+use crate::stats;
 
 use super::expert_bytes::slot_bytes_from_qtensor;
 use super::layer::LookaheadChannel;
@@ -18,7 +19,7 @@ use super::registry::CacheLoan;
 use super::staging::alloc_bank;
 use super::{
     loan_bank_slots, CachedExperts, CachedLayer, CachedLayerState, LayerRegistry, SlotEntry,
-    CAPTURE_MAX_BATCH, COUNTERS, SCHEDULE, WAITS_PER_LAYER,
+    CAPTURE_MAX_BATCH, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ impl GpuCacheMoeProvider {
         lookahead_swaps: usize,
         lookahead: bool,
     ) -> Self {
-        COUNTERS.installed.store(true, Ordering::Relaxed);
+        stats::record_cache_installed();
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let registry: Arc<LayerRegistry> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.

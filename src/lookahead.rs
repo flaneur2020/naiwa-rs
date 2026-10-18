@@ -26,7 +26,7 @@
 //! Configuration is fixed here, by commit, not by an environment variable (`architecture-v2` §6.4).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -46,13 +46,6 @@ static LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The one thread, once it exists.
 static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
-
-/// Predictions dropped because the queue was full (advisory work, so this is a cost, not an error).
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-
-pub fn dropped() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
-}
 
 /// Wake the lookahead thread: there may be work (a submit) or permission to run it (a batch ended).
 pub fn wake() {
@@ -77,7 +70,7 @@ pub fn submit(job: Thunk) {
     {
         let mut jobs = JOBS.lock().unwrap();
         if jobs.len() >= DEPTH {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_cache_lookahead_dropped();
             return;
         }
         jobs.push_back(job);

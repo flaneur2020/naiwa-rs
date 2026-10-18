@@ -8,10 +8,11 @@ use candle_core::{DType, Device, Tensor};
 use tracing::debug;
 
 use crate::copy_stream::{self, CopyStream, ReadFence};
+use crate::stats;
 
 use super::expert_bytes::{expert_qtensor_on_device, expert_range};
 use super::staging::alloc_bank;
-use super::{schedule, CachedLayer, SlotBuf, SlotWeights, COUNTERS};
+use super::{schedule, CachedLayer, SlotBuf, SlotWeights};
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
 /// token thread queues ONE kernel that copies this step's activation into mapped memory
@@ -193,7 +194,7 @@ impl CachedLayer {
         let Some(sched) = schedule() else {
             return Ok(());
         };
-        COUNTERS.gate_replays.fetch_add(1, Ordering::Relaxed);
+        stats::record_cache_gate_replay();
         let id = sched.sync_id(self.layer as u32, kind);
         sched.wait_ready(&self.slot_device, id)
     }
@@ -476,12 +477,12 @@ impl CachedLayer {
                 continue;
             }
             if self.admit(e, false)?.is_some() {
-                COUNTERS.lookahead_loads.fetch_add(1, Ordering::Relaxed);
+                stats::record_cache_lookahead_load();
                 continue;
             }
             if swaps < max_swaps && self.replace(e, &predicted, false)?.is_some() {
                 swaps += 1;
-                COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
+                stats::record_cache_swap();
             }
         }
         // Claim then publish: a reader that sees `pass` knows the point is coming.

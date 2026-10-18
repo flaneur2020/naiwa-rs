@@ -197,7 +197,7 @@ pub async fn run_bench(
         if let Ok(logger) = mistralrs.get_logger(None) {
             logger.reset();
         }
-        let _ = crate::expert_cache::take_stats();
+        let _ = crate::stats::dump_cache_stats();
     }
 
     // Run benchmarks
@@ -321,7 +321,8 @@ pub async fn run_bench(
 
     // Print results
     print_results(&model_id, iterations, &results);
-    if let Some(stats) = crate::expert_cache::take_stats() {
+    let stats = crate::stats::dump_cache_stats();
+    if stats.installed {
         println!(
             "Expert cache (decode): {:.1}% hit rate ({} hits, {} misses); lookahead loaded {} into empty slots, {} over residents, dropped {} requests",
             100.0 * stats.hit_rate(),

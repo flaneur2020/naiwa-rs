@@ -36,21 +36,19 @@
 mod decode;
 mod expert_bytes;
 mod layer;
-mod probe;
 mod provider;
 mod registry;
 mod staging;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use probe::record_cpu_compute;
 pub use provider::GpuCacheMoeProvider;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::quantized::QTensor;
 use candle_core::{Device, Tensor};
@@ -117,32 +115,6 @@ const fn scratch_ring_slots() -> usize {
     16
 }
 
-
-// ---------------------------------------------------------------------------
-// Counters
-// ---------------------------------------------------------------------------
-
-/// Decode-path counters over every cached layer of the process (one model per process).
-struct Counters {
-    installed: AtomicBool,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    /// Experts served from the staging ring (PCIe), counted apart from cache hits.
-    staged: AtomicU64,
-    lookahead_loads: AtomicU64,
-    swaps: AtomicU64,
-    pcie_misses: AtomicU64,
-    pcie_bytes: AtomicU64,
-    /// v2 M2: decode-step MoE segments served by replaying a captured graph (1 `cuGraphLaunch`
-    /// each) rather than ~5 raw launches.
-    /// v2 M4: layer DMA gates captured at warmup (one per layer with staging in service).
-    /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
-    gate_replays: AtomicU64,
-    /// v2 M4: DMA-gate waits launched warm because the gate graph could not be captured. Must stay
-    /// 0 — a non-zero value means the graph route failed and only the fallback ran.
-    staging_eager_waits: AtomicU64,
-}
-
 #[cfg(feature = "cuda")]
 static SCHEDULE: OnceLock<Arc<crate::doorbell::ScheduleBuf>> = OnceLock::new();
 
@@ -156,72 +128,6 @@ fn zero_buf(max_len: usize) -> &'static [f32] {
     static ZEROS: OnceLock<Vec<f32>> = OnceLock::new();
     ZEROS.get_or_init(|| vec![0f32; max_len])
 }
-
-static COUNTERS: Counters = Counters {
-    installed: AtomicBool::new(false),
-    hits: AtomicU64::new(0),
-    misses: AtomicU64::new(0),
-    staged: AtomicU64::new(0),
-    lookahead_loads: AtomicU64::new(0),
-    swaps: AtomicU64::new(0),
-    pcie_misses: AtomicU64::new(0),
-    pcie_bytes: AtomicU64::new(0),
-    gate_replays: AtomicU64::new(0),
-    staging_eager_waits: AtomicU64::new(0),
-};
-
-/// Expert-cache counters since the last call to `take_stats`.
-pub struct CacheStats {
-    /// Routed experts of decode steps served from a slot.
-    pub hits: u64,
-    /// Routed experts of decode steps run on the CPU.
-    pub misses: u64,
-    /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
-    pub staged: u64,
-    /// Experts the lookahead loaded into empty slots.
-    pub lookahead_loads: u64,
-    /// Experts the lookahead loaded over a least-recently-used resident.
-    pub swaps: u64,
-    /// Lookahead requests dropped because the worker was busy.
-    pub lookahead_dropped: u64,
-    /// v2 M4: layer DMA gates captured at warmup.
-    /// v2 M4: layer DMA gates replayed.
-    pub gate_replays: u64,
-    /// v2 M4: DMA-gate waits launched warm (gate graph unavailable); 0 in the normal path.
-    pub staging_eager_waits: u64,
-    /// Experts DMA'd into a scratch slot and run on the GPU instead of the CPU (`--pcie-frac`).
-    pub pcie_misses: u64,
-    /// Bytes those DMAs moved host-to-device.
-    pub pcie_bytes: u64,
-}
-
-impl CacheStats {
-    pub fn hit_rate(&self) -> f64 {
-        self.hits as f64 / (self.hits + self.misses).max(1) as f64
-    }
-}
-
-/// Read and reset the counters; `None` when no expert cache is installed.
-pub fn take_stats() -> Option<CacheStats> {
-    let c = &COUNTERS;
-    if !c.installed.load(Ordering::Relaxed) {
-        return None;
-    }
-    let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
-    Some(CacheStats {
-        hits: take(&c.hits),
-        misses: take(&c.misses),
-        staged: take(&c.staged),
-        lookahead_loads: take(&c.lookahead_loads),
-        swaps: take(&c.swaps),
-        lookahead_dropped: crate::lookahead::dropped(),
-        pcie_misses: take(&c.pcie_misses),
-        pcie_bytes: take(&c.pcie_bytes),
-        gate_replays: take(&c.gate_replays),
-        staging_eager_waits: take(&c.staging_eager_waits),
-    })
-}
-
 
 /// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling
 /// layer `l + 1`'s slots. Weak references: the model owns the layers, not the registry.
