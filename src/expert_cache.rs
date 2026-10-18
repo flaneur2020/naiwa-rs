@@ -2189,24 +2189,10 @@ impl CachedLayer {
         }
 
         let n = rows * self.top_k;
-        // M6 P2: with the device dispatch armed the host does not need the selection itself - the kernel
-        // emits hits/misses with rows and weights - so the per-layer top-k readback (a host spin of a few
-        // hundred microseconds) is skipped entirely. That readback is the latency the flip is meant to
-        // remove; keeping it made the flip slower than the baseline.
-        #[cfg(feature = "cuda")]
-        let device_flip = dispatch_probe::use_device()
-            && self.top_k > 0
-            && topk_ids.elem_count() % self.top_k == 0
-            && topk_ids.elem_count() / self.top_k == rows;
-        #[cfg(not(feature = "cuda"))]
-        let device_flip = false;
-
         // Step 5 doorbell: lazily acquire (first decode), queue the ring on the same
         // stream the top-k kernels ran on, then spin host-side for the payload — no
         // stream sync, no D2H launch. Falls back to `to_vec2` when unavailable.
-        let ring = if device_flip {
-            None
-        } else {
+        let ring = {
             let mut st = self.state.lock().unwrap();
             if st.doorbell.is_none() {
                 let cap = n.max(8 * self.top_k).max(64);
@@ -2318,37 +2304,6 @@ impl CachedLayer {
         COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
 
 
-
-        // P2/S1 self-check: run the device dispatch on the same selection and compare it with what the
-        // host just decided. The host stays authoritative; this only proves the kernel agrees on real
-        // data before the switch is flipped.
-        #[cfg(feature = "cuda")]
-        if dispatch_probe::enabled() {
-            let resident = {
-                let st = self.state.lock().unwrap();
-                let mut bits = [0u32; 8];
-                for (&id, _) in st.slots.iter() {
-                    if id < 256 {
-                        bits[id >> 5] |= 1 << (id & 31);
-                    }
-                }
-                bits
-            };
-            let frac_num = (self.pcie_frac * 1000.0).round() as i32;
-            dispatch_probe::check(
-                &self.slot_device,
-                self.layer,
-                topk_ids,
-                topk_weights,
-                rows * self.top_k,
-                self.top_k,
-                frac_num,
-                1000,
-                resident,
-                n_hits,
-                misses.iter().map(Vec::len).sum(),
-            );
-        }
 
         // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
         // GPU with the hits, leaving the rest on the CPU. Every CUDA call stays on this thread.
@@ -2598,84 +2553,6 @@ impl RoutedExperts for CachedExperts {
     }
 }
 
-
-#[cfg(feature = "cuda")]
-mod dispatch_probe {
-    //! P2/S1 self-check: run the **device** dispatch on the real selection and compare it with what the
-    //! host decided. The host stays authoritative here - this only proves the kernel agrees before the
-    //! switch is flipped.
-
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use candle_core::Tensor;
-
-    use crate::doorbell::DispatchBuf;
-
-    static BUF: OnceLock<Mutex<Option<Arc<Mutex<DispatchBuf>>>>> = OnceLock::new();
-
-    pub(super) fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("NAIWA_DISPATCH_DBG").is_some())
-    }
-
-    /// Flip: use the device lists as authoritative instead of the host's hashing loop.
-    pub(super) fn use_device() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("NAIWA_DISPATCH_USE").is_some())
-    }
-
-    pub(super) fn buf_for(device: &candle_core::Device) -> Option<Arc<Mutex<DispatchBuf>>> {
-        buf(device, 64, 64 * 8)
-    }
-
-    fn buf(device: &candle_core::Device, layers: usize, max_hits: usize) -> Option<Arc<Mutex<DispatchBuf>>> {
-        let cell = BUF.get_or_init(|| Mutex::new(None));
-        let mut cell = cell.lock().unwrap();
-        if cell.is_none() {
-            *cell = DispatchBuf::acquire(device, layers, max_hits).ok().flatten().map(|b| Arc::new(Mutex::new(b)));
-        }
-        cell.clone()
-    }
-
-    /// `resident`: this layer's expert bitmap (8 words). Returns nothing; logs disagreements.
-    pub(super) fn check(
-        device: &candle_core::Device,
-        layer: usize,
-        ids: &Tensor,
-        weights: &Tensor,
-        n: usize,
-        top_k: usize,
-        frac_num: i32,
-        frac_den: i32,
-        resident: [u32; 8],
-        host_hits: usize,
-        host_misses: usize,
-    ) {
-        let Some(buf) = buf(device, 64, 64 * 8) else { return };
-        let Ok(mut b) = buf.try_lock() else { return };
-        {
-            b.bitmap_mut(layer).copy_from_slice(&resident);
-            if b.dispatch(layer, ids, weights, n, top_k, frac_num, frac_den).is_err() {
-                return;
-            }
-            let _ = device.synchronize();
-            let (hits, stream, cpu) = b.read(layer);
-            let miss_weights: f32 = stream.iter().chain(cpu.iter()).map(|e| e.2).sum();
-            if !miss_weights.is_finite() {
-                eprintln!("DISPATCH_DBG layer {layer} non-finite miss weights");
-            }
-            if hits.len() != host_hits || stream.len() + cpu.len() != host_misses {
-                eprintln!(
-                    "DISPATCH_DBG layer {layer} MISMATCH host hits {host_hits} misses {host_misses} \
-                     vs device hits {} stream {} cpu {}",
-                    hits.len(),
-                    stream.len(),
-                    cpu.len()
-                );
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
