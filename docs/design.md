@@ -234,7 +234,7 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 ```
 ~/code/naiwa-rs            engine + docs/ + harness/
   src/doorbell/            Doorbell/FlagBuf/ScheduleBuf + kernels
-    mod.rs ffi, topk.rs, flag.rs, schedule.rs, ptr_wait_tests.rs
+    mod.rs ffi, topk.rs, flag.rs, schedule.rs, tests.rs
   src/expert_cache/        GPU expert cache
     mod.rs                 module docs, constants, slot/bank/layer types
     provider.rs            RoutedExpertsProvider + layer construction

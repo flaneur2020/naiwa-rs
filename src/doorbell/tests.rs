@@ -1,4 +1,4 @@
-//! Mapped-memory wait/copy kernel tests (see `super`).
+//! Doorbell tests: the mapped-memory wait/copy kernels and the v2 schedule protocol.
 
 use super::*;
 use candle_core::{DType, Device, Tensor};

@@ -113,7 +113,7 @@ mod schedule;
 mod topk;
 
 #[cfg(all(test, feature = "cuda"))]
-mod ptr_wait_tests;
+mod tests;
 
 pub use flag::FlagBuf;
 pub use schedule::{ScheduleBuf, SYNC_CPU_EXPERTS, SYNC_PRELOAD, SYNC_STAGING};
