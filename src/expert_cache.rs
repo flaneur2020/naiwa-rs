@@ -2598,6 +2598,22 @@ impl CachedLayer {
         // Hit rate counts only experts actually resident in the cache. Staged ones are injected into
         // `hits` by `stream_pcie` below, so the count has to happen *before* it - otherwise a layer that
         // streams everything reads as a 100% cache hit.
+        // Probe `NAIWA_GPU_ONLY_EXPERTS`: once the cache is full, drop every expert that is not resident and
+        // never stage or compute one. This is *lossy* (the layer loses those experts' contribution, so the
+        // text changes) - it exists to measure what a round costs with no CPU leg and no DMA at all, i.e. the
+        // upper bound a perfect cache would give.
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("NAIWA_GPU_ONLY_EXPERTS").is_some() {
+            let full = {
+                let st = self.state.lock().unwrap();
+                st.resident[..st.usable].iter().all(|s| s.is_some())
+            };
+            if full {
+                for row in misses.iter_mut() {
+                    row.clear();
+                }
+            }
+        }
         let n_hits: usize = hits.iter().map(Vec::len).sum();
         COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
 
