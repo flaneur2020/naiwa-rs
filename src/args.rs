@@ -251,6 +251,14 @@ pub struct ModelOptions {
           value_parser = parse_unit_fraction)]
     pub pcie_frac: f32,
 
+    /// With `--cpu-moe`, how many predicted experts may displace a resident one per row and pass
+    /// (`--lookahead-swaps`, default 2, `0` disables replacement entirely so a prediction can only
+    /// fill an empty slot). Each swap is a 2 MB PCIe copy and a cache eviction, so lowering it trades
+    /// hit rate for less copy traffic; raising it trades traffic for hit rate.
+    #[arg(long = "lookahead-swaps", requires = "expert_cache_gb", default_value_t = 2,
+          value_name = "N")]
+    pub lookahead_swaps: usize,
+
     /// With `--cpu-moe`, run the routed experts of long prefill chunks on the GPU,
     /// uploading each layer's experts while the previous layer computes. Needs two layers' worth
     /// of expert memory in VRAM, borrowed from `--expert-cache-gb` while a prompt runs when that

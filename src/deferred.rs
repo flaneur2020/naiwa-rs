@@ -95,11 +95,16 @@ mod retired_probe {
     static N: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn record(t_submit: Instant, t_start: Instant) {
+        let done = Instant::now();
+        // Always account the gemv time, so `--round-stats` sees every job whatever path it took. This has
+        // to come before the probe's own early return.
+        crate::expert_cache::record_cpu_compute(
+            done.saturating_duration_since(t_start).as_nanos() as u64,
+        );
         let on = *ON.get_or_init(|| std::env::var_os("NAIWA_RET_DBG").is_some());
         if !on {
             return;
         }
-        let done = Instant::now();
         QUEUE_NS.fetch_add(
             t_start.saturating_duration_since(t_submit).as_nanos() as u64,
             Ordering::Relaxed,

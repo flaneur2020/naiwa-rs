@@ -116,6 +116,8 @@ struct Counters {
     installed: AtomicBool,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Experts served from the staging ring (PCIe), counted apart from cache hits.
+    staged: AtomicU64,
     lookahead_loads: AtomicU64,
     swaps: AtomicU64,
     pcie_misses: AtomicU64,
@@ -149,6 +151,7 @@ static COUNTERS: Counters = Counters {
     installed: AtomicBool::new(false),
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
+    staged: AtomicU64::new(0),
     lookahead_loads: AtomicU64::new(0),
     swaps: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
@@ -164,6 +167,8 @@ pub struct CacheStats {
     pub hits: u64,
     /// Routed experts of decode steps run on the CPU.
     pub misses: u64,
+    /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
+    pub staged: u64,
     /// Experts the lookahead loaded into empty slots.
     pub lookahead_loads: u64,
     /// Experts the lookahead loaded over a least-recently-used resident.
@@ -199,6 +204,7 @@ pub fn take_stats() -> Option<CacheStats> {
     Some(CacheStats {
         hits: take(&c.hits),
         misses: take(&c.misses),
+        staged: take(&c.staged),
         lookahead_loads: take(&c.lookahead_loads),
         swaps: take(&c.swaps),
         lookahead_dropped: crate::lookahead::dropped(),
@@ -235,10 +241,17 @@ pub struct GpuCacheMoeProvider {
     prefill: Option<PrefillStreams>,
     /// `--pcie-frac`: share of decode misses to DMA into scratch slots and run on the GPU.
     pcie_frac: f32,
+    /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass.
+    lookahead_swaps: usize,
 }
 
 impl GpuCacheMoeProvider {
-    pub fn new(cache_gb: f64, prefill: Option<PrefillStreams>, pcie_frac: f32) -> Self {
+    pub fn new(
+        cache_gb: f64,
+        prefill: Option<PrefillStreams>,
+        pcie_frac: f32,
+        lookahead_swaps: usize,
+    ) -> Self {
         COUNTERS.installed.store(true, Ordering::Relaxed);
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let registry: Arc<LayerRegistry> = Arc::default();
@@ -258,6 +271,7 @@ impl GpuCacheMoeProvider {
             copy_streams: CopyStreams::default(),
             prefill,
             pcie_frac,
+            lookahead_swaps,
         }
     }
 
@@ -627,6 +641,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             slot_bufs,
             banks,
             pcie_frac: self.pcie_frac,
+            lookahead_swaps: self.lookahead_swaps,
             prefill,
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),
@@ -892,6 +907,76 @@ mod lookahead_probe {
 /// or already done (GPU-bound: the stream ran dry waiting for the host)? Reports the busy
 /// and dry fractions plus the host wall time between layer entries — the number R2 (no
 /// host syncs, host runs ahead) competes to shrink is the DRY fraction.
+
+/// The CPU job's gemv time, reported per pass by `--round-stats` (`NAIWA_ROUND_STATS`).
+pub(crate) fn record_cpu_compute(ns: u64) {
+    round_stats::record_cpu_compute(ns);
+}
+
+/// Per-pass accounting of the three producers, so the bench can print where a round's MoE time went:
+/// resident hits, staged experts (PCIe) and CPU-computed misses, plus the CPU compute time that the
+/// deferred probe measured for this pass.
+mod round_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    static CPU_MISSES: AtomicU64 = AtomicU64::new(0);
+    static LAYERS: AtomicU64 = AtomicU64::new(0);
+    static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CPU_NS: AtomicU64 = AtomicU64::new(0);
+    static HEADER: Mutex<bool> = Mutex::new(false);
+
+    pub(super) fn record_plan(hits: usize, staged: usize, cpu: usize) {
+        HITS.fetch_add(hits as u64, Ordering::Relaxed);
+        STAGED.fetch_add(staged as u64, Ordering::Relaxed);
+        CPU_MISSES.fetch_add(cpu as u64, Ordering::Relaxed);
+    }
+
+    /// Called by the staging path: how many bytes this layer copied over PCIe.
+    pub(super) fn record_staged_bytes(bytes: u64) {
+        STAGED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Called by the CPU job when it finishes: the gemv time of one job.
+    pub(super) fn record_cpu_compute(ns: u64) {
+        CPU_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Called once per pass (layer 0).
+    pub(super) fn finish_pass(on: bool) {
+        let layers = LAYERS.fetch_add(1, Ordering::Relaxed) + 1;
+        if !on || layers % 4 != 0 {
+            return;
+        }
+        let h = HITS.swap(0, Ordering::Relaxed);
+        let st = STAGED.swap(0, Ordering::Relaxed);
+        let cpu = CPU_MISSES.swap(0, Ordering::Relaxed);
+        let bytes = STAGED_BYTES.swap(0, Ordering::Relaxed);
+        let cpu_ns = CPU_NS.swap(0, Ordering::Relaxed);
+        let sel = h + st + cpu;
+        if sel == 0 {
+            return;
+        }
+        let mut hdr = HEADER.lock().unwrap();
+        if !*hdr {
+            *hdr = true;
+            eprintln!(
+                "ROUND_STATS rounds hit% staged% cpu% staged_MiB cpu_ms/stage"
+            );
+        }
+        eprintln!(
+            "ROUND_STATS {layers} {:.1} {:.1} {:.1} {:.1} {:.2}",
+            100.0 * h as f64 / sel as f64,
+            100.0 * st as f64 / sel as f64,
+            100.0 * cpu as f64 / sel as f64,
+            bytes as f64 / (1024.0 * 1024.0),
+            cpu_ns as f64 / 1e6,
+        );
+    }
+}
+
 mod step_probe {
     use std::sync::Mutex;
     use std::time::Instant;
@@ -961,6 +1046,9 @@ mod step_probe {
         if layer != 0 {
             return;
         }
+        crate::expert_cache::round_stats::finish_pass(
+            std::env::var_os("NAIWA_ROUND_STATS").is_some(),
+        );
         let mut g = ROUND.lock().unwrap();
         let now = Instant::now();
         if let Some(prev) = g.0.replace(now) {
@@ -1548,6 +1636,9 @@ struct CachedLayer {
     slot_bufs: Vec<SlotEntry>,
     /// Copy-stream mode: the banks as `(first slot, len)`, in slot order. Lent whole.
     banks: Vec<(usize, usize)>,
+    /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass
+    /// (`0` means a prediction can only fill an empty slot).
+    lookahead_swaps: usize,
     /// `--pcie-frac`: share of a step's misses to stream over PCIe into the model-wide staging
     /// ring (held by the registry, created lazily at the first decode — `stream_pcie`; 0.0
     /// disables the feature).
@@ -1901,7 +1992,7 @@ impl CachedLayer {
         if self.copy_stream.is_none() {
             return Ok(());
         }
-        let max_swaps = max_lookahead_swaps() * rows;
+        let max_swaps = self.lookahead_swaps * rows;
         let mut swaps = 0;
         for &e in &predicted {
             if e >= self.num_experts {
@@ -2189,6 +2280,7 @@ impl CachedLayer {
                     // SAFETY: the stacks are page-locked, and `self.cpu` keeps them alive and
                     // unmodified for the model's lifetime, well past `done`.
                     unsafe {
+                        round_stats::record_staged_bytes(bytes as u64);
                         cs.queue_async(
                             &buf.fence,
                             &[
@@ -2464,6 +2556,9 @@ impl CachedLayer {
             }
         }
 
+        // Hit rate counts only experts actually resident in the cache. Staged ones are injected into
+        // `hits` by `stream_pcie` below, so the count has to happen *before* it - otherwise a layer that
+        // streams everything reads as a 100% cache hit.
         let n_hits: usize = hits.iter().map(Vec::len).sum();
         COUNTERS.hits.fetch_add(n_hits as u64, Ordering::Relaxed);
 
@@ -2512,6 +2607,13 @@ impl CachedLayer {
 
         let n_cpu: usize = misses.iter().map(Vec::len).sum();
         COUNTERS.misses.fetch_add(n_cpu as u64, Ordering::Relaxed);
+        // Experts that went to the staging ring: counted apart from both hits and CPU misses.
+        #[cfg(feature = "cuda")]
+        {
+            let staged_n: usize = hits.iter().map(Vec::len).sum::<usize>() - n_hits;
+            COUNTERS.staged.fetch_add(staged_n as u64, Ordering::Relaxed);
+            round_stats::record_plan(n_hits, staged_n, n_cpu);
+        }
 
         let compute: Option<Box<dyn FnOnce() -> candle_core::Result<Vec<f32>> + Send>> =
             if n_cpu == 0 {
@@ -3016,6 +3118,7 @@ mod tests {
             slot_bufs: Vec::new(),
             banks: Vec::new(),
             pcie_frac: 0.0,
+            lookahead_swaps: 2,
             prefill: None,
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),

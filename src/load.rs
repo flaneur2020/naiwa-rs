@@ -237,6 +237,7 @@ pub fn base_builder(
                 .prefill_stream
                 .then_some(model.prefill_stream_min_tokens.get()),
             model.pcie_frac,
+            model.lookahead_swaps,
         )?;
     }
     let paged = &model.paged_attn;
