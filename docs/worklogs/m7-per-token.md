@@ -1,6 +1,6 @@
 # M7 — reduce the per-token cost of speculative decode
 
-> Prerequisite reading: [`m6.md`](m6.md) for the round budget and [`perf-vs-strata.md`](../perf-vs-strata.md)
+> Prerequisite reading: [`m6.md`](m6.md) for the round budget and [`../design.md` §6.7](../design.md#67-the-gap-vs-strata)
 > for the comparison with Strata. M7 changes nothing about correctness gates: `frac 0` + `NO_LOOKAHEAD` stays
 > byte-exact against `harness/m1/reference.oracle.txt` after every commit.
 

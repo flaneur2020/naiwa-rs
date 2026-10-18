@@ -1,5 +1,5 @@
 // naiwa-rs v2 — M0 harness: zero-argument doorbell primitives.
-// See .plans/roadmap.md (M0) and .plans/worklogs/m0.md.
+// See docs/roadmap.md (M0) and docs/worklogs/m0.md.
 //
 // Proves the two properties the v2 architecture rests on:
 //
