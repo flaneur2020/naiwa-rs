@@ -96,14 +96,9 @@ const SCRATCH_RING_FIRST: usize = 1 << 30;
 /// Ring capacity: enough that consecutive layers' steps rarely collide on one slot, small
 /// enough to be a rounding error next to the cache. Strata uses 16 (`kStagingBlobs`).
 /// `NAIWA_SCRATCH_SLOTS` overrides.
-fn scratch_ring_slots() -> usize {
-    if let Ok(v) = std::env::var("NAIWA_SCRATCH_SLOTS") {
-        if let Ok(n) = v.trim().parse() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
+/// Staging-ring slots per quant shape. Measured: 16 and 64 perform identically (the ring has no id -> slot
+/// lookup, so a staged expert is copied again either way), so this is a constant, not a knob.
+const fn scratch_ring_slots() -> usize {
     16
 }
 
@@ -118,8 +113,6 @@ struct Counters {
     misses: AtomicU64,
     /// Experts served from the staging ring (PCIe), counted apart from cache hits.
     staged: AtomicU64,
-    /// Predicted CPU-only experts whose stacks were warmed into L3 (`NAIWA_CPU_PREFETCH`).
-    cpu_prefetched: AtomicU64,
     lookahead_loads: AtomicU64,
     swaps: AtomicU64,
     pcie_misses: AtomicU64,
@@ -154,7 +147,6 @@ static COUNTERS: Counters = Counters {
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
     staged: AtomicU64::new(0),
-    cpu_prefetched: AtomicU64::new(0),
     lookahead_loads: AtomicU64::new(0),
     swaps: AtomicU64::new(0),
     pcie_misses: AtomicU64::new(0),
@@ -172,7 +164,6 @@ pub struct CacheStats {
     pub misses: u64,
     /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
     pub staged: u64,
-    pub cpu_prefetched: u64,
     /// Experts the lookahead loaded into empty slots.
     pub lookahead_loads: u64,
     /// Experts the lookahead loaded over a least-recently-used resident.
@@ -209,7 +200,6 @@ pub fn take_stats() -> Option<CacheStats> {
         hits: take(&c.hits),
         misses: take(&c.misses),
         staged: take(&c.staged),
-        cpu_prefetched: take(&c.cpu_prefetched),
         lookahead_loads: take(&c.lookahead_loads),
         swaps: take(&c.swaps),
         lookahead_dropped: crate::lookahead::dropped(),
@@ -2017,40 +2007,6 @@ impl CachedLayer {
                 COUNTERS.swaps.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Warm the experts that will stay on the CPU (`NAIWA_CPU_PREFETCH`): the prediction gives their ids a
-        // layer early, and the machine has 32 MB of L3 while three experts are ~6.3 MB - so reading their
-        // three stacks here makes the later gemv come out of cache instead of DRAM. One byte per cache line
-        // pulls the whole line, so the sweep costs a DRAM read, not a copy.
-        if std::env::var_os("NAIWA_CPU_PREFETCH").is_some() {
-            let stay: Vec<usize> = predicted
-                .iter()
-                .copied()
-                .filter(|&e| e < self.num_experts)
-                .filter(|e| {
-                    let st = self.state.lock().unwrap();
-                    st.slots.get(e).is_none()
-                })
-                .collect();
-            if !stay.is_empty() {
-                if let Some((gate, up, down)) = self.cpu.expert_qtensors() {
-                    for &e in &stay {
-                        for stack in [&gate, &up, &down] {
-                            if let Ok(Some(bytes)) = host_memory::stack_bytes(stack, e, self.num_experts) {
-                                let mut sink = 0u64;
-                                let mut i = 0;
-                                while i < bytes.len() {
-                                    // SAFETY: `i` is inside the stack's bytes.
-                                    sink ^= unsafe { std::ptr::read_volatile(bytes.as_ptr().add(i)) } as u64;
-                                    i += 64;
-                                }
-                                std::hint::black_box(sink);
-                            }
-                        }
-                    }
-                    COUNTERS.cpu_prefetched.fetch_add(stay.len() as u64, Ordering::Relaxed);
-                }
-            }
-        }
         // Claim then publish: a reader that sees `pass` knows the point is coming.
         if let Some(sched) = schedule() {
             self.preload_claimed.store(pass, Ordering::Release);
@@ -3093,19 +3049,9 @@ mod tests {
     }
 
     #[test]
-    fn scratch_ring_slots_default_and_override() {
-        // The default matches Strata's kStagingBlobs; NAIWA_SCRATCH_SLOTS overrides, and
-        // zero/garbage fall back to the default rather than disabling the ring.
-        let default = scratch_ring_slots();
-        assert!(default >= 8);
-        std::env::set_var("NAIWA_SCRATCH_SLOTS", "24");
-        assert_eq!(scratch_ring_slots(), 24);
-        std::env::set_var("NAIWA_SCRATCH_SLOTS", "0");
-        assert_eq!(scratch_ring_slots(), default);
-        std::env::set_var("NAIWA_SCRATCH_SLOTS", "not-a-number");
-        assert_eq!(scratch_ring_slots(), default);
-        std::env::remove_var("NAIWA_SCRATCH_SLOTS");
-        assert_eq!(scratch_ring_slots(), default);
+    fn scratch_ring_slots_is_fixed() {
+        // Measured: 16 and 64 slots perform identically, so the ring size is a constant (M9).
+        assert_eq!(scratch_ring_slots(), 16);
     }
 
     #[test]

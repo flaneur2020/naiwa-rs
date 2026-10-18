@@ -63,26 +63,6 @@ fn host_bytes(stack: &QTensor) -> candle_core::Result<Option<&[u8]>> {
 }
 
 /// Huge-page every expert stack of `experts`. Returns the bytes advised.
-/// Expert `expert`'s byte slice in one `[E, N, K]` stack, for the CPU-side prefetch.
-pub fn stack_bytes(
-    stack: &QTensor,
-    expert: usize,
-    num_experts: usize,
-) -> candle_core::Result<Option<&[u8]>> {
-    let Some(all) = host_bytes(stack)? else {
-        return Ok(None);
-    };
-    if num_experts == 0 {
-        return Ok(None);
-    }
-    let per = all.len() / num_experts;
-    let start = expert * per;
-    if start + per > all.len() {
-        return Ok(None);
-    }
-    Ok(Some(&all[start..start + per]))
-}
-
 pub fn advise_expert_stacks(experts: &MoEExperts) -> candle_core::Result<usize> {
     let Some((gate, up, down)) = experts.expert_qtensors() else {
         return Ok(0);
