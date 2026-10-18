@@ -318,9 +318,14 @@ impl GpuCacheMoeProvider {
         }
         #[allow(unused_mut)]
         let mut captures = 0usize;
+        // Probe `NAIWA_NO_CAPTURE`: skip every segment capture, so decode runs the eager segment path. Used to
+        // price what the per-layer graphs are worth (they cost ~36 us each to instantiate and 12-15 us per
+        // replay, against ~5-6 us per raw launch).
         #[cfg(feature = "cuda")]
-        for layer in &layers {
-            captures += layer.warmup_captures(DType::BF16)?;
+        if std::env::var_os("NAIWA_NO_CAPTURE").is_none() {
+            for layer in &layers {
+                captures += layer.warmup_captures(DType::BF16)?;
+            }
         }
         let mut rings = 0usize;
         if self.pcie_frac > 0.0 {
