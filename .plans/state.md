@@ -101,6 +101,10 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0. **M7 = 降低 MTP 单 token 成本**(`worklogs/m7.md`)。指标 = 轮时间 / token 数;当前 np2/frac 0.2/cache 4 =
+   47 ms/token(21.0 tok/s),目标 ≤35 ms/token(≥28 tok/s)。五步:M7.1 copy stream 优先级(staging 先于预载)
+   → M7.2 藏住 CPU payload(20% 轮时间,用预测复用做 CPU 侧预载)→ M7.3 预载过度替换(2380 次 over residents
+   vs 470 次进空槽)→ M7.4 attention 区域捕获(host 发射链 20 ms)→ M7.5 接受率策略化。
 0. **M6 = 性能里程碑**(`worklogs/m6.md`;图形捕获那部分已改名 `m6-graph.md`)。当前:80-85 ms TPOT /
    11.6-12.4 tok/s(`frac 0` + NO_LOOKAHEAD,**19.7% 命中**);出货配置 78-87 ms、**81-84% 命中**。
    已划掉:更大缓存(实测更慢)、GPU kernel(GPU 98% 空闲)、整步图(不可行)、attention 捕获(1-4 ms)。
