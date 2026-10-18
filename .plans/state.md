@@ -101,6 +101,11 @@ cargo test --offline --release --features cuda          # 33/33
 
 ## 下一步（M5c / M6）
 
+0. **M8 = 削减 host 发射链**(`worklogs/m8.md`)。依据:M7 的完美缓存探针只给 +8%,所以 92% 的轮时间是
+   GPU 计算(40 ms)+ host 发射链(~70 ms)。M8.1 捕获 attention 区域(常驻输入与 `dispatch_topk` 列表已就绪,
+   只差 mixer 窗口接线)→ M8.2 把单节点门并入段图(捕获按层,可直接烘 sync id)→ M8.3 捕获 MTP 块 →
+   M8.4 在 `--depth 2048/4096` 重测(现有全部数字都是 4-token 上下文)。目标:每层 30-40 次 launch → 1-2 次,
+   轮 185 → ~125 ms,单 token 23.1 → ~15.6 ms。
 0. **M7 已收尾**:完美缓存(`NAIWA_GPU_ONLY_EXPERTS`)只值 **+8%**(47.4 vs 43.9 tok/s),即
    **miss 路径整体不到一轮的 1/10**;92% 是 GPU 计算(~40 ms/轮)+ host 发射链(~70 ms/轮)。带宽/缓存这条线
    到顶,已否证:交错重排、L3 预热、环加大(16→64 无变化)、第二条 stream(只值 3 ms)、更大缓存(更慢)。
