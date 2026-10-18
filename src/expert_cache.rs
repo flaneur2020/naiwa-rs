@@ -233,6 +233,8 @@ pub struct GpuCacheMoeProvider {
     pcie_frac: f32,
     /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass.
     lookahead_swaps: usize,
+    /// `--no-lookahead`: the provider's prediction is off (tests only).
+    lookahead: bool,
 }
 
 impl GpuCacheMoeProvider {
@@ -241,6 +243,7 @@ impl GpuCacheMoeProvider {
         prefill: Option<PrefillStreams>,
         pcie_frac: f32,
         lookahead_swaps: usize,
+        lookahead: bool,
     ) -> Self {
         COUNTERS.installed.store(true, Ordering::Relaxed);
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -262,6 +265,7 @@ impl GpuCacheMoeProvider {
             prefill,
             pcie_frac,
             lookahead_swaps,
+            lookahead,
         }
     }
 
@@ -633,6 +637,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             banks,
             pcie_frac: self.pcie_frac,
             lookahead_swaps: self.lookahead_swaps,
+            lookahead: self.lookahead,
             prefill,
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),
@@ -816,7 +821,7 @@ fn lru_victim(
 }
 
 /// `NAIWA_LOOKAHEAD_DBG=1`: per decode step, the synchronous D2H of the activation that the lookahead
-/// needs, in ms. `NAIWA_NO_LOOKAHEAD=1` skips the prediction (and its D2H) entirely, so the cache only
+/// needs, in ms. `--no-lookahead` skips the prediction (and its D2H) entirely, so the cache only
 /// ever holds what prefill left, and the A/B is the price of the prediction against its benefit.
 mod lookahead_probe {
     use std::sync::Mutex;
@@ -1452,6 +1457,8 @@ struct CachedLayer {
     /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass
     /// (`0` means a prediction can only fill an empty slot).
     lookahead_swaps: usize,
+    /// `--no-lookahead`: this layer does not predict for the next one.
+    lookahead: bool,
     /// `--pcie-frac`: share of a step's misses to stream over PCIe into the model-wide staging
     /// ring (held by the registry, created lazily at the first decode — `stream_pcie`; 0.0
     /// disables the feature).
@@ -2104,7 +2111,7 @@ impl CachedLayer {
         // obsolete with the channel path.
         if let Some(next) = self.registry.get(self.layer + 1) {
             if next.router.is_some() {
-                let queued = std::env::var_os("NAIWA_NO_LOOKAHEAD").is_none();
+                let queued = self.lookahead;
                 if !self.slot_device.is_cuda() {
                     // Non-CUDA slot device: cheap host copy, same job shape.
                     let x = x2d.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
@@ -2416,7 +2423,7 @@ impl CachedLayer {
         // per layer, like the `cudaStreamWaitEvent` it replaces, so the protocol stays one protocol.
         // M5b: same for the preload point, but only when this pass was actually claimed — a layer
         // with no preload this pass has nothing to wait for, and replaying its gate would wait for a
-        // publish that nobody owes (`NAIWA_NO_LOOKAHEAD` makes that the normal case).
+        // publish that nobody owes (`--no-lookahead` makes that the normal case).
         #[cfg(feature = "cuda")]
         if self.preload_claimed.load(Ordering::Acquire) == pass {
             self.replay_gate(crate::doorbell::SYNC_PRELOAD)?;
@@ -2734,6 +2741,7 @@ mod tests {
             banks: Vec::new(),
             pcie_frac: 0.0,
             lookahead_swaps: 2,
+            lookahead: true,
             prefill: None,
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),

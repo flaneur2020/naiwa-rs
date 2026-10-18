@@ -237,6 +237,13 @@ pub struct ModelOptions {
     #[arg(long)]
     pub cpu_moe: bool,
 
+    /// With `--cpu-moe`, turn the next-layer expert prediction off: no router matmul, no preload copies, so
+    /// the cache only ever holds what the miss path put there. Deterministic for the oracle gates (the
+    /// prediction changes which experts are resident, hence the split, hence the last-bit rounding), and much
+    /// slower - it exists for tests, not for serving.
+    #[arg(long = "no-lookahead", requires = "cpu_moe")]
+    pub no_lookahead: bool,
+
     /// With `--cpu-moe`, cache the most-used routed experts in VRAM for decode, in GiB.
     #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
     pub expert_cache_gb: Option<f64>,

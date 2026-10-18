@@ -25,7 +25,7 @@ LOG="$OUT/serve.$TAG.log"
     -m "$HOME/models/qwen3-coder/requant" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
     --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
-    --pa-context-len "$PA_CTX" --prefix-cache-n 0 $EXTRA \
+    --pa-context-len "$PA_CTX" --prefix-cache-n 0 ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
     --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true' EXIT

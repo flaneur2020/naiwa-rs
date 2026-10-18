@@ -33,6 +33,7 @@ pub fn install_cpu_moe(
     prefill_stream: Option<usize>,
     pcie_frac: f32,
     lookahead_swaps: usize,
+    lookahead: bool,
 ) -> Result<()> {
     let prefill = prefill_stream.map(PrefillStreams::new);
     if let Some(min_tokens) = prefill_stream {
@@ -41,7 +42,7 @@ pub fn install_cpu_moe(
         );
     }
     if let Some(gb) = expert_cache_gb {
-        let provider = Arc::new(GpuCacheMoeProvider::new(gb, prefill, pcie_frac, lookahead_swaps));
+        let provider = Arc::new(GpuCacheMoeProvider::new(gb, prefill, pcie_frac, lookahead_swaps, lookahead));
         let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
         install_routed_experts_provider(provider)?;
         info!(
