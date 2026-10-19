@@ -1,6 +1,5 @@
 //! The `RoutedExpertsProvider` that builds one cached layer per MoE block.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,12 +9,12 @@ use tracing::{debug, info, warn};
 use crate::copy_stream::CopyStreams;
 use crate::host_memory::{self, PinnedStack};
 use crate::offload::{attach_prefill, CpuExperts};
-use crate::prefill_stream::PrefillStreams;
+use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;
 
 use super::{
-    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CacheLoan, CachedExperts, CachedLayer,
-    CachedLayerState, LayerRegistry, LookaheadChannel, SlotEntry, SCHEDULE, WAITS_PER_LAYER,
+    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer,
+    LayerRegistry, LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,11 +60,8 @@ impl GpuCacheMoeProvider {
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let registry: Arc<LayerRegistry> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
-        let prefill = prefill.map(|p| {
-            p.with_lender(Arc::new(CacheLoan {
-                registry: Arc::clone(&registry),
-            }))
-        });
+        let lender: Arc<dyn ExpertMemoryLender> = registry.clone();
+        let prefill = prefill.map(|p| p.with_lender(lender));
         Self {
             cache_gb,
             inner: Mutex::new(ProviderInner {
@@ -324,16 +320,19 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             .filter(|&(_, len)| len > 0)
             .collect();
         let mut copy_stream = self.copy_streams.get(&slot_device);
-        let mut slot_bufs = Vec::new();
+        let slots: Vec<Slot> = (0..num_slots).map(|_| Slot::empty()).collect();
         if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
             for &(first, len) in &banks {
-                for buf in alloc_bank(cs, &stacks, first, len, &slot_device)? {
-                    slot_bufs.push(SlotEntry::new(Some(buf)));
+                for (i, buf) in alloc_bank(cs, &stacks, first, len, &slot_device)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    *slots[first + i].storage.lock() = Some(buf);
                 }
             }
             cs.after_device_work()?;
         }
-        if slot_bufs.is_empty() {
+        if slots.iter().all(|s| s.storage.lock().is_none()) {
             copy_stream = None;
         }
 
@@ -344,7 +343,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // some load orders (W105: 33 MiB at 11.6 GiB free, OOM in 2 of 3 runs). Once load has
         // finished the allocator has large free blocks left, where it fits reliably.
         // The ring's `first` sits past every resident slot, and it is kept out of
-        // `slot_bufs`/`banks`, so `lend`/`give_back`/`admit`/`replace` never see it; `run_hits`
+        // slot storage/banks, so `lend`/`give_back`/`admit`/`replace` never see it; `run_hits`
         // picks it up only because the injected hits carry its `Arc<Bank>`.
 
         let cached = Arc::new(CachedLayer {
@@ -360,19 +359,15 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             router,
             lookahead_chan,
             #[cfg(feature = "cuda")]
-            state: Mutex::new(CachedLayerState {
+            state: Mutex::new(LayerState {
                 doorbell: None,
                 doorbell_seq: 0,
-                slots: HashMap::new(),
-                resident: vec![None; num_slots],
+                slots,
                 hit_counts: vec![0u64; num_experts],
-                last_use: vec![0u64; num_slots],
                 tick: 0,
-                published: vec![None; num_slots],
                 usable: num_slots,
             }),
             copy_stream,
-            slot_bufs,
             banks,
             pcie_frac: self.pcie_frac,
             lookahead_swaps: self.lookahead_swaps,

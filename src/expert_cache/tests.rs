@@ -3,9 +3,34 @@
 use super::*;
 use super::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 use candle_core::quantized::GgmlDType;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+fn slot(expert: Option<usize>, last_use: u64) -> Slot {
+    let mut s = Slot::empty();
+    s.expert = expert;
+    s.last_use = last_use;
+    s
+}
+
+fn slots(experts: &[Option<usize>]) -> Vec<Slot> {
+    experts.iter().map(|&e| slot(e, 0)).collect()
+}
+
+fn published_slot(expert: usize, last_use: u64) -> Slot {
+    let qt = Arc::new(stacked(1, 1, 32));
+    let proj = Projections {
+        gate: Arc::clone(&qt),
+        up: Arc::clone(&qt),
+        down: qt,
+    };
+    let mut s = slot(Some(expert), last_use);
+    s.buf = Some(Arc::new(SlotBuf {
+        data: SlotData::Owned(proj),
+        fence: ReadFence::none(),
+    }));
+    s
+}
 
 /// A stacked `[E, N, K]` Q8_0 tensor whose experts hold distinct values.
 fn stacked(e: usize, n: usize, k: usize) -> QTensor {
@@ -57,13 +82,16 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
     // expert 2 is hottest but already reserved; 3 and 1 tie, lowest id wins
     let resident = [Some(2), None];
     let hits = [0, 5, 9, 5];
-    assert_eq!(fill_candidate(&resident, &hits), Some(1));
+    assert_eq!(fill_candidate(&slots(&resident), &hits), Some(1));
     // with no history, fill in id order
-    assert_eq!(fill_candidate(&[None, None], &[0, 0, 0]), Some(0));
+    assert_eq!(fill_candidate(&slots(&[None, None]), &[0, 0, 0]), Some(0));
     // full layer: nothing to do
-    assert_eq!(fill_candidate(&[Some(0), Some(1)], &[3, 3, 3]), None);
+    assert_eq!(fill_candidate(&slots(&[Some(0), Some(1)]), &[3, 3, 3]), None);
     // every expert already placed
-    assert_eq!(fill_candidate(&[Some(0), Some(1), None], &[1, 1]), None);
+    assert_eq!(
+        fill_candidate(&slots(&[Some(0), Some(1), None]), &[1, 1]),
+        None
+    );
 }
 
 #[test]
@@ -110,12 +138,15 @@ fn top_k_ids_orders_by_logit_then_index() {
 
 #[test]
 fn lru_victim_skips_protected_and_prefers_oldest() {
-    // expert -> slot; slot 1 is oldest but holds a protected (predicted) expert
-    let slots = HashMap::from([(10, 0), (11, 1), (12, 2)]);
-    let last_use = [5, 1, 3];
-    assert_eq!(lru_victim(&slots, &last_use, &[11]), Some((12, 2)));
-    assert_eq!(lru_victim(&slots, &last_use, &[]), Some((11, 1)));
-    assert_eq!(lru_victim(&slots, &last_use, &[10, 11, 12]), None);
+    // slot 1 is oldest but holds a protected (predicted) expert
+    let slots = vec![
+        published_slot(10, 5),
+        published_slot(11, 1),
+        published_slot(12, 3),
+    ];
+    assert_eq!(lru_victim(&slots, &[11]), Some((12, 2)));
+    assert_eq!(lru_victim(&slots, &[]), Some((11, 1)));
+    assert_eq!(lru_victim(&slots, &[10, 11, 12]), None);
 }
 
 /// A cached layer on the CPU (fresh-upload mode) over small Q8_0 stacks: `e` experts,
@@ -155,19 +186,15 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         act: Activation::Silu,
         router: None,
         lookahead_chan: None,
-        state: Mutex::new(CachedLayerState {
+        state: Mutex::new(LayerState {
             doorbell: None,
             doorbell_seq: 0,
-            slots: HashMap::new(),
-            resident: vec![None; slots],
+            slots: (0..slots).map(|_| Slot::empty()).collect(),
             hit_counts: vec![0; e],
-            last_use: vec![0; slots],
             tick: 0,
-            published: vec![None; slots],
             usable: slots,
         }),
         copy_stream: None,
-        slot_bufs: Vec::new(),
         banks: Vec::new(),
         pcie_frac: 0.0,
         lookahead_swaps: 2,
@@ -194,9 +221,12 @@ fn lent_slots_leave_service_and_come_back_refilled() {
     {
         let st = layer.state.lock().unwrap();
         assert_eq!(st.usable, 2);
-        assert_eq!(st.resident, vec![Some(5), Some(6), None, None]);
-        assert!(st.published[2].is_none() && st.published[3].is_none());
-        assert_eq!(st.slots.len(), 2);
+        assert_eq!(
+            st.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
+            vec![Some(5), Some(6), None, None]
+        );
+        assert!(st.slots[2].buf.is_none() && st.slots[3].buf.is_none());
+        assert_eq!(st.slots.iter().filter(|s| s.buf.is_some()).count(), 2);
     }
     // no room while lent: lent slots are not admitted into, nor filled
     assert!(layer.admit(1, true).unwrap().is_none());
@@ -208,8 +238,11 @@ fn lent_slots_leave_service_and_come_back_refilled() {
     wait_for_fill(&layer);
     let st = layer.state.lock().unwrap();
     assert_eq!(st.usable, 4);
-    assert_eq!(st.resident, vec![Some(5), Some(6), Some(2), Some(3)]);
-    assert!(st.published.iter().all(Option::is_some));
+    assert_eq!(
+        st.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
+        vec![Some(5), Some(6), Some(2), Some(3)]
+    );
+    assert!(st.slots[..4].iter().all(|s| s.buf.is_some()));
 }
 
 #[test]

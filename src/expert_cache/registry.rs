@@ -28,15 +28,11 @@ impl LayerRegistry {
     }
 }
 
-/// Lends the cache's tail slots to the prefill stream while a prompt runs (see
-/// `prefill_stream`): each layer gives up an equal share of the bytes asked for.
-pub(super) struct CacheLoan {
-    pub(super) registry: Arc<LayerRegistry>,
-}
-
-impl ExpertMemoryLender for CacheLoan {
+// Lends the cache's tail slots to the prefill stream while a prompt runs (see
+// `prefill_stream`): each layer gives up an equal share of the bytes asked for.
+impl ExpertMemoryLender for LayerRegistry {
     fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
-        let layers = self.registry.all();
+        let layers = self.all();
         let share = bytes.div_ceil(layers.len().max(1));
         Ok(layers
             .iter()
@@ -51,7 +47,7 @@ impl ExpertMemoryLender for CacheLoan {
     }
 
     fn give_back(&self) -> candle_core::Result<()> {
-        for layer in self.registry.all() {
+        for layer in self.all() {
             layer.give_back()?;
         }
         Ok(())

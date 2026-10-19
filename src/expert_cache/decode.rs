@@ -409,12 +409,12 @@ impl CachedLayer {
                     st.hit_counts[id as usize] += 1;
                     let resident = st
                         .slots
-                        .get(&(id as usize))
-                        .copied()
-                        .and_then(|slot| st.published[slot].clone().map(|buf| (slot, buf)));
+                        .iter()
+                        .position(|s| s.expert == Some(id as usize) && s.buf.is_some())
+                        .map(|slot| (slot, st.slots[slot].buf.clone().unwrap()));
                     match resident {
                         Some((slot, buf)) => {
-                            st.last_use[slot] = tick;
+                            st.slots[slot].last_use = tick;
                             hits[t].push((buf, slot, w));
                         }
                         None => misses[t].push((id, w)),
@@ -434,7 +434,7 @@ impl CachedLayer {
         if std::env::var_os("NAIWA_GPU_ONLY_EXPERTS").is_some() {
             let full = {
                 let st = self.state.lock().unwrap();
-                st.resident[..st.usable].iter().all(|s| s.is_some())
+                st.slots[..st.usable].iter().all(|s| s.expert.is_some())
             };
             if full {
                 for row in misses.iter_mut() {

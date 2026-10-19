@@ -55,7 +55,6 @@ pub(in crate::expert_cache) use layer::{streamed_misses, LookaheadChannel};
 pub(in crate::expert_cache) use layer::{
     fill_candidate, lru_victim, top_k_ids, union_by_votes,
 };
-pub(in crate::expert_cache) use registry::CacheLoan;
 pub(in crate::expert_cache) use staging::alloc_bank;
 
 use std::collections::HashMap;
@@ -136,31 +135,43 @@ struct LayerRegistry {
 /// stacks' dtype.
 type ScratchKey = ([usize; 3], u8);
 
-struct CachedLayerState {
-    /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host
-    /// read needs no stream sync or D2H (the pattern the doorbell harness proved).
-    /// Acquired lazily at first decode; None on non-CUDA or alloc failure, where
-    /// decode keeps the `to_vec2` path. In the state lock for interior mutability
-    /// through the shared `Arc`.
+/// One cache slot: reservation/published state, permanent storage, and LRU age.
+/// See the state list in `m9a.md`; `storage` is cloned out under the state lock so uploads and
+/// lending never hold the state lock while waiting for readers.
+struct Slot {
+    /// Reserved (weights copying) or published expert; `None` = empty.
+    expert: Option<usize>,
+    /// Published contents. Readers clone this `Arc` under the state lock, so a later fill never
+    /// changes what an in-flight token computes with.
+    buf: Option<Arc<SlotBuf>>,
+    /// Copy-stream mode: the slot's permanent buffer; `None` while lent.
+    storage: Arc<parking_lot::Mutex<Option<Arc<SlotBuf>>>>,
+    /// `tick` of the last decode hit or fill; drives LRU replacement.
+    last_use: u64,
+}
+
+impl Slot {
+    fn empty() -> Self {
+        Self {
+            expert: None,
+            buf: None,
+            storage: Arc::new(parking_lot::Mutex::new(None)),
+            last_use: 0,
+        }
+    }
+}
+
+struct LayerState {
+    /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host read needs
+    /// no stream sync or D2H. Acquired lazily at first decode.
     doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
     /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
     doorbell_seq: u32,
-    /// Published residents: expert id -> slot. Only experts whose weights are fully written
-    /// appear here, and it is the only table readers consult.
-    slots: HashMap<usize, usize>,
-    /// Slot -> expert id, set when a slot is *reserved* (before its weights are written), so
-    /// two admitters can never claim the same slot.
-    resident: Vec<Option<usize>>,
+    slots: Vec<Slot>,
     hit_counts: Vec<u64>,
-    /// Slot -> `tick` of its last decode hit (or its fill); drives LRU replacement.
-    last_use: Vec<u64>,
     /// Decode steps seen by this layer.
     tick: u64,
-    /// Slot -> its contents, for the slots listed in `slots`. Readers clone the `Arc` under
-    /// the lock, so a slot replaced later never changes what an in-flight token computes with.
-    published: Vec<Option<Arc<SlotBuf>>>,
-    /// Slots `[0, usable)` are in service; the rest are lent to the prefill stream (empty,
-    /// unpublished, and without device memory in copy-stream mode).
+    /// Slots `[0, usable)` are in service; the rest are lent to the prefill stream.
     usable: usize,
 }
 
@@ -197,11 +208,6 @@ struct SlotBuf {
     fence: ReadFence,
 }
 
-/// A slot's permanent buffer in copy-stream mode; `None` while the slot is lent. An upload
-/// holds the lock for its duration, so lending a slot waits for any upload into it.
-type SlotEntry = parking_lot::Mutex<Option<Arc<SlotBuf>>>;
-
-
 /// The model-wide `--pcie-frac` staging ring (see `SCRATCH_RING_FIRST`): one bank of slots
 /// past every resident slot, shared by every layer, borrowed round-robin per decode step.
 ///
@@ -235,12 +241,10 @@ struct CachedLayer {
     router: Option<Tensor>,
     /// R2a: the layer's GPU->host activation channel. `Some` only when the router exists
     /// and the slot device is CUDA.
-    lookahead_chan: Option<LookaheadChannel>,
-    state: Mutex<CachedLayerState>,
+    lookahead_chan: Option<Arc<LookaheadChannel>>,
+    state: Mutex<LayerState>,
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     copy_stream: Option<Arc<CopyStream>>,
-    /// Copy-stream mode: every slot's permanent buffer (empty otherwise).
-    slot_bufs: Vec<SlotEntry>,
     /// Copy-stream mode: the banks as `(first slot, len)`, in slot order. Lent whole.
     banks: Vec<(usize, usize)>,
     /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass

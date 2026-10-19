@@ -11,7 +11,7 @@ use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Projections,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Projections, Slot,
     SlotBuf, SlotData,
 };
 
@@ -23,17 +23,9 @@ use super::{
 /// wait) and no way for the prediction to queue late on the stream (the W99 failure that
 /// made an earlier mode switch regress hit 74% -> 38-45%).
 pub(super) struct LookaheadChannel {
-    /// The channel's shared half: the mapped activation doorbell plus the publish/consume
-    /// counters the token thread (publish) and lookahead worker (consume) share.
-    inner: std::sync::Arc<LookaheadShared>,
-}
-
-/// Per-channel shared state. `next_seq` is touched only by the token thread;
-/// `consumed` is written by whichever worker job ran last for this channel.
-pub(super) struct LookaheadShared {
     pub(super) chan: Arc<crate::doorbell::ActivationDoorbell>,
     /// The seq the last queued GPU publish will bump the counter to (0 before any):
-    /// `last_seq + 1` is the value `wait_publish` waits for.
+    /// `last_seq + 1` is the value `wait_publish` waits for. Touched only by the token thread.
     pub(super) next_seq: std::sync::atomic::AtomicU32,
     /// How many queued publishes the worker has consumed (`wait_publish` returned).
     /// The difference to `next_seq` is the queue depth; publish backpressure keeps
@@ -51,47 +43,52 @@ impl LookaheadChannel {
     /// the whole allocation into the neighboring doorbell buffer: garbage
     /// router ids shaped like the activation's f32 bits (W106). 16 rows is
     /// headroom over any current window (np4 verify = 5, observed verify = 7).
-    pub(super) fn new(device: &Device, max_rows: usize, hidden: usize) -> candle_core::Result<Option<Self>> {
+    pub(super) fn new(
+        device: &Device,
+        max_rows: usize,
+        hidden: usize,
+    ) -> candle_core::Result<Option<Arc<Self>>> {
         let max_rows = max_rows.max(16);
-        Ok(crate::doorbell::ActivationDoorbell::acquire(device, max_rows * hidden)
-            .ok()
-            .flatten()
-            .map(|chan| Self {
-                inner: std::sync::Arc::new(LookaheadShared {
-                    chan: Arc::new(chan),
-                    next_seq: std::sync::atomic::AtomicU32::new(0),
-                    consumed: std::sync::atomic::AtomicU32::new(0),
+        Ok(
+            crate::doorbell::ActivationDoorbell::acquire(device, max_rows * hidden)
+                .ok()
+                .flatten()
+                .map(|chan| {
+                    Arc::new(Self {
+                        chan: Arc::new(chan),
+                        next_seq: std::sync::atomic::AtomicU32::new(0),
+                        consumed: std::sync::atomic::AtomicU32::new(0),
+                    })
                 }),
-            }))
+        )
     }
 
     /// Queue the publish on the stream (token thread): one kernel writes the `[rows,
-    /// hidden]` activation into a slot and bumps seq. Returns the `LookaheadShared`
-    /// handle plus the `last_seq` the worker job needs to wait and read, or `None` when
-    /// the worker is more than `depth - 1` publishes behind — the prediction is advisory,
-    /// so skipping this publish is cheaper than overwriting an unread slot.
+    /// hidden]` activation into a slot and bumps seq. Returns this channel plus the
+    /// `last_seq` the worker job needs to wait and read, or `None` when the worker is more
+    /// than `depth - 1` publishes behind — the prediction is advisory, so skipping this
+    /// publish is cheaper than overwriting an unread slot.
     pub(super) fn publish(
-        &self,
+        self: &Arc<Self>,
         x: &Tensor,
         n: usize,
-    ) -> candle_core::Result<Option<(std::sync::Arc<LookaheadShared>, u32)>> {
-        let sh = &self.inner;
+    ) -> candle_core::Result<Option<(Arc<Self>, u32)>> {
         // Hard error, not a skip: an oversized publish would overflow the slot
         // (the doorbell checks too, but fail before queueing anything).
-        if n > sh.chan.max_n() {
+        if n > self.chan.max_n() {
             candle_core::bail!(
                 "lookahead publish of {n} f32 exceeds the channel slot ({})",
-                sh.chan.max_n()
+                self.chan.max_n()
             );
         }
-        let next = sh.next_seq.load(Ordering::Relaxed);
-        let consumed = sh.consumed.load(Ordering::Relaxed);
-        if next - consumed >= (sh.chan.depth() as u32).saturating_sub(1) {
+        let next = self.next_seq.load(Ordering::Relaxed);
+        let consumed = self.consumed.load(Ordering::Relaxed);
+        if next - consumed >= (self.chan.depth() as u32).saturating_sub(1) {
             return Ok(None); // backpressure: an unread slot would be overwritten
         }
-        sh.chan.publish(x, n, next)?;
-        sh.next_seq.store(next + 1, Ordering::Relaxed);
-        Ok(Some((std::sync::Arc::clone(sh), next)))
+        self.chan.publish(x, n, next)?;
+        self.next_seq.store(next + 1, Ordering::Relaxed);
+        Ok(Some((Arc::clone(self), next)))
     }
 }
 
@@ -102,12 +99,12 @@ impl LookaheadChannel {
 
 /// The most-routed expert not in (or reserved for) a slot, ties to the lowest id; `None` when
 /// every slot is taken.
-pub(super) fn fill_candidate(resident: &[Option<usize>], hit_counts: &[u64]) -> Option<usize> {
-    if !resident.contains(&None) {
+pub(super) fn fill_candidate(slots: &[Slot], hit_counts: &[u64]) -> Option<usize> {
+    if slots.iter().all(|s| s.expert.is_some()) {
         return None;
     }
     let mut taken = vec![false; hit_counts.len()];
-    for &e in resident.iter().flatten() {
+    for e in slots.iter().filter_map(|s| s.expert) {
         taken[e] = true;
     }
     (0..hit_counts.len())
@@ -159,16 +156,15 @@ pub(super) fn streamed_misses(misses: &[Vec<(u32, f32)>], frac: f32, cap: usize)
 }
 
 /// The least-recently-used published resident that is not in `protect`, as `(expert, slot)`.
-pub(super) fn lru_victim(
-    slots: &HashMap<usize, usize>,
-    last_use: &[u64],
-    protect: &[usize],
-) -> Option<(usize, usize)> {
+pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, usize)> {
     slots
         .iter()
-        .filter(|(e, _)| !protect.contains(e))
-        .min_by_key(|(&e, &slot)| (last_use[slot], e))
-        .map(|(&e, &slot)| (e, slot))
+        .enumerate()
+        .filter_map(|(slot, s)| {
+            let expert = s.expert?;
+            (s.buf.is_some() && !protect.contains(&expert)).then_some((expert, slot))
+        })
+        .min_by_key(|(expert, slot)| (slots[*slot].last_use, *expert))
 }
 
 impl CachedLayer {
@@ -237,14 +233,14 @@ impl CachedLayer {
     pub(super) fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
-            if st.resident.contains(&Some(expert_id)) {
+            if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
                 return Ok(None);
             }
             let usable = st.usable;
-            let Some(slot) = st.resident[..usable].iter().position(Option::is_none) else {
+            let Some(slot) = st.slots[..usable].iter().position(|s| s.expert.is_none()) else {
                 return Ok(None);
             };
-            st.resident[slot] = Some(expert_id);
+            st.slots[slot].expert = Some(expert_id);
             slot
         };
         self.load_reserved(expert_id, slot, sync)
@@ -262,15 +258,14 @@ impl CachedLayer {
     ) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
-            if st.resident.contains(&Some(expert_id)) {
+            if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
                 return Ok(None);
             }
-            let Some((victim, slot)) = lru_victim(&st.slots, &st.last_use, protect) else {
+            let Some((_victim, slot)) = lru_victim(&st.slots, protect) else {
                 return Ok(None);
             };
-            st.slots.remove(&victim);
-            st.published[slot] = None;
-            st.resident[slot] = Some(expert_id);
+            st.slots[slot].expert = Some(expert_id);
+            st.slots[slot].buf = None;
             slot
         };
         self.load_reserved(expert_id, slot, sync)
@@ -299,21 +294,22 @@ impl CachedLayer {
         match loaded {
             // Lent while this upload ran: drop it rather than publish into a lent slot.
             Ok(Some(_)) if slot >= st.usable => {
-                st.resident[slot] = None;
+                st.slots[slot].expert = None;
                 Ok(None)
             }
             Ok(Some(buf)) => {
-                st.published[slot] = Some(buf);
-                st.slots.insert(expert_id, slot);
-                st.last_use[slot] = st.tick;
+                let tick = st.tick;
+                let s = &mut st.slots[slot];
+                s.buf = Some(buf);
+                s.last_use = tick;
                 Ok(Some(slot))
             }
             Ok(None) => {
-                st.resident[slot] = None;
+                st.slots[slot].expert = None;
                 Ok(None)
             }
             Err(e) => {
-                st.resident[slot] = None;
+                st.slots[slot].expert = None;
                 Err(e)
             }
         }
@@ -332,8 +328,13 @@ impl CachedLayer {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(None);
         };
-        // Held for the whole upload: lending this slot waits for it.
-        let entry = self.slot_bufs[slot].lock();
+        // Clone the per-slot storage under the state lock, then take its own lock for the whole
+        // upload. Lending this slot waits for the upload to finish.
+        let storage = {
+            let st = self.state.lock().unwrap();
+            Arc::clone(&st.slots[slot].storage)
+        };
+        let entry = storage.lock();
         let Some(buf) = entry.as_ref() else {
             return Ok(None); // lent
         };
@@ -376,7 +377,7 @@ impl CachedLayer {
     /// is ordered on candle's stream after any kernel already reading the slot. Returns the
     /// number of slots lent.
     pub(super) fn lend(&self, k: usize) -> usize {
-        let (from, to) = {
+        let (from, to, storages) = {
             let mut st = self.state.lock().unwrap();
             let to = st.usable;
             let want = to.saturating_sub(k);
@@ -389,19 +390,20 @@ impl CachedLayer {
                 .max()
                 .unwrap_or(want);
             for slot in from..to {
-                if let Some(e) = st.resident[slot].take() {
-                    if st.slots.get(&e) == Some(&slot) {
-                        st.slots.remove(&e);
-                    }
-                }
-                st.published[slot] = None;
+                let s = &mut st.slots[slot];
+                s.expert = None;
+                s.buf = None;
             }
             st.usable = from;
-            (from, to)
+            let storages = st.slots[from..to]
+                .iter()
+                .map(|s| Arc::clone(&s.storage))
+                .collect::<Vec<_>>();
+            (from, to, storages)
         };
-        for entry in &self.slot_bufs[from.min(self.slot_bufs.len())..to.min(self.slot_bufs.len())] {
+        for storage in storages {
             // Waits for an upload into the slot; its result is then discarded.
-            if let Some(buf) = entry.lock().take() {
+            if let Some(buf) = storage.lock().take() {
                 copy_stream::wait_for_readers(&buf);
             }
         }
@@ -411,9 +413,15 @@ impl CachedLayer {
     /// Put every lent slot back in service, empty (with fresh device memory in copy-stream
     /// mode), and refill the layer in the background by routing count.
     pub(super) fn give_back(self: &Arc<Self>) -> candle_core::Result<()> {
-        let (from, to) = {
+        let (from, to, storages) = {
             let st = self.state.lock().unwrap();
-            (st.usable, st.resident.len())
+            let from = st.usable;
+            let to = st.slots.len();
+            let storages = st.slots[from..to]
+                .iter()
+                .map(|s| Arc::clone(&s.storage))
+                .collect::<Vec<_>>();
+            (from, to, storages)
         };
         if from == to {
             return Ok(());
@@ -421,8 +429,8 @@ impl CachedLayer {
         if let (Some(cs), Some(stacks)) = (&self.copy_stream, self.cpu.expert_qtensors()) {
             for &(first, len) in self.banks.iter().filter(|&&(first, _)| first >= from) {
                 let bufs = alloc_bank(cs, &stacks, first, len, &self.slot_device)?;
-                for (entry, buf) in self.slot_bufs[first..first + len].iter().zip(bufs) {
-                    *entry.lock() = Some(buf);
+                for (i, buf) in bufs.into_iter().enumerate() {
+                    *storages[first - from + i].lock() = Some(buf);
                 }
             }
             cs.after_device_work()?;
@@ -493,7 +501,7 @@ impl CachedLayer {
     /// The next expert to fill into this layer, if a slot is still empty.
     pub(super) fn next_fill_candidate(&self) -> Option<usize> {
         let st = self.state.lock().unwrap();
-        fill_candidate(&st.resident[..st.usable], &st.hit_counts)
+        fill_candidate(&st.slots[..st.usable], &st.hit_counts)
     }
 
     /// Fill every empty slot of this layer on a background thread and return immediately.
