@@ -57,30 +57,49 @@ impl CpuPending {
 ## Files
 
 ```
+src/main.rs          // mod components; mod decode;
+src/decode.rs        // orchestrator only (no stage bodies)
 src/components/
-  mod.rs          // exports + pipeline order docs
-  route.rs        // RoutePlan, Route::split, hit lookup
-  preload.rs      // LookaheadChannel, Preload::submit, predict/prefetch
-  dma_miss.rs     // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
-  cpu_miss.rs     // CpuMiss::submit, CpuPending::upload, CPU job construction
-  gpu.rs          // GpuExperts::run, run_expert, fused_decode
-src/decode.rs      // orchestrator only (no stage bodies)
+  mod.rs             // exports + pipeline order docs
+  route.rs           // RoutePlan, Route::split, hit lookup
+  preload.rs         // LookaheadChannel, Preload::submit, predict/prefetch
+  dma_miss.rs        // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
+  cpu_miss.rs        // CpuMiss::submit, CpuPending::upload, CPU job construction
+  gpu.rs             // GpuExperts::run, run_expert, fused_decode
 src/expert_cache/
-  mod.rs          // #[path = "../components/mod.rs"] mod components;
-                  // #[path = "../decode.rs"] mod decode;
-  layer.rs        // CachedLayer lifecycle: admit/replace/load/lend/give_back
-  provider.rs     // provider + build/warmup
-  registry.rs     // LayerRegistry lookup + lender
+  mod.rs             // private submodules + pub(crate) facade
+  layer.rs           // CachedLayer lifecycle: admit/replace/load/lend/give_back
+  provider.rs        // provider + build/warmup
+  registry.rs        // LayerRegistry lookup + lender
+```
+
+Dependency direction is one-way:
+
+```
+components/ + decode.rs  ──►  expert_cache/ (pub(crate) facade)
+expert_cache/            ──X──►  components/ or decode.rs
 ```
 
 `staging.rs` disappears: its scratch-ring and `stream_pcie`/`stage_misses` bodies move into
 `src/components/dma_miss.rs`.
 
-`src/components/` and `src/decode.rs` are declared from `expert_cache/mod.rs` with
-`#[path = "../components/mod.rs"] mod components;` and `#[path = "../decode.rs"] mod decode;`.
-They stay descendants of `expert_cache` (they need `CachedLayer`/`Slot` private fields) while the
-files live at the requested paths. A crate-level `mod components;`/`mod decode;` would need a narrow
-`pub(crate)` facade from `expert_cache`; that is a larger API change and is not part of this plan.
+### expert_cache facade
+
+`expert_cache/mod.rs` keeps its submodules private and exports only what the components need:
+
+- types: `CachedLayer`, `LayerState`, `Slot`, `SlotBuf`, `SlotData`, `Projections`, `Bank`,
+  `LayerRegistry`, `LookaheadChannel`
+- `CachedLayer` accessors: `state()`, `cpu()`, `slot_device()`, `hidden()`, `num_experts()`, `top_k()`,
+  `act()`, `router()`, `lookahead_chan()`, `lookahead_swaps()`, `copy_stream()`, `pcie_frac()`,
+  `registry()`, `layer()`, `preload_claimed()`
+- `CachedLayer` mutation: `admit()`, `replace()`, `lend()`, `give_back()`, `spawn_fill()`,
+  `replay_gate()`, `staging_enabled()`, `warmup_scratch_ring()`
+- `LayerRegistry`: `get()`, `all()`, `insert()`, `scratch_ring()`
+
+`LayerState` and `Slot` fields are `pub(crate)` too: the route component updates `tick`,
+`hit_counts` and `last_use` under the layer's state lock, and the gpu/dma components read slot
+buffers. They are the shared state vocabulary, not a public API. `Hit` and the `*Plan` data types
+belong to `components`, not `expert_cache`.
 
 ## Doorbell ownership
 
@@ -120,12 +139,14 @@ files live at the requested paths. A crate-level `mod components;`/`mod decode;`
 
 ## Tasks
 
-- [ ] Add `src/components/mod.rs` (declared from `expert_cache` via `#[path]`), `Hit`, `RoutePlan`,
-  `StagedHits`.
+- [ ] Add `mod components; mod decode;` to `src/main.rs`.
+- [ ] Add the `pub(crate)` facade in `expert_cache/mod.rs` and turn the fields/components need into
+  `pub(crate)` accessors; keep submodules private.
+- [ ] Add `src/components/mod.rs`, `Hit`, `RoutePlan`, `StagedHits`.
 - [ ] Move top-k read and hit/miss split to `route.rs`.
 - [ ] Move `run_hits` / `run_expert` / `fused_decode` to `gpu.rs`.
 - [ ] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
 - [ ] Move `stream_pcie` / `stage_misses` / scratch ring to `dma_miss.rs`; delete `staging.rs`.
 - [ ] Move `LookaheadChannel` / `predict` / `prefetch_predicted` to `preload.rs`.
-- [ ] Reduce `src/decode.rs` to orchestration and gate replay.
+- [ ] Move `decode.rs` out of `expert_cache/` and reduce it to orchestration and gate replay.
 - [ ] Run the gates above and merge only if all pass.
