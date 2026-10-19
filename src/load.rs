@@ -17,7 +17,6 @@ use crate::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::moe::CpuMoeProvider;
 use crate::moe::GpuCacheMoeProvider;
 use crate::prefill_stream::PrefillStreams;
 
@@ -28,10 +27,11 @@ const MEBIBYTE_BYTES: usize = 1024 * 1024;
 /// spill whole layers to the CPU.
 pub const ALL_LAYERS_ON_DEVICE: usize = usize::MAX;
 
+/// `expert_cache_gb`: the GPU cache budget; `--cpu-moe` is invalid without it.
 /// `prefill_stream`: `Some(min_tokens)` with `--prefill-stream`.
 /// `pcie_frac`: share of decode misses to DMA to the GPU (`--pcie-frac`), 0.0 when off.
 pub fn install_cpu_moe(
-    expert_cache_gb: Option<f64>,
+    expert_cache_gb: f64,
     prefill_stream: Option<usize>,
     pcie_frac: f32,
     lookahead_swaps: usize,
@@ -43,24 +43,19 @@ pub fn install_cpu_moe(
             "--prefill-stream: prefill chunks of {min_tokens} tokens or more run their experts on the GPU"
         );
     }
-    if let Some(gb) = expert_cache_gb {
-        let provider = Arc::new(GpuCacheMoeProvider::new(
-            gb,
-            prefill,
-            pcie_frac,
-            lookahead_swaps,
-            lookahead,
-        ));
-        let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
-        install_routed_experts_provider(provider)?;
-        info!(
-            "--cpu-moe + expert cache: routed experts in host memory; {:.1} GB GPU cache",
-            gb
-        );
-    } else {
-        install_routed_experts_provider(Arc::new(CpuMoeProvider::new(prefill)))?;
-        info!("--cpu-moe: routed experts load into host memory and run on the CPU");
-    }
+    let provider = Arc::new(GpuCacheMoeProvider::new(
+        expert_cache_gb,
+        prefill,
+        pcie_frac,
+        lookahead_swaps,
+        lookahead,
+    ));
+    let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
+    install_routed_experts_provider(provider)?;
+    info!(
+        "--cpu-moe + expert cache: routed experts in host memory; {:.1} GB GPU cache",
+        expert_cache_gb
+    );
     Ok(())
 }
 
@@ -299,7 +294,9 @@ pub fn base_builder(
         // configuration is experts-on-rayon, predictions-on-dedicated-threads (§6.3), fixed here
         // rather than switched by an environment variable (§6.4).
         install_cpu_moe(
-            model.expert_cache_gb,
+            model
+                .expert_cache_gb
+                .context("--cpu-moe requires --expert-cache-gb")?,
             model
                 .prefill_stream
                 .then_some(model.prefill_stream_min_tokens.get()),
@@ -595,14 +592,37 @@ mod tests {
     }
 
     #[test]
+    fn cpu_moe_requires_an_expert_cache() {
+        let err = match Cli::try_parse_from(["naiwa-rs", "tune", "-m", "x", "--cpu-moe"]) {
+            Ok(_) => panic!("--cpu-moe parsed without --expert-cache-gb"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("--expert-cache-gb"), "{err}");
+    }
+
+    #[test]
     fn cpu_moe_keeps_every_layer_on_the_device() {
         assert_eq!(device_layers(&model_options(&["-m", "x"])), None);
         assert_eq!(
-            device_layers(&model_options(&["-m", "x", "--cpu-moe"])),
+            device_layers(&model_options(&[
+                "-m",
+                "x",
+                "--cpu-moe",
+                "--expert-cache-gb",
+                "1"
+            ])),
             Some(vec![usize::MAX.to_string()])
         );
         assert_eq!(
-            device_layers(&model_options(&["-m", "x", "--cpu-moe", "-n", "0:10;1:20"])),
+            device_layers(&model_options(&[
+                "-m",
+                "x",
+                "--cpu-moe",
+                "--expert-cache-gb",
+                "1",
+                "-n",
+                "0:10;1:20"
+            ])),
             Some(vec!["0:10".to_string(), "1:20".to_string()])
         );
     }

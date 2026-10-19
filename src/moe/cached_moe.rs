@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use crate::prefill_stream::ExpertMemoryLender;
 
-use super::layer::CachedLayer;
+use super::cached_layer::CachedLayer;
 use super::staging::StagingRings;
 
 /// Every cached layer of one model, by decoder-layer index, plus the model-wide staging rings.

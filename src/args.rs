@@ -232,9 +232,9 @@ pub struct ModelOptions {
     pub paged_attn: PagedAttentionOptions,
 
     /// Keep routed MoE experts in host memory and compute them on the CPU; attention, routers,
-    /// shared experts, the MTP head, and the KV cache stay on the GPU. Places every layer on the
-    /// GPU unless `--device-layers` is given.
-    #[arg(long)]
+    /// shared experts, the MTP head, and the KV cache stay on the GPU. Requires
+    /// `--expert-cache-gb`. Places every layer on the GPU unless `--device-layers` is given.
+    #[arg(long, requires = "expert_cache_gb")]
     pub cpu_moe: bool,
 
     /// With `--cpu-moe`, turn the next-layer expert prediction off: no router matmul, no preload copies, so
@@ -262,8 +262,12 @@ pub struct ModelOptions {
     /// (`--lookahead-swaps`, default 2, `0` disables replacement entirely so a prediction can only
     /// fill an empty slot). Each swap is a 2 MB PCIe copy and a cache eviction, so lowering it trades
     /// hit rate for less copy traffic; raising it trades traffic for hit rate.
-    #[arg(long = "lookahead-swaps", requires = "expert_cache_gb", default_value_t = 2,
-          value_name = "N")]
+    #[arg(
+        long = "lookahead-swaps",
+        requires = "expert_cache_gb",
+        default_value_t = 2,
+        value_name = "N"
+    )]
     pub lookahead_swaps: usize,
 
     /// With `--cpu-moe`, run the routed experts of long prefill chunks on the GPU,

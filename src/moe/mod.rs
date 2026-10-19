@@ -33,28 +33,28 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
+mod cached_layer;
 mod cached_moe;
 mod cpu;
 mod decode;
 mod expert_bytes;
-mod gpu;
-mod layer;
+mod provider;
 mod slot;
 mod stages;
 mod staging;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use cpu::{fused_decode, CpuMoeProvider};
-pub use gpu::GpuCacheMoeProvider;
+pub(crate) use cpu::fused_decode;
+pub use provider::GpuCacheMoeProvider;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
 // another child module directly. The submodules themselves stay private.
+#[cfg(test)]
+pub(in crate::moe) use cached_layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
+pub(crate) use cached_layer::{streamed_misses, CachedExperts, CachedLayer, LookaheadChannel};
 pub(crate) use cached_moe::CachedMoe;
 pub(crate) use expert_bytes::{expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor};
-#[cfg(test)]
-pub(in crate::moe) use layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
-pub(crate) use layer::{streamed_misses, CachedExperts, CachedLayer, LookaheadChannel};
 pub(crate) use slot::{Bank, LayerState, Projections, Slot, SlotBuf, SlotData};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
