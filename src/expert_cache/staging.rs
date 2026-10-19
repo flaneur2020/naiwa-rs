@@ -14,7 +14,7 @@ use crate::stats;
 
 use super::{
     expert_range, schedule, scratch_ring_slots, streamed_misses, Bank, CachedLayer, Hit,
-    LayerRegistry, ScratchKey, ScratchRing, ScratchSlot, SlotBuf, SCRATCH_RING_FIRST,
+    LayerRegistry, Projections, ScratchKey, ScratchRing, SlotBuf, SlotData, SCRATCH_RING_FIRST,
 };
 
 impl LayerRegistry {
@@ -39,12 +39,8 @@ impl LayerRegistry {
             return Ok(Some(Arc::clone(ring)));
         }
         let len = scratch_ring_slots();
-        let bufs = alloc_bank(cs, stacks, SCRATCH_RING_FIRST, len, device)?;
+        let slots = alloc_bank(cs, stacks, SCRATCH_RING_FIRST, len, device)?;
         let per_slot: usize = bytes.iter().sum();
-        let mut slots = Vec::with_capacity(len);
-        for buf in bufs {
-            slots.push(ScratchSlot { buf });
-        }
         let ring = Arc::new(Mutex::new(ScratchRing { slots, cursor: 0 }));
         info!(
             "--pcie-frac: {len} staging-ring slots for dtype {:?} shared by its layers \
@@ -69,7 +65,7 @@ impl ScratchRing {
     }
 
     /// The `n` slots starting at `from`, wrapping past the end, in that order.
-    pub(super) fn take<'a>(&'a self, from: usize, n: usize) -> Vec<&'a ScratchSlot> {
+    pub(super) fn take<'a>(&'a self, from: usize, n: usize) -> Vec<&'a Arc<SlotBuf>> {
         let len = self.slots.len();
         (0..n).map(|i| &self.slots[(from + i) % len]).collect()
     }
@@ -89,9 +85,7 @@ pub(super) fn alloc_bank(
     let (down, down_views) = cs.alloc_bank(&stacks.2, len)?;
     let bank = Arc::new(Bank {
         first,
-        gate,
-        up,
-        down,
+        proj: Projections { gate, up, down },
     });
     gate_views
         .into_iter()
@@ -99,9 +93,10 @@ pub(super) fn alloc_bank(
         .zip(down_views)
         .map(|((g, u), d)| {
             Ok(Arc::new(SlotBuf {
-                weights: None,
-                memory: Some([g, u, d]),
-                bank: Some(Arc::clone(&bank)),
+                data: SlotData::Banked {
+                    bank: Arc::clone(&bank),
+                    memory: [g, u, d],
+                },
                 fence: ReadFence::new(device)?,
             }))
         })
@@ -162,7 +157,7 @@ impl CachedLayer {
         };
         // Everything below runs under the ring mutex: the whole pipeline is on the token
         // thread, so this lock only excludes the (one-time) creation race in `scratch_ring`.
-        // Working on `&ScratchSlot` directly matters: `wait_for_readers` waits for the refcount
+        // Working on `&Arc<SlotBuf>` directly matters: `wait_for_readers` waits for the refcount
         // to fall back to the ring's own `Arc` — cloning into a borrow list first would count
         // that clone and spin forever (W105: three 900s-timeout hangs, exactly here).
         let slot_of = {
@@ -184,9 +179,11 @@ impl CachedLayer {
                     // slot last step of the ring (they record their fence before dropping it),
                     // then let the copy stream wait on that fence before overwriting. This step
                     // is itself the next reader through the `Arc` injected into `slot_of`.
-                    copy_stream::wait_for_readers(&scratch.buf);
-                    let buf = &scratch.buf;
-                    let memory = buf.memory.as_ref().expect("scratch slot has memory");
+                    copy_stream::wait_for_readers(scratch);
+                    let buf = scratch;
+                    let SlotData::Banked { memory, .. } = &buf.data else {
+                        unreachable!("staging ring slots are banked");
+                    };
                     let (er, e) = (expert_range(&gate, expert as usize)?, expert as usize);
                     let bytes = er.len()
                         + expert_range(&up, e)?.len()

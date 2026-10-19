@@ -164,9 +164,9 @@ struct CachedLayerState {
     usable: usize,
 }
 
-/// One expert's projections in a slot.
+/// One expert's three projections.
 #[derive(Clone)]
-struct SlotWeights {
+struct Projections {
     gate: Arc<QTensor>,
     up: Arc<QTensor>,
     down: Arc<QTensor>,
@@ -177,20 +177,23 @@ struct SlotWeights {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct Bank {
     first: usize,
-    gate: Arc<QTensor>,
-    up: Arc<QTensor>,
-    down: Arc<QTensor>,
+    proj: Projections,
 }
 
-/// One slot's contents. In copy-stream mode `memory` is the slot's view of its bank, overwritten
-/// in place on every fill; otherwise each fill makes a new `SlotBuf` with its own `weights`.
+/// The two legal ways a slot can hold an expert.
+enum SlotData {
+    /// Non-copy-stream mode: this slot owns a fresh per-expert QTensor set.
+    Owned(Projections),
+    /// Copy-stream mode: this slot is a view into a shared bank, overwritten in place.
+    Banked {
+        bank: Arc<Bank>,
+        memory: [SlotMemory; 3],
+    },
+}
+
+/// One slot's contents plus the read fence readers record after launching its kernels.
 struct SlotBuf {
-    weights: Option<SlotWeights>,
-    memory: Option<[SlotMemory; 3]>,
-    /// Copy-stream mode: the bank this slot is part of (held, so the bank outlives readers).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    bank: Option<Arc<Bank>>,
-    /// Recorded by readers after enqueueing the kernels that read this slot.
+    data: SlotData,
     fence: ReadFence,
 }
 
@@ -198,13 +201,6 @@ struct SlotBuf {
 /// holds the lock for its duration, so lending a slot waits for any upload into it.
 type SlotEntry = parking_lot::Mutex<Option<Arc<SlotBuf>>>;
 
-
-/// One `--pcie-frac` staging slot of the global ring: a VRAM buffer a decode step DMAs a missed
-/// expert into, plus the event that marks the DMA done for candle's stream to wait on.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct ScratchSlot {
-    buf: Arc<SlotBuf>,
-}
 
 /// The model-wide `--pcie-frac` staging ring (see `SCRATCH_RING_FIRST`): one bank of slots
 /// past every resident slot, shared by every layer, borrowed round-robin per decode step.
@@ -216,7 +212,7 @@ struct ScratchSlot {
 /// so `wait_for_readers` never spins in practice.
 /// Ring slots' `Bank.first` is `SCRATCH_RING_FIRST`, past every resident slot.
 struct ScratchRing {
-    slots: Vec<ScratchSlot>,
+    slots: Vec<Arc<SlotBuf>>,
     cursor: usize,
 }
 

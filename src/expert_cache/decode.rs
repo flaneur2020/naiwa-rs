@@ -12,7 +12,7 @@ use crate::deferred;
 use crate::offload::fused_decode as offload_fused_decode;
 use crate::stats;
 
-use super::{schedule, Bank, CachedLayer, SlotBuf, SlotWeights};
+use super::{schedule, Bank, CachedLayer, Projections, SlotBuf, SlotData};
 
 /// The fused MoE decode kernel's activation id, if it has one for `act`.
 #[cfg(feature = "cuda")]
@@ -55,9 +55,9 @@ fn fused_decode(
     // stream after the kernels queued here.
     unsafe {
         mistralrs_quant::indexed_moe_fused_decode(
-            &bank.gate,
-            &bank.up,
-            &bank.down,
+            &bank.proj.gate,
+            &bank.proj.up,
+            &bank.proj.down,
             x2d,
             ids_cuda.as_cuda_slice::<u32>()?,
             w_ptr,
@@ -96,7 +96,7 @@ impl CachedLayer {
         #[cfg(feature = "cuda")]
         if let (Some(act_type), true) = (
             fused_act(act),
-            hits.iter().flatten().all(|(buf, _, _)| buf.bank.is_some()),
+            hits.iter().flatten().all(|(buf, _, _)| matches!(buf.data, SlotData::Banked { .. })),
         ) {
             // Per bank, each row's (local slot, weight) pairs. The kernel takes the same number
             // per row, so short rows are padded with a weight-0 entry on a slot of that bank that
@@ -104,7 +104,9 @@ impl CachedLayer {
             let mut groups: Vec<(&Arc<Bank>, Vec<Vec<(u32, f32)>>)> = Vec::new();
             for (t, row) in hits.iter().enumerate() {
                 for (buf, slot, w) in row {
-                    let bank = buf.bank.as_ref().expect("checked above");
+                    let SlotData::Banked { bank, .. } = &buf.data else {
+                        unreachable!("checked above");
+                    };
                     let local = (slot - bank.first) as u32;
                     let i = match groups.iter().position(|(b, _)| Arc::ptr_eq(b, bank)) {
                         Some(i) => i,
@@ -144,10 +146,10 @@ impl CachedLayer {
             let x = x2d.narrow(0, t, 1)?;
             let mut sum = Tensor::zeros((1, self.hidden), DType::F32, &self.slot_device)?;
             for (buf, _, w) in row {
-                let Some(weights) = &buf.weights else {
+                let SlotData::Owned(proj) = &buf.data else {
                     candle_core::bail!("expert cache: slot has no weights to run");
                 };
-                let y = Self::run_expert(weights, &x, act)?;
+                let y = Self::run_expert(proj, &x, act)?;
                 sum = (sum + (y.to_dtype(DType::F32)? * *w as f64)?)?;
             }
             out.push(sum);
@@ -157,7 +159,7 @@ impl CachedLayer {
     }
 
     /// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
-    fn run_expert(w: &SlotWeights, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
+    fn run_expert(w: &Projections, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
         let g = QMatMul::QTensor(w.gate.clone()).forward(x2d)?;
         let u = QMatMul::QTensor(w.up.clone()).forward(x2d)?;
         let h = (act.forward(&g)? * u)?;

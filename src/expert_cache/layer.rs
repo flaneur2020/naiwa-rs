@@ -11,7 +11,8 @@ use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, SlotBuf, SlotWeights,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Projections,
+    SlotBuf, SlotData,
 };
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
@@ -219,11 +220,11 @@ impl CachedLayer {
 
     /// Byte-slice expert `expert_id` out of the CPU stacks onto the slot device — never
     /// dequantized. `None` when the backend holds no `QTensor`s.
-    fn expert_weights(&self, expert_id: usize) -> candle_core::Result<Option<SlotWeights>> {
+    fn expert_weights(&self, expert_id: usize) -> candle_core::Result<Option<Projections>> {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(None);
         };
-        Ok(Some(SlotWeights {
+        Ok(Some(Projections {
             gate: expert_qtensor_on_device(&gate, expert_id, &self.slot_device)?,
             up: expert_qtensor_on_device(&up, expert_id, &self.slot_device)?,
             down: expert_qtensor_on_device(&down, expert_id, &self.slot_device)?,
@@ -286,11 +287,9 @@ impl CachedLayer {
         let loaded = match &self.copy_stream {
             Some(cs) => self.upload_in_place(cs, expert_id, slot, sync),
             None => self.expert_weights(expert_id).map(|w| {
-                w.map(|weights| {
+                w.map(|proj| {
                     Arc::new(SlotBuf {
-                        weights: Some(weights),
-                        memory: None,
-                        bank: None,
+                        data: SlotData::Owned(proj),
                         fence: ReadFence::none(),
                     })
                 })
@@ -338,7 +337,7 @@ impl CachedLayer {
         let Some(buf) = entry.as_ref() else {
             return Ok(None); // lent
         };
-        let Some(memory) = &buf.memory else {
+        let SlotData::Banked { memory, .. } = &buf.data else {
             return Ok(None);
         };
         copy_stream::wait_for_readers(buf);
