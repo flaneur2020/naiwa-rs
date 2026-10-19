@@ -37,7 +37,7 @@ pub(crate) fn submit(
                 let x = x.flatten_all()?.to_vec1::<f32>()?;
                 if queued {
                     let next = Arc::clone(&next);
-                    crate::lookahead::submit(Box::new(move || {
+                    crate::deferred::submit_lookahead(Box::new(move || {
                         let r = x.len() / next.hidden().max(1);
                         let x = Tensor::from_vec(x, (r, next.hidden()), &Device::Cpu);
                         if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
@@ -53,7 +53,7 @@ pub(crate) fn submit(
                 let pub_res = chan.publish(&x2d, n);
                 stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
                 if let Some((sh, last_seq)) = pub_res? {
-                    crate::lookahead::submit(Box::new(move || {
+                    crate::deferred::submit_lookahead(Box::new(move || {
                         let t0 = std::time::Instant::now();
                         // The GAP is the scheduler's business, not this
                         // closure's: the lookahead thread only drains its queue
@@ -98,7 +98,7 @@ pub(crate) fn submit(
                 let x_clone = x2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                 let d2h = t0.elapsed().as_secs_f64() * 1e3;
                 let next = Arc::clone(&next);
-                crate::lookahead::submit(Box::new(move || {
+                crate::deferred::submit_lookahead(Box::new(move || {
                     let x = Tensor::from_vec(x_clone, (rows, next.hidden()), &Device::Cpu);
                     if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                         debug!("expert cache: layer {} lookahead failed: {e}", next.layer());

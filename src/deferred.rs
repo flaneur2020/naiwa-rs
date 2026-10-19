@@ -18,6 +18,14 @@
 //!
 //! A failed computation leaves the returned tensor unwritten; the error is returned by the next
 //! [`start`] (the next layer of the same step, or the next step's first).
+//!
+//! The module also owns the single lookahead prediction worker. Predictions only run in the gaps
+//! between CPU-expert batches, so the batch completion is the wake-up; see [`submit_lookahead`].
+
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -49,8 +57,81 @@ impl Drop for BatchBusy {
         if BATCH_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
             // The gap opened: predictions may run now. This is the wake-up that replaces polling
             // for `expert_batch_idle` from inside a prediction.
-            crate::lookahead::wake();
+            wake_lookahead();
         }
+    }
+}
+
+/// A queued prediction.
+type Thunk = Box<dyn FnOnce() + Send>;
+
+/// Safety net only: every real wake comes from a submit or a batch completion, so a lost unpark
+/// costs at most this much.
+const LOOKAHEAD_PARK: Duration = Duration::from_millis(2);
+
+/// Queue depth: one step's worth of layer jobs (48) plus headroom. Overflow drops.
+const LOOKAHEAD_DEPTH: usize = 64;
+
+/// Pending predictions. `LEN` mirrors `JOBS.len()` so the drain loop can skip the mutex.
+static LOOKAHEAD_JOBS: Mutex<VecDeque<Thunk>> = Mutex::new(VecDeque::new());
+static LOOKAHEAD_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The one prediction thread, once it exists.
+static LOOKAHEAD_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+/// Wake the prediction thread: there may be work (a submit) or permission to run it (a batch
+/// ended).
+pub fn wake_lookahead() {
+    if let Some(t) = LOOKAHEAD_THREAD.get() {
+        t.unpark();
+    }
+}
+
+/// Queue a prediction and wake its thread. Never blocks the token thread: on overflow the job is
+/// dropped.
+pub fn submit_lookahead(job: Thunk) {
+    LOOKAHEAD_THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("lookahead".into())
+            .spawn(lookahead_worker)
+            .map(|h| h.thread().clone())
+            .unwrap_or_else(|e| {
+                tracing::warn!("no lookahead thread ({e}); predictions will not run");
+                std::thread::current()
+            })
+    });
+    {
+        let mut jobs = LOOKAHEAD_JOBS.lock().unwrap();
+        if jobs.len() >= LOOKAHEAD_DEPTH {
+            crate::stats::record_cache_lookahead_dropped();
+            return;
+        }
+        jobs.push_back(job);
+        LOOKAHEAD_LEN.store(jobs.len(), std::sync::atomic::Ordering::Release);
+    }
+    wake_lookahead();
+}
+
+fn take_lookahead() -> Option<Thunk> {
+    if LOOKAHEAD_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut jobs = LOOKAHEAD_JOBS.lock().unwrap();
+    let job = jobs.pop_front();
+    LOOKAHEAD_LEN.store(jobs.len(), std::sync::atomic::Ordering::Release);
+    job
+}
+
+/// Drain predictions while no expert batch is running, then park until the next event.
+fn lookahead_worker() {
+    loop {
+        // The gap check is re-tested before every job: a batch can start mid-drain, and its
+        // completion will wake us again.
+        while expert_batch_idle() {
+            let Some(job) = take_lookahead() else { break };
+            job();
+        }
+        std::thread::park_timeout(LOOKAHEAD_PARK);
     }
 }
 
