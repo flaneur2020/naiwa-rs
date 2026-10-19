@@ -1,7 +1,7 @@
 //! Cached layers and the model-wide `Layers` index.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::{DType, Device, Tensor};
@@ -11,13 +11,14 @@ use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
 use tracing::debug;
 
-use crate::copy_stream::{self, CopyStream, ReadFence};
+use crate::copy_stream::{self, CopyDone, CopyStream, ReadFence};
+use crate::doorbell::{PassCell, TopkDoorbell};
 use crate::host_memory::PinnedStack;
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStream};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, Projections, Slot, SlotBuf,
+    alloc_bank, expert_qtensor_on_device, expert_range, Projections, Slot, SlotBuf,
     SlotData, StagingRings,
 };
 
@@ -254,6 +255,10 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
 // needs (the target runs the n drafts plus one token in one forward).
 const PREFILL_THRESHOLD: usize = 16;
 
+/// The largest decode window the cache serves, i.e. the row count every warmup-sized mapped buffer
+/// and the CPU-result ring must cover. `PREFILL_THRESHOLD` is the same number by construction.
+pub(crate) const MAX_DECODE_ROWS: usize = PREFILL_THRESHOLD;
+
 /// Mutable per-layer decode state: doorbell, slots and LRU/hit counters.
 pub(crate) struct LayerState {
     /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host read needs
@@ -303,10 +308,14 @@ pub(crate) struct CachedLayer {
     pub(crate) prefill: Option<Arc<PrefillStream>>,
     /// A background fill of this layer is running; at most one at a time.
     pub(crate) filling: AtomicBool,
-    /// v2 M5b: the pass whose preload copies the prediction thread has claimed (0 = none). Claimed
-    /// before the copies are queued and before the point is published, so the token thread replays
-    /// the preload gate exactly when a publish is guaranteed to arrive for its pass.
-    pub(crate) preload_claimed: AtomicU32,
+    /// The preload handoff: the lookahead thread records its batch's completion and claims it, the
+    /// token thread waits for the claim it sees (`wait_preload`). `None` when the layer has no copy
+    /// stream, i.e. when its fills go through candle's stream and need no ordering.
+    pub(crate) preload: Option<PassCell>,
+    /// Completion of this layer's staging DMA on the copy stream (`--pcie-frac`). `None` disables
+    /// the staging path for this layer: without a completion signal the staged slots could be read
+    /// while the copies are still in flight, so the path fails closed instead.
+    pub(crate) staging_done: Option<Arc<CopyDone>>,
 }
 
 /// The model holds `Arc<dyn RoutedExperts>`; this wrapper keeps an `Arc<CachedLayer>` so the
@@ -411,6 +420,10 @@ impl CachedLayer {
         self.pcie_frac
     }
 
+    pub(crate) fn staging_done(&self) -> Option<&Arc<CopyDone>> {
+        self.staging_done.as_ref()
+    }
+
     pub(crate) fn layers(&self) -> &Arc<Layers> {
         &self.layers
     }
@@ -423,30 +436,44 @@ impl CachedLayer {
         self.layer
     }
 
-    pub(crate) fn preload_claimed(&self) -> u32 {
-        self.preload_claimed.load(Ordering::Acquire)
-    }
-    /// v2 M4: is the PCIe staging path in service for this layer? One predicate for all three
-    /// sites — capture the DMA gate, publish the point, replay the gate — because they must agree:
-    /// a gate whose point is never published spins forever, and at `--pcie-frac 0` the copy stream
-    /// still exists (the cache banks use it) while nothing is ever staged.
-    #[cfg(feature = "cuda")]
+    /// Is the PCIe staging path in service for this layer? True only when the copies have a
+    /// completion event: `--pcie-frac 0`, or a layer whose event could not be created, must not
+    /// DMA into slots that nobody waits for.
     pub(crate) fn staging_enabled(&self) -> bool {
-        self.pcie_frac > 0.0 && self.copy_stream.is_some()
+        self.staging_done.is_some()
     }
 
-    /// M4/M5b/M6: gate this layer's segment on `kind` by launching the wait node on the stream.
-    ///
-    /// M6 folds the gate graphs away: the node was already launched warm whenever capture failed,
-    /// and a plain launch is *cheaper* than replaying a one-node graph (measured 5.9 us vs 15.4 us
-    /// per launch), so a captured gate buys nothing. Stream ordering is identical.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn replay_gate(&self, kind: u32) -> candle_core::Result<()> {
-        let Some(sched) = schedule() else {
+    /// Wait on the calling stream for this layer's staging DMA (a GPU-side event wait; the host
+    /// does not block). A no-op when the layer does not stage.
+    pub(crate) fn wait_staging(&self) -> candle_core::Result<()> {
+        let Some(done) = &self.staging_done else {
             return Ok(());
         };
-        stats::record_cache_gate_replay();
-        sched.wait(&self.slot_device, self.layer as u32, kind)
+        stats::record_cache_sync_wait();
+        done.wait_on(&self.slot_device)
+    }
+
+    /// Wait on the calling stream for the latest preload claim, if any. Waiting for the claim this
+    /// call *sees* — rather than for a pass number of its own — is what drains a copy the lookahead
+    /// queued late: a stale claim is still waited for, so the slots cannot be read mid-copy.
+    pub(crate) fn wait_preload(&self) -> candle_core::Result<()> {
+        let Some(cell) = &self.preload else {
+            return Ok(());
+        };
+        if cell.wait_latest(&self.slot_device)?.is_some() {
+            stats::record_cache_sync_wait();
+        }
+        Ok(())
+    }
+
+    /// Create this layer's top-k doorbell at warmup, sized for the largest decode window. Without
+    /// it the router read falls back to a blocking D2H, which is correct but slow.
+    pub(crate) fn warmup_doorbell(&self) -> candle_core::Result<()> {
+        let cap = MAX_DECODE_ROWS * self.top_k;
+        if let Some(bell) = TopkDoorbell::acquire(&self.slot_device, cap)? {
+            self.state.lock().unwrap().doorbell = Some(Arc::new(bell));
+        }
+        Ok(())
     }
 
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
@@ -603,11 +630,11 @@ impl CachedLayer {
         if sync {
             cs.upload(&buf.fence, &parts)?;
         } else {
-            // M5b: the caller claims this pass and publishes `SYNC_PRELOAD` on this same stream right
-            // after the copies, so the layer's gate — not a host wait — orders the reader. Blocking
-            // here was 81% of a prediction job.
+            // The caller records one completion event after the whole batch and claims it, so the
+            // event — not a host wait — orders the reader. Blocking here was 81% of a prediction
+            // job.
             // SAFETY: the sources are page-locked stacks that outlive the copies, and the caller
-            // publishes the completion point on the same stream.
+            // records the batch's completion on the same stream.
             unsafe { cs.queue_async(&buf.fence, &parts)? };
         }
         Ok(Some(Arc::clone(buf)))
@@ -716,19 +743,20 @@ impl CachedLayer {
         ))
     }
 
-    /// M5b: turn the prediction for `x` into **asynchronous** copies on the copy stream, then claim
-    /// this pass and publish `SYNC_PRELOAD` for it — all from the prediction thread, in the gap after
-    /// the CPU-expert batch, so the DMA hides in the host's work for the next layer.
+    /// Turn the prediction for `x` into **asynchronous** copies on the copy stream, record one
+    /// completion event after them, and claim the pass with that event — all from the prediction
+    /// thread, in the gap after the CPU-expert batch, so the DMA hides in the host's work for the
+    /// next layer.
     ///
-    /// The copies are queued *before* the claim is published, and the publish is monotonic
-    /// (`Gate::publish_stream_max`), so the token thread either sees no claim (nothing to wait for) or
-    /// sees one whose point is already on its way and can only move the word forward.
-    pub(crate) fn prefetch_predicted(&self, x: &Tensor, pass: u32) -> candle_core::Result<()> {
+    /// The event is recorded *before* the claim is visible, so a consumer that sees the claim
+    /// always has a completion signal to wait on. A consumer that skips a pass (no new claim)
+    /// waits for the previous claim, which is exactly what keeps an in-flight copy from being read.
+    pub(crate) fn prefetch_predicted(&self, x: &Tensor) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
-        if self.copy_stream.is_none() {
+        let Some(cs) = &self.copy_stream else {
             return Ok(());
-        }
+        };
         let max_swaps = self.lookahead_swaps * rows;
         let mut swaps = 0;
         for &e in &predicted {
@@ -744,15 +772,9 @@ impl CachedLayer {
                 stats::record_cache_swap();
             }
         }
-        // Claim then publish: a reader that sees `pass` knows the point is coming.
-        if let Some(sched) = schedule() {
-            self.preload_claimed.store(pass, Ordering::Release);
-            sched.publish_stream_max(
-                &self.slot_device,
-                self.layer as u32,
-                crate::doorbell::SYNC_PRELOAD,
-                pass,
-            )?;
+        // Record the batch's completion, then claim: a reader that sees the claim has an event.
+        if let Some(cell) = &self.preload {
+            cell.claim(cs)?;
         }
         Ok(())
     }

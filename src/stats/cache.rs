@@ -19,12 +19,15 @@ pub(crate) struct CacheStats {
     pub swaps: u64,
     /// Lookahead requests dropped because the worker was busy.
     pub lookahead_dropped: u64,
-    /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
-    pub gate_replays: u64,
+    /// Stream-side completion waits enqueued (staging DMA and preload, one per layer per pass).
+    pub sync_waits: u64,
     /// Experts DMA'd into a staging slot and run on the GPU instead of the CPU (`--pcie-frac`).
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
     pub pcie_bytes: u64,
+    /// CPU-result payloads dropped because the stream had not consumed the ring slot in time.
+    /// Any non-zero value means the model output for that expert is wrong.
+    pub result_stalls: u64,
 }
 
 static CACHE_STATS: Mutex<CacheStats> = Mutex::new(CacheStats {
@@ -35,9 +38,10 @@ static CACHE_STATS: Mutex<CacheStats> = Mutex::new(CacheStats {
     lookahead_loads: 0,
     swaps: 0,
     lookahead_dropped: 0,
-    gate_replays: 0,
+    sync_waits: 0,
     pcie_misses: 0,
     pcie_bytes: 0,
+    result_stalls: 0,
 });
 
 /// One expert cache was installed in this process.
@@ -77,9 +81,15 @@ pub(crate) fn record_cache_pcie(bytes: u64) {
     s.pcie_bytes += bytes;
 }
 
-/// v2 M4: one layer DMA gate replayed.
-pub(crate) fn record_cache_gate_replay() {
-    CACHE_STATS.lock().unwrap().gate_replays += 1;
+/// One stream-side completion wait enqueued (a `cudaStreamWaitEvent` for the staging DMA or the
+/// preload claim).
+pub(crate) fn record_cache_sync_wait() {
+    CACHE_STATS.lock().unwrap().sync_waits += 1;
+}
+
+/// The CPU-result ring was still full after the bounded wait: a result payload was dropped.
+pub(crate) fn record_cache_result_stall() {
+    CACHE_STATS.lock().unwrap().result_stalls += 1;
 }
 
 pub(crate) fn record_cache_lookahead_dropped() {

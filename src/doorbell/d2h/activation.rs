@@ -1,10 +1,11 @@
 //! Device-to-host activation doorbell for the lookahead: a ring of f32 slots.
 
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
+use candle_core::cuda_backend::cudarc::driver::sys;
+use candle_core::cuda_backend::cudarc::driver::{CudaEvent, CudaStream, DevicePtr};
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::doorbell::ffi;
@@ -17,15 +18,32 @@ pub struct ActivationDoorbell {
     ring: PayloadRing,
     /// Publish side stream: publish kernels are ordered after `src`'s producers by an event, so
     /// they never sit behind the main stream's result-wait kernels.
-    side_stream: OnceLock<Arc<CudaStream>>,
+    side: Arc<CudaStream>,
+    /// One persistent ordering event, created once instead of per publish (a per-publish event
+    /// was `cuEventCreate` + `cuEventDestroy` with timing enabled). Reuse is safe because
+    /// `publish` records it and enqueues the side stream's wait on the same thread, so every wait
+    /// is enqueued after its own record.
+    ready: CudaEvent,
 }
 
 impl ActivationDoorbell {
+    /// Both the mapped ring and the side stream/event are created here, at warmup: a failure is a
+    /// missing channel (`Ok(None)` → the caller keeps its blocking fallback), never a panic on the
+    /// decode path.
     pub fn acquire(device: &Device, max_n: usize) -> Result<Option<Self>> {
-        Ok(PayloadRing::acquire(device, max_n)?.map(|ring| Self {
-            ring,
-            side_stream: OnceLock::new(),
-        }))
+        let Some(ring) = PayloadRing::acquire(device, max_n)? else {
+            return Ok(None);
+        };
+        let dev = device.as_cuda_device()?;
+        let main = dev.cuda_stream();
+        let context = main.context();
+        let (Ok(side), Ok(ready)) = (
+            context.new_stream(),
+            context.new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Self { ring, side, ready }))
     }
 
     pub fn max_n(&self) -> usize {
@@ -47,16 +65,12 @@ impl ActivationDoorbell {
         }
         let src = src.to_dtype(DType::F32)?.contiguous()?;
         let dev = src.device().as_cuda_device()?;
-        let side = self.side_stream.get_or_init(|| {
-            dev.cuda_stream()
-                .context()
-                .new_stream()
-                .expect("create the activation doorbell side stream")
-        });
         let main = dev.cuda_stream();
         // Order the publish after `src`'s producers only.
-        let ready = main.record_event(None).map_err(candle_core::Error::wrap)?;
-        side.wait(&ready).map_err(candle_core::Error::wrap)?;
+        self.ready.record(&main).map_err(candle_core::Error::wrap)?;
+        self.side
+            .wait(&self.ready)
+            .map_err(candle_core::Error::wrap)?;
 
         let (storage, layout) = src.storage_and_layout();
         let candle_core::Storage::Cuda(s) = &*storage else {
@@ -74,7 +88,7 @@ impl ActivationDoorbell {
                 self.ring.slot_dev(seq),
                 ptr as *const c_void,
                 n as i32,
-                side.cu_stream() as i64,
+                self.side.cu_stream() as i64,
             );
         }
         Ok(())

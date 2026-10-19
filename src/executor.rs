@@ -43,6 +43,21 @@ pub(crate) fn cpu() -> &'static Executor {
     &CPU
 }
 
+/// Size the engine-wide CPU-result channel at warmup: one mapped allocation for the model's
+/// lifetime. `max_n` is the largest result window the decode path can submit.
+#[cfg(feature = "cuda")]
+pub(crate) fn warmup_result_channel(device: &Device, max_n: usize) -> Result<()> {
+    match device {
+        Device::Cuda(dev) => cuda::warmup_channel(dev, max_n),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn warmup_result_channel(_device: &Device, _max_n: usize) -> Result<()> {
+    Ok(())
+}
+
 impl Executor {
     const fn new(name: &'static str) -> Self {
         Self {
@@ -98,7 +113,7 @@ impl Executor {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(dev) = device {
             cuda::take_error()?;
-            let chan = cuda::global_channel(dev, rows * cols)?;
+            let chan = cuda::ensure_channel(dev, rows * cols)?;
             let seq = chan.next_job();
             let len = rows * cols;
             let done = cuda::SetFlag::new(Arc::clone(chan.doorbell()), seq);
@@ -221,7 +236,8 @@ mod cuda {
         }
     }
 
-    /// The engine-wide CPU-return channel: one result doorbell plus its seq allocator.
+    /// The engine-wide CPU-return channel: one result doorbell plus its seq allocator. Sized once
+    /// at warmup for the largest result window, so the decode path never allocates.
     pub(super) struct Channel {
         doorbell: Arc<ResultDoorbell>,
         next: Mutex<u32>,
@@ -243,34 +259,50 @@ mod cuda {
         }
     }
 
-    /// The global channel. It grows and retires the mapped allocation when a larger result window
-    /// arrives; retired channels are kept alive because a queued wait kernel may still hold their
-    /// raw mapped pointers.
-    pub(super) fn global_channel(dev: &CudaDevice, min_n: usize) -> Result<Arc<Channel>> {
-        static CHANNEL: Mutex<(Option<Arc<Channel>>, Vec<Arc<Channel>>)> =
-            Mutex::new((None, Vec::new()));
+    /// The one channel, plus any earlier channel a queued wait kernel may still point at. Growth
+    /// only happens for the startup shape-check run, i.e. before warmup has sized the ring for the
+    /// real decode window.
+    static CHANNEL: Mutex<(Option<Arc<Channel>>, Vec<Arc<Channel>>)> =
+        Mutex::new((None, Vec::new()));
+    static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Allocate the mapped result ring now, for `max_n` f32 per job, so the decode path never
+    /// allocates one. A failure is a warmup error: the decode path has no fallback and must not
+    /// discover that at the first CPU miss.
+    pub(super) fn warmup_channel(dev: &CudaDevice, max_n: usize) -> Result<()> {
+        let _ = ensure_channel(dev, max_n)?;
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The channel, grown to hold `min_n` f32 per job. Retired channels are kept alive because a
+    /// queued wait kernel may still hold their raw mapped pointers.
+    pub(super) fn ensure_channel(dev: &CudaDevice, min_n: usize) -> Result<Arc<Channel>> {
         let mut guard = CHANNEL.lock().unwrap();
         let (chan, retired) = &mut *guard;
-        if chan.as_ref().is_none_or(|c| c.max_n() < min_n) {
-            // Grow with headroom so verify windows a few rows larger do not realloc again.
-            let want = min_n.max(chan.as_ref().map_or(0, |c| 2 * c.max_n()));
-            let next = ResultDoorbell::acquire(&Device::Cuda(dev.clone()), want)
-                .ok()
-                .flatten()
-                .map(|doorbell| {
-                    Arc::new(Channel {
-                        doorbell: Arc::new(doorbell),
-                        next: Mutex::new(0),
-                    })
-                });
-            if let (Some(old), Some(_next)) = (chan.take(), &next) {
-                retired.push(old);
+        if let Some(current) = chan {
+            if current.max_n() >= min_n {
+                return Ok(Arc::clone(current));
             }
-            *chan = next;
+            if WARMED.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::warn!(
+                    "CPU-result window of {min_n} f32 exceeds the warmup size ({}); the warmup \
+                     estimate was too small",
+                    current.max_n()
+                );
+            }
         }
-        Ok(Arc::clone(chan.as_ref().ok_or_else(|| {
-            Error::Msg("the mapped result doorbell is unavailable".into())
-        })?))
+        // Headroom so a verify window a few rows larger does not allocate again.
+        let want = min_n.max(chan.as_ref().map_or(0, |c| 2 * c.max_n()));
+        let doorbell = ResultDoorbell::acquire(&Device::Cuda(dev.clone()), want)?
+            .ok_or_else(|| Error::Msg("no mapped memory for the CPU-result doorbell".into()))?;
+        if let Some(old) = chan.replace(Arc::new(Channel {
+            doorbell: Arc::new(doorbell),
+            next: Mutex::new(0),
+        })) {
+            retired.push(old);
+        }
+        Ok(Arc::clone(chan.as_ref().expect("just set")))
     }
 
     pub(super) struct Running {
@@ -306,7 +338,19 @@ mod cuda {
             if self.published {
                 return;
             }
-            self.bell.publish(values, self.seq);
+            if !self.bell.publish(values, self.seq) {
+                // The ring was still full after the bounded wait: the stream gets its seq bump so
+                // it cannot hang, but this slot's payload was dropped. Count it and say so once.
+                crate::stats::record_cache_result_stall();
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "CPU-result doorbell: the stream fell {} jobs behind; dropping a result \
+                         payload (the model output is wrong for that expert)",
+                        self.bell.depth()
+                    )
+                });
+            }
             self.published = true;
         }
     }

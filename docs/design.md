@@ -24,7 +24,7 @@ The shipped path is eager MoE and eager attention. Plan and evidence:
 | `--pcie-frac` | 0.2 optimum at np3/np8; bandwidth knob, not a TPOT lever |
 | experts | fork rayon pool, 8 threads |
 | prediction | one dedicated event-driven thread; issue-only, never performs the DMA |
-| staging | residents run **before** the staging gate; staged experts after it |
+| staging | residents run **before** the staging DMA's completion event; staged experts after it |
 | MoE / attention | eager; no capture |
 | PLE | host-only table; not implemented on decode |
 | MTP | works in steady state on short/benchmark prompts; long-prompt drafter prefill is an open fault |
@@ -47,7 +47,7 @@ read 3 lists (no hashing)
 issue staging DMA  ────────→  copy stream
 submit CPU job     ────────→                                     rayon: CPU expert gemv
 launch residents   ────────→  [resident experts]
-launch staging gate ───────→  wait SYNC_STAGING
+wait staging event ────────→  cuStreamWaitEvent(staging DMA done)
 launch staged      ────────→  [staged experts]
 wait CPU payload   ────────→  wait_copy_slot, add to acc
                               next layer's attention (eager)
@@ -61,14 +61,20 @@ activation/format is supported, generic otherwise.
 Stream order inside one layer:
 
 ```
+wait preload claim (event)        released as soon as the lookahead's copies land
 [resident MoE]                    starts immediately
-wait_ready(layer, SYNC_STAGING)   DMA lands under the resident compute
+wait staging event                DMA lands under the resident compute
 [staged MoE]                      only now reads the staging ring
 wait CPU payload, add             completes the MoE output
 ```
 
-Resident-first staging is unconditional: **78.9 → 62.8 ms/pass (−20%)**, staging-gate p50 858 → 11 µs. The CPU add
+Resident-first staging is unconditional: **78.9 → 62.8 ms/pass (−20%)**, staging wait p50 858 → 11 µs. The CPU add
 stays last because its result belongs to this layer's output, which the next layer consumes.
+
+The preload wait has to come **before** the resident compute: a preload may have *replaced* a
+resident slot, so the resident hits can include slots the lookahead is still copying into. It was
+previously published as a gate word on candle's stream while the copies ran on the copy stream —
+i.e. it did not order anything, and a resident hit could be read mid-copy.
 
 The prediction thread runs only in the gap **after** a CPU-expert batch (beside it cost
 10 ms/step). Workers make **no CUDA calls**; a CUDA call from a worker delays predictions and
@@ -78,55 +84,50 @@ collapses the hit rate (measured 74% → 38%).
 
 ## 3. Synchronisation
 
-### Gates (staging and preload)
+### Completion events (staging and preload)
 
-```
-epoch    u32        device-written once per pass (layer 0 prologue)
-ready    [K] u32    one word per sync point; value = pass whose data is ready
+There are no gate words and no epoch (deleted in M9c, see
+[`worklogs/m9c.md`](worklogs/m9c.md)). Both barriers are CUDA events:
 
-PRELOAD = 0, STAGING = 1
-sync_id(layer, kind) = layer * 2 + kind
-slots = max_decoder_layer + 1
-K = slots * 2
-```
-
-Node:
-
-```
-e = *epoch
-spin while (ready[id] < e)
-__threadfence_system()
-```
-
-`epoch` is **device-written only**, so the host can lag or match, never lead. Gates carry no
-payload; CPU results use `ResultDoorbell` (see below).
+| barrier | event | producer | consumer |
+|---|---|---|---|
+| staging DMA | one `CopyDone` per layer, created at build | copy stream, recorded after the layer's copies | `cuStreamWaitEvent` on candle's stream, after the resident compute |
+| preload | one `CopyDone` per layer + a claim counter (`PassCell`) | lookahead thread, recorded once after the batch of fills, then claimed | `cuStreamWaitEvent` on candle's stream, before the resident compute |
 
 Rules:
 
-1. **FIFO per point.** Stream publications are ordered on their stream; a host producer (tests
-   today) uses the release store. A stale publish must not move `ready` backwards for preload.
-2. **`ready` is a level.** Preload uses one-thread `atomicMax(ready[id], pass)`; staging uses
-   `cuStreamWriteValue32` after the copies. A stale publish must be harmless.
-3. **Every staging path publishes** (nothing / staged / failed); its gate is replayed every pass.
-   Preload's gate is replayed only when `inflight == pass`.
-4. **Failure must still publish the gate**, or the GPU spins forever.
-5. `u32` wrap is ~4.29B passes; no handling needed.
-6. Device epoch is fenced before/after; host ready uses release; the node fences after the spin.
-   Ada did not need the fences here, but they stay for RDNA.
+1. **Record before claim.** The lookahead records the batch's completion and only then publishes
+   the claim, so a consumer that sees a claim always has an event to wait on.
+2. **Wait for the claim you see, not for a pass of your own.** The cell owns its sequence; the
+   token thread waits for whatever was claimed last. That drains a copy the lookahead queued late
+   (a stale claim is waited for instead of skipped) and deletes the pass number, the device epoch
+   and the "every path must publish or the GPU spins" rule.
+3. **One persistent event per layer, one record per claim.** Re-recording is safe: a new claim for
+   a layer comes from a job the token thread scheduled one layer earlier, i.e. after its wait for
+   the previous claim was enqueued (`cuStreamWaitEvent` binds to the most recent record at call
+   time). A *fresh* event per claim costs ~1 ms per lookahead job — destroying an event whose
+   record is still queued on the copy stream blocks — and measurably drops the hit rate.
+4. **Failure closes.** A layer without its staging event does not stage (`staging_enabled()`);
+   mapped memory that cannot be allocated at warmup is an error, not a silently unordered path.
+5. Every stream shared by a producer and a consumer means "event completed = everything queued
+   before it on that stream completed". The preload event therefore also waits for any staging DMA
+   queued earlier on the same copy stream. Accepted: the alternative is a second stream.
 
 ### CPU return
 
-One path: `ResultDoorbell` (`doorbell/h2d/result.rs`) — a seq plus a slot ring. The worker
-publishes seq; the stream queues a wait+copy kernel. `ScheduleBuf` no longer carries payload: it
-is a gate grid only (epoch + ready words). The schedule `CPU_EXPERTS` point, `wait_add`,
-`publish_cpu`, `deferred::start_schedule` and the per-layer `Channel` were deleted in M9.2.
+One path: `ResultDoorbell` (`doorbell/h2d/result.rs`) — a seq, a slot ring and a device-written
+`consumed` word. The worker publishes seq; the stream queues a wait+copy kernel that sets
+`consumed = seq` once it has read the slot out, so the worker's ring depth is *checked* (bounded
+wait, then a counted drop) instead of assumed. Ring: depth 8, sized once at warmup; the schedule
+`CPU_EXPERTS` point, `wait_add`, `publish_cpu`, `deferred::start_schedule` and the per-layer
+`Channel` were deleted in M9.2.
 
 ### PLE
 
 `PleHash::rows` is a **pure function of the last `ngram-1` token ids**; PLE is **one layer**,
 before its attention. The ~100 GB hashed table stays on the host, never VRAM. If implemented,
 PLE is the third host-produced DMA: compute rows (µs), mmap → pinned → async H2D on the copy
-stream, publish `SYNC_PLE` a pass early. It is ~0.1–0.3% of a pass and not needed now.
+stream, record a completion event a pass early. It is ~0.1–0.3% of a pass and not needed now.
 
 ---
 
@@ -136,9 +137,9 @@ stream, publish `SYNC_PLE` a pass early. It is ~0.1–0.3% of a pass and not nee
 [VRAM]
   expert_banks      per-layer; mixed quant (7 expert shapes in IQ1_M)
   staging_ring      global, shape-keyed (16 slots; 64 measured identical)
-  result_ring       global ring depth 8 (host -> device CPU results)
+  result_ring       global ring depth 8, seq + consumed (host -> device CPU results)
   activation_rings  per-layer ring depth 8 (device -> host activations)
-  gates             epoch, ready[2 * slots]
+  topk_doorbells    per-layer, one publish outstanding (device -> host router ids)
 [host pinned]
   expert stacks     per-layer, three projections, cuMemHostRegister(PORTABLE)
 ```
@@ -203,9 +204,9 @@ now uses the global result doorbell, so the old schedule sizing bug (MTP site = 
 - **One fixed configuration per decision.** Env vars are probes/overrides, not A/B arms. Current
   surface (6): `NAIWA_STEP_DBG`, `NAIWA_ROUND_STATS`, `NAIWA_RET_DBG`, `NAIWA_FUSED_DBG`,
   `NAIWA_LOOKAHEAD_DBG`, `NAIWA_GPU_ONLY_EXPERTS` (lossy bound). The oracle switch is the `--no-lookahead` flag.
-- **Pitfalls:** host-written per-step targets race (use device epoch); publish FIFO; `bump_epoch`
-  needs the mapped **device view**; publish/gate replay must share `staging_enabled()` (a copy
-  stream exists at `frac 0`).
+- **Pitfalls:** host-written per-step targets race (the claim cell owns its sequence); publish FIFO
+  needs the mapped **device view**; the DMA and its wait must share `staging_enabled()` (a copy
+  stream exists at `frac 0`, so the copy stream's existence is not the predicate).
 
 ---
 
@@ -235,7 +236,7 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     d2h/topk.rs            TopkDoorbell (device -> host)
     d2h/activation.rs      ActivationDoorbell (device -> host)
     h2d/result.rs          ResultDoorbell (host -> device)
-    gate.rs                GateSet/Gate (device-side pass gates)
+    handoff.rs             PassCell (cross-thread completion claim)
     tests.rs
   src/moe/                 MoE execution + GPU expert cache
     mod.rs                 module docs, constants, exports

@@ -1,27 +1,30 @@
 //! Device-to-host top-k doorbell: the router's ids/weights, so the host read needs no D2H launch.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::doorbell::ffi;
-use crate::doorbell::mapped::{load_f32, load_u32, wait_host_ge, MappedBuf};
+use crate::doorbell::mapped::{load_f32, load_u32, wait_host_ge, MappedBuf, HEADER_BYTES};
 
-const IDS_OFF: usize = 8;
+const IDS_OFF: usize = HEADER_BYTES;
 
 /// `[seq u32][pad][ids max_n u32][weights max_n f32]`.
+///
+/// The device counter is the only sequence: the publish kernel bumps it, and this host reads it
+/// before queueing the next publish. Depth 1 means there is never more than one publish
+/// outstanding, so "the value before I published, plus one" is exactly the publish to wait for,
+/// with no host-side mirror to keep in sync.
 pub struct TopkDoorbell {
     buf: MappedBuf,
     max_n: usize,
-    /// Host-side sequence mirror. The device increments the mapped seq; this tracks which
-    /// publish the next `publish_and_read` owns.
-    seq: AtomicU32,
 }
 
 impl TopkDoorbell {
+    /// `max_n` f32 of ids plus `max_n` f32 of weights. Sized once at warmup for the largest window
+    /// the layer will ever publish (`rows * top_k`).
     pub fn acquire(device: &Device, max_n: usize) -> Result<Option<Self>> {
         if max_n == 0 {
             return Ok(None);
@@ -29,11 +32,7 @@ impl TopkDoorbell {
         let Some(bytes) = max_n.checked_mul(8).and_then(|n| n.checked_add(IDS_OFF)) else {
             return Ok(None);
         };
-        Ok(MappedBuf::alloc_zeroed(device, bytes)?.map(|buf| Self {
-            buf,
-            max_n,
-            seq: AtomicU32::new(0),
-        }))
+        Ok(MappedBuf::alloc_zeroed(device, bytes)?.map(|buf| Self { buf, max_n }))
     }
 
     /// Queue a publish, wait for its seq, and return the ids/weights. This is the whole public
@@ -44,11 +43,14 @@ impl TopkDoorbell {
         weights: &Tensor,
         n: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
-        let seq = self.seq.load(Ordering::Relaxed);
+        let seq = self.seq();
         self.publish(ids, weights, n)?;
-        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
-        let (_, ids, ws) = self.wait_and_read(seq, n);
-        Ok((ids, ws))
+        Ok(self.wait_and_read(seq, n))
+    }
+
+    /// The device counter's current value: the seq of the last completed publish.
+    fn seq(&self) -> u32 {
+        load_u32(self.buf.host_u32(0))
     }
 
     /// Queue the ring on the device's current stream: copy `n` ids/weights into the mapped buffer,
@@ -56,7 +58,7 @@ impl TopkDoorbell {
     fn publish(&self, ids: &Tensor, weights: &Tensor, n: usize) -> Result<()> {
         if n > self.max_n {
             candle_core::bail!(
-                "top-k doorbell publish of {n} exceeds the slot capacity ({})",
+                "top-k doorbell publish of {n} f32 exceeds the slot capacity ({})",
                 self.max_n
             );
         }
@@ -98,26 +100,26 @@ impl TopkDoorbell {
         Ok(())
     }
 
-    /// Wait until seq advances past `last_seq`, then copy out the published ids and weights.
-    /// No CUDA calls: safe from the token-driving thread. The wait never times out — stale ids
-    /// would silently corrupt routing.
-    fn wait_and_read(&self, last_seq: u32, n: usize) -> (u32, Vec<u32>, Vec<f32>) {
+    /// Wait until the device counter advances past `last_seq`, then copy out the published ids and
+    /// weights. No CUDA calls: safe from the token-driving thread. The wait never times out —
+    /// stale ids would silently corrupt routing.
+    fn wait_and_read(&self, last_seq: u32, n: usize) -> (Vec<u32>, Vec<f32>) {
         assert!(n <= self.max_n, "top-k doorbell read exceeds capacity");
         let want = last_seq.wrapping_add(1);
         // `>=` not `==`: a lagging consumer may see the counter already past `want`.
         let _ = wait_host_ge(
-            self.buf.host().cast(),
+            self.buf.host_u32(0),
             want,
             None,
             Duration::from_micros(50),
         );
         // SAFETY: seq read orders these payload reads (the device fenced before the bump).
-        let ids_ptr = unsafe { self.buf.host().add(IDS_OFF).cast::<u32>() };
+        let ids_ptr = self.buf.host_u32(IDS_OFF);
         let w_ptr = unsafe { self.buf.host().add(IDS_OFF + self.max_n * 4).cast::<f32>() };
         let ids = (0..n)
             .map(|i| load_u32(unsafe { ids_ptr.add(i) }))
             .collect();
         let ws = (0..n).map(|i| load_f32(unsafe { w_ptr.add(i) })).collect();
-        (want, ids, ws)
+        (ids, ws)
     }
 }

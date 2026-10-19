@@ -20,7 +20,6 @@ impl Preload {
         x2d: &Tensor,
         rows: usize,
         hidden: usize,
-        pass: u32,
     ) -> Result<()> {
         // Start predicting the next layer's experts now, off the token path; whatever is not
         // resident by the time that layer runs goes to the CPU.
@@ -46,7 +45,7 @@ impl Preload {
                         schedule(Box::new(move || {
                             let r = x.len() / next.hidden().max(1);
                             let x = Tensor::from_vec(x, (r, next.hidden()), &Device::Cpu);
-                            if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
+                            if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
                                 debug!(
                                     "expert cache: layer {} lookahead failed: {e}",
                                     next.layer()
@@ -72,7 +71,7 @@ impl Preload {
                             // ms/step slower).
                             if let Some(v) = sh.read(last_seq, n) {
                                 let x = Tensor::from_vec(v, (rows, next.hidden()), &Device::Cpu);
-                                if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
+                                if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
                                     debug!(
                                         "expert cache: layer {} lookahead failed: {e}",
                                         next.layer()
@@ -93,7 +92,7 @@ impl Preload {
                     let next = Arc::clone(&next);
                     schedule(Box::new(move || {
                         let x = Tensor::from_vec(x_clone, (rows, next.hidden()), &Device::Cpu);
-                        if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
+                        if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x)) {
                             debug!("expert cache: layer {} lookahead failed: {e}", next.layer());
                         }
                     }));

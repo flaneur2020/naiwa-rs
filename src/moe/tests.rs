@@ -6,7 +6,7 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::MoEExperts;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::copy_stream::ReadFence;
@@ -208,7 +208,8 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         lookahead: true,
         prefill: None,
         filling: AtomicBool::new(false),
-        preload_claimed: AtomicU32::new(0),
+        preload: None,
+        staging_done: None,
     })
 }
 

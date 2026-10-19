@@ -52,6 +52,7 @@ pub(crate) use stages::fused_decode;
 pub(in crate::moe) use cached_layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 pub(crate) use cached_layer::{
     streamed_misses, CachedExperts, CachedLayer, Layers, LayerState, LookaheadChannel,
+    MAX_DECODE_ROWS,
 };
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
 pub(crate) use slot::{slot_bytes_from_qtensor, Bank, Projections, Slot, SlotBuf, SlotData};
@@ -60,23 +61,9 @@ pub(in crate::moe) use staging::alloc_bank;
 pub(in crate::moe) use staging::staging_ring_slots;
 pub(crate) use staging::{StagingRings, STAGING_RING_FIRST};
 
-#[cfg(feature = "cuda")]
-use std::sync::{Arc, OnceLock};
-
 /// With `--prefill-stream`, each layer keeps its last slots in a separate bank of about its
 /// share of the loan: two layers of experts, spread over the estimated 48 layers, plus a
 /// quarter for layers with smaller slots than the largest one. The loan lends whole banks.
 fn loan_bank_slots(num_experts: usize) -> usize {
     (2 * num_experts * 5).div_ceil(4 * 48)
 }
-
-#[cfg(feature = "cuda")]
-static SCHEDULE: OnceLock<Arc<crate::doorbell::GateSet>> = OnceLock::new();
-
-#[cfg(feature = "cuda")]
-pub(crate) fn schedule() -> Option<&'static Arc<crate::doorbell::GateSet>> {
-    SCHEDULE.get()
-}
-
-#[cfg(feature = "cuda")]
-const WAITS_PER_LAYER: u32 = 2;

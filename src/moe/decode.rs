@@ -1,16 +1,14 @@
 //! The decode path: split top-k into GPU hits and CPU misses, run both, sum.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use candle_core::Tensor;
 use mistralrs_core::layers::Activation;
-use tracing::warn;
 
 use super::stages::{CpuMiss, DmaMiss, Gpu, Hit, Preload, Route};
 use crate::stats;
 
-use super::{schedule, CachedLayer};
+use super::CachedLayer;
 
 /// Decode path (one token, or the few rows of a speculative verify step): split each row's
 /// top-k into GPU hits and CPU misses, run both concurrently, sum. Misses are never loaded on
@@ -28,9 +26,9 @@ use super::{schedule, CachedLayer};
 /// `deferred::start` untouched. The injected hits carry the staging `SlotBuf`, so the caller's
 /// fence loop covers them and the next step's DMA waits on this step's readers.
 ///
-/// `upload_async` returns as soon as the copy is queued; the layer's DMA gate (a captured wait
-/// node, M4) spins until the copy stream has published `SYNC_STAGING` for this pass, so candle's
-/// stream never waits on the copy stream and the host enqueues nothing per streamed expert.
+/// `upload_async` returns as soon as the copy is queued; the layer's staging completion event is
+/// waited on candle's stream, so candle's stream never blocks the host and the host enqueues one
+/// event wait per layer instead of one stream wait per streamed expert.
 
 pub(crate) fn forward(
     layer: &Arc<CachedLayer>,
@@ -43,30 +41,7 @@ pub(crate) fn forward(
     let rows = batch * seq;
     let x2d = xs.reshape((rows, hidden))?;
     stats::record_step_layer(layer.slot_device(), layer.layer());
-    // M3/M4: this layer's pass index. Bumped once per pass at layer 0, together with the device
-    // epoch, and only once the schedule exists — so the two counters cannot drift. It has to be
-    // known before the DMA, because that is what publishes the staging point for this pass.
-    #[cfg(feature = "cuda")]
-    let pass = {
-        static PASS: AtomicU32 = AtomicU32::new(0);
-        if layer.layer() == 0 {
-            match schedule() {
-                Some(sched) => {
-                    let p = PASS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Err(e) = sched.bump_epoch(layer.slot_device()) {
-                        warn!("expert cache: epoch bump failed: {e}");
-                    }
-                    p
-                }
-                None => 0,
-            }
-        } else {
-            PASS.load(Ordering::Relaxed)
-        }
-    };
-    #[cfg(not(feature = "cuda"))]
-    let pass: u32 = 0;
-    Preload::submit(layer, &x2d, rows, hidden, pass)?;
+    Preload::submit(layer, &x2d, rows, hidden)?;
 
     let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
     let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
@@ -77,8 +52,8 @@ pub(crate) fn forward(
     // `plan.hits`, so the resident prefix is exactly what was there before the call.
     #[cfg(feature = "cuda")]
     let resident_prefix: Vec<usize> = plan.hits.iter().map(Vec::len).collect();
-    if layer.pcie_frac() > 0.0 {
-        DmaMiss::submit(layer, &mut plan, pass)?;
+    if layer.staging_enabled() {
+        DmaMiss::submit(layer, &mut plan)?;
     }
 
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
@@ -93,24 +68,15 @@ pub(crate) fn forward(
 
     let cpu = CpuMiss::submit(layer, &plan.misses, &x2d, rows)?;
 
-    // M4: the copy stream published this layer's `SYNC_STAGING` point on its own stream, after
-    // this step's copies. Replaying the layer's gate spins here, inside a captured node, so
-    // nothing below can read a staging slot that is still in flight — and the host enqueues no
-    // per-expert stream wait to get that guarantee.
-    //
-    // When warmup could not capture the gate, the *same* node is launched warm: one host call
-    // per layer, like the `cudaStreamWaitEvent` it replaces, so the protocol stays one protocol.
-    // M5b: same for the preload point, but only when this pass was actually claimed — a layer
-    // with no preload this pass has nothing to wait for, and replaying its gate would wait for a
-    // publish that nobody owes (`--no-lookahead` makes that the normal case).
+    // Wait for the latest preload claim on candle's stream. The claim carries its own completion
+    // event, so this also drains a copy the lookahead queued late; a layer that never gets
+    // predicted has no claim and costs no CUDA call at all.
     #[cfg(feature = "cuda")]
-    if layer.preload_claimed() == pass {
-        layer.replay_gate(crate::doorbell::SYNC_PRELOAD)?;
-    }
+    layer.wait_preload()?;
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
-    // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the gate's p50 wait drops
-    // from 858 us to 11 us). The staged experts still need the ring, so they keep the gate. This is the
-    // one fixed behaviour - there is no switch.
+    // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
+    // from 858 us to 11 us). The staged experts still need the ring, so they keep the wait. This is
+    // the one fixed behaviour - there is no switch.
     #[cfg(feature = "cuda")]
     let split = layer.staging_enabled();
     #[cfg(not(feature = "cuda"))]
@@ -140,11 +106,9 @@ pub(crate) fn forward(
         None
     };
 
-    // M4: ... and the staging point, which every pass publishes.
+    // ... and the staging DMA's completion event, on candle's stream.
     #[cfg(feature = "cuda")]
-    if layer.staging_enabled() {
-        layer.replay_gate(crate::doorbell::SYNC_STAGING)?;
-    }
+    layer.wait_staging()?;
 
     #[cfg(feature = "cuda")]
     let hits_to_run: Vec<Vec<Hit>> = if split {

@@ -1,4 +1,4 @@
-//! The one mapped-allocation owner for every doorbell.
+//! The mapped-allocation owner shared by every doorbell.
 //!
 //! `cudaHostAllocMapped` memory has a host address and a device address for the same bytes. All
 //! doorbells are views over one of these allocations; the protocol in each doorbell decides who
@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use candle_core::{Device, Result};
 
 use super::ffi;
+
+/// Bytes reserved at the front of every doorbell layout for its counters (`seq`, `consumed`), so
+/// every payload starts 8-byte aligned and the offsets stay one number instead of one per file.
+pub(super) const HEADER_BYTES: usize = 8;
 
 pub(super) struct MappedBuf {
     host: *mut u8,
@@ -68,13 +72,25 @@ impl MappedBuf {
     pub(super) fn len(&self) -> usize {
         self.len
     }
+
+    /// Host view of a `u32` word at `offset`.
+    pub(super) fn host_u32(&self, offset: usize) -> *mut u32 {
+        debug_assert!(offset + 4 <= self.len);
+        // SAFETY: `offset` is inside the allocation.
+        unsafe { self.host.add(offset).cast() }
+    }
 }
 
 impl Drop for MappedBuf {
     fn drop(&mut self) {
         if !self.host.is_null() {
             // SAFETY: allocated by doorbell_alloc_mapped, freed nowhere else.
-            unsafe { ffi::doorbell_free_host(self.host.cast()) };
+            let rc = unsafe { ffi::doorbell_free_host(self.host.cast()) };
+            if rc != 0 {
+                // Benign at process exit: the doorbell statics outlive the CUDA context, so the
+                // driver is already deinitialized (error 4) when they drop.
+                tracing::debug!("cudaFreeHost failed on a doorbell mapping: {rc}");
+            }
         }
     }
 }

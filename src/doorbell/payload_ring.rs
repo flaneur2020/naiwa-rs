@@ -1,4 +1,4 @@
-//! The shared `seq + ring of f32 slots` layout used by the two payload doorbells.
+//! The shared `seq + consumed + ring of f32 slots` layout used by the two payload doorbells.
 //!
 //! This is layout/ownership only; the direction-specific protocol lives in
 //! `d2h::ActivationDoorbell` and `h2d::ResultDoorbell`.
@@ -7,14 +7,20 @@ use std::ffi::c_void;
 
 use candle_core::{Device, Result};
 
-use super::mapped::MappedBuf;
+use super::mapped::{MappedBuf, HEADER_BYTES};
 
 /// Slots in the ring. One slot is being consumed while the others absorb publishes the consumer
 /// has not picked up yet.
 pub(super) const DEPTH: usize = 8;
 
 const SEQ_OFF: usize = 0;
-const SLOTS_OFF: usize = 8;
+
+/// Device-written "the consumer has copied slot `consumed % DEPTH` out". Only the host-to-device
+/// ring uses it (there the *device* is the consumer); the device-to-host ring tracks consumption
+/// on the host side instead.
+const CONSUMED_OFF: usize = 4;
+
+const SLOTS_OFF: usize = HEADER_BYTES;
 
 pub(super) struct PayloadRing {
     buf: MappedBuf,
@@ -41,11 +47,19 @@ impl PayloadRing {
     }
 
     pub(super) fn seq_host(&self) -> *mut u32 {
-        self.buf.host().cast()
+        self.buf.host_u32(SEQ_OFF)
     }
 
     pub(super) fn seq_dev(&self) -> *mut c_void {
         self.buf.dev(SEQ_OFF)
+    }
+
+    pub(super) fn consumed_host(&self) -> *mut u32 {
+        self.buf.host_u32(CONSUMED_OFF)
+    }
+
+    pub(super) fn consumed_dev(&self) -> *mut c_void {
+        self.buf.dev(CONSUMED_OFF)
     }
 
     fn slot_offset(&self, seq: u32) -> usize {

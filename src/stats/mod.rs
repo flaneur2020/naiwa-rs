@@ -19,9 +19,9 @@ mod round;
 mod step;
 
 pub(crate) use cache::{
-    dump_cache_stats, record_cache_gate_replay, record_cache_hits, record_cache_installed,
-    record_cache_lookahead_dropped, record_cache_lookahead_load, record_cache_misses,
-    record_cache_pcie, record_cache_staged, record_cache_swap,
+    dump_cache_stats, record_cache_hits, record_cache_installed, record_cache_lookahead_dropped,
+    record_cache_lookahead_load, record_cache_misses, record_cache_pcie, record_cache_result_stall,
+    record_cache_staged, record_cache_swap, record_cache_sync_wait,
 };
 pub(crate) use fused::{dump_fused_stats, record_fused_decode};
 pub(crate) use lookahead::{

@@ -1,6 +1,8 @@
-//! Doorbell tests: the D2H/H2D round trips and the v2 gate protocol.
+//! Doorbell tests: the D2H/H2D round trips, the result ring's backpressure and the preload
+//! handoff.
 
 use super::*;
+use crate::copy_stream::{CopyDone, CopyStream};
 use candle_core::{DType, Device, Tensor};
 
 #[test]
@@ -44,59 +46,60 @@ fn result_doorbell_copies_host_payload_to_the_device() {
     };
     let dst = Tensor::zeros(4, DType::F32, &dev).unwrap();
     let values = [1.0f32, 2.0, 3.0, 4.0];
-    bell.publish(Some(&values), 1);
+    assert!(bell.publish(Some(&values), 1), "an empty ring always takes the payload");
     bell.wait_copy(1, 4, &dst).unwrap();
     dev.synchronize().unwrap();
     assert_eq!(dst.to_vec1::<f32>().unwrap(), values);
+    // The copy kernel publishes `consumed` once it has read the slot out.
+    assert!(bell.consumed() >= 1, "consumed = {}", bell.consumed());
 }
 
 #[test]
-fn epoch_advances_a_replayed_gate_to_the_next_pass() {
+fn result_doorbell_backpressure_waits_for_consumed_and_then_drops() {
     let Ok(dev) = Device::new_cuda(0) else {
         return;
     };
-    let Ok(Some(set)) = GateSet::acquire(&dev, 1, 2) else {
+    let Ok(Some(bell)) = ResultDoorbell::acquire(&dev, 4) else {
         return;
     };
-    let gate = set.gate(set.sync_id(0, SYNC_STAGING));
-
-    set.bump_epoch(&dev).unwrap();
-    gate.publish_host(1);
-    gate.wait(&dev).unwrap();
+    let depth = bell.depth() as u32;
+    let values = [1.0f32, 2.0, 3.0, 4.0];
+    // Fill the whole ring without ever queueing a copy: the slots are unpublished but their
+    // previous lap does not exist, so they are all free.
+    for seq in 1..=depth {
+        assert!(bell.publish(Some(&values), seq), "seq {seq} is inside the first lap");
+    }
+    // The next lap's first slot belongs to seq 1, which the device never consumed.
+    assert!(
+        !bell.publish(Some(&values), depth + 1),
+        "a full ring must refuse the payload instead of overwriting an unread slot"
+    );
+    // ... and the seq bump still happened, so the stream cannot hang waiting for it.
+    let dst = Tensor::zeros(4, DType::F32, &dev).unwrap();
+    bell.wait_copy(depth + 1, 4, &dst).unwrap();
     dev.synchronize().unwrap();
-    assert_eq!(set.epoch(), 1, "one pass -> epoch 1");
-
-    set.bump_epoch(&dev).unwrap();
-    gate.publish_stream(dev.as_cuda_device().unwrap().cuda_stream().cu_stream(), 2)
-        .unwrap();
-    gate.wait(&dev).unwrap();
-    dev.synchronize().unwrap();
-    assert_eq!(set.epoch(), 2, "two passes -> epoch 2");
-    assert_eq!(gate.ready(), 2);
+    assert!(bell.consumed() >= depth + 1);
+    // Slot 1 is consumed now, so the next lap is accepted again.
+    assert!(bell.publish(Some(&values), depth + 2));
 }
 
 #[test]
-fn stream_published_gate_satisfies_a_wait_only_node() {
+fn pass_cell_hands_the_latest_claim_to_the_consumer() {
     let Ok(dev) = Device::new_cuda(0) else {
         return;
     };
-    let Ok(Some(set)) = GateSet::acquire(&dev, 1, 2) else {
+    let Ok(Some(cs)) = CopyStream::new(&dev) else {
         return;
     };
-    let gate = set.gate(set.sync_id(1, SYNC_PRELOAD));
-    set.bump_epoch(&dev).unwrap();
-    gate.publish_stream(dev.as_cuda_device().unwrap().cuda_stream().cu_stream(), 1)
-        .unwrap();
-    gate.wait(&dev).unwrap();
-    dev.synchronize().unwrap();
-    assert_eq!(gate.ready(), 1, "the host sees the stream-published pass");
+    let cell = PassCell::new(std::sync::Arc::new(CopyDone::new(&cs).unwrap()));
+    assert_eq!(cell.wait_latest(&dev).unwrap(), None, "no claim, no CUDA work");
 
-    // A stale producer must not move the level backwards.
-    gate.publish_host(1);
-    gate.publish_stream_max(&dev, 0).unwrap();
+    assert_eq!(cell.claim(&cs).unwrap(), 1);
     dev.synchronize().unwrap();
-    assert_eq!(gate.ready(), 1);
-    gate.publish_stream_max(&dev, 3).unwrap();
+    assert_eq!(cell.wait_latest(&dev).unwrap(), Some(1));
+
+    assert_eq!(cell.claim(&cs).unwrap(), 2);
+    assert_eq!(cell.claimed(), 2);
     dev.synchronize().unwrap();
-    assert_eq!(gate.ready(), 3);
+    assert_eq!(cell.wait_latest(&dev).unwrap(), Some(2));
 }

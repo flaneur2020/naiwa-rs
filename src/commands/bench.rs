@@ -350,11 +350,17 @@ pub async fn run_bench(
                 stats.pcie_bytes as f64 / (1024.0 * 1024.0),
             );
         }
-        if stats.gate_replays > 0 {
+        if stats.sync_waits > 0 {
             println!(
-                "  M6 gate: {} wait node(s) launched warm (M6 deleted the gate graphs; 0 graphs, \
-                 0 fallbacks)",
-                stats.gate_replays,
+                "  sync: {} stream-side completion wait(s) (staging DMA and preload claims)",
+                stats.sync_waits,
+            );
+        }
+        if stats.result_stalls > 0 {
+            println!(
+                "  CPU-result ring: {} payload(s) dropped after the bounded slot wait - the \
+                 results are WRONG for those experts",
+                stats.result_stalls,
             );
         }
         println!();

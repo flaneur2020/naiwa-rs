@@ -1,11 +1,11 @@
-//! DMA miss: stage misses into the PCIe staging ring and publish SYNC_STAGING.
+//! DMA miss: stage misses into the PCIe staging ring and record its completion event.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::copy_stream::{self, CopyStream};
 use crate::moe::{
-    expert_range, schedule, streamed_misses, CachedLayer, SlotBuf, SlotData, STAGING_RING_FIRST,
+    expert_range, streamed_misses, CachedLayer, SlotBuf, SlotData, STAGING_RING_FIRST,
 };
 use crate::stats;
 
@@ -15,35 +15,23 @@ fn stream_pcie(
     layer: &Arc<CachedLayer>,
     misses: &mut [Vec<(u32, f32)>],
     hits: &mut [Vec<Hit>],
-    pass: u32,
 ) -> candle_core::Result<()> {
-    let Some(cs) = layer.copy_stream() else {
+    let (Some(cs), Some(done)) = (layer.copy_stream(), layer.staging_done()) else {
         return Ok(());
     };
+    // Every path records the layer's completion event: `upload_async` after each expert's copies,
+    // and one bare record when there was nothing to stage, so the consumer's wait is satisfied
+    // either way (a wait on an event that was never recorded would hang the stream).
     let staged = stage_misses(layer, cs, misses, hits);
-    // M4: release this layer's DMA gate on *every* path — nothing staged, staged, or failed.
-    // The gate is replayed for every layer of every pass, so a point left unpublished would
-    // spin forever. This is a stream memory op on the copy stream, ordered after the copies
-    // above it, so a node spinning on the word cannot see it before the data has landed.
-    #[cfg(feature = "cuda")]
-    if let Some(sched) = schedule() {
-        sched.publish_stream(
-            cs.cu_stream(),
-            layer.layer() as u32,
-            crate::doorbell::SYNC_STAGING,
-            pass,
-        )?;
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _ = pass;
+    done.record(cs)?;
     staged
 }
 
 /// The DMA half of [`Self::stream_pcie`]: pick this step's misses, queue their copies on the
 /// copy stream, and turn them into hits.
 ///
-/// The copies record no completion event: the caller publishes this layer's `SYNC_STAGING`
-/// point on this same stream right after them, and the layer's gate graph spins on that word.
+/// The copies queue without a completion event: the caller records the layer's event once, after
+/// the last of them, and `candle`'s stream waits on it before it reads a staged slot.
 fn stage_misses(
     layer: &Arc<CachedLayer>,
     cs: &Arc<CopyStream>,
@@ -107,9 +95,6 @@ fn stage_misses(
                         ],
                     )?;
                 }
-                // M4: the completion is no longer a `cudaStreamWaitEvent` on candle's stream;
-                // the copy stream publishes the layer's `SYNC_STAGING` point itself (below),
-                // and this layer's gate graph spins on it.
                 stats::record_cache_pcie(bytes as u64);
                 slot_of.insert(expert, (Arc::clone(buf), pos));
             }
@@ -138,8 +123,7 @@ impl DmaMiss {
     pub(crate) fn submit(
         layer: &Arc<CachedLayer>,
         plan: &mut super::RoutePlan,
-        pass: u32,
     ) -> candle_core::Result<()> {
-        stream_pcie(layer, &mut plan.misses, &mut plan.hits, pass)
+        stream_pcie(layer, &mut plan.misses, &mut plan.hits)
     }
 }

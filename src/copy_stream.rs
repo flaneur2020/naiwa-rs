@@ -191,12 +191,6 @@ mod cuda {
             self.stream.synchronize().map_err(Error::wrap)
         }
 
-        /// The raw handle, so a producer here can order a stream memory op on it — M4 publishes a
-        /// sync point with `cuStreamWriteValue32` right after a batch of copies.
-        pub fn cu_stream(&self) -> sys::CUstream {
-            self.stream.cu_stream()
-        }
-
         /// Order this stream after everything already queued on candle's stream, i.e. the slot
         /// allocations and their zero-fill.
         pub fn after_device_work(&self) -> Result<()> {
@@ -224,12 +218,12 @@ mod cuda {
         }
 
         /// Queue the copies and return at once, **without** recording a completion event — for a
-        /// producer whose completion signal is a doorbell point (`cuStreamWriteValue32` on this
-        /// stream, M4) rather than a CUDA event.
+        /// producer that records one event for a whole batch of copies after queueing them all
+        /// (the doorbell preload claims its pass only once the event exists).
         ///
         /// # Safety
-        /// As [`Self::upload_async`], minus the event: the caller must order every consumer after
-        /// the copies some other way (the doorbell point, or a stream wait on the *reader* side).
+        /// As [`Self::upload_async`], minus the event: the caller must record one after the last
+        /// copy and order every consumer after it.
         pub unsafe fn queue_async(
             &self,
             fence: &ReadFence,
@@ -285,6 +279,20 @@ mod cuda {
             Ok(Self { event })
         }
 
+        /// Record this completion on the copy stream, after everything queued on it so far.
+        /// Used by a producer that queues its copies first and records one event for the batch
+        /// (the doorbell preload), rather than one event per batch member.
+        ///
+        /// Binds the context: a producer that queued nothing has not bound it on this thread yet
+        /// (`queue_copies` is the other caller), and `cuEventRecord` needs it.
+        pub fn record(&self, cs: &CopyStream) -> Result<()> {
+            cs.stream
+                .context()
+                .bind_to_thread()
+                .map_err(Error::wrap)?;
+            self.event.record(&cs.stream).map_err(Error::wrap)
+        }
+
         /// Make candle's stream wait for the upload (a GPU-side wait; the host does not block).
         pub fn wait_on(&self, device: &Device) -> Result<()> {
             let Device::Cuda(dev) = device else {
@@ -337,6 +345,10 @@ mod stub {
     impl CopyDone {
         pub fn new(cs: &CopyStream) -> Result<Self> {
             match *cs {}
+        }
+
+        pub fn record(&self, _cs: &CopyStream) -> Result<()> {
+            match *self {}
         }
 
         pub fn wait_on(&self, _device: &Device) -> Result<()> {

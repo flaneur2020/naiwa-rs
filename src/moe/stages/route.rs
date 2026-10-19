@@ -1,7 +1,5 @@
 //! Route: top-k doorbell read and hit/miss split.
 
-use std::sync::Arc;
-
 use candle_core::{DType, Result, Tensor};
 
 use crate::moe::CachedLayer;
@@ -30,25 +28,20 @@ impl Route {
         #[cfg(not(feature = "cuda"))]
         let device_flip = false;
 
-        // Step 5 doorbell: lazily acquire (first decode), queue the ring on the same stream the top-k
-        // kernels ran on, then spin host-side for the payload — no stream sync, no D2H launch.
-        // Falls back to `to_vec2` when unavailable.
+        // Step 5 doorbell: queue the ring on the same stream the top-k kernels ran on, then spin
+        // host-side for the payload — no stream sync, no D2H launch. The doorbell is sized at
+        // warmup for the largest window, so a publish that does not fit is a bug and fails here
+        // rather than silently falling back to a blocking read. Without a doorbell (allocation
+        // failed) `to_vec2` is the fallback: correct, just slower.
         let db = if device_flip {
             None
         } else {
-            let mut st = layer.state().lock().unwrap();
-            if st.doorbell.is_none() {
-                let cap = n.max(8 * layer.top_k()).max(64);
-                st.doorbell = crate::doorbell::TopkDoorbell::acquire(layer.slot_device(), cap)
-                    .ok()
-                    .flatten()
-                    .map(Arc::new);
-            }
-            st.doorbell.clone()
+            layer.state().lock().unwrap().doorbell.clone()
         };
-        let read = db
-            .as_ref()
-            .and_then(|db| db.publish_and_read(topk_ids, topk_weights, n).ok());
+        let read = match db.as_ref() {
+            Some(db) => Some(db.publish_and_read(topk_ids, topk_weights, n)?),
+            None => None,
+        };
         let (ids_rows, weight_rows): (Vec<Vec<u32>>, Vec<Vec<f32>>) = if let Some((ids, ws)) = read
         {
             // W106 sanitation: a garbage id means the doorbell payload was read stale or

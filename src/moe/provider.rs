@@ -1,14 +1,14 @@
 //! The `RoutedExpertsProvider` that builds one cached layer per MoE block. The provider owns the
 //! model-wide layer index and staging rings; each cached layer borrows both.
 
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
 
 use super::expert::CpuExperts;
-use crate::copy_stream::CopyStreams;
+use crate::copy_stream::{CopyDone, CopyStreams};
 use crate::host_memory::{self, pin_expert_stacks, PinnedStack};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
 use crate::stats;
@@ -17,7 +17,7 @@ use mistralrs_core::MoEExperts;
 
 use super::{
     alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
-    Layers, LookaheadChannel, Slot, StagingRings, SCHEDULE, WAITS_PER_LAYER,
+    Layers, LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
 };
 
 /// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
@@ -113,30 +113,23 @@ impl GpuCacheMoeProvider {
     /// `--pcie-frac`, which is where the ~215 MiB belongs). Returns `(captures, rings)`.
     pub fn warmup(&self) -> candle_core::Result<(usize, usize)> {
         let layers = self.layers.all();
+        // Every mapped buffer is sized and allocated here, once: the top-k doorbell per layer (for
+        // the largest decode window) and the engine-wide CPU-result ring. A staging ring is only
+        // built with `--pcie-frac` (that is where its ~215 MiB belongs).
         #[cfg(feature = "cuda")]
         if let Some(first) = layers.first() {
-            let device = first.slot_device.clone();
-            let slots = layers
-                .iter()
-                .map(|l| l.layer)
-                .max()
-                .map(|max| max + 1)
-                .unwrap_or(layers.len());
-            match crate::doorbell::GateSet::acquire(&device, WAITS_PER_LAYER, slots) {
-                Ok(Some(gates)) => {
-                    let _ = SCHEDULE.set(Arc::new(gates));
-                }
-                Ok(None) => warn!("expert cache: no gate buffer; DMA/preload gates disabled"),
-                Err(e) => warn!("expert cache: gate allocation failed: {e}"),
+            for layer in &layers {
+                layer.warmup_doorbell()?;
             }
+            crate::executor::warmup_result_channel(
+                first.slot_device(),
+                MAX_DECODE_ROWS * first.hidden(),
+            )?;
         }
         #[allow(unused_mut)]
         let mut captures = 0usize;
         // M9: no segment captures. Measured before the deletion (graphs on/off): 43.5 vs 44.1 tok/s,
-        // graphs off 44.1 - identical, so the eager segment is the one fixed configuration and the capture
-        // machinery below is dead code kept only until the deletion commit.
-        #[cfg(feature = "cuda")]
-        let _ = &layers;
+        // graphs off 44.1 - identical, so the eager segment is the one fixed configuration.
         let mut rings = 0usize;
         if self.pcie_frac > 0.0 {
             for layer in &layers {
@@ -366,6 +359,19 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // slot storage/banks, so `lend`/`give_back`/`admit`/`replace` never see it; `run_hits`
         // picks it up only because the injected hits carry its `Arc<Bank>`.
 
+        // Both completion events are created here (the decode path must not allocate a sync
+        // object). `staging_done: None` is what disables `--pcie-frac` for a layer whose copies
+        // nobody would wait for; `preload: None` means the layer's fills go through candle's
+        // stream, where they are already ordered.
+        let staging_done = match (&copy_stream, self.pcie_frac > 0.0) {
+            (Some(cs), true) => Some(Arc::new(CopyDone::new(cs)?)),
+            _ => None,
+        };
+        let preload = match &copy_stream {
+            Some(cs) => Some(crate::doorbell::PassCell::new(Arc::new(CopyDone::new(cs)?))),
+            None => None,
+        };
+
         let cached = Arc::new(CachedLayer {
             _pinned: pinned,
             cpu: cpu_experts,
@@ -394,7 +400,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             lookahead: self.lookahead,
             prefill,
             filling: AtomicBool::new(false),
-            preload_claimed: AtomicU32::new(0),
+            preload,
+            staging_done,
         });
         self.layers.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))

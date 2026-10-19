@@ -1,22 +1,30 @@
 //! Doorbell primitives: mapped pinned memory the device and the host use to hand each other data
 //! and progress, with no stream syncs and no host callbacks.
 //!
-//! Every primitive is one direction. The shared rule is *payload first, then a volatile bump of a
-//! counter, with a fence between*:
+//! Every primitive is one direction, and there is exactly one rule:
 //!
-//! - [`TopkDoorbell`] — device -> host: the router's top-k. It owns its host sequence;
-//!   call `publish_and_read` and do not track a second seq.
+//! > **Payload first, then a system fence, then a `volatile` bump of a mapped counter.**
+//!
+//! The consumer sees the counter and may read the payload behind it. Device-side words are
+//! written `volatile` and fenced with `__threadfence_system()`; host-side words use a release
+//! fence and a volatile store (which also relies on x86 TSO for the device to observe host stores
+//! in order).
+//!
+//! - [`TopkDoorbell`] — device -> host: the router's top-k, depth 1. The device counter *is* the
+//!   sequence; the host reads it before publishing and waits for `seq + 1`.
 //! - [`ActivationDoorbell`] — device -> host: the lookahead activation over a slot ring.
 //!   `LookaheadChannel` owns its publish/read seq and backpressure.
-//! - [`ResultDoorbell`] — host -> device: the CPU experts' result over a slot ring.
-//!   `executor::cuda::Channel` owns its seq allocation.
-//! - [`GateSet`] / `Gate` — device-side pass gates: an epoch plus one ready word per gate.
-//!   `GateSet::publish_stream` / `wait` hide the raw `sync_id`. There is no payload here;
-//!   CPU results use [`ResultDoorbell`].
+//! - [`ResultDoorbell`] — host -> device: the CPU experts' result over a slot ring. The device
+//!   writes a `consumed` word after each copy, so the host can check its ring depth instead of
+//!   assuming it.
+//! - [`PassCell`] — a cross-thread *completion* handoff with no payload: the producer (lookahead
+//!   thread) records a [`CopyDone`](crate::copy_stream::CopyDone) and claims a pass, the consumer
+//!   (token thread) waits for the claim it sees. Both barriers in the decode path — the staging
+//!   DMA and the preload — are this one mechanism; there are no gate words and no epoch.
 //!
-//! The slot index is always derived from the sequence number (`seq % DEPTH`); callers own the
-//! sequence/backpressure policy. [`MappedBuf`](mapped::MappedBuf) is the single allocation owner
-//! and is private, so the unsafe mapped-memory surface stays inside this module.
+//! The slot index is always derived from the sequence number (`seq % DEPTH`).
+//! [`MappedBuf`](mapped::MappedBuf) is the single allocation owner and is private, so the unsafe
+//! mapped-memory surface stays inside this module.
 
 /// The doorbell kernels' `extern "C"` surface. Module-private: everything above it is safe.
 #[allow(dead_code)]
@@ -25,7 +33,7 @@ mod ffi {
 
     extern "C" {
         pub(crate) fn doorbell_alloc_mapped(out: *mut *mut c_void, bytes: usize) -> i32;
-        pub(crate) fn doorbell_free_host(p: *mut c_void);
+        pub(crate) fn doorbell_free_host(p: *mut c_void) -> i32;
         pub(crate) fn doorbell_get_device_ptr(host: *mut c_void, dev: *mut *mut c_void);
         pub(crate) fn doorbell_ring(
             d_seq: *mut c_void,         // mapped seq counter
@@ -44,27 +52,20 @@ mod ffi {
             stream: i64,
         );
         pub(crate) fn doorbell_wait_copy_f32(
-            d_seq: *mut c_void,     // mapped seq counter the host bumps
-            target: u32,            // seq value that means "payload slot complete"
-            d_payload: *mut c_void, // mapped payload slot, device view
-            slot_off: i64,          // float offset from d_payload (0 when it is the slot itself)
-            dst: *mut c_void,       // device f32 destination
-            n: i32,                 // float count
-            stream: i64,
-        );
-        pub(crate) fn doorbell_publish_max(d_ready: *mut c_void, id: i32, pass: u32, stream: i64);
-        pub(crate) fn doorbell_epoch_bump(d_epoch: *mut c_void, stream: i64);
-        pub(crate) fn doorbell_wait_ready(
-            d_epoch: *mut c_void,
-            d_ready: *mut c_void,
-            id: i32,
+            d_seq: *mut c_void,      // mapped seq counter the host bumps
+            target: u32,             // seq value that means "payload slot complete"
+            d_payload: *mut c_void,  // mapped payload slot, device view
+            slot_off: i64,           // float offset from d_payload (0 when it is the slot itself)
+            d_consumed: *mut c_void, // mapped word the kernel sets to `target` after copying
+            dst: *mut c_void,        // device f32 destination
+            n: i32,                  // float count
             stream: i64,
         );
     }
 }
 
 mod d2h;
-mod gate;
+mod handoff;
 mod h2d;
 mod mapped;
 mod payload_ring;
@@ -73,5 +74,5 @@ mod payload_ring;
 mod tests;
 
 pub use d2h::{ActivationDoorbell, TopkDoorbell};
-pub use gate::{GateSet, SYNC_PRELOAD, SYNC_STAGING};
+pub use handoff::PassCell;
 pub use h2d::ResultDoorbell;
