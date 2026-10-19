@@ -1,7 +1,8 @@
 # M9b — expert_cache decode components
 
-Status: **planned**. Parent: [m9a.md](m9a.md). Goal: split the decode path into `components/` with one
-entry, one exit and explicit doorbell ownership per stage. No behaviour or performance change.
+Status: **done**. Branch `m9b-decode-components` (`7e20a3b`), merged to main after the gates below.
+Parent: [m9a.md](m9a.md). Goal: split the decode path into `components/` with one entry, one exit and
+explicit doorbell ownership per stage. No behaviour or performance change.
 
 ## Pipeline
 
@@ -9,7 +10,8 @@ entry, one exit and explicit doorbell ownership per stage. No behaviour or perfo
 x2d ──► Preload ──► Route ──► DmaMiss ──► CpuMiss ──► Gpu(residents) ──► gates ──► Gpu(staged)
          │          │         │            │
          ▼          ▼         ▼            ▼
-   SYNC_PRELOAD  RoutePlan  CpuPending  SYNC_STAGING + StagedHits
+   SYNC_PRELOAD  RoutePlan  SYNC_STAGING  CpuPending
+                             (plan mutated)
 ```
 
 `src/decode.rs` becomes the orchestrator: it calls the components in this order and replays the two gates.
@@ -19,11 +21,11 @@ The order is the current `decode_forward` order; the split must not reorder it.
 
 | component | entry | exit | owns |
 |---|---|---|---|
-| `Preload` | `submit(layer, x2d, pass)` on the token thread | `SYNC_PRELOAD` published by the lookahead worker after the next-layer copies | `ActivationDoorbell` / `LookaheadChannel`, next-layer router + slot admit/replace |
-| `Route` | `split(topk_ids, weights)` | `RoutePlan { hits, misses }` | `TopkDoorbell` read, slot hit lookup, tick/hit_counts/last_use update |
-| `DmaMiss` | `stage(&mut RoutePlan, pass)` | `StagedHits` + `SYNC_STAGING` on the copy stream | scratch ring, `CopyStream`, staging gate publish; removes staged ids from `plan.misses` |
+| `Preload` | `submit(layer, x2d, rows, hidden, pass)` | `SYNC_PRELOAD` published by the lookahead worker after the next-layer copies | `ActivationDoorbell` publish; the lookahead worker calls `CachedLayer::prefetch_predicted` |
+| `Route` | `split(layer, topk_ids, weights, rows)` | `RoutePlan { hits, misses }` | `TopkDoorbell` read, slot hit lookup, tick/hit_counts/last_use update |
+| `DmaMiss` | `stage(layer, &mut RoutePlan, pass)` | `SYNC_STAGING` on the copy stream; `plan.hits` gains the staged experts | `CopyStream`, staging gate publish; uses the cache's scratch ring |
 | `CpuMiss` | `submit(&plan.misses, x2d)` | `Option<CpuPending>` | CPU job body; `ResultDoorbell` is owned by `deferred::Channel` |
-| `GpuExperts` | `run(hits, x2d, act)` | output tensor + read fences on every slot | fused decode / per-expert `QMatMul`; no doorbell |
+| `GpuExperts` | `run(layer, hits, x2d, act)` | output tensor + read fences on every slot | fused decode / per-expert `QMatMul`; no doorbell |
 
 `CpuPending::upload()` is the CPU-result exit: it queues the `ResultDoorbell` wait+copy and returns the
 tensor to add. `Decode` performs the add, not the components.
@@ -39,10 +41,6 @@ struct RoutePlan {
     misses: Vec<Vec<(u32, f32)>>,
 }
 
-struct StagedHits {
-    hits: Vec<Vec<Hit>>,
-}
-
 struct CpuPending {
     inner: deferred::Pending,
 }
@@ -52,7 +50,8 @@ impl CpuPending {
 }
 ```
 
-`RoutePlan` and `StagedHits` are plain data; components do not hold each other.
+`RoutePlan` is plain data; components do not hold each other. `CpuPending` is private to
+`components::cpu_miss`; the orchestrator only calls `upload()`.
 
 ## Files
 
@@ -62,13 +61,14 @@ src/decode.rs        // orchestrator only (no stage bodies)
 src/components/
   mod.rs             // exports + pipeline order docs
   route.rs           // RoutePlan, Route::split, hit lookup
-  preload.rs         // LookaheadChannel, Preload::submit, predict/prefetch
-  dma_miss.rs        // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
+  preload.rs         // Preload::submit (ActivationDoorbell publish)
+  dma_miss.rs        // DmaMiss::stage and CachedLayer::stream_pcie/stage_misses
   cpu_miss.rs        // CpuMiss::submit, CpuPending::upload, CPU job construction
   gpu.rs             // GpuExperts::run, run_expert, fused_decode
 src/expert_cache/
   mod.rs             // private submodules + pub(crate) facade
-  layer.rs           // CachedLayer lifecycle: admit/replace/load/lend/give_back
+  layer.rs           // CachedLayer lifecycle + LookaheadChannel/predict/prefetch
+  staging.rs         // scratch ring + alloc_bank (cache state used by DmaMiss)
   provider.rs        // provider + build/warmup
   registry.rs        // LayerRegistry lookup + lender
 ```
@@ -80,8 +80,10 @@ components/ + decode.rs  ──►  expert_cache/ (pub(crate) facade)
 expert_cache/            ──X──►  components/ or decode.rs
 ```
 
-`staging.rs` disappears: its scratch-ring and `stream_pcie`/`stage_misses` bodies move into
-`src/components/dma_miss.rs`.
+`stream_pcie`/`stage_misses` moved into `src/components/dma_miss.rs`; the scratch ring and
+`alloc_bank` stay in `expert_cache/staging.rs` because they are cache state. `LookaheadChannel`,
+`predict` and `prefetch_predicted` stay in `expert_cache/layer.rs` for the same reason; `Preload`
+owns only the activation publish and worker submit.
 
 ### expert_cache facade
 
@@ -90,10 +92,10 @@ expert_cache/            ──X──►  components/ or decode.rs
 - types: `CachedLayer`, `LayerState`, `Slot`, `SlotBuf`, `SlotData`, `Projections`, `Bank`,
   `LayerRegistry`, `LookaheadChannel`
 - `CachedLayer` accessors: `state()`, `cpu()`, `slot_device()`, `hidden()`, `num_experts()`, `top_k()`,
-  `act()`, `router()`, `lookahead_chan()`, `lookahead_swaps()`, `copy_stream()`, `pcie_frac()`,
+  `act()`, `router()`, `lookahead()`, `lookahead_chan()`, `copy_stream()`, `pcie_frac()`,
   `registry()`, `layer()`, `preload_claimed()`
-- `CachedLayer` mutation: `admit()`, `replace()`, `lend()`, `give_back()`, `spawn_fill()`,
-  `replay_gate()`, `staging_enabled()`, `warmup_scratch_ring()`
+- `CachedLayer` mutation used by components/decode: `admit()`, `replace()`, `prefetch_predicted()`,
+  `replay_gate()`, `staging_enabled()`
 - `LayerRegistry`: `get()`, `all()`, `insert()`, `scratch_ring()`
 
 `LayerState` and `Slot` fields are `pub(crate)` too: the route component updates `tick`,
@@ -139,14 +141,13 @@ belong to `components`, not `expert_cache`.
 
 ## Tasks
 
-- [ ] Add `mod components; mod decode;` to `src/main.rs`.
-- [ ] Add the `pub(crate)` facade in `expert_cache/mod.rs` and turn the fields/components need into
-  `pub(crate)` accessors; keep submodules private.
-- [ ] Add `src/components/mod.rs`, `Hit`, `RoutePlan`, `StagedHits`.
-- [ ] Move top-k read and hit/miss split to `route.rs`.
-- [ ] Move `run_hits` / `run_expert` / `fused_decode` to `gpu.rs`.
-- [ ] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
-- [ ] Move `stream_pcie` / `stage_misses` / scratch ring to `dma_miss.rs`; delete `staging.rs`.
-- [ ] Move `LookaheadChannel` / `predict` / `prefetch_predicted` to `preload.rs`.
-- [ ] Move `decode.rs` out of `expert_cache/` and reduce it to orchestration and gate replay.
-- [ ] Run the gates above and merge only if all pass.
+- [x] Add `mod components; mod decode;` to `src/main.rs`.
+- [x] Add the `pub(crate)` facade in `expert_cache/mod.rs`; keep submodules private.
+- [x] Add `src/components/mod.rs`, `Hit`, `RoutePlan`.
+- [x] Move top-k read and hit/miss split to `route.rs`.
+- [x] Move `run_hits` / `run_expert` / `fused_decode` to `gpu.rs`.
+- [x] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
+- [x] Move `stream_pcie` / `stage_misses` to `dma_miss.rs`; keep the scratch ring in `staging.rs`.
+- [x] Move the preload submit block to `preload.rs`; keep `LookaheadChannel`/`predict`/`prefetch` in the cache.
+- [x] Move `decode.rs` out of `expert_cache/`; it is now 198 lines of orchestration.
+- [x] Gates: 0 warnings, 33/33 tests, oracle identical (also `--prefill-stream`), np8 53.3 / 52.2 tok/s.

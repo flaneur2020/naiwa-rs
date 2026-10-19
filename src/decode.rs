@@ -119,7 +119,8 @@ impl CachedLayer {
 
         #[cfg(feature = "cuda")]
         let resident_acc = if split {
-            let residents: Vec<Vec<Hit>> = plan.hits
+            let residents: Vec<Vec<Hit>> = plan
+                .hits
                 .iter()
                 .zip(&resident_prefix)
                 .map(|(row, &n)| row[..n].to_vec())
@@ -148,7 +149,8 @@ impl CachedLayer {
 
         #[cfg(feature = "cuda")]
         let hits_to_run: Vec<Vec<Hit>> = if split {
-            plan.hits.iter()
+            plan.hits
+                .iter()
                 .zip(&resident_prefix)
                 .map(|(row, &n)| row[n..].to_vec())
                 .collect()
@@ -184,7 +186,6 @@ impl CachedLayer {
         #[allow(unused_variables)]
         let (gpu_out, capture_bank) = acc?;
         fenced?;
-
 
         // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
         let cpu_out = cpu.map(|p| p.upload()).transpose();

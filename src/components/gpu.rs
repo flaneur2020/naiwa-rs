@@ -66,96 +66,98 @@ fn fused_decode(
 }
 
 /// A resident expert a token is routed to: its slot buffer, slot index and routing weight.
-    /// The weighted sum of the hits' outputs, `[rows, hidden]` F32 on the slot device, for
-    /// `hits[t]` the hits of row `t` of `x2d: [rows, hidden]`. In copy-stream mode each bank's hits
-    /// run as one fused MoE decode over every row (four kernels); otherwise every expert runs on
-    /// its own.
+/// The weighted sum of the hits' outputs, `[rows, hidden]` F32 on the slot device, for
+/// `hits[t]` the hits of row `t` of `x2d: [rows, hidden]`. In copy-stream mode each bank's hits
+/// run as one fused MoE decode over every row (four kernels); otherwise every expert runs on
+/// its own.
 pub(crate) fn run(
     layer: &CachedLayer,
-        hits: &[Vec<Hit>],
-        x2d: &Tensor,
-        act: Activation,
-    ) -> candle_core::Result<(Tensor, Option<Arc<Bank>>)> {
-        let rows = hits.len();
-        // M9: no captures, so nothing to remember for the CPU-return node.
-        let capture_bank: Option<Arc<Bank>> = None;
-        let mut acc: Option<Tensor> = None;
-        let mut add = |y: Tensor| -> candle_core::Result<()> {
-            acc = Some(match acc.take() {
-                Some(a) => (a + y)?,
-                None => y,
-            });
-            Ok(())
-        };
-        #[cfg(feature = "cuda")]
-        if let (Some(act_type), true) = (
-            fused_act(act),
-            hits.iter().flatten().all(|(buf, _, _)| matches!(buf.data, SlotData::Banked { .. })),
-        ) {
-            // Per bank, each row's (local slot, weight) pairs. The kernel takes the same number
-            // per row, so short rows are padded with a weight-0 entry on a slot of that bank that
-            // some row hits (published and fenced, so it holds finite values).
-            let mut groups: Vec<(&Arc<Bank>, Vec<Vec<(u32, f32)>>)> = Vec::new();
-            for (t, row) in hits.iter().enumerate() {
-                for (buf, slot, w) in row {
-                    let SlotData::Banked { bank, .. } = &buf.data else {
-                        unreachable!("checked above");
-                    };
-                    let local = (slot - bank.first) as u32;
-                    let i = match groups.iter().position(|(b, _)| Arc::ptr_eq(b, bank)) {
-                        Some(i) => i,
-                        None => {
-                            groups.push((bank, vec![Vec::new(); rows]));
-                            groups.len() - 1
-                        }
-                    };
-                    groups[i].1[t].push((local, *w));
-                }
-            }
-            for (bank, per_row) in groups {
-                let width = per_row.iter().map(Vec::len).max().unwrap_or(0);
-                let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
-                let mut ids = Vec::with_capacity(rows * width);
-                let mut ws = Vec::with_capacity(rows * width);
-                for row in &per_row {
-                    for i in 0..width {
-                        let (l, w) = row.get(i).copied().unwrap_or((pad, 0.0));
-                        ids.push(l);
-                        ws.push(w);
-                    }
-                }
-                add(fused_decode(bank, x2d, ids, ws, rows, act_type)?)?;
-            }
-            return match acc {
-                Some(acc) => Ok((acc, capture_bank)),
-                None => Ok((
-                    Tensor::zeros((rows, layer.hidden()), DType::F32, &layer.slot_device())?,
-                    None,
-                )),
-            };
-        }
-        // One expert at a time, row by row.
-        let mut out = Vec::with_capacity(rows);
+    hits: &[Vec<Hit>],
+    x2d: &Tensor,
+    act: Activation,
+) -> candle_core::Result<(Tensor, Option<Arc<Bank>>)> {
+    let rows = hits.len();
+    // M9: no captures, so nothing to remember for the CPU-return node.
+    let capture_bank: Option<Arc<Bank>> = None;
+    let mut acc: Option<Tensor> = None;
+    let mut add = |y: Tensor| -> candle_core::Result<()> {
+        acc = Some(match acc.take() {
+            Some(a) => (a + y)?,
+            None => y,
+        });
+        Ok(())
+    };
+    #[cfg(feature = "cuda")]
+    if let (Some(act_type), true) = (
+        fused_act(act),
+        hits.iter()
+            .flatten()
+            .all(|(buf, _, _)| matches!(buf.data, SlotData::Banked { .. })),
+    ) {
+        // Per bank, each row's (local slot, weight) pairs. The kernel takes the same number
+        // per row, so short rows are padded with a weight-0 entry on a slot of that bank that
+        // some row hits (published and fenced, so it holds finite values).
+        let mut groups: Vec<(&Arc<Bank>, Vec<Vec<(u32, f32)>>)> = Vec::new();
         for (t, row) in hits.iter().enumerate() {
-            let x = x2d.narrow(0, t, 1)?;
-            let mut sum = Tensor::zeros((1, layer.hidden()), DType::F32, &layer.slot_device())?;
-            for (buf, _, w) in row {
-                let SlotData::Owned(proj) = &buf.data else {
-                    candle_core::bail!("expert cache: slot has no weights to run");
+            for (buf, slot, w) in row {
+                let SlotData::Banked { bank, .. } = &buf.data else {
+                    unreachable!("checked above");
                 };
-                let y = run_expert(proj, &x, act)?;
-                sum = (sum + (y.to_dtype(DType::F32)? * *w as f64)?)?;
+                let local = (slot - bank.first) as u32;
+                let i = match groups.iter().position(|(b, _)| Arc::ptr_eq(b, bank)) {
+                    Some(i) => i,
+                    None => {
+                        groups.push((bank, vec![Vec::new(); rows]));
+                        groups.len() - 1
+                    }
+                };
+                groups[i].1[t].push((local, *w));
             }
-            out.push(sum);
         }
-        add(Tensor::cat(&out, 0)?)?;
-        Ok((acc.expect("added above"), capture_bank))
+        for (bank, per_row) in groups {
+            let width = per_row.iter().map(Vec::len).max().unwrap_or(0);
+            let pad = per_row.iter().flatten().next().map_or(0, |&(l, _)| l);
+            let mut ids = Vec::with_capacity(rows * width);
+            let mut ws = Vec::with_capacity(rows * width);
+            for row in &per_row {
+                for i in 0..width {
+                    let (l, w) = row.get(i).copied().unwrap_or((pad, 0.0));
+                    ids.push(l);
+                    ws.push(w);
+                }
+            }
+            add(fused_decode(bank, x2d, ids, ws, rows, act_type)?)?;
+        }
+        return match acc {
+            Some(acc) => Ok((acc, capture_bank)),
+            None => Ok((
+                Tensor::zeros((rows, layer.hidden()), DType::F32, &layer.slot_device())?,
+                None,
+            )),
+        };
     }
+    // One expert at a time, row by row.
+    let mut out = Vec::with_capacity(rows);
+    for (t, row) in hits.iter().enumerate() {
+        let x = x2d.narrow(0, t, 1)?;
+        let mut sum = Tensor::zeros((1, layer.hidden()), DType::F32, &layer.slot_device())?;
+        for (buf, _, w) in row {
+            let SlotData::Owned(proj) = &buf.data else {
+                candle_core::bail!("expert cache: slot has no weights to run");
+            };
+            let y = run_expert(proj, &x, act)?;
+            sum = (sum + (y.to_dtype(DType::F32)? * *w as f64)?)?;
+        }
+        out.push(sum);
+    }
+    add(Tensor::cat(&out, 0)?)?;
+    Ok((acc.expect("added above"), capture_bank))
+}
 
-    /// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
+/// Run one token through a cached expert. `x2d: [1, hidden]` on the slot device.
 fn run_expert(w: &Projections, x2d: &Tensor, act: Activation) -> candle_core::Result<Tensor> {
-        let g = QMatMul::QTensor(w.gate.clone()).forward(x2d)?;
-        let u = QMatMul::QTensor(w.up.clone()).forward(x2d)?;
-        let h = (act.forward(&g)? * u)?;
-        QMatMul::QTensor(w.down.clone()).forward(&h)
+    let g = QMatMul::QTensor(w.gate.clone()).forward(x2d)?;
+    let u = QMatMul::QTensor(w.up.clone()).forward(x2d)?;
+    let h = (act.forward(&g)? * u)?;
+    QMatMul::QTensor(w.down.clone()).forward(&h)
 }

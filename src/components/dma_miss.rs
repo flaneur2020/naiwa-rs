@@ -54,11 +54,7 @@ impl CachedLayer {
         // load is over by then, so the allocation is not fighting load-time fragmentation).
         let Some(ring) = self.registry().scratch_ring(
             cs,
-            &(
-                Arc::clone(&gate),
-                Arc::clone(&up),
-                Arc::clone(&down),
-            ),
+            &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device(),
         )?
         else {
@@ -94,9 +90,8 @@ impl CachedLayer {
                         unreachable!("staging ring slots are banked");
                     };
                     let (er, e) = (expert_range(&gate, expert as usize)?, expert as usize);
-                    let bytes = er.len()
-                        + expert_range(&up, e)?.len()
-                        + expert_range(&down, e)?.len();
+                    let bytes =
+                        er.len() + expert_range(&up, e)?.len() + expert_range(&down, e)?.len();
                     // SAFETY: the stacks are page-locked, and `self.cpu()` keeps them alive and
                     // unmodified for the model's lifetime, well past `done`.
                     unsafe {
@@ -135,7 +130,6 @@ impl CachedLayer {
         }
         Ok(())
     }
-
 }
 
 pub(crate) fn stage(
@@ -145,4 +139,3 @@ pub(crate) fn stage(
 ) -> candle_core::Result<()> {
     layer.stream_pcie(&mut plan.misses, &mut plan.hits, pass)
 }
-

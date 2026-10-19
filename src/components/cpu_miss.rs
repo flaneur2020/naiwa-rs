@@ -41,7 +41,10 @@ pub(crate) fn submit(
     let xs_cpu = x2d.unsqueeze(0)?.to_device(&Device::Cpu)?;
     let this = Arc::clone(layer);
     let job = move || {
-        let x = xs_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let x = xs_cpu
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         if let Some(ys) = offload_fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)? {
             return Ok(ys);
         }
