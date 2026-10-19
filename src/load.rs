@@ -2,21 +2,88 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use mistralrs_core::{
     HfConfigOverrides, IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
 };
+use mistralrs_core::moe_offload::install_routed_experts_provider;
 use mistralrs_quant::GgufArchive;
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
+use tracing::info;
 
 use crate::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::offload::{install_cpu_moe, ALL_LAYERS_ON_DEVICE};
+use crate::cpu_experts::CpuMoeProvider;
+use crate::expert_cache::GpuCacheMoeProvider;
+use crate::prefill_stream::PrefillStreams;
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
+
+/// Device-layer map that keeps every decoder layer on the main device; mistral.rs clamps the
+/// count to the model's layer count. Taken-over experts are not counted, so auto mapping would
+/// spill whole layers to the CPU.
+pub const ALL_LAYERS_ON_DEVICE: usize = usize::MAX;
+
+/// `prefill_stream`: `Some(min_tokens)` with `--prefill-stream`.
+/// `pcie_frac`: share of decode misses to DMA to the GPU (`--pcie-frac`), 0.0 when off.
+pub fn install_cpu_moe(
+    expert_cache_gb: Option<f64>,
+    prefill_stream: Option<usize>,
+    pcie_frac: f32,
+    lookahead_swaps: usize,
+    lookahead: bool,
+) -> Result<()> {
+    let prefill = prefill_stream.map(PrefillStreams::new);
+    if let Some(min_tokens) = prefill_stream {
+        info!(
+            "--prefill-stream: prefill chunks of {min_tokens} tokens or more run their experts on the GPU"
+        );
+    }
+    if let Some(gb) = expert_cache_gb {
+        let provider = Arc::new(GpuCacheMoeProvider::new(
+            gb,
+            prefill,
+            pcie_frac,
+            lookahead_swaps,
+            lookahead,
+        ));
+        let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
+        install_routed_experts_provider(provider)?;
+        info!(
+            "--cpu-moe + expert cache: routed experts in host memory; {:.1} GB GPU cache",
+            gb
+        );
+    } else {
+        install_routed_experts_provider(Arc::new(CpuMoeProvider::new(prefill)))?;
+        info!("--cpu-moe: routed experts load into host memory and run on the CPU");
+    }
+    Ok(())
+}
+
+/// The installed GPU expert-cache provider, kept so the engine can warm it up after the
+/// model finishes loading (`warmup_rings`). `None` when `--expert-cache-gb` was not used.
+static GPU_CACHE_PROVIDER: OnceLock<Arc<GpuCacheMoeProvider>> = OnceLock::new();
+
+/// v2 M1/M2: build every fixed-address structure after load and before the first decode — each
+/// resident bank's fixed-grid capture path, and (with `--pcie-frac`) the quant shapes' staging
+/// rings. Returns `(captures, rings)`; `(0, 0)` when no GPU expert cache is installed.
+pub fn warmup() -> Result<(usize, usize)> {
+    match GPU_CACHE_PROVIDER.get() {
+        Some(provider) => Ok(provider.warmup()?),
+        None => Ok((0, 0)),
+    }
+}
+
+/// v2 M1 criterion ①: staging rings created so far. Must not change after warmup — a further
+/// increment means a ring materialized on the decode path, i.e. an address that was not fixed
+/// up front (which a capture cannot tolerate).
+pub fn ring_creations() -> usize {
+    GPU_CACHE_PROVIDER.get().map_or(0, |p| p.ring_creations())
+}
 
 /// The architecture this server runs on, across both on-disk representations.
 const HF_ARCHITECTURE: &str = "Qwen4ExpForConditionalGeneration";

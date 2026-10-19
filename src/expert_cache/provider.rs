@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::copy_stream::CopyStreams;
 use crate::host_memory::{self, PinnedStack};
-use crate::offload::{attach_prefill, CpuExperts};
+use crate::cpu_experts::{attach_prefill, CpuExperts};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;
 

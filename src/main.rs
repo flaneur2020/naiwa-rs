@@ -12,7 +12,7 @@ mod doorbell;
 mod expert_cache;
 mod host_memory;
 mod load;
-mod offload;
+mod cpu_experts;
 mod prefill_stream;
 mod stats;
 

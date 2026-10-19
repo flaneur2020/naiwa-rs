@@ -23,7 +23,7 @@
 //! # Decode (single token)
 //!
 //! - Top-k is split into slot hits and misses. Hits run via `QMatMul` on the slot device, misses
-//!   on the CPU with only the miss ids, through the fused two-pass decode (`offload::fused_decode`)
+//!   on the CPU with only the miss ids, through the fused two-pass decode (`cpu_experts::fused_decode`)
 //!   or, for experts it does not serve, `MoEExperts::forward`; both sides at once, router weights
 //!   applied once per side. The misses run on the `deferred` worker over host copies; every CUDA
 //!   call stays on the calling thread.

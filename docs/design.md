@@ -242,9 +242,13 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     provider.rs            RoutedExpertsProvider + layer construction
     layer.rs               slots, fills, LRU replacement, lookahead prediction
     decode.rs              run_hits, decode_forward
-    staging.rs             --pcie-frac ring + DMA of misses
+    staging.rs             --pcie-frac scratch ring + alloc_bank
     registry.rs            layer lookups + prefill loan
     expert_bytes.rs        per-expert byte slicing
+  src/components/          decode stages: route, gpu, cpu-miss, dma-miss, preload
+  src/decode.rs            decode pipeline orchestrator
+  src/cpu_experts.rs       CPU routed experts + fused decode + prefill attach
+  src/load.rs              model loading + provider install + warmup
   src/stats/               counters + NAIWA_* measurement probes
     mod.rs                 shared gate/window/header/units; re-exports record_*/dump_*
     cache.rs               expert-cache counters (`dump_cache_stats`)

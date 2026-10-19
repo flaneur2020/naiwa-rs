@@ -153,13 +153,13 @@ pub async fn run_bench(
 
     // v2 M1: build every staging ring up front, after load and before the first decode, so ring
     // addresses are fixed for the process lifetime (a capture needs that).
-    match crate::offload::warmup()? {
+    match crate::load::warmup()? {
         (0, 0) => {}
         (caps, rings) => info!("warmup: {caps} capture(s), {rings} staging ring(s) fixed"),
     }
     // v2 M1 criterion ①: after warmup the ring set must be frozen — the decode must not create
     // any further ring. Checked after the benchmark below.
-    let rings_warmed = crate::offload::ring_creations();
+    let rings_warmed = crate::load::ring_creations();
 
     if warmup > 0 {
         info!("Running {warmup} warmup iteration(s) per benchmark case...");
@@ -361,7 +361,7 @@ pub async fn run_bench(
     }
 
     // v2 M1 criterion ①: no staging ring may be created on the decode path.
-    let rings_after = crate::offload::ring_creations();
+    let rings_after = crate::load::ring_creations();
     if rings_after != rings_warmed {
         anyhow::bail!(
             "M1: {} staging ring(s) created during decode (had {rings_warmed} after warmup) — \
