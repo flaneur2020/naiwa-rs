@@ -15,4 +15,4 @@ pub(crate) use preload::submit as submit_preload;
 pub(crate) use route::split as split_route;
 pub(crate) use route::RoutePlan;
 
-pub(crate) type Hit = (std::sync::Arc<crate::expert_cache::SlotBuf>, usize, f32);
+pub(crate) type Hit = (std::sync::Arc<crate::moe::SlotBuf>, usize, f32);

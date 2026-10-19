@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::components::{run_gpu, Hit};
 use crate::stats;
 
-use crate::expert_cache::{schedule, CachedLayer};
+use crate::moe::{schedule, CachedLayer};
 
 impl CachedLayer {
     /// Decode path (one token, or the few rows of a speculative verify step): split each row's

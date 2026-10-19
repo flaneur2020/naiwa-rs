@@ -1,4 +1,4 @@
-//! GPU expert cache for `--cpu-moe --expert-cache-gb N`.
+//! MoE execution: the GPU expert cache, CPU-side routed experts, and both providers.
 //!
 //! Each decoder layer gets its own per-layer slot range from a total VRAM budget. Slots hold the
 //! expert's *quantized* bytes (GGML block format) — never a dequantized copy — so both the GPU
@@ -33,6 +33,7 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
+mod cpu_experts;
 mod expert_bytes;
 mod layer;
 mod provider_cpu;
@@ -42,20 +43,17 @@ mod staging;
 #[cfg(test)]
 mod tests;
 
-pub use provider_gpu::GpuCacheMoeProvider;
+pub(crate) use cpu_experts::fused_decode;
 pub(crate) use provider_cpu::CpuMoeProvider;
+pub use provider_gpu::GpuCacheMoeProvider;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
 // another child module directly. The submodules themselves stay private.
-pub(crate) use expert_bytes::{
-    expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor,
-};
-pub(crate) use layer::{streamed_misses, LookaheadChannel};
+pub(crate) use expert_bytes::{expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor};
 #[cfg(test)]
-pub(in crate::expert_cache) use layer::{
-    fill_candidate, lru_victim, top_k_ids, union_by_votes,
-};
-pub(in crate::expert_cache) use staging::alloc_bank;
+pub(in crate::moe) use layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
+pub(crate) use layer::{streamed_misses, LookaheadChannel};
+pub(in crate::moe) use staging::alloc_bank;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};

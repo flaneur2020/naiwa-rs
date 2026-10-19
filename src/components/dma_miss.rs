@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::copy_stream::{self, CopyStream};
-use crate::expert_cache::{
+use crate::moe::{
     expert_range, schedule, streamed_misses, CachedLayer, SlotBuf, SlotData, SCRATCH_RING_FIRST,
 };
 use crate::stats;

@@ -9,7 +9,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use tracing::debug;
 
 use crate::executor::{self, Task};
-use crate::expert_cache::CachedLayer;
+use crate::moe::CachedLayer;
 use crate::stats;
 
 pub(crate) fn submit(

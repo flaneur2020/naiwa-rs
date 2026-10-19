@@ -1,6 +1,7 @@
 # M9b — expert_cache decode components
 
 Status: **done**. Branch `m9b-decode-components` (`7e20a3b`), merged to main after the gates below.
+The cache module was later renamed `expert_cache/` -> `moe/`; paths below keep the historical name.
 Parent: [m9a.md](m9a.md). Goal: split the decode path into `components/` with one entry, one exit and
 explicit doorbell ownership per stage. No behaviour or performance change.
 

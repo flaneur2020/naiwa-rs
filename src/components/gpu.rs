@@ -6,7 +6,7 @@ use candle_core::quantized::QMatMul;
 use candle_core::{DType, Module, Tensor};
 use mistralrs_core::layers::Activation;
 
-use crate::expert_cache::{Bank, CachedLayer, Projections, SlotData};
+use crate::moe::{Bank, CachedLayer, Projections, SlotData};
 
 use super::Hit;
 

@@ -7,8 +7,8 @@ use candle_core::Device;
 use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
 use tracing::debug;
 
+use super::cpu_experts::{attach_prefill, CpuExperts};
 use crate::copy_stream::CopyStreams;
-use crate::cpu_experts::{attach_prefill, CpuExperts};
 use crate::host_memory::advise_expert_stacks;
 use crate::prefill_stream::PrefillStreams;
 

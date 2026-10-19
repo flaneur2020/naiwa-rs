@@ -5,8 +5,8 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::executor;
-use crate::expert_cache::CachedLayer;
-use crate::cpu_experts::fused_decode as offload_fused_decode;
+use crate::moe::CachedLayer;
+use crate::moe::fused_decode as offload_fused_decode;
 
 pub(crate) struct CpuPending {
     inner: executor::Pending,

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
 
+use super::cpu_experts::{attach_prefill, CpuExperts};
 use crate::copy_stream::CopyStreams;
-use crate::cpu_experts::{attach_prefill, CpuExperts};
 use crate::host_memory::{self, PinnedStack};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;

@@ -86,7 +86,10 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
     // with no history, fill in id order
     assert_eq!(fill_candidate(&slots(&[None, None]), &[0, 0, 0]), Some(0));
     // full layer: nothing to do
-    assert_eq!(fill_candidate(&slots(&[Some(0), Some(1)]), &[3, 3, 3]), None);
+    assert_eq!(
+        fill_candidate(&slots(&[Some(0), Some(1)]), &[3, 3, 3]),
+        None
+    );
     // every expert already placed
     assert_eq!(
         fill_candidate(&slots(&[Some(0), Some(1), None]), &[1, 1]),
@@ -161,8 +164,7 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
     };
     let comm = Arc::new(
-        mistralrs_quant::Comm::from_device(mistralrs_quant::Id::new(), &Device::Cpu, 0, 1)
-            .unwrap(),
+        mistralrs_quant::Comm::from_device(mistralrs_quant::Id::new(), &Device::Cpu, 0, 1).unwrap(),
     );
     let cpu = MoEExperts::from_qtensors(
         q(inter, hidden, 0.1),

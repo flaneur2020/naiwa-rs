@@ -11,8 +11,8 @@ use tracing::info;
 use crate::copy_stream::{CopyStream, ReadFence};
 
 use super::{
-    expert_range, scratch_ring_slots, Bank, LayerRegistry,
-    Projections, ScratchKey, ScratchRing, SlotBuf, SlotData, SCRATCH_RING_FIRST,
+    expert_range, scratch_ring_slots, Bank, LayerRegistry, Projections, ScratchKey, ScratchRing,
+    SlotBuf, SlotData, SCRATCH_RING_FIRST,
 };
 
 impl LayerRegistry {
@@ -28,8 +28,7 @@ impl LayerRegistry {
         // The per-projection expert byte counts are the ground truth a ring must match (they
         // fold in dtype and dims, including per-projection differences inside one layer).
         let bytes: [usize; 3] = std::array::from_fn(|i| {
-            expert_range(&[&stacks.0, &stacks.1, &stacks.2][i], 0)
-                .map_or(0, |r| r.len())
+            expert_range(&[&stacks.0, &stacks.1, &stacks.2][i], 0).map_or(0, |r| r.len())
         });
         let key: ScratchKey = (bytes, stacks.0.dtype() as u8);
         let mut rings = self.scratch.lock().unwrap();

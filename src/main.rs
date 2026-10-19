@@ -9,10 +9,9 @@ mod decode;
 mod copy_stream;
 mod executor;
 mod doorbell;
-mod expert_cache;
+mod moe;
 mod host_memory;
 mod load;
-mod cpu_experts;
 mod prefill_stream;
 mod stats;
 

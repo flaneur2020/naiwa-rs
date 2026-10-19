@@ -13,8 +13,8 @@ use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Projections, Slot,
-    LayerRegistry, LayerState, SlotBuf, SlotData,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, LayerRegistry,
+    LayerState, Projections, Slot, SlotBuf, SlotData,
 };
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
@@ -93,7 +93,6 @@ impl LookaheadChannel {
         Ok(Some((Arc::clone(self), next)))
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // CachedLayer — the real workhorse
@@ -265,11 +264,7 @@ impl CachedLayer {
         };
         self.registry.scratch_ring(
             cs,
-            &(
-                Arc::clone(&gate),
-                Arc::clone(&up),
-                Arc::clone(&down),
-            ),
+            &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device,
         )?;
         Ok(())
@@ -518,7 +513,10 @@ impl CachedLayer {
         let x = x.to_dtype(DType::F32)?.reshape((rows, self.hidden))?;
         let logits = x.matmul(&router.t()?)?;
         Ok(union_by_votes(
-            logits.to_vec2::<f32>()?.iter().map(|row| top_k_ids(row, self.top_k)),
+            logits
+                .to_vec2::<f32>()?
+                .iter()
+                .map(|row| top_k_ids(row, self.top_k)),
         ))
     }
 

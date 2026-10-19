@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
+use mistralrs_core::moe_offload::install_routed_experts_provider;
 use mistralrs_core::{
     HfConfigOverrides, IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
 };
-use mistralrs_core::moe_offload::install_routed_experts_provider;
 use mistralrs_quant::GgufArchive;
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 use tracing::info;
@@ -17,8 +17,8 @@ use crate::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::expert_cache::CpuMoeProvider;
-use crate::expert_cache::GpuCacheMoeProvider;
+use crate::moe::CpuMoeProvider;
+use crate::moe::GpuCacheMoeProvider;
 use crate::prefill_stream::PrefillStreams;
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;

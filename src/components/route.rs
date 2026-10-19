@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Result, Tensor};
 
-use crate::expert_cache::CachedLayer;
+use crate::moe::CachedLayer;
 
 use super::Hit;
 
