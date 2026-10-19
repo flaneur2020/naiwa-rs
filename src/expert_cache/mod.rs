@@ -35,13 +35,15 @@
 
 mod expert_bytes;
 mod layer;
-mod provider;
+mod provider_cpu;
+mod provider_gpu;
 mod registry;
 mod staging;
 #[cfg(test)]
 mod tests;
 
-pub use provider::GpuCacheMoeProvider;
+pub use provider_gpu::GpuCacheMoeProvider;
+pub(crate) use provider_cpu::CpuMoeProvider;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
 // another child module directly. The submodules themselves stay private.

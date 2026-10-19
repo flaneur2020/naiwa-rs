@@ -69,7 +69,8 @@ src/expert_cache/
   mod.rs             // private submodules + pub(crate) facade
   layer.rs           // CachedLayer lifecycle + LookaheadChannel/predict/prefetch
   staging.rs         // scratch ring + alloc_bank (cache state used by DmaMiss)
-  provider.rs        // provider + build/warmup
+  provider_gpu.rs    // GPU-cache provider + build/warmup
+  provider_cpu.rs    // no-cache CPU-only provider
   registry.rs        // LayerRegistry lookup + lender
 ```
 

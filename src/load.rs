@@ -17,7 +17,7 @@ use crate::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::cpu_experts::CpuMoeProvider;
+use crate::expert_cache::CpuMoeProvider;
 use crate::expert_cache::GpuCacheMoeProvider;
 use crate::prefill_stream::PrefillStreams;
 

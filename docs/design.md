@@ -239,7 +239,8 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     tests.rs
   src/expert_cache/        GPU expert cache
     mod.rs                 module docs, constants, slot/bank/layer types
-    provider.rs            RoutedExpertsProvider + layer construction
+    provider_gpu.rs        GPU-cache RoutedExpertsProvider + layer construction
+    provider_cpu.rs        no-cache CPU-only RoutedExpertsProvider
     layer.rs               slots, fills, LRU replacement, lookahead prediction
     decode.rs              run_hits, decode_forward
     staging.rs             --pcie-frac scratch ring + alloc_bank

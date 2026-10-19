@@ -5,55 +5,12 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
 use mistralrs_core::layers::Activation;
-use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
+use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts};
 use mistralrs_core::MoEExperts;
-use tracing::debug;
 
 use crate::copy_stream::CopyStreams;
-use crate::host_memory::{advise_expert_stacks, pin_expert_stacks, PinnedStack};
+use crate::host_memory::{pin_expert_stacks, PinnedStack};
 use crate::prefill_stream::{PrefillStream, PrefillStreams};
-
-pub(crate) struct CpuMoeProvider {
-    prefill: Option<PrefillStreams>,
-    copy_streams: CopyStreams,
-}
-
-impl CpuMoeProvider {
-    pub(crate) fn new(prefill: Option<PrefillStreams>) -> Self {
-        Self {
-            prefill,
-            copy_streams: CopyStreams::default(),
-        }
-    }
-}
-
-impl RoutedExpertsProvider for CpuMoeProvider {
-    fn build(
-        &self,
-        ctx: ExpertLoadContext<'_>,
-    ) -> candle_core::Result<Option<Arc<dyn RoutedExperts>>> {
-        if ctx.layer_device.is_cpu() {
-            return Ok(None);
-        }
-        debug!(
-            "Routed experts of {} layer {} load on the CPU",
-            if ctx.site.is_mtp { "MTP" } else { "decoder" },
-            ctx.site.layer
-        );
-        let experts = ctx.load_builtin(Device::Cpu)?;
-        let huge_bytes = advise_expert_stacks(&experts)?;
-        debug!("  {} MiB of its stacks on huge pages", huge_bytes >> 20);
-        let (pinned, prefill) = attach_prefill(&self.prefill, &ctx, &experts, &self.copy_streams)?;
-        Ok(Some(Arc::new(CpuExperts::new(
-            experts,
-            ctx.act,
-            ctx.layer_device.clone(),
-            ctx.site.layer,
-            prefill,
-            pinned,
-        ))))
-    }
-}
 
 /// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
 /// stream. The pinned registrations must live as long as the layer.
