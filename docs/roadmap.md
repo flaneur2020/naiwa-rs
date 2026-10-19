@@ -5,7 +5,7 @@ Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity 
 Design and current-state detail live in [`design.md`](design.md); per-milestone evidence lives in
 [`worklogs/`](worklogs/).
 
-Recorded 2026-10-16; last updated 2026-10-18 after M9.2 progress.
+Recorded 2026-10-16; last updated 2026-10-19 after M9c (doorbell events) and the M10 chat harness plan.
 
 ---
 
@@ -401,6 +401,9 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 ---
 
 ## M10 — chat workload parity with Strata — ⬜ PROPOSED
+
+Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
+is the older MoE-naming milestone and unrelated).
 
 ### Why
 
