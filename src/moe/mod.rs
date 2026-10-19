@@ -34,9 +34,8 @@
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
 mod cached_layer;
-mod cpu;
 mod decode;
-mod expert_bytes;
+mod expert;
 mod provider;
 mod slot;
 mod stages;
@@ -54,8 +53,10 @@ pub(in crate::moe) use cached_layer::{fill_candidate, lru_victim, top_k_ids, uni
 pub(crate) use cached_layer::{
     streamed_misses, CachedExperts, CachedLayer, Layers, LookaheadChannel,
 };
-pub(crate) use expert_bytes::{expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor};
-pub(crate) use slot::{Bank, LayerState, Projections, Slot, SlotBuf, SlotData};
+pub(crate) use expert::{expert_qtensor_on_device, expert_range};
+pub(crate) use slot::{
+    slot_bytes_from_qtensor, Bank, LayerState, Projections, Slot, SlotBuf, SlotData,
+};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;

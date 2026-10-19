@@ -7,16 +7,35 @@ use std::sync::{Arc, Mutex};
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
 
-use super::cpu::{attach_prefill, CpuExperts};
+use super::expert::CpuExperts;
 use crate::copy_stream::CopyStreams;
-use crate::host_memory::{self, PinnedStack};
-use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
+use crate::host_memory::{self, pin_expert_stacks, PinnedStack};
+use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
 use crate::stats;
+use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
+use mistralrs_core::MoEExperts;
 
 use super::{
     alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
     Layers, LookaheadChannel, Slot, StagingRings, SCHEDULE, WAITS_PER_LAYER,
 };
+
+/// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
+/// stream. The pinned registrations must live as long as the layer.
+fn attach_prefill(
+    prefill: &Option<PrefillStreams>,
+    ctx: &ExpertLoadContext<'_>,
+    experts: &MoEExperts,
+    copy_streams: &CopyStreams,
+) -> candle_core::Result<(Vec<PinnedStack>, Option<Arc<PrefillStream>>)> {
+    let Some(streams) = prefill else {
+        return Ok((Vec::new(), None));
+    };
+    // Prefill uploads read straight from the stacks, asynchronously: they must be pinned.
+    let (pinned, failed) = pin_expert_stacks(experts, ctx.layer_device);
+    let stream = streams.attach(ctx, experts, failed == 0, copy_streams)?;
+    Ok((pinned, stream))
+}
 
 // ---------------------------------------------------------------------------
 // Provider state
@@ -138,8 +157,6 @@ impl GpuCacheMoeProvider {
 // ---------------------------------------------------------------------------
 // RoutedExpertsProvider impl
 // ---------------------------------------------------------------------------
-
-use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
 
 impl RoutedExpertsProvider for GpuCacheMoeProvider {
     fn build(

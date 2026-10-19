@@ -1,36 +1,21 @@
-//! CPU routed experts.
+//! Experts: CPU fallback execution and byte-level slicing of stacked QTensor weights.
 //!
-//! `CpuExperts` owns the model's host weights and the optional prefill-stream attachment; its
-//! decode-sized path calls the fused decode in `stages/cpu_miss.rs`. The cache provider uses it
-//! for the MTP head, for layers with no cache slots, and when the cache budget is zero.
+//! `CpuExperts` owns the model's host weights; its decode-sized path calls the fused decode in
+//! `stages/cpu_miss.rs`. The cache provider uses it for the MTP head, for layers with no cache
+//! slots, and when the cache budget is zero. The byte helpers never dequantize: they slice one
+//! expert out of the stacked `[E, N, K]` QTensor.
 
 use std::sync::Arc;
 
-use super::fused_decode;
-use crate::copy_stream::CopyStreams;
-use crate::host_memory::{pin_expert_stacks, PinnedStack};
-use crate::prefill_stream::{PrefillStream, PrefillStreams};
+use candle_core::quantized::{ggml_file::qtensor_from_ggml, QTensor};
 use candle_core::{DType, Device, Tensor};
 use mistralrs_core::layers::Activation;
-use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts};
+use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
 
-/// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
-/// stream. The pinned registrations must live as long as the layer.
-pub(crate) fn attach_prefill(
-    prefill: &Option<PrefillStreams>,
-    ctx: &ExpertLoadContext<'_>,
-    experts: &MoEExperts,
-    copy_streams: &CopyStreams,
-) -> candle_core::Result<(Vec<PinnedStack>, Option<Arc<PrefillStream>>)> {
-    let Some(streams) = prefill else {
-        return Ok((Vec::new(), None));
-    };
-    // Prefill uploads read straight from the stacks, asynchronously: they must be pinned.
-    let (pinned, failed) = pin_expert_stacks(experts, ctx.layer_device);
-    let stream = streams.attach(ctx, experts, failed == 0, copy_streams)?;
-    Ok((pinned, stream))
-}
+use super::fused_decode;
+use crate::host_memory::PinnedStack;
+use crate::prefill_stream::PrefillStream;
 
 /// Calls of at most this many tokens are decode-sized (one token, or a speculative verify step)
 /// and take the fused CPU path; longer ones are prefill chunks, where the generic path's routed
@@ -129,4 +114,50 @@ impl RoutedExperts for CpuExperts {
             .to_dtype(xs.dtype())?
             .to_device(&self.layer_device)
     }
+}
+
+/// The byte range of expert `e` in a stacked `[E, N, K]` `QTensor`.
+///
+/// Row-block formats never cross expert boundaries, so `[e·stride, (e+1)·stride)` of the
+/// stack's buffer is exactly expert `e`.
+pub(crate) fn expert_range(qt: &QTensor, e: usize) -> candle_core::Result<std::ops::Range<usize>> {
+    let dims = qt.shape().dims();
+    if dims.len() < 2 {
+        candle_core::bail!("expert QTensor must be at least 2-D, got {:?}", dims);
+    }
+    let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+    let block_size = qt.dtype().block_size();
+    if k % block_size != 0 {
+        candle_core::bail!(
+            "expert K={k} is not divisible by block_size={block_size} for dtype {:?}",
+            qt.dtype()
+        );
+    }
+    let stride = n * (k / block_size) * qt.dtype().type_size();
+    let range = e * stride..(e + 1) * stride;
+    if range.end > qt.storage_size_in_bytes() {
+        candle_core::bail!(
+            "expert {e} byte range {range:?} exceeds buffer length {}",
+            qt.storage_size_in_bytes()
+        );
+    }
+    Ok(range)
+}
+
+/// Build a single-expert `[N, K]` `QTensor` on `device` from a stacked `[E, N, K]` `QTensor`.
+///
+/// Copies straight out of the stack, with no intermediate host buffer. When the stack is pinned
+/// (`host_memory`), that copy is an asynchronous DMA that may still be reading after this
+/// returns; it is safe because the stack outlives every copy (the layer owns it).
+pub(crate) fn expert_qtensor_on_device(
+    stack: &QTensor,
+    e: usize,
+    device: &Device,
+) -> candle_core::Result<Arc<QTensor>> {
+    let dims = stack.shape().dims();
+    let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+    let range = expert_range(stack, e)?;
+    let data = stack.data()?;
+    let qt = qtensor_from_ggml(stack.dtype(), &data[range], vec![n, k], device)?;
+    Ok(Arc::new(qt))
 }

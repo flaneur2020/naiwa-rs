@@ -78,3 +78,20 @@ pub(crate) struct SlotBuf {
     pub(crate) data: SlotData,
     pub(crate) fence: ReadFence,
 }
+
+/// Slot-bytes estimate for a single expert from a `QTensor` stack.
+/// Returns `None` when the stack is not accessible (dense/float).
+pub(crate) fn slot_bytes_from_qtensor(qt: &QTensor) -> Option<u64> {
+    let dims = qt.shape().dims();
+    if dims.len() < 2 {
+        return None;
+    }
+    let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+    let block_size = qt.dtype().block_size();
+    if k % block_size != 0 {
+        return None;
+    }
+    let type_size = qt.dtype().type_size();
+    // gate + up + down (gate/up are [inter, hidden]; down is [hidden, inter] — same bytes)
+    Some((3 * n * (k / block_size) * type_size) as u64)
+}
