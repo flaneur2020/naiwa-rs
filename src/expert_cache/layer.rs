@@ -10,9 +10,9 @@ use tracing::debug;
 use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
-use super::expert_bytes::{expert_qtensor_on_device, expert_range};
-use super::staging::alloc_bank;
-use super::{schedule, CachedLayer, SlotBuf, SlotWeights};
+use super::{
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, SlotBuf, SlotWeights,
+};
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
 /// token thread queues ONE kernel that copies this step's activation into mapped memory

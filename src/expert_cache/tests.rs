@@ -1,8 +1,7 @@
 //! Unit tests for the expert cache (see `super`).
 
-use super::expert_bytes::{expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor};
-use super::layer::{fill_candidate, lru_victim, streamed_misses, top_k_ids, union_by_votes};
 use super::*;
+use super::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 use candle_core::quantized::GgmlDType;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

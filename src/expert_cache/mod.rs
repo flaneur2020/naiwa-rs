@@ -44,6 +44,20 @@ mod tests;
 
 pub use provider::GpuCacheMoeProvider;
 
+// Cross-module items are re-exported here; siblings import them from `super`, never from
+// another child module directly. The submodules themselves stay private.
+pub(in crate::expert_cache) use decode::Hit;
+pub(in crate::expert_cache) use expert_bytes::{
+    expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor,
+};
+pub(in crate::expert_cache) use layer::{streamed_misses, LookaheadChannel};
+#[cfg(test)]
+pub(in crate::expert_cache) use layer::{
+    fill_candidate, lru_victim, top_k_ids, union_by_votes,
+};
+pub(in crate::expert_cache) use registry::CacheLoan;
+pub(in crate::expert_cache) use staging::alloc_bank;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 #[cfg(feature = "cuda")]
@@ -60,8 +74,6 @@ use parking_lot::RwLock;
 use crate::copy_stream::{CopyStream, ReadFence, SlotMemory};
 use crate::host_memory::PinnedStack;
 use crate::prefill_stream::PrefillStream;
-
-use layer::LookaheadChannel;
 
 // Number of prefill tokens above which we skip the cache entirely.
 // Calls with more tokens than this are prefill chunks: every expert runs on the CPU (or the

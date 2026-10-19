@@ -13,13 +13,9 @@ use crate::offload::{attach_prefill, CpuExperts};
 use crate::prefill_stream::PrefillStreams;
 use crate::stats;
 
-use super::expert_bytes::slot_bytes_from_qtensor;
-use super::layer::LookaheadChannel;
-use super::registry::CacheLoan;
-use super::staging::alloc_bank;
 use super::{
-    loan_bank_slots, CachedExperts, CachedLayer, CachedLayerState, LayerRegistry, SlotEntry,
-    SCHEDULE, WAITS_PER_LAYER,
+    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CacheLoan, CachedExperts, CachedLayer,
+    CachedLayerState, LayerRegistry, LookaheadChannel, SlotEntry, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------

@@ -12,12 +12,9 @@ use tracing::info;
 use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
-use super::decode::Hit;
-use super::expert_bytes::expert_range;
-use super::layer::streamed_misses;
 use super::{
-    schedule, scratch_ring_slots, Bank, CachedLayer, LayerRegistry, ScratchKey, ScratchRing,
-    ScratchSlot, SlotBuf, SCRATCH_RING_FIRST,
+    expert_range, schedule, scratch_ring_slots, streamed_misses, Bank, CachedLayer, Hit,
+    LayerRegistry, ScratchKey, ScratchRing, ScratchSlot, SlotBuf, SCRATCH_RING_FIRST,
 };
 
 impl LayerRegistry {
