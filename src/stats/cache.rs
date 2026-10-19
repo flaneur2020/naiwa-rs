@@ -21,7 +21,7 @@ pub(crate) struct CacheStats {
     pub lookahead_dropped: u64,
     /// v2 M4: layer DMA gates replayed (one per layer per pass, when PCIe staging is on).
     pub gate_replays: u64,
-    /// Experts DMA'd into a scratch slot and run on the GPU instead of the CPU (`--pcie-frac`).
+    /// Experts DMA'd into a staging slot and run on the GPU instead of the CPU (`--pcie-frac`).
     pub pcie_misses: u64,
     /// Bytes those DMAs moved host-to-device.
     pub pcie_bytes: u64,
@@ -70,7 +70,7 @@ pub(crate) fn record_cache_swap() {
     CACHE_STATS.lock().unwrap().swaps += 1;
 }
 
-/// `--pcie-frac`: one expert DMA'd into a scratch slot and run on the GPU instead of the CPU.
+/// `--pcie-frac`: one expert DMA'd into a staging slot and run on the GPU instead of the CPU.
 pub(crate) fn record_cache_pcie(bytes: u64) {
     let mut s = CACHE_STATS.lock().unwrap();
     s.pcie_misses += 1;

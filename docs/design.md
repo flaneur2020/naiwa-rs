@@ -243,8 +243,8 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     provider_cpu.rs        no-cache CPU-only RoutedExpertsProvider
     cpu_experts.rs         CPU routed experts + fused decode + prefill attach
     layer.rs               slots, fills, LRU replacement, lookahead prediction
-    staging.rs             --pcie-frac scratch ring + alloc_bank
-    registry.rs            layer lookups + prefill loan
+    staging.rs             --pcie-frac staging ring + alloc_bank
+    layers.rs              layer lookups + prefill loan
     expert_bytes.rs        per-expert byte slicing
   src/components/          decode stages: route, gpu, cpu-miss, dma-miss, preload
   src/decode.rs            decode pipeline orchestrator

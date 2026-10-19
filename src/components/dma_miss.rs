@@ -1,11 +1,11 @@
-//! DMA miss: stage misses into the PCIe scratch ring and publish SYNC_STAGING.
+//! DMA miss: stage misses into the PCIe staging ring and publish SYNC_STAGING.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::copy_stream::{self, CopyStream};
 use crate::moe::{
-    expert_range, schedule, streamed_misses, CachedLayer, SlotBuf, SlotData, SCRATCH_RING_FIRST,
+    expert_range, schedule, streamed_misses, CachedLayer, SlotBuf, SlotData, STAGING_RING_FIRST,
 };
 use crate::stats;
 
@@ -52,7 +52,7 @@ impl CachedLayer {
         };
         // Lazily create the ring at the first decode step that has misses to stream (model
         // load is over by then, so the allocation is not fighting load-time fragmentation).
-        let Some(ring) = self.registry().scratch_ring(
+        let Some(ring) = self.registry().staging_ring(
             cs,
             &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device(),
@@ -61,7 +61,7 @@ impl CachedLayer {
             return Ok(());
         };
         // Everything below runs under the ring mutex: the whole pipeline is on the token
-        // thread, so this lock only excludes the (one-time) creation race in `scratch_ring`.
+        // thread, so this lock only excludes the (one-time) creation race in `staging_ring`.
         // Working on `&Arc<SlotBuf>` directly matters: `wait_for_readers` waits for the refcount
         // to fall back to the ring's own `Arc` — cloning into a borrow list first would count
         // that clone and spin forever (W105: three 900s-timeout hangs, exactly here).
@@ -77,15 +77,15 @@ impl CachedLayer {
                 let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
                 let mut slot_of: HashMap<u32, (Arc<SlotBuf>, usize)> =
                     HashMap::with_capacity(chosen.len());
-                for (i, scratch) in taken.into_iter().enumerate() {
+                for (i, staging) in taken.into_iter().enumerate() {
                     let expert = chosen[i];
                     let pos = (start + i) % len;
                     // Same guard as `upload_in_place`: wait for the readers that captured this
                     // slot last step of the ring (they record their fence before dropping it),
                     // then let the copy stream wait on that fence before overwriting. This step
                     // is itself the next reader through the `Arc` injected into `slot_of`.
-                    copy_stream::wait_for_readers(scratch);
-                    let buf = scratch;
+                    copy_stream::wait_for_readers(staging);
+                    let buf = staging;
                     let SlotData::Banked { memory, .. } = &buf.data else {
                         unreachable!("staging ring slots are banked");
                     };
@@ -114,7 +114,7 @@ impl CachedLayer {
                 slot_of
             }
         };
-        let bank_first = SCRATCH_RING_FIRST;
+        let bank_first = STAGING_RING_FIRST;
         if slot_of.is_empty() {
             return Ok(());
         }

@@ -99,7 +99,7 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
 
 #[test]
 fn registry_does_not_keep_layers_alive() {
-    let reg = LayerRegistry::default();
+    let reg = Layers::default();
     assert!(reg.get(3).is_none());
     assert!(reg.layers.read().is_empty());
 }
@@ -122,15 +122,15 @@ fn streamed_misses_ranks_by_total_weight_and_dedups() {
     assert_eq!(streamed_misses(&misses, 0.5, 3), vec![1, 3]);
     // cap 1 clamps below the fraction.
     assert_eq!(streamed_misses(&misses, 1.0, 1), vec![1]);
-    // off, or no scratch to hold anything.
+    // off, or no staging to hold anything.
     assert!(streamed_misses(&misses, 0.0, 3).is_empty());
     assert!(streamed_misses(&misses, 1.0, 0).is_empty());
 }
 
 #[test]
-fn scratch_ring_slots_is_fixed() {
+fn staging_ring_slots_is_fixed() {
     // Measured: 16 and 64 slots perform identically, so the ring size is a constant (M9).
-    assert_eq!(scratch_ring_slots(), 16);
+    assert_eq!(staging_ring_slots(), 16);
 }
 
 #[test]

@@ -13,7 +13,7 @@ use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, LayerRegistry,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Layers,
     LayerState, Projections, Slot, SlotBuf, SlotData,
 };
 
@@ -217,7 +217,7 @@ impl CachedLayer {
         self.pcie_frac
     }
 
-    pub(crate) fn registry(&self) -> &Arc<LayerRegistry> {
+    pub(crate) fn registry(&self) -> &Arc<Layers> {
         &self.registry
     }
 
@@ -255,14 +255,14 @@ impl CachedLayer {
 
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
     /// A no-op when the layer has no copy stream or no CPU `QTensor`s. Called once after load.
-    pub(super) fn warmup_scratch_ring(&self) -> candle_core::Result<()> {
+    pub(super) fn warmup_staging_ring(&self) -> candle_core::Result<()> {
         let Some(cs) = &self.copy_stream else {
             return Ok(());
         };
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(());
         };
-        self.registry.scratch_ring(
+        self.registry.staging_ring(
             cs,
             &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device,

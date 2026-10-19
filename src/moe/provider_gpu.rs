@@ -14,7 +14,7 @@ use crate::stats;
 
 use super::{
     alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer,
-    LayerRegistry, LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
+    Layers, LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,11 +36,11 @@ struct ProviderInner {
 pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
-    registry: Arc<LayerRegistry>,
+    registry: Arc<Layers>,
     copy_streams: CopyStreams,
     /// `--prefill-stream`: run long prefill chunks' experts on the GPU.
     prefill: Option<PrefillStreams>,
-    /// `--pcie-frac`: share of decode misses to DMA into scratch slots and run on the GPU.
+    /// `--pcie-frac`: share of decode misses to DMA into staging slots and run on the GPU.
     pcie_frac: f32,
     /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass.
     lookahead_swaps: usize,
@@ -58,7 +58,7 @@ impl GpuCacheMoeProvider {
     ) -> Self {
         stats::record_cache_installed();
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-        let registry: Arc<LayerRegistry> = Arc::default();
+        let registry: Arc<Layers> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
         let lender: Arc<dyn ExpertMemoryLender> = registry.clone();
         let prefill = prefill.map(|p| p.with_lender(lender));
@@ -117,7 +117,7 @@ impl GpuCacheMoeProvider {
         let mut rings = 0usize;
         if self.pcie_frac > 0.0 {
             for layer in &layers {
-                layer.warmup_scratch_ring()?;
+                layer.warmup_staging_ring()?;
             }
             rings = self.registry.ring_creations.load(Ordering::Relaxed);
         }

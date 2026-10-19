@@ -11,34 +11,34 @@ use tracing::info;
 use crate::copy_stream::{CopyStream, ReadFence};
 
 use super::{
-    expert_range, scratch_ring_slots, Bank, LayerRegistry, Projections, ScratchKey, ScratchRing,
-    SlotBuf, SlotData, SCRATCH_RING_FIRST,
+    expert_range, staging_ring_slots, Bank, Layers, Projections, StagingKey, StagingRing,
+    SlotBuf, SlotData, STAGING_RING_FIRST,
 };
 
-impl LayerRegistry {
+impl Layers {
     /// The staging ring for this shape of expert stacks on `device`, creating it at the first
     /// decode step that needs it. `None` only on allocation failure — a layer on another
     /// device simply never finds `cs` for it (copy streams are per-device).
-    pub(crate) fn scratch_ring(
+    pub(crate) fn staging_ring(
         &self,
         cs: &CopyStream,
         stacks: &(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>),
         device: &Device,
-    ) -> candle_core::Result<Option<Arc<Mutex<ScratchRing>>>> {
+    ) -> candle_core::Result<Option<Arc<Mutex<StagingRing>>>> {
         // The per-projection expert byte counts are the ground truth a ring must match (they
         // fold in dtype and dims, including per-projection differences inside one layer).
         let bytes: [usize; 3] = std::array::from_fn(|i| {
             expert_range(&[&stacks.0, &stacks.1, &stacks.2][i], 0).map_or(0, |r| r.len())
         });
-        let key: ScratchKey = (bytes, stacks.0.dtype() as u8);
-        let mut rings = self.scratch.lock().unwrap();
+        let key: StagingKey = (bytes, stacks.0.dtype() as u8);
+        let mut rings = self.staging.lock().unwrap();
         if let Some(ring) = rings.get(&key) {
             return Ok(Some(Arc::clone(ring)));
         }
-        let len = scratch_ring_slots();
-        let slots = alloc_bank(cs, stacks, SCRATCH_RING_FIRST, len, device)?;
+        let len = staging_ring_slots();
+        let slots = alloc_bank(cs, stacks, STAGING_RING_FIRST, len, device)?;
         let per_slot: usize = bytes.iter().sum();
-        let ring = Arc::new(Mutex::new(ScratchRing { slots, cursor: 0 }));
+        let ring = Arc::new(Mutex::new(StagingRing { slots, cursor: 0 }));
         info!(
             "--pcie-frac: {len} staging-ring slots for dtype {:?} shared by its layers \
              (~{} MiB total, beyond the cache), DMA'd misses run on the GPU",
@@ -50,7 +50,7 @@ impl LayerRegistry {
         Ok(Some(ring))
     }
 }
-impl ScratchRing {
+impl StagingRing {
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }

@@ -4,9 +4,9 @@ use std::sync::{Arc, Weak};
 
 use crate::prefill_stream::ExpertMemoryLender;
 
-use super::{CachedLayer, LayerRegistry};
+use super::{CachedLayer, Layers};
 
-impl LayerRegistry {
+impl Layers {
     pub(crate) fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
         let mut layers = self.layers.write();
         if layers.len() <= layer {
@@ -30,7 +30,7 @@ impl LayerRegistry {
 
 // Lends the cache's tail slots to the prefill stream while a prompt runs (see
 // `prefill_stream`): each layer gives up an equal share of the bytes asked for.
-impl ExpertMemoryLender for LayerRegistry {
+impl ExpertMemoryLender for Layers {
     fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
         let layers = self.all();
         let share = bytes.div_ceil(layers.len().max(1));

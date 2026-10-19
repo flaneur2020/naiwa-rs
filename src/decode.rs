@@ -23,10 +23,10 @@ impl CachedLayer {
     ///
     /// Returns without waiting for the misses: their sum is copied in on candle's stream when
     /// the worker is done (`deferred`), so the next layer's launches overlap the CPU experts.
-    /// `--pcie-frac`: DMA the highest-weight misses of this step into the scratch slots and turn
+    /// `--pcie-frac`: DMA the highest-weight misses of this step into the staging slots and turn
     /// them into hits, so `run_hits` runs them on the GPU with the residents and the rest stay on
     /// the CPU. The chosen ids are removed from `misses`, leaving the caller's CPU padding and
-    /// `deferred::start` untouched. The injected hits carry the scratch `SlotBuf`, so the caller's
+    /// `deferred::start` untouched. The injected hits carry the staging `SlotBuf`, so the caller's
     /// fence loop covers them and the next step's DMA waits on this step's readers.
     ///
     /// `upload_async` returns as soon as the copy is queued; the layer's DMA gate (a captured wait

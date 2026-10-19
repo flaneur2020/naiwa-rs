@@ -24,7 +24,7 @@ The order is the current `decode_forward` order; the split must not reorder it.
 |---|---|---|---|
 | `Preload` | `submit(layer, x2d, rows, hidden, pass)` | `SYNC_PRELOAD` published by the lookahead worker after the next-layer copies | `ActivationDoorbell` publish; the lookahead worker calls `CachedLayer::prefetch_predicted` |
 | `Route` | `split(layer, topk_ids, weights, rows)` | `RoutePlan { hits, misses }` | `TopkDoorbell` read, slot hit lookup, tick/hit_counts/last_use update |
-| `DmaMiss` | `stage(layer, &mut RoutePlan, pass)` | `SYNC_STAGING` on the copy stream; `plan.hits` gains the staged experts | `CopyStream`, staging gate publish; uses the cache's scratch ring |
+| `DmaMiss` | `stage(layer, &mut RoutePlan, pass)` | `SYNC_STAGING` on the copy stream; `plan.hits` gains the staged experts | `CopyStream`, staging gate publish; uses the cache's staging ring |
 | `CpuMiss` | `submit(&plan.misses, x2d)` | `Option<CpuPending>` | CPU job body; `ResultDoorbell` is owned by `executor result channel` |
 | `GpuExperts` | `run(layer, hits, x2d, act)` | output tensor + read fences on every slot | fused decode / per-expert `QMatMul`; no doorbell |
 
@@ -69,10 +69,10 @@ src/components/
 src/expert_cache/
   mod.rs             // private submodules + pub(crate) facade
   layer.rs           // CachedLayer lifecycle + LookaheadChannel/predict/prefetch
-  staging.rs         // scratch ring + alloc_bank (cache state used by DmaMiss)
+  staging.rs         // staging ring + alloc_bank (cache state used by DmaMiss)
   provider_gpu.rs    // GPU-cache provider + build/warmup
   provider_cpu.rs    // no-cache CPU-only provider
-  registry.rs        // LayerRegistry lookup + lender
+  layers.rs          // Layers lookup + lender
 ```
 
 Dependency direction is one-way:
@@ -82,7 +82,7 @@ components/ + decode.rs  ──►  expert_cache/ (pub(crate) facade)
 expert_cache/            ──X──►  components/ or decode.rs
 ```
 
-`stream_pcie`/`stage_misses` moved into `src/components/dma_miss.rs`; the scratch ring and
+`stream_pcie`/`stage_misses` moved into `src/components/dma_miss.rs`; the staging ring and
 `alloc_bank` stay in `expert_cache/staging.rs` because they are cache state. `LookaheadChannel`,
 `predict` and `prefetch_predicted` stay in `expert_cache/layer.rs` for the same reason; `Preload`
 owns only the activation publish and worker submit.
@@ -92,13 +92,13 @@ owns only the activation publish and worker submit.
 `expert_cache/mod.rs` keeps its submodules private and exports only what the components need:
 
 - types: `CachedLayer`, `LayerState`, `Slot`, `SlotBuf`, `SlotData`, `Projections`, `Bank`,
-  `LayerRegistry`, `LookaheadChannel`
+  `Layers`, `LookaheadChannel`
 - `CachedLayer` accessors: `state()`, `cpu()`, `slot_device()`, `hidden()`, `num_experts()`, `top_k()`,
   `act()`, `router()`, `lookahead()`, `lookahead_chan()`, `copy_stream()`, `pcie_frac()`,
   `registry()`, `layer()`, `preload_claimed()`
 - `CachedLayer` mutation used by components/decode: `admit()`, `replace()`, `prefetch_predicted()`,
   `replay_gate()`, `staging_enabled()`
-- `LayerRegistry`: `get()`, `all()`, `insert()`, `scratch_ring()`
+- `Layers`: `get()`, `all()`, `insert()`, `staging_ring()`
 
 `LayerState` and `Slot` fields are `pub(crate)` too: the route component updates `tick`,
 `hit_counts` and `last_use` under the layer's state lock, and the gpu/dma components read slot
@@ -149,7 +149,7 @@ belong to `components`, not `expert_cache`.
 - [x] Move top-k read and hit/miss split to `route.rs`.
 - [x] Move `run_hits` / `run_expert` / `fused_decode` to `gpu.rs`.
 - [x] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
-- [x] Move `stream_pcie` / `stage_misses` to `dma_miss.rs`; keep the scratch ring in `staging.rs`.
+- [x] Move `stream_pcie` / `stage_misses` to `dma_miss.rs`; keep the staging ring in `staging.rs`.
 - [x] Move the preload submit block to `preload.rs`; keep `LookaheadChannel`/`predict`/`prefetch` in the cache.
 - [x] Move `decode.rs` out of `expert_cache/`; it is now 198 lines of orchestration.
 - [x] Gates: 0 warnings, 33/33 tests, oracle identical (also `--prefill-stream`), np8 53.3 / 52.2 tok/s.

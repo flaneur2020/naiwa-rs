@@ -38,7 +38,7 @@ mod expert_bytes;
 mod layer;
 mod provider_cpu;
 mod provider_gpu;
-mod registry;
+mod layers;
 mod staging;
 #[cfg(test)]
 mod tests;
@@ -86,20 +86,20 @@ fn loan_bank_slots(num_experts: usize) -> usize {
 }
 
 /// With `--pcie-frac`, a decode step DMAs its highest-weight misses into a staging ring shared
-/// by every layer of the model (Strata's `kStagingBlobs` shape), instead of a per-layer scratch
+/// by every layer of the model (Strata's `kStagingBlobs` shape), instead of a per-layer staging
 /// bank: per-layer banks could only hold `ceil(frac*top_k)` slots each, which at `frac` 0.55
 /// meant 6 slots x 48 layers of VRAM and OOM'd, while cross-layer reuse needs one fixed pool of
 /// slots that every layer's step borrows in turn. The fence model already serializes reusers —
 /// a reader holds the `SlotBuf` `Arc` until it has recorded its fence, and the next layer's DMA
 /// waits on that fence — so no cross-layer accounting is needed.
-pub(crate) const SCRATCH_RING_FIRST: usize = 1 << 30;
+pub(crate) const STAGING_RING_FIRST: usize = 1 << 30;
 
 /// Ring capacity: enough that consecutive layers' steps rarely collide on one slot, small
 /// enough to be a rounding error next to the cache. Strata uses 16 (`kStagingBlobs`).
 /// Fixed: 16 measured the same as 64, and a bigger ring only costs VRAM.
 /// Staging-ring slots per quant shape. Measured: 16 and 64 perform identically (the ring has no id -> slot
 /// lookup, so a staged expert is copied again either way), so this is a constant, not a knob.
-const fn scratch_ring_slots() -> usize {
+const fn staging_ring_slots() -> usize {
     16
 }
 
@@ -112,16 +112,16 @@ pub(crate) fn schedule() -> Option<&'static Arc<crate::doorbell::GateSet>> {
 }
 
 /// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling
-/// layer `l + 1`'s slots. Weak references: the model owns the layers, not the registry.
+/// layer `l + 1`'s slots. Weak references: the model owns the layers, not this index.
 #[derive(Default)]
-pub(crate) struct LayerRegistry {
+pub(crate) struct Layers {
     layers: RwLock<Vec<Weak<CachedLayer>>>,
     /// The model-wide `--pcie-frac` staging rings, keyed by the shape of the expert stacks
     /// (dtype and per-projection dims): mixed-quant models give different layers different
     /// GGML dtypes, and one bank cannot serve two shapes (W105: 524800-byte experts against a
-    /// 627200-byte slot). Each shape gets its own ring of `scratch_ring_slots()` slots.
-    /// Behind a `Mutex` because `ScratchRing::acquire` mutates each ring's cursor.
-    scratch: Mutex<HashMap<ScratchKey, Arc<Mutex<ScratchRing>>>>,
+    /// 627200-byte slot). Each shape gets its own ring of `staging_ring_slots()` slots.
+    /// Behind a `Mutex` because `StagingRing::acquire` mutates each ring's cursor.
+    staging: Mutex<HashMap<StagingKey, Arc<Mutex<StagingRing>>>>,
     /// v2 M1: how many rings have actually been *created* (not looked up). `warmup_rings` runs
     /// after load and before the first decode; any further increment means a ring materialized
     /// on the decode path, i.e. an address that was not fixed up front.
@@ -131,7 +131,7 @@ pub(crate) struct LayerRegistry {
 /// A staging ring's shape key: every projection's per-expert byte count (folds in dtype and
 /// dims, and separates a layer whose gate/up/down are heterogeneously quantized), plus the
 /// stacks' dtype.
-type ScratchKey = ([usize; 3], u8);
+type StagingKey = ([usize; 3], u8);
 
 /// One cache slot: reservation/published state, permanent storage, and LRU age.
 /// See the state list in `m9a.md`; `storage` is cloned out under the state lock so uploads and
@@ -206,7 +206,7 @@ pub(crate) struct SlotBuf {
     pub(crate) fence: ReadFence,
 }
 
-/// The model-wide `--pcie-frac` staging ring (see `SCRATCH_RING_FIRST`): one bank of slots
+/// The model-wide `--pcie-frac` staging ring (see `STAGING_RING_FIRST`): one bank of slots
 /// past every resident slot, shared by every layer, borrowed round-robin per decode step.
 ///
 /// `acquire(n)` runs under the registry lock, so consecutive layers get disjoint slots even
@@ -214,8 +214,8 @@ pub(crate) struct SlotBuf {
 /// caller). Round-robin keeps the reuse distance at one full revolution of the ring: by the
 /// time the cursor returns to a slot, several layers' readers have long recorded their fences,
 /// so `wait_for_readers` never spins in practice.
-/// Ring slots' `Bank.first` is `SCRATCH_RING_FIRST`, past every resident slot.
-pub(crate) struct ScratchRing {
+/// Ring slots' `Bank.first` is `STAGING_RING_FIRST`, past every resident slot.
+pub(crate) struct StagingRing {
     slots: Vec<Arc<SlotBuf>>,
     cursor: usize,
 }
@@ -230,7 +230,7 @@ pub(crate) struct CachedLayer {
     cpu: MoEExperts,
     slot_device: Device,
     layer: usize,
-    registry: Arc<LayerRegistry>,
+    registry: Arc<Layers>,
     hidden: usize,
     num_experts: usize,
     top_k: usize,
