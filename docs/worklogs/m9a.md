@@ -1,7 +1,7 @@
 # M9a — expert_cache concept reduction
 
-Status: **planned, not started**. Baseline: `f9b862e` (expert_cache now has private submodules and a single
-export surface in `expert_cache/mod.rs`).
+Status: **done**. Branch `m9a-expert-cache-concepts` (`7601fbf`, `08c369a`), merged to main after the gates
+below. Baseline: `f9b862e` (expert_cache has private submodules and a single export surface).
 
 ## Why
 
@@ -132,40 +132,49 @@ changing `Slot`.
 - `LookaheadChannel` + `LookaheadShared` -> one `LookaheadChannel` with `Arc<ActivationDoorbell>` and the two
   counters.
 
-Expected: ~17 named types -> ~13–14, five per-slot tables -> one, and ~100–150 fewer lines. The module layout
+Result: ~17 named types -> 14, five per-slot tables -> one. The diff is +246/−216 (net +30) because the
+explicit `Slot` helpers cost a few lines; the win is the state machine and the invariants, not line count. The module layout
 stays as is: `mod.rs` remains the state/type hub so children keep private field access; splitting the types into
 another file would force `pub(in crate::expert_cache)` on fields without reducing concepts.
+
+## Result
+
+- `Slot { expert, buf, storage, last_use }` is the only per-slot state; `LayerState.slots` is the only table.
+- `Projections` / `Bank` / `SlotData` make the two buffer modes explicit.
+- `SlotEntry`, `ScratchSlot`, `CacheLoan` and `LookaheadShared` are gone.
+- Hit lookup scans the slot vector; the np8 run shows no measurable cost.
 
 ## Phases
 
 ### Phase 1 — slot data (low risk)
 
-- [ ] `Projections`; `Bank` uses it.
-- [ ] `SlotData` + `SlotBuf`.
-- [ ] `ScratchSlot` removed; `ScratchRing` holds `Vec<Arc<SlotBuf>>`.
-- [ ] Adapt `alloc_bank`, `run_hits`, `stage_misses`, `upload_in_place`.
+- [x] `Projections`; `Bank` uses it.
+- [x] `SlotData` + `SlotBuf`.
+- [x] `ScratchSlot` removed; `ScratchRing` holds `Vec<Arc<SlotBuf>>`.
+- [x] Adapt `alloc_bank`, `run_hits`, `stage_misses`, `upload_in_place`.
 
 ### Phase 2 — slot state (main win)
 
-- [ ] `Slot` and `LayerState`.
-- [ ] Remove the five per-slot tables and the reverse map.
-- [ ] Rewrite `admit`, `replace`, `load_reserved`, `lend`, `give_back`, hit lookup.
-- [ ] Adapt `fill_candidate`, `lru_victim`, `CachedLayer::spawn_fill`, tests.
+- [x] `Slot` and `LayerState`.
+- [x] Remove the five per-slot tables and the reverse map.
+- [x] Rewrite `admit`, `replace`, `load_reserved`, `lend`, `give_back`, hit lookup.
+- [x] Adapt `fill_candidate`, `lru_victim`, `CachedLayer::spawn_fill`, tests.
 
 ### Phase 3 — wrappers
 
-- [ ] `impl ExpertMemoryLender for LayerRegistry`; delete `CacheLoan`.
-- [ ] Merge `LookaheadChannel` and `LookaheadShared`.
-- [ ] Optional: rename `ProviderInner` to `Budget` (naming only).
+- [x] `impl ExpertMemoryLender for LayerRegistry`; delete `CacheLoan`.
+- [x] Merge `LookaheadChannel` and `LookaheadShared`.
+- [ ] Optional: rename `ProviderInner` to `Budget` (not taken; naming only).
 
 ## Gates after each phase
 
-- `cargo check --features cuda`: 0 naiwa warnings.
-- `cargo test --features cuda --bin naiwa-rs`: currently 33/33.
-- `frac 0` + `NO_LOOKAHEAD`: oracle byte-identical to `harness/m1/reference.oracle.txt`.
-- np8 counting prompt: round p50 / tok/s within the current 52–53 tok/s band.
-- Verify the `lent_slots_leave_service_and_come_back_refilled` and `fill_candidate`/`lru_victim` tests after
-  the state rewrite; they are the canaries for the table merge.
+- [x] `cargo check --features cuda`: 0 naiwa warnings.
+- [x] `cargo test --features cuda --bin naiwa-rs`: 33/33.
+- [x] `frac 0` + `NO_LOOKAHEAD`: oracle byte-identical to `harness/m1/reference.oracle.txt`; also with
+  `--prefill-stream` (exercises `lend`/`give_back`).
+- [x] np8 counting prompt: 52.2 tok/s, inside the current 52–53 tok/s band.
+- [x] `lent_slots_leave_service_and_come_back_refilled`, `fill_candidate` and `lru_victim` tests pass after
+  the state rewrite.
 
 ## Non-goals
 
