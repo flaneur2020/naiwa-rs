@@ -1,11 +1,14 @@
 //! Preload: publish this layer's activation for the next layer's prediction.
 
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use candle_core::{DType, Device, Result, Tensor};
 use tracing::debug;
 
+use crate::executor::{self, Task};
 use crate::expert_cache::CachedLayer;
 use crate::stats;
 
@@ -37,7 +40,7 @@ pub(crate) fn submit(
                 let x = x.flatten_all()?.to_vec1::<f32>()?;
                 if queued {
                     let next = Arc::clone(&next);
-                    crate::deferred::submit_lookahead(Box::new(move || {
+                    schedule(Box::new(move || {
                         let r = x.len() / next.hidden().max(1);
                         let x = Tensor::from_vec(x, (r, next.hidden()), &Device::Cpu);
                         if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
@@ -53,7 +56,7 @@ pub(crate) fn submit(
                 let pub_res = chan.publish(&x2d, n);
                 stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
                 if let Some((sh, last_seq)) = pub_res? {
-                    crate::deferred::submit_lookahead(Box::new(move || {
+                    schedule(Box::new(move || {
                         let t0 = std::time::Instant::now();
                         // The GAP is the scheduler's business, not this
                         // closure's: the lookahead thread only drains its queue
@@ -98,7 +101,7 @@ pub(crate) fn submit(
                 let x_clone = x2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                 let d2h = t0.elapsed().as_secs_f64() * 1e3;
                 let next = Arc::clone(&next);
-                crate::deferred::submit_lookahead(Box::new(move || {
+                schedule(Box::new(move || {
                     let x = Tensor::from_vec(x_clone, (rows, next.hidden()), &Device::Cpu);
                     if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                         debug!("expert cache: layer {} lookahead failed: {e}", next.layer());
@@ -112,4 +115,62 @@ pub(crate) fn submit(
     }
 
     Ok(())
+}
+
+const LOOKAHEAD_PARK: Duration = Duration::from_millis(2);
+const LOOKAHEAD_DEPTH: usize = 64;
+
+static LOOKAHEAD_JOBS: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
+static LOOKAHEAD_LEN: AtomicUsize = AtomicUsize::new(0);
+static LOOKAHEAD_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+fn ensure_thread() -> std::thread::Thread {
+    LOOKAHEAD_THREAD
+        .get_or_init(|| {
+            let t = std::thread::Builder::new()
+                .name("lookahead".into())
+                .spawn(lookahead_worker)
+                .map(|h| h.thread().clone())
+                .unwrap_or_else(|e| {
+                    tracing::warn!("no lookahead thread ({e}); predictions will not run");
+                    std::thread::current()
+                });
+            executor::cpu().on_idle(t.clone());
+            t
+        })
+        .clone()
+}
+
+fn schedule(job: Task) {
+    let thread = ensure_thread();
+    {
+        let mut jobs = LOOKAHEAD_JOBS.lock().unwrap();
+        if jobs.len() >= LOOKAHEAD_DEPTH {
+            stats::record_cache_lookahead_dropped();
+            return;
+        }
+        jobs.push_back(job);
+        LOOKAHEAD_LEN.store(jobs.len(), Ordering::Release);
+    }
+    thread.unpark();
+}
+
+fn take() -> Option<Task> {
+    if LOOKAHEAD_LEN.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut jobs = LOOKAHEAD_JOBS.lock().unwrap();
+    let job = jobs.pop_front();
+    LOOKAHEAD_LEN.store(jobs.len(), Ordering::Release);
+    job
+}
+
+fn lookahead_worker() {
+    loop {
+        while executor::cpu().is_idle() {
+            let Some(job) = take() else { break };
+            job();
+        }
+        std::thread::park_timeout(LOOKAHEAD_PARK);
+    }
 }

@@ -253,7 +253,7 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     step.rs                STEP_DBG + ROUND_DBG
     fused.rs               FUSED_DBG
     retired.rs             RET_DBG
-  src/deferred.rs          CPU worker + CPU-return channel
+  src/executor.rs          single-thread CPU executor + result doorbell + idle signal
   harness/                  primitives, oracle, bandwidth harnesses
 ~/code/mistral.rs-iq4xs    fork
 ~/naiwa-rs/target          crate target

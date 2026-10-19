@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use crate::deferred;
+use crate::executor;
 use crate::expert_cache::CachedLayer;
 use crate::offload::fused_decode as offload_fused_decode;
 
 pub(crate) struct CpuPending {
-    inner: deferred::Pending,
+    inner: executor::Pending,
 }
 
 impl CpuPending {
@@ -56,6 +56,6 @@ pub(crate) fn submit(
             .flatten_all()?
             .to_vec1::<f32>()
     };
-    let pending = deferred::start(layer.slot_device(), rows, layer.hidden(), job)?;
+    let pending = executor::cpu().submit_result(layer.slot_device(), rows, layer.hidden(), job)?;
     Ok(Some(CpuPending { inner: pending }))
 }

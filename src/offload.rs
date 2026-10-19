@@ -42,7 +42,13 @@ pub fn install_cpu_moe(
         );
     }
     if let Some(gb) = expert_cache_gb {
-        let provider = Arc::new(GpuCacheMoeProvider::new(gb, prefill, pcie_frac, lookahead_swaps, lookahead));
+        let provider = Arc::new(GpuCacheMoeProvider::new(
+            gb,
+            prefill,
+            pcie_frac,
+            lookahead_swaps,
+            lookahead,
+        ));
         let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
         install_routed_experts_provider(provider)?;
         info!(
@@ -225,9 +231,18 @@ impl RoutedExperts for CpuExperts {
         // One token, or a speculative verify step's rows.
         let (experts, act) = (Arc::clone(&self.experts), self.act);
         let run = move || -> candle_core::Result<Vec<f32>> {
-            let x = xs_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let ids = ids_cpu.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
-            let ws = weights_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let x = xs_cpu
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let ids = ids_cpu
+                .to_dtype(DType::U32)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            let ws = weights_cpu
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
             if let Some(ys) = fused_decode(&experts, act, &x, &ids, &ws, ids.len() / tokens)? {
                 return Ok(ys);
             }
@@ -240,7 +255,9 @@ impl RoutedExperts for CpuExperts {
         if seq == 1 && self.layer_device.is_cuda() {
             // Decode: return before the CPU experts finish; the next layer's launches overlap
             // them (`deferred`).
-            let ys = crate::deferred::start(&self.layer_device, batch, hidden, run)?.upload()?;
+            let ys = crate::executor::cpu()
+                .submit_result(&self.layer_device, batch, hidden, run)?
+                .upload()?;
             return ys.reshape((batch, seq, hidden))?.to_dtype(xs.dtype());
         }
         Tensor::from_vec(run()?, (batch, seq, hidden), &Device::Cpu)?

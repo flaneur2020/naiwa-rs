@@ -7,7 +7,7 @@ mod commands;
 mod components;
 mod decode;
 mod copy_stream;
-mod deferred;
+mod executor;
 mod doorbell;
 mod expert_cache;
 mod host_memory;

@@ -24,7 +24,7 @@ The order is the current `decode_forward` order; the split must not reorder it.
 | `Preload` | `submit(layer, x2d, rows, hidden, pass)` | `SYNC_PRELOAD` published by the lookahead worker after the next-layer copies | `ActivationDoorbell` publish; the lookahead worker calls `CachedLayer::prefetch_predicted` |
 | `Route` | `split(layer, topk_ids, weights, rows)` | `RoutePlan { hits, misses }` | `TopkDoorbell` read, slot hit lookup, tick/hit_counts/last_use update |
 | `DmaMiss` | `stage(layer, &mut RoutePlan, pass)` | `SYNC_STAGING` on the copy stream; `plan.hits` gains the staged experts | `CopyStream`, staging gate publish; uses the cache's scratch ring |
-| `CpuMiss` | `submit(&plan.misses, x2d)` | `Option<CpuPending>` | CPU job body; `ResultDoorbell` is owned by `deferred::Channel` |
+| `CpuMiss` | `submit(&plan.misses, x2d)` | `Option<CpuPending>` | CPU job body; `ResultDoorbell` is owned by `executor result channel` |
 | `GpuExperts` | `run(layer, hits, x2d, act)` | output tensor + read fences on every slot | fused decode / per-expert `QMatMul`; no doorbell |
 
 `CpuPending::upload()` is the CPU-result exit: it queues the `ResultDoorbell` wait+copy and returns the
@@ -42,7 +42,7 @@ struct RoutePlan {
 }
 
 struct CpuPending {
-    inner: deferred::Pending,
+    inner: executor::Pending,
 }
 
 impl CpuPending {
@@ -107,7 +107,7 @@ belong to `components`, not `expert_cache`.
 
 - `TopkDoorbell` — `Route`, lazily acquired in `LayerState`; the only blocking host read.
 - `ActivationDoorbell` — `Preload`, one per layer; worker reads it and runs the router.
-- `ResultDoorbell` — `CpuMiss` via `deferred::Channel`; the worker publishes, the stream wait+copy is
+- `ResultDoorbell` — `CpuMiss` via the executor's result channel; the worker publishes, the stream wait+copy is
   queued by `CpuPending::upload`.
 - `GateSet` — shared primitive. `Preload` publishes `SYNC_PRELOAD` with `publish_stream_max`; `DmaMiss`
   publishes `SYNC_STAGING` with `publish_stream`; `Decode` replays both gates.
