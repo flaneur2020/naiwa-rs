@@ -2,9 +2,14 @@
 
 use super::*;
 use super::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
-use candle_core::quantized::GgmlDType;
-use std::sync::atomic::{AtomicBool, Ordering};
+use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::{Device, Tensor};
+use mistralrs_core::layers::Activation;
+use mistralrs_core::MoEExperts;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::copy_stream::ReadFence;
 
 fn slot(expert: Option<usize>, last_use: u64) -> Slot {
     let mut s = Slot::empty();
@@ -101,7 +106,7 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
 fn registry_does_not_keep_layers_alive() {
     let reg = Layers::default();
     assert!(reg.get(3).is_none());
-    assert!(reg.layers.read().is_empty());
+    assert!(reg.all().is_empty());
 }
 
 #[test]
@@ -258,9 +263,7 @@ fn decode_split_matches_running_every_expert_on_the_cpu() {
     // expert 0 is a hit, expert 3 a miss
     let ids = Tensor::new(&[[0u32, 3]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4]], &Device::Cpu).unwrap();
-    let got = layer
-        .decode_forward(&xs, &ws, &ids, Activation::Silu)
-        .unwrap();
+    let got = crate::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
     let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)
@@ -290,9 +293,7 @@ fn verify_rows_split_matches_running_every_expert_on_the_cpu() {
     let xs = Tensor::from_vec(xs, (1, 3, 64), &Device::Cpu).unwrap();
     let ids = Tensor::new(&[[0u32, 3], [2, 0], [3, 5]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4], [0.7, 0.3], [0.5, 0.5]], &Device::Cpu).unwrap();
-    let got = layer
-        .decode_forward(&xs, &ws, &ids, Activation::Silu)
-        .unwrap();
+    let got = crate::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
     let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)

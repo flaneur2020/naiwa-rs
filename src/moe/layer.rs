@@ -1,20 +1,23 @@
 //! `CachedLayer` lifecycle: slots, fills, LRU replacement, lookahead prediction.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
 use mistralrs_core::layers::Activation;
+use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
 use tracing::debug;
 
 use crate::copy_stream::{self, CopyStream, ReadFence};
+use crate::host_memory::PinnedStack;
+use crate::prefill_stream::PrefillStream;
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Layers,
-    LayerState, Projections, Slot, SlotBuf, SlotData,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, LayerState, Layers, Projections,
+    Slot, SlotBuf, SlotData,
 };
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
@@ -168,6 +171,106 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
         .min_by_key(|(expert, slot)| (slots[*slot].last_use, *expert))
 }
 
+// Number of prefill tokens above which we skip the cache entirely.
+// Calls with more tokens than this are prefill chunks: every expert runs on the CPU (or the
+// prefill stream). Up to it they take the decode split, which is what a speculative verify step
+// needs (the target runs the n drafts plus one token in one forward).
+const PREFILL_THRESHOLD: usize = 16;
+
+pub(crate) struct CachedLayer {
+    /// Page-locked registrations of `cpu`'s stacks; each holds its stack, so it stays valid
+    /// for as long as it is registered.
+    pub(crate) _pinned: Vec<PinnedStack>,
+    pub(crate) cpu: MoEExperts,
+    pub(crate) slot_device: Device,
+    pub(crate) layer: usize,
+    pub(crate) registry: Arc<Layers>,
+    pub(crate) hidden: usize,
+    pub(crate) num_experts: usize,
+    pub(crate) top_k: usize,
+    pub(crate) act: Activation,
+    /// `[num_experts, hidden]` F32 on the CPU; `None` disables the lookahead for this layer.
+    pub(crate) router: Option<Tensor>,
+    /// R2a: the layer's GPU->host activation channel. `Some` only when the router exists
+    /// and the slot device is CUDA.
+    pub(crate) lookahead_chan: Option<Arc<LookaheadChannel>>,
+    pub(crate) state: Mutex<LayerState>,
+    /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
+    pub(crate) copy_stream: Option<Arc<CopyStream>>,
+    /// Copy-stream mode: the banks as `(first slot, len)`, in slot order. Lent whole.
+    pub(crate) banks: Vec<(usize, usize)>,
+    /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass
+    /// (`0` means a prediction can only fill an empty slot).
+    pub(crate) lookahead_swaps: usize,
+    /// `--no-lookahead`: this layer does not predict for the next one.
+    pub(crate) lookahead: bool,
+    /// `--pcie-frac`: share of a step's misses to stream over PCIe into the model-wide staging
+    /// ring (held by the registry, created lazily at the first decode — `stream_pcie`; 0.0
+    /// disables the feature).
+    pub(crate) pcie_frac: f32,
+    /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
+    pub(crate) prefill: Option<Arc<PrefillStream>>,
+    /// A background fill of this layer is running; at most one at a time.
+    pub(crate) filling: AtomicBool,
+    /// v2 M5b: the pass whose preload copies the prediction thread has claimed (0 = none). Claimed
+    /// before the copies are queued and before the point is published, so the token thread replays
+    /// the preload gate exactly when a publish is guaranteed to arrive for its pass.
+    pub(crate) preload_claimed: AtomicU32,
+}
+
+/// The model holds `Arc<dyn RoutedExperts>`; this wrapper keeps an `Arc<CachedLayer>` so the
+/// layer can hand itself to background fills.
+pub(crate) struct CachedExperts(pub(crate) Arc<CachedLayer>);
+
+impl RoutedExperts for CachedExperts {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let layer = &self.0;
+        let (batch, seq, hidden_dim) = xs.dims3()?;
+        debug_assert_eq!(hidden_dim, layer.hidden);
+        let num_tokens = batch * seq;
+
+        // Prefill: every routed expert runs on the CPU. Meanwhile, fill the empty slots of the
+        // next layer in the background, off the token path. This layer is filled too, for the
+        // first layer of the stack
+        // (no predecessor triggers it); a layer already full or filling is a no-op.
+        if num_tokens > PREFILL_THRESHOLD {
+            let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
+            {
+                let mut st = layer.state.lock().unwrap();
+                for &id in &ids_vec {
+                    st.hit_counts[id as usize] += 1;
+                }
+            }
+            if let Some(next) = layer.registry.get(layer.layer + 1) {
+                next.spawn_fill();
+            }
+            layer.spawn_fill();
+            if let Some(ps) = &layer.prefill {
+                if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
+                    return Ok(out);
+                }
+            }
+            let out = layer.cpu.forward(
+                &xs.to_device(&Device::Cpu)?,
+                topk_weights.to_device(&Device::Cpu)?,
+                &topk_ids.to_device(&Device::Cpu)?,
+            )?;
+            return out.to_device(&layer.slot_device);
+        }
+
+        // Decode: single token, split GPU hits / CPU misses.
+        if let Some(ps) = &layer.prefill {
+            ps.note_decode(layer.layer)?;
+        }
+        crate::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
+    }
+}
+
 impl CachedLayer {
     pub(crate) fn state(&self) -> &Mutex<LayerState> {
         &self.state
@@ -262,7 +365,7 @@ impl CachedLayer {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(());
         };
-        self.registry.staging_ring(
+        self.registry.staging().ring(
             cs,
             &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device,

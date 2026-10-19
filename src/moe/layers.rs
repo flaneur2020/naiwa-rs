@@ -2,11 +2,34 @@
 
 use std::sync::{Arc, Weak};
 
+use parking_lot::RwLock;
+
 use crate::prefill_stream::ExpertMemoryLender;
 
-use super::{CachedLayer, Layers};
+use super::layer::CachedLayer;
+use super::staging::StagingRings;
+
+/// Every cached layer of one model, by decoder-layer index, plus the model-wide staging rings.
+/// Weak references: the model owns the layers, not this index.
+pub(crate) struct Layers {
+    layers: RwLock<Vec<Weak<CachedLayer>>>,
+    staging: Arc<StagingRings>,
+}
+
+impl Default for Layers {
+    fn default() -> Self {
+        Self {
+            layers: RwLock::new(Vec::new()),
+            staging: Arc::new(StagingRings::default()),
+        }
+    }
+}
 
 impl Layers {
+    pub(crate) fn staging(&self) -> &StagingRings {
+        &self.staging
+    }
+
     pub(crate) fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
         let mut layers = self.layers.write();
         if layers.len() <= layer {

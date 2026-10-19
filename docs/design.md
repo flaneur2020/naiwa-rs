@@ -238,13 +238,14 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     gate.rs                GateSet/Gate (device-side pass gates)
     tests.rs
   src/moe/                 MoE execution + GPU expert cache
-    mod.rs                 module docs, constants, slot/bank/layer types
+    mod.rs                 module docs, constants, exports
     provider_gpu.rs        GPU-cache RoutedExpertsProvider + layer construction
     provider_cpu.rs        no-cache CPU-only RoutedExpertsProvider
     cpu_experts.rs         CPU routed experts + fused decode + prefill attach
-    layer.rs               slots, fills, LRU replacement, lookahead prediction
-    staging.rs             --pcie-frac staging ring + alloc_bank
-    layers.rs              layer lookups + prefill loan
+    layer.rs               CachedLayer + CachedExperts + lookahead prediction
+    slot.rs                Slot/LayerState/SlotBuf/Bank/Projections
+    layers.rs              Layers lookup + prefill loan
+    staging.rs             StagingRings/StagingRing + alloc_bank
     expert_bytes.rs        per-expert byte slicing
   src/components/          decode stages: route, gpu, cpu-miss, dma-miss, preload
   src/decode.rs            decode pipeline orchestrator

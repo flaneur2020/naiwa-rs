@@ -1,6 +1,6 @@
 //! The `RoutedExpertsProvider` that builds one cached layer per MoE block.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
@@ -13,8 +13,8 @@ use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;
 
 use super::{
-    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer,
-    Layers, LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
+    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
+    Layers, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ impl GpuCacheMoeProvider {
             for layer in &layers {
                 layer.warmup_staging_ring()?;
             }
-            rings = self.registry.ring_creations.load(Ordering::Relaxed);
+            rings = self.registry.staging().creations();
         }
         Ok((captures, rings))
     }
@@ -127,7 +127,7 @@ impl GpuCacheMoeProvider {
     /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
     /// decode has started.
     pub fn ring_creations(&self) -> usize {
-        self.registry.ring_creations.load(Ordering::Relaxed)
+        self.registry.staging().creations()
     }
 }
 
