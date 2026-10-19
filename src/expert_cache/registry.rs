@@ -7,7 +7,7 @@ use crate::prefill_stream::ExpertMemoryLender;
 use super::{CachedLayer, LayerRegistry};
 
 impl LayerRegistry {
-    pub(super) fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
+    pub(crate) fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
         let mut layers = self.layers.write();
         if layers.len() <= layer {
             layers.resize_with(layer + 1, Weak::new);
@@ -15,11 +15,11 @@ impl LayerRegistry {
         layers[layer] = Arc::downgrade(cached);
     }
 
-    pub(super) fn get(&self, layer: usize) -> Option<Arc<CachedLayer>> {
+    pub(crate) fn get(&self, layer: usize) -> Option<Arc<CachedLayer>> {
         self.layers.read().get(layer).and_then(Weak::upgrade)
     }
 
-    pub(super) fn all(&self) -> Vec<Arc<CachedLayer>> {
+    pub(crate) fn all(&self) -> Vec<Arc<CachedLayer>> {
         self.layers
             .read()
             .iter()

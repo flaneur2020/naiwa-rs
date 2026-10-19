@@ -4,6 +4,8 @@
 
 mod args;
 mod commands;
+mod components;
+mod decode;
 mod copy_stream;
 mod deferred;
 mod doorbell;

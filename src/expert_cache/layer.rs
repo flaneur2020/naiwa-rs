@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
+use mistralrs_core::layers::Activation;
+use mistralrs_core::MoEExperts;
 use tracing::debug;
 
 use crate::copy_stream::{self, CopyStream, ReadFence};
@@ -12,7 +14,7 @@ use crate::stats;
 
 use super::{
     alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedLayer, Projections, Slot,
-    SlotBuf, SlotData,
+    LayerRegistry, LayerState, SlotBuf, SlotData,
 };
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
@@ -22,15 +24,15 @@ use super::{
 /// The token thread never waits — no `to_vec1` D2H (W105b: 0.30-0.34 ms/layer of blocking
 /// wait) and no way for the prediction to queue late on the stream (the W99 failure that
 /// made an earlier mode switch regress hit 74% -> 38-45%).
-pub(super) struct LookaheadChannel {
-    pub(super) chan: Arc<crate::doorbell::ActivationDoorbell>,
+pub(crate) struct LookaheadChannel {
+    pub(crate) chan: Arc<crate::doorbell::ActivationDoorbell>,
     /// The seq the last queued GPU publish will bump the counter to (0 before any):
     /// `last_seq + 1` is the value `wait_publish` waits for. Touched only by the token thread.
-    pub(super) next_seq: std::sync::atomic::AtomicU32,
+    pub(crate) next_seq: std::sync::atomic::AtomicU32,
     /// How many queued publishes the worker has consumed (`wait_publish` returned).
     /// The difference to `next_seq` is the queue depth; publish backpressure keeps
     /// it below the doorbell's ring depth so a lagging job's slot is never overwritten.
-    pub(super) consumed: std::sync::atomic::AtomicU32,
+    pub(crate) consumed: std::sync::atomic::AtomicU32,
 }
 
 impl LookaheadChannel {
@@ -68,7 +70,7 @@ impl LookaheadChannel {
     /// `last_seq` the worker job needs to wait and read, or `None` when the worker is more
     /// than `depth - 1` publishes behind — the prediction is advisory, so skipping this
     /// publish is cheaper than overwriting an unread slot.
-    pub(super) fn publish(
+    pub(crate) fn publish(
         self: &Arc<Self>,
         x: &Tensor,
         n: usize,
@@ -140,7 +142,7 @@ pub(super) fn union_by_votes(rankings: impl IntoIterator<Item = Vec<usize>>) -> 
 /// the total router weight routed to them, truncated to `cap`. An expert missed by several rows
 /// is DMA'd once and serves them all, so the distinct count is what `frac` applies to; when the
 /// fraction does not cover every miss, the ones that contribute most to the output go first.
-pub(super) fn streamed_misses(misses: &[Vec<(u32, f32)>], frac: f32, cap: usize) -> Vec<u32> {
+pub(crate) fn streamed_misses(misses: &[Vec<(u32, f32)>], frac: f32, cap: usize) -> Vec<u32> {
     if frac <= 0.0 || cap == 0 {
         return Vec::new();
     }
@@ -168,12 +170,71 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
 }
 
 impl CachedLayer {
+    pub(crate) fn state(&self) -> &Mutex<LayerState> {
+        &self.state
+    }
+
+    pub(crate) fn cpu(&self) -> &MoEExperts {
+        &self.cpu
+    }
+
+    pub(crate) fn slot_device(&self) -> &Device {
+        &self.slot_device
+    }
+
+    pub(crate) fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    pub(crate) fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+
+    pub(crate) fn top_k(&self) -> usize {
+        self.top_k
+    }
+
+    pub(crate) fn act(&self) -> Activation {
+        self.act
+    }
+
+    pub(crate) fn router(&self) -> Option<&Tensor> {
+        self.router.as_ref()
+    }
+
+    pub(crate) fn lookahead(&self) -> bool {
+        self.lookahead
+    }
+
+    pub(crate) fn lookahead_chan(&self) -> Option<&Arc<LookaheadChannel>> {
+        self.lookahead_chan.as_ref()
+    }
+
+    pub(crate) fn copy_stream(&self) -> Option<&Arc<CopyStream>> {
+        self.copy_stream.as_ref()
+    }
+
+    pub(crate) fn pcie_frac(&self) -> f32 {
+        self.pcie_frac
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<LayerRegistry> {
+        &self.registry
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn preload_claimed(&self) -> u32 {
+        self.preload_claimed.load(Ordering::Acquire)
+    }
     /// v2 M4: is the PCIe staging path in service for this layer? One predicate for all three
     /// sites — capture the DMA gate, publish the point, replay the gate — because they must agree:
     /// a gate whose point is never published spins forever, and at `--pcie-frac 0` the copy stream
     /// still exists (the cache banks use it) while nothing is ever staged.
     #[cfg(feature = "cuda")]
-    pub(super) fn staging_enabled(&self) -> bool {
+    pub(crate) fn staging_enabled(&self) -> bool {
         self.pcie_frac > 0.0 && self.copy_stream.is_some()
     }
 
@@ -183,7 +244,7 @@ impl CachedLayer {
     /// and a plain launch is *cheaper* than replaying a one-node graph (measured 5.9 us vs 15.4 us
     /// per launch), so a captured gate buys nothing. Stream ordering is identical.
     #[cfg(feature = "cuda")]
-    pub(super) fn replay_gate(&self, kind: u32) -> candle_core::Result<()> {
+    pub(crate) fn replay_gate(&self, kind: u32) -> candle_core::Result<()> {
         let Some(sched) = schedule() else {
             return Ok(());
         };
@@ -230,7 +291,7 @@ impl CachedLayer {
     /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the
     /// (slow) copy and published only after it, so concurrent admitters never share a slot
     /// and readers never see a half-written one. `None`: already resident or no empty slot.
-    pub(super) fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
+    pub(crate) fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
         let slot = {
             let mut st = self.state.lock().unwrap();
             if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
@@ -250,7 +311,7 @@ impl CachedLayer {
     /// is unpublished and the slot reserved in one critical section. Tokens already holding the
     /// victim keep computing with it: a fresh upload leaves the old buffer alone, and an
     /// in-place one waits for them (`upload_in_place`).
-    fn replace(
+    pub(crate) fn replace(
         &self,
         expert_id: usize,
         protect: &[usize],
@@ -468,7 +529,7 @@ impl CachedLayer {
     /// The copies are queued *before* the claim is published, and the publish is monotonic
     /// (`Gate::publish_stream_max`), so the token thread either sees no claim (nothing to wait for) or
     /// sees one whose point is already on its way and can only move the word forward.
-    pub(super) fn prefetch_predicted(&self, x: &Tensor, pass: u32) -> candle_core::Result<()> {
+    pub(crate) fn prefetch_predicted(&self, x: &Tensor, pass: u32) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
         if self.copy_stream.is_none() {

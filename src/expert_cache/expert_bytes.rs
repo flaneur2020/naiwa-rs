@@ -14,7 +14,7 @@ use candle_core::Device;
 ///
 /// Row-block formats never cross expert boundaries, so `[e·stride, (e+1)·stride)` of the
 /// stack's buffer is exactly expert `e`.
-pub(super) fn expert_range(qt: &QTensor, e: usize) -> candle_core::Result<std::ops::Range<usize>> {
+pub(crate) fn expert_range(qt: &QTensor, e: usize) -> candle_core::Result<std::ops::Range<usize>> {
     let dims = qt.shape().dims();
     if dims.len() < 2 {
         candle_core::bail!("expert QTensor must be at least 2-D, got {:?}", dims);
@@ -43,7 +43,7 @@ pub(super) fn expert_range(qt: &QTensor, e: usize) -> candle_core::Result<std::o
 /// Copies straight out of the stack, with no intermediate host buffer. When the stack is pinned
 /// (`host_memory`), that copy is an asynchronous DMA that may still be reading after this
 /// returns; it is safe because the stack outlives every copy (the layer owns it).
-pub(super) fn expert_qtensor_on_device(
+pub(crate) fn expert_qtensor_on_device(
     stack: &QTensor,
     e: usize,
     device: &Device,
@@ -58,7 +58,7 @@ pub(super) fn expert_qtensor_on_device(
 
 /// Slot-bytes estimate for a single expert from a `QTensor` stack.
 /// Returns `None` when the stack is not accessible (dense/float).
-pub(super) fn slot_bytes_from_qtensor(qt: &QTensor) -> Option<u64> {
+pub(crate) fn slot_bytes_from_qtensor(qt: &QTensor) -> Option<u64> {
     let dims = qt.shape().dims();
     if dims.len() < 2 {
         return None;

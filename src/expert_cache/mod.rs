@@ -33,7 +33,6 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
-mod decode;
 mod expert_bytes;
 mod layer;
 mod provider;
@@ -46,11 +45,10 @@ pub use provider::GpuCacheMoeProvider;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
 // another child module directly. The submodules themselves stay private.
-pub(in crate::expert_cache) use decode::Hit;
-pub(in crate::expert_cache) use expert_bytes::{
+pub(crate) use expert_bytes::{
     expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor,
 };
-pub(in crate::expert_cache) use layer::{streamed_misses, LookaheadChannel};
+pub(crate) use layer::{streamed_misses, LookaheadChannel};
 #[cfg(test)]
 pub(in crate::expert_cache) use layer::{
     fill_candidate, lru_victim, top_k_ids, union_by_votes,
@@ -94,7 +92,7 @@ fn loan_bank_slots(num_experts: usize) -> usize {
 /// slots that every layer's step borrows in turn. The fence model already serializes reusers —
 /// a reader holds the `SlotBuf` `Arc` until it has recorded its fence, and the next layer's DMA
 /// waits on that fence — so no cross-layer accounting is needed.
-const SCRATCH_RING_FIRST: usize = 1 << 30;
+pub(crate) const SCRATCH_RING_FIRST: usize = 1 << 30;
 
 /// Ring capacity: enough that consecutive layers' steps rarely collide on one slot, small
 /// enough to be a rounding error next to the cache. Strata uses 16 (`kStagingBlobs`).
@@ -109,14 +107,14 @@ const fn scratch_ring_slots() -> usize {
 static SCHEDULE: OnceLock<Arc<crate::doorbell::GateSet>> = OnceLock::new();
 
 #[cfg(feature = "cuda")]
-fn schedule() -> Option<&'static Arc<crate::doorbell::GateSet>> {
+pub(crate) fn schedule() -> Option<&'static Arc<crate::doorbell::GateSet>> {
     SCHEDULE.get()
 }
 
 /// Every cached layer of one model, by decoder-layer index, so layer `l` can start filling
 /// layer `l + 1`'s slots. Weak references: the model owns the layers, not the registry.
 #[derive(Default)]
-struct LayerRegistry {
+pub(crate) struct LayerRegistry {
     layers: RwLock<Vec<Weak<CachedLayer>>>,
     /// The model-wide `--pcie-frac` staging rings, keyed by the shape of the expert stacks
     /// (dtype and per-projection dims): mixed-quant models give different layers different
@@ -138,20 +136,20 @@ type ScratchKey = ([usize; 3], u8);
 /// One cache slot: reservation/published state, permanent storage, and LRU age.
 /// See the state list in `m9a.md`; `storage` is cloned out under the state lock so uploads and
 /// lending never hold the state lock while waiting for readers.
-struct Slot {
+pub(crate) struct Slot {
     /// Reserved (weights copying) or published expert; `None` = empty.
-    expert: Option<usize>,
+    pub(crate) expert: Option<usize>,
     /// Published contents. Readers clone this `Arc` under the state lock, so a later fill never
     /// changes what an in-flight token computes with.
-    buf: Option<Arc<SlotBuf>>,
+    pub(crate) buf: Option<Arc<SlotBuf>>,
     /// Copy-stream mode: the slot's permanent buffer; `None` while lent.
-    storage: Arc<parking_lot::Mutex<Option<Arc<SlotBuf>>>>,
+    pub(crate) storage: Arc<parking_lot::Mutex<Option<Arc<SlotBuf>>>>,
     /// `tick` of the last decode hit or fill; drives LRU replacement.
-    last_use: u64,
+    pub(crate) last_use: u64,
 }
 
 impl Slot {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             expert: None,
             buf: None,
@@ -161,38 +159,38 @@ impl Slot {
     }
 }
 
-struct LayerState {
+pub(crate) struct LayerState {
     /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host read needs
     /// no stream sync or D2H. Acquired lazily at first decode.
-    doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
+    pub(crate) doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
     /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
-    doorbell_seq: u32,
-    slots: Vec<Slot>,
-    hit_counts: Vec<u64>,
+    pub(crate) doorbell_seq: u32,
+    pub(crate) slots: Vec<Slot>,
+    pub(crate) hit_counts: Vec<u64>,
     /// Decode steps seen by this layer.
-    tick: u64,
+    pub(crate) tick: u64,
     /// Slots `[0, usable)` are in service; the rest are lent to the prefill stream.
-    usable: usize,
+    pub(crate) usable: usize,
 }
 
 /// One expert's three projections.
 #[derive(Clone)]
-struct Projections {
-    gate: Arc<QTensor>,
-    up: Arc<QTensor>,
-    down: Arc<QTensor>,
+pub(crate) struct Projections {
+    pub(crate) gate: Arc<QTensor>,
+    pub(crate) up: Arc<QTensor>,
+    pub(crate) down: Arc<QTensor>,
 }
 
 /// Slots `[first, first + len)` of a layer in copy-stream mode: one `[len, N, K]` device
 /// allocation per projection, which the fused decode kernel indexes by `slot - first`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct Bank {
-    first: usize,
-    proj: Projections,
+pub(crate) struct Bank {
+    pub(crate) first: usize,
+    pub(crate) proj: Projections,
 }
 
 /// The two legal ways a slot can hold an expert.
-enum SlotData {
+pub(crate) enum SlotData {
     /// Non-copy-stream mode: this slot owns a fresh per-expert QTensor set.
     Owned(Projections),
     /// Copy-stream mode: this slot is a view into a shared bank, overwritten in place.
@@ -203,9 +201,9 @@ enum SlotData {
 }
 
 /// One slot's contents plus the read fence readers record after launching its kernels.
-struct SlotBuf {
-    data: SlotData,
-    fence: ReadFence,
+pub(crate) struct SlotBuf {
+    pub(crate) data: SlotData,
+    pub(crate) fence: ReadFence,
 }
 
 /// The model-wide `--pcie-frac` staging ring (see `SCRATCH_RING_FIRST`): one bank of slots
@@ -217,7 +215,7 @@ struct SlotBuf {
 /// time the cursor returns to a slot, several layers' readers have long recorded their fences,
 /// so `wait_for_readers` never spins in practice.
 /// Ring slots' `Bank.first` is `SCRATCH_RING_FIRST`, past every resident slot.
-struct ScratchRing {
+pub(crate) struct ScratchRing {
     slots: Vec<Arc<SlotBuf>>,
     cursor: usize,
 }
@@ -225,7 +223,7 @@ struct ScratchRing {
 #[cfg(feature = "cuda")]
 const WAITS_PER_LAYER: u32 = 2;
 
-struct CachedLayer {
+pub(crate) struct CachedLayer {
     /// Page-locked registrations of `cpu`'s stacks; each holds its stack, so it stays valid
     /// for as long as it is registered.
     _pinned: Vec<PinnedStack>,
