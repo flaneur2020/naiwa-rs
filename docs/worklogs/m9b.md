@@ -12,7 +12,7 @@ x2d ──► Preload ──► Route ──► DmaMiss ──► CpuMiss ──
    SYNC_PRELOAD  RoutePlan  CpuPending  SYNC_STAGING + StagedHits
 ```
 
-`decode.rs` becomes the orchestrator: it calls the components in this order and replays the two gates.
+`src/decode.rs` becomes the orchestrator: it calls the components in this order and replays the two gates.
 The order is the current `decode_forward` order; the split must not reorder it.
 
 ## Components
@@ -64,9 +64,10 @@ src/components/
   dma_miss.rs     // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
   cpu_miss.rs     // CpuMiss::submit, CpuPending::upload, CPU job construction
   gpu.rs          // GpuExperts::run, run_expert, fused_decode
+src/decode.rs      // orchestrator only (no stage bodies)
 src/expert_cache/
   mod.rs          // #[path = "../components/mod.rs"] mod components;
-  decode.rs       // orchestrator only (no stage bodies)
+                  // #[path = "../decode.rs"] mod decode;
   layer.rs        // CachedLayer lifecycle: admit/replace/load/lend/give_back
   provider.rs     // provider + build/warmup
   registry.rs     // LayerRegistry lookup + lender
@@ -75,11 +76,11 @@ src/expert_cache/
 `staging.rs` disappears: its scratch-ring and `stream_pcie`/`stage_misses` bodies move into
 `src/components/dma_miss.rs`.
 
-`src/components/` is declared from `expert_cache/mod.rs` with
-`#[path = "../components/mod.rs"] mod components;`, so the components stay descendants of
-`expert_cache` (they need `CachedLayer`/`Slot` private fields) while the files live at the requested
-path. A crate-level `mod components;` would need a narrow `pub(crate)` facade from `expert_cache`;
-that is a larger API change and is not part of this plan.
+`src/components/` and `src/decode.rs` are declared from `expert_cache/mod.rs` with
+`#[path = "../components/mod.rs"] mod components;` and `#[path = "../decode.rs"] mod decode;`.
+They stay descendants of `expert_cache` (they need `CachedLayer`/`Slot` private fields) while the
+files live at the requested paths. A crate-level `mod components;`/`mod decode;` would need a narrow
+`pub(crate)` facade from `expert_cache`; that is a larger API change and is not part of this plan.
 
 ## Doorbell ownership
 
@@ -126,5 +127,5 @@ that is a larger API change and is not part of this plan.
 - [ ] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
 - [ ] Move `stream_pcie` / `stage_misses` / scratch ring to `dma_miss.rs`; delete `staging.rs`.
 - [ ] Move `LookaheadChannel` / `predict` / `prefetch_predicted` to `preload.rs`.
-- [ ] Reduce `decode.rs` to orchestration and gate replay.
+- [ ] Reduce `src/decode.rs` to orchestration and gate replay.
 - [ ] Run the gates above and merge only if all pass.
