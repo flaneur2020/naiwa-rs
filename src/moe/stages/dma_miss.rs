@@ -51,7 +51,7 @@ fn stage_misses(
     };
     // Lazily create the ring at the first decode step that has misses to stream (model
     // load is over by then, so the allocation is not fighting load-time fragmentation).
-    let Some(ring) = layer.registry().staging().ring(
+    let Some(ring) = layer.cached_moe().staging().ring(
         cs,
         &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
         layer.slot_device(),
@@ -128,10 +128,14 @@ fn stage_misses(
     }
     Ok(())
 }
-pub(crate) fn stage(
-    layer: &Arc<CachedLayer>,
-    plan: &mut super::RoutePlan,
-    pass: u32,
-) -> candle_core::Result<()> {
-    stream_pcie(layer, &mut plan.misses, &mut plan.hits, pass)
+pub(crate) struct DmaMiss;
+
+impl DmaMiss {
+    pub(crate) fn submit(
+        layer: &Arc<CachedLayer>,
+        plan: &mut super::RoutePlan,
+        pass: u32,
+    ) -> candle_core::Result<()> {
+        stream_pcie(layer, &mut plan.misses, &mut plan.hits, pass)
+    }
 }

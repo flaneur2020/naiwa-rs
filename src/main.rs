@@ -4,14 +4,12 @@
 
 mod args;
 mod commands;
-mod components;
-mod decode;
 mod copy_stream;
-mod executor;
 mod doorbell;
-mod moe;
+mod executor;
 mod host_memory;
 mod load;
+mod moe;
 mod prefill_stream;
 mod stats;
 

@@ -239,16 +239,15 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     tests.rs
   src/moe/                 MoE execution + GPU expert cache
     mod.rs                 module docs, constants, exports
-    provider_gpu.rs        GPU-cache RoutedExpertsProvider + layer construction
-    provider_cpu.rs        no-cache CPU-only RoutedExpertsProvider
-    cpu_experts.rs         CPU routed experts + fused decode + prefill attach
+    gpu.rs                 GPU-cache RoutedExpertsProvider + layer construction
+    cpu.rs                 CPU-only provider + CpuExperts + fused decode
     layer.rs               CachedLayer + CachedExperts + lookahead prediction
     slot.rs                Slot/LayerState/SlotBuf/Bank/Projections
-    layers.rs              Layers lookup + prefill loan
+    cached_moe.rs          CachedMoe lookup + prefill loan
     staging.rs             StagingRings/StagingRing + alloc_bank
+    decode.rs              decode orchestrator
+    stages/                route, gpu, cpu-miss, dma-miss, preload
     expert_bytes.rs        per-expert byte slicing
-  src/components/          decode stages: route, gpu, cpu-miss, dma-miss, preload
-  src/decode.rs            decode pipeline orchestrator
   src/load.rs              model loading + provider install + warmup
   src/stats/               counters + NAIWA_* measurement probes
     mod.rs                 shared gate/window/header/units; re-exports record_*/dump_*

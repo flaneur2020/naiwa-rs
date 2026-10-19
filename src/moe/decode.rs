@@ -7,10 +7,10 @@ use candle_core::Tensor;
 use mistralrs_core::layers::Activation;
 use tracing::warn;
 
-use crate::components::{run_gpu, Hit};
+use super::stages::{CpuMiss, DmaMiss, Gpu, Hit, Preload, Route};
 use crate::stats;
 
-use crate::moe::{schedule, CachedLayer};
+use super::{schedule, CachedLayer};
 
 /// Decode path (one token, or the few rows of a speculative verify step): split each row's
 /// top-k into GPU hits and CPU misses, run both concurrently, sum. Misses are never loaded on
@@ -66,9 +66,9 @@ pub(crate) fn forward(
     };
     #[cfg(not(feature = "cuda"))]
     let pass: u32 = 0;
-    crate::components::submit_preload(layer, &x2d, rows, hidden, pass)?;
+    Preload::submit(layer, &x2d, rows, hidden, pass)?;
 
-    let mut plan = crate::components::split_route(layer, topk_ids, topk_weights, rows)?;
+    let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
     let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
     stats::record_cache_hits(n_hits);
 
@@ -78,7 +78,7 @@ pub(crate) fn forward(
     #[cfg(feature = "cuda")]
     let resident_prefix: Vec<usize> = plan.hits.iter().map(Vec::len).collect();
     if layer.pcie_frac() > 0.0 {
-        crate::components::stage_dma_miss(layer, &mut plan, pass)?;
+        DmaMiss::submit(layer, &mut plan, pass)?;
     }
 
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
@@ -91,7 +91,7 @@ pub(crate) fn forward(
         stats::record_round_plan(n_hits, staged_n, n_cpu);
     }
 
-    let cpu = crate::components::submit_cpu_miss(layer, &plan.misses, &x2d, rows)?;
+    let cpu = CpuMiss::submit(layer, &plan.misses, &x2d, rows)?;
 
     // M4: the copy stream published this layer's `SYNC_STAGING` point on its own stream, after
     // this step's copies. Replaying the layer's gate spins here, inside a captured node, so
@@ -124,7 +124,7 @@ pub(crate) fn forward(
             .zip(&resident_prefix)
             .map(|(row, &n)| row[..n].to_vec())
             .collect();
-        let acc = run_gpu(layer, &residents, &x2d, act);
+        let acc = Gpu::submit(layer, &residents, &x2d, act);
         let mut fenced = Ok(());
         for (buf, _, _) in residents.iter().flatten() {
             if let Err(e) = buf.fence.record_reads(layer.slot_device()) {
@@ -161,14 +161,14 @@ pub(crate) fn forward(
         if hits_to_run.iter().all(|row| row.is_empty()) {
             Ok((resident_out, resident_bank))
         } else {
-            let (staged_out, staged_bank) = run_gpu(layer, &hits_to_run, &x2d, act)?;
+            let (staged_out, staged_bank) = Gpu::submit(layer, &hits_to_run, &x2d, act)?;
             Ok(((resident_out + staged_out)?, resident_bank.or(staged_bank)))
         }
     } else {
-        run_gpu(layer, &plan.hits, &x2d, act)
+        Gpu::submit(layer, &plan.hits, &x2d, act)
     };
     #[cfg(not(feature = "cuda"))]
-    let acc = run_gpu(layer, &plan.hits, &x2d, act);
+    let acc = Gpu::submit(layer, &plan.hits, &x2d, act);
     // Kernels reading these slots may be queued even if a later step failed: fence every
     // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
     // cannot be recorded, wait for the device instead.

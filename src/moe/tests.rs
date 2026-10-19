@@ -103,10 +103,10 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
 }
 
 #[test]
-fn registry_does_not_keep_layers_alive() {
-    let reg = Layers::default();
-    assert!(reg.get(3).is_none());
-    assert!(reg.all().is_empty());
+fn cached_moe_does_not_keep_layers_alive() {
+    let cached_moe = CachedMoe::default();
+    assert!(cached_moe.get(3).is_none());
+    assert!(cached_moe.all().is_empty());
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         cpu,
         slot_device: Device::Cpu,
         layer: 0,
-        registry: Arc::default(),
+        cached_moe: Arc::default(),
         hidden,
         num_experts: e,
         top_k: 2,
@@ -263,7 +263,7 @@ fn decode_split_matches_running_every_expert_on_the_cpu() {
     // expert 0 is a hit, expert 3 a miss
     let ids = Tensor::new(&[[0u32, 3]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4]], &Device::Cpu).unwrap();
-    let got = crate::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
+    let got = super::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
     let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)
@@ -293,7 +293,7 @@ fn verify_rows_split_matches_running_every_expert_on_the_cpu() {
     let xs = Tensor::from_vec(xs, (1, 3, 64), &Device::Cpu).unwrap();
     let ids = Tensor::new(&[[0u32, 3], [2, 0], [3, 5]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4], [0.7, 0.3], [0.5, 0.5]], &Device::Cpu).unwrap();
-    let got = crate::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
+    let got = super::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
     let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)

@@ -16,8 +16,8 @@ use crate::prefill_stream::PrefillStream;
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, LayerState, Layers, Projections,
-    Slot, SlotBuf, SlotData,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedMoe, LayerState,
+    Projections, Slot, SlotBuf, SlotData,
 };
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
@@ -184,7 +184,7 @@ pub(crate) struct CachedLayer {
     pub(crate) cpu: MoEExperts,
     pub(crate) slot_device: Device,
     pub(crate) layer: usize,
-    pub(crate) registry: Arc<Layers>,
+    pub(crate) cached_moe: Arc<CachedMoe>,
     pub(crate) hidden: usize,
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
@@ -205,7 +205,7 @@ pub(crate) struct CachedLayer {
     /// `--no-lookahead`: this layer does not predict for the next one.
     pub(crate) lookahead: bool,
     /// `--pcie-frac`: share of a step's misses to stream over PCIe into the model-wide staging
-    /// ring (held by the registry, created lazily at the first decode — `stream_pcie`; 0.0
+    /// ring (held by `CachedMoe`, created lazily at the first decode — `stream_pcie`; 0.0
     /// disables the feature).
     pub(crate) pcie_frac: f32,
     /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
@@ -246,7 +246,7 @@ impl RoutedExperts for CachedExperts {
                     st.hit_counts[id as usize] += 1;
                 }
             }
-            if let Some(next) = layer.registry.get(layer.layer + 1) {
+            if let Some(next) = layer.cached_moe.get(layer.layer + 1) {
                 next.spawn_fill();
             }
             layer.spawn_fill();
@@ -267,7 +267,7 @@ impl RoutedExperts for CachedExperts {
         if let Some(ps) = &layer.prefill {
             ps.note_decode(layer.layer)?;
         }
-        crate::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
+        super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
     }
 }
 
@@ -320,8 +320,8 @@ impl CachedLayer {
         self.pcie_frac
     }
 
-    pub(crate) fn registry(&self) -> &Arc<Layers> {
-        &self.registry
+    pub(crate) fn cached_moe(&self) -> &Arc<CachedMoe> {
+        &self.cached_moe
     }
 
     pub(crate) fn layer(&self) -> usize {
@@ -365,7 +365,7 @@ impl CachedLayer {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(());
         };
-        self.registry.staging().ring(
+        self.cached_moe.staging().ring(
             cs,
             &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device,

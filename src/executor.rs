@@ -6,7 +6,7 @@
 //! later queue as a stream-ordered wait+copy.
 //!
 //! The executor also exposes whether it is idle ([`Executor::is_idle`]) and a one-shot idle
-//! notification ([`Executor::on_idle`]). The lookahead scheduler in `components/preload` uses
+//! notification ([`Executor::on_idle`]). The lookahead scheduler in `moe/stages/preload` uses
 //! those to run its prediction jobs in the gaps between CPU tasks. The executor does not know
 //! what a prediction is; it only knows tasks, busy/idle and result slots.
 

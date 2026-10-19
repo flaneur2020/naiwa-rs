@@ -23,7 +23,7 @@
 //! # Decode (single token)
 //!
 //! - Top-k is split into slot hits and misses. Hits run via `QMatMul` on the slot device, misses
-//!   on the CPU with only the miss ids, through the fused two-pass decode (`cpu_experts::fused_decode`)
+//!   on the CPU with only the miss ids, through the fused two-pass decode (`cpu::fused_decode`)
 //!   or, for experts it does not serve, `MoEExperts::forward`; both sides at once, router weights
 //!   applied once per side. The misses run on the `deferred` worker over host copies; every CUDA
 //!   call stays on the calling thread.
@@ -33,28 +33,28 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
-mod cpu_experts;
+mod cached_moe;
+mod cpu;
+mod decode;
 mod expert_bytes;
+mod gpu;
 mod layer;
-mod layers;
-mod provider_cpu;
-mod provider_gpu;
 mod slot;
+mod stages;
 mod staging;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use cpu_experts::fused_decode;
-pub(crate) use provider_cpu::CpuMoeProvider;
-pub use provider_gpu::GpuCacheMoeProvider;
+pub(crate) use cpu::{fused_decode, CpuMoeProvider};
+pub use gpu::GpuCacheMoeProvider;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
 // another child module directly. The submodules themselves stay private.
+pub(crate) use cached_moe::CachedMoe;
 pub(crate) use expert_bytes::{expert_qtensor_on_device, expert_range, slot_bytes_from_qtensor};
 #[cfg(test)]
 pub(in crate::moe) use layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 pub(crate) use layer::{streamed_misses, CachedExperts, CachedLayer, LookaheadChannel};
-pub(crate) use layers::Layers;
 pub(crate) use slot::{Bank, LayerState, Projections, Slot, SlotBuf, SlotData};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]

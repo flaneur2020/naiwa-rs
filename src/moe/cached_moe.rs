@@ -1,4 +1,4 @@
-//! Layer lookups and the prefill stream's memory loan against the cache.
+//! Model-wide cached MoE layers: layer lookups and the prefill stream's memory loan.
 
 use std::sync::{Arc, Weak};
 
@@ -11,12 +11,12 @@ use super::staging::StagingRings;
 
 /// Every cached layer of one model, by decoder-layer index, plus the model-wide staging rings.
 /// Weak references: the model owns the layers, not this index.
-pub(crate) struct Layers {
+pub(crate) struct CachedMoe {
     layers: RwLock<Vec<Weak<CachedLayer>>>,
     staging: Arc<StagingRings>,
 }
 
-impl Default for Layers {
+impl Default for CachedMoe {
     fn default() -> Self {
         Self {
             layers: RwLock::new(Vec::new()),
@@ -25,7 +25,7 @@ impl Default for Layers {
     }
 }
 
-impl Layers {
+impl CachedMoe {
     pub(crate) fn staging(&self) -> &StagingRings {
         &self.staging
     }
@@ -53,7 +53,7 @@ impl Layers {
 
 // Lends the cache's tail slots to the prefill stream while a prompt runs (see
 // `prefill_stream`): each layer gives up an equal share of the bytes asked for.
-impl ExpertMemoryLender for Layers {
+impl ExpertMemoryLender for CachedMoe {
     fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
         let layers = self.all();
         let share = bytes.div_ceil(layers.len().max(1));

@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex};
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
 
-use super::cpu_experts::{attach_prefill, CpuExperts};
+use super::cpu::{attach_prefill, CpuExperts};
 use crate::copy_stream::CopyStreams;
 use crate::host_memory::{self, PinnedStack};
 use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;
 
 use super::{
-    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
-    Layers, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
+    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, CachedMoe,
+    LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ struct ProviderInner {
 pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
-    registry: Arc<Layers>,
+    cached_moe: Arc<CachedMoe>,
     copy_streams: CopyStreams,
     /// `--prefill-stream`: run long prefill chunks' experts on the GPU.
     prefill: Option<PrefillStreams>,
@@ -58,9 +58,9 @@ impl GpuCacheMoeProvider {
     ) -> Self {
         stats::record_cache_installed();
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-        let registry: Arc<Layers> = Arc::default();
+        let cached_moe: Arc<CachedMoe> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
-        let lender: Arc<dyn ExpertMemoryLender> = registry.clone();
+        let lender: Arc<dyn ExpertMemoryLender> = cached_moe.clone();
         let prefill = prefill.map(|p| p.with_lender(lender));
         Self {
             cache_gb,
@@ -68,7 +68,7 @@ impl GpuCacheMoeProvider {
                 remaining_bytes: total_bytes,
                 bytes_per_layer: None,
             }),
-            registry,
+            cached_moe,
             copy_streams: CopyStreams::default(),
             prefill,
             pcie_frac,
@@ -89,7 +89,7 @@ impl GpuCacheMoeProvider {
     /// resident bank's fixed-grid capture path (always), and the staging rings (only with
     /// `--pcie-frac`, which is where the ~215 MiB belongs). Returns `(captures, rings)`.
     pub fn warmup(&self) -> candle_core::Result<(usize, usize)> {
-        let layers = self.registry.all();
+        let layers = self.cached_moe.all();
         #[cfg(feature = "cuda")]
         if let Some(first) = layers.first() {
             let device = first.slot_device.clone();
@@ -119,7 +119,7 @@ impl GpuCacheMoeProvider {
             for layer in &layers {
                 layer.warmup_staging_ring()?;
             }
-            rings = self.registry.staging().creations();
+            rings = self.cached_moe.staging().creations();
         }
         Ok((captures, rings))
     }
@@ -127,7 +127,7 @@ impl GpuCacheMoeProvider {
     /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
     /// decode has started.
     pub fn ring_creations(&self) -> usize {
-        self.registry.staging().creations()
+        self.cached_moe.staging().creations()
     }
 }
 
@@ -350,7 +350,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             cpu: cpu_experts,
             slot_device,
             layer: layer_idx,
-            registry: Arc::clone(&self.registry),
+            cached_moe: Arc::clone(&self.cached_moe),
             hidden,
             num_experts,
             top_k: ctx.config.num_experts_per_tok,
@@ -375,7 +375,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),
         });
-        self.registry.insert(layer_idx, &cached);
+        self.cached_moe.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))
     }
 }
