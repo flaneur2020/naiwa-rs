@@ -40,12 +40,15 @@ struct BenchMeasurement {
     time_to_first_token: Duration,
     decode_duration: Duration,
     decode_intervals: usize,
+    /// Decode speed over the last `TAIL_INTERVALS` completion chunks, excluding the startup.
+    tail: Option<(usize, Duration)>,
 }
 
 const BENCH_TOKEN_BASE: u32 = 1000;
 const BENCH_TOKEN_SPAN: u32 = 2048;
 const BENCH_ITER_STRIDE: u32 = 131;
 const BENCH_CASE_STRIDE: u32 = 719;
+const TAIL_INTERVALS: usize = 8;
 
 pub struct BenchRunConfig {
     pub prompt_lens: Vec<usize>,
@@ -265,6 +268,14 @@ pub async fn run_bench(
                 } else {
                     0.0
                 };
+                if let Some((n, tail)) = measurement.tail {
+                    let secs = tail.as_secs_f32();
+                    println!(
+                        "Decode tail {n} intervals: {:.1} T/s ({:.2} ms/interval)",
+                        n as f32 / secs,
+                        secs * 1000.0 / n as f32
+                    );
+                }
                 let ms_per_tok = if tok_per_sec > 0.0 {
                     1000.0 / tok_per_sec
                 } else {
@@ -454,6 +465,7 @@ async fn recv_measurement(
     expected_tokens: usize,
 ) -> Result<BenchMeasurement> {
     let mut first_token = None;
+    let mut token_times = Vec::new();
 
     let last_token = loop {
         match rx.recv().await {
@@ -468,6 +480,7 @@ async fn recv_measurement(
                     .any(|choice| choice.finish_reason.is_some());
                 if !response.choices.is_empty() {
                     first_token.get_or_insert(received);
+                    token_times.push(received);
                 }
                 if finished {
                     break received;
@@ -483,10 +496,18 @@ async fn recv_measurement(
     };
 
     let first_token = first_token.expect("finished response must contain a token");
+    let tail = if token_times.len() > 1 {
+        let n = TAIL_INTERVALS.min(token_times.len() - 1);
+        let start = token_times[token_times.len() - 1 - n];
+        Some((n, last_token.duration_since(start)))
+    } else {
+        None
+    };
     Ok(BenchMeasurement {
         time_to_first_token: first_token.duration_since(request_start),
         decode_duration: last_token.duration_since(first_token),
         decode_intervals: expected_tokens.saturating_sub(1),
+        tail,
     })
 }
 
