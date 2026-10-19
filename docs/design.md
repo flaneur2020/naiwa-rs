@@ -241,8 +241,8 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     mod.rs                 module docs, constants, exports
     provider.rs            GPU-cache provider + layer construction + staging rings + attach_prefill
     expert.rs              CpuExperts fallback + per-expert byte slicing
-    cached_layer.rs        Layers + CachedLayer + CachedExperts + lookahead prediction
-    slot.rs                Slot/LayerState/SlotBuf/Bank/Projections + slot byte estimate
+    cached_layer.rs        Layers + LayerState + CachedLayer + CachedExperts + lookahead prediction
+    slot.rs                Slot/SlotBuf/Bank/Projections + slot byte estimate
     staging.rs             StagingRings/StagingRing + alloc_bank
     decode.rs              decode orchestrator
     stages/                route, gpu, cpu-miss (+ fused decode), dma-miss, preload

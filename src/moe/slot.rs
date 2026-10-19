@@ -32,20 +32,6 @@ impl Slot {
     }
 }
 
-pub(crate) struct LayerState {
-    /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host read needs
-    /// no stream sync or D2H. Acquired lazily at first decode.
-    pub(crate) doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
-    /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
-    pub(crate) doorbell_seq: u32,
-    pub(crate) slots: Vec<Slot>,
-    pub(crate) hit_counts: Vec<u64>,
-    /// Decode steps seen by this layer.
-    pub(crate) tick: u64,
-    /// Slots `[0, usable)` are in service; the rest are lent to the prefill stream.
-    pub(crate) usable: usize,
-}
-
 /// One expert's three projections.
 #[derive(Clone)]
 pub(crate) struct Projections {

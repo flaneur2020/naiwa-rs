@@ -51,12 +51,10 @@ pub(crate) use stages::fused_decode;
 #[cfg(test)]
 pub(in crate::moe) use cached_layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 pub(crate) use cached_layer::{
-    streamed_misses, CachedExperts, CachedLayer, Layers, LookaheadChannel,
+    streamed_misses, CachedExperts, CachedLayer, Layers, LayerState, LookaheadChannel,
 };
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
-pub(crate) use slot::{
-    slot_bytes_from_qtensor, Bank, LayerState, Projections, Slot, SlotBuf, SlotData,
-};
+pub(crate) use slot::{slot_bytes_from_qtensor, Bank, Projections, Slot, SlotBuf, SlotData};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;
