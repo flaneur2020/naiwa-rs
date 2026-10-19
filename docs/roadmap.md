@@ -51,7 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M10** | chat workload parity with Strata | ⬜ proposed | harness first; side-by-side TTFT/ITL/tok/s on a fixed chat corpus |
+| **M10** | chat workload parity with Strata | 🔶 M10.1–2 done | chat gap is TTFT (28–265×), not decode (1.4–1.6×): naiwa has no cross-turn prefix reuse and 13 tok/s prefill |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -70,7 +70,8 @@ M6 (re-scoped) ── M7 ── M8 ── M9 ── M10
 
 M5's implementation only needed M2; its measurement needed M4 (host off the critical path).
 M9 depends on all measurements above it: it deletes what M6–M8 proved worthless.
-M10 needs the MTP fix and the long-context measurement (M10.4) before a parity claim is meaningful.
+M10 measured the chat gap before any parity claim: TTFT is 28–265× off (no cross-turn prefix reuse,
+13 tok/s serve-mode prefill); decode is 1.4–1.6×.
 
 ---
 
@@ -400,10 +401,15 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ---
 
-## M10 — chat workload parity with Strata — ⬜ PROPOSED
+## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
 Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
-is the older MoE-naming milestone and unrelated).
+is the older MoE-naming milestone and unrelated). Harness: `harness/chat/`.
+
+**Baseline (2026-10-19, 3 rounds short/code + 1 round doc/long, paired `spec` arm, cache-matched):** turns ≥2
+TTFT `short` 40.6 s vs 0.61 s, `doc` 164 s vs 0.62 s; TPOT 59 vs 38 ms; end-to-end per conversation 5–51×.
+Strata reuses 95–99% of the prompt, naiwa reports 0%. M10.3 is re-scoped by that: prefix reuse across turns,
+then a prefill path that runs, then draft acceptance — not the MoE/decode path.
 
 ### Why
 
@@ -442,7 +448,9 @@ Primary metrics, per workload class and aggregate:
 | memory | peak VRAM and host RSS |
 
 Concurrency: at least 1, 2, 4; report request throughput separately from per-request latency.
-Correctness is not measured here: the `frac 0` + `--no-lookahead` oracle remains the gate.
+Measured at **1** so far: Strata serves one sequence behind a FIFO, so nothing else is like-for-like
+until its slot/batch path is configured. Correctness is not measured here: the `frac 0` +
+`--no-lookahead` oracle remains the gate.
 Performance runs use temperature 0 and the same seed so the compared text is stable.
 
 ### Judging
@@ -461,8 +469,7 @@ Performance runs use temperature 0 and the same seed so the compared text is sta
 
 ### Work items
 
-- `harness/chat/corpus.jsonl` + `harness/chat/run.py` (or an equivalent Rust driver) and
-  `harness/chat/README.md` with the exact protocol.
+- ✅ `harness/chat/corpus.jsonl`, `run.py`, `summarize.py`, `engines/*.json` and `README.md`.
 - A server wrapper that pins the configuration (model, cache, `frac`, MTP, context) and emits
   the comparability record.
 - A results schema and summary table: per class × concurrency × engine, p50/p90, tokens,

@@ -1,0 +1,31 @@
+{
+  "exe": "/home/yazhou/code/strata/engine/strata",
+  "args": [
+    "--pack",
+    "/home/yazhou/code/Strata-data/packs/coder-iq1_m",
+    "--native",
+    "/home/yazhou/models/qwen3-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/home/yazhou/models/qwen3-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+    "--expert-profile",
+    "/home/yazhou/code/strata/data/expert-profile-coder.bin",
+    "--expert-cache",
+    "800",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4",
+    "--spec-min-p",
+    "0.5",
+    "--max-context",
+    "4096",
+    "--kv",
+    "int8"
+  ],
+  "cwd": "/home/yazhou/code/strata",
+  "tokenizer": "/home/yazhou/code/Strata-data/packs/coder-iq1_m/tokenizer",
+  "model_name": "qwen3.8-flash-next-coder-iq1_m",
+  "log": "/tmp/strata-engine.log",
+  "port": 18101,
+  "open_browser": false
+}

@@ -1,0 +1,40 @@
+{
+  "name": "naiwa-nospec",
+  "arm": "nospec",
+  "exe": "~/naiwa-rs/target/release/naiwa-rs",
+  "cwd": "~/code/naiwa-rs",
+  "port": 18110,
+  "args": [
+    "serve",
+    "-m",
+    "~/models/qwen3-coder/IQ1_M",
+    "-f",
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+    "--cpu-moe",
+    "--expert-cache-gb",
+    "2",
+    "--pcie-frac",
+    "0.2",
+    "--pa-context-len",
+    "4096",
+    "--prefix-cache-n",
+    "1",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "{port}",
+    "--disable-access-log"
+  ],
+  "body": {
+    "enable_thinking": false
+  },
+  "record": {
+    "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M, both shards (native, not the requant)",
+    "kv": "BF16 paged attention, 32-token blocks",
+    "context": 4096,
+    "expert_cache": "2 GB",
+    "pcie_frac": 0.2,
+    "speculation": "none",
+    "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)"
+  }
+}

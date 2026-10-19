@@ -1,0 +1,36 @@
+{
+  "name": "strata",
+  "arm": "spec",
+  "exe": "~/code/strata/.venv/bin/python",
+  "cwd": "~/code/strata",
+  "port": 18101,
+  "write_config": {
+    "from": "harness/chat/engines/strata-engine.json",
+    "path": "{out}/logs/strata-engine-r{round}.json",
+    "set": {
+      "port": "{port}",
+      "log": "{out}/logs/strata-engine-r{round}.log",
+      "open_browser": false
+    }
+  },
+  "args": [
+    "serve/server.py",
+    "--engine",
+    "strata",
+    "--config",
+    "{config}",
+    "--port",
+    "{port}"
+  ],
+  "body": {
+    "reasoning_effort": "none"
+  },
+  "record": {
+    "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M via ~/code/Strata-data/packs/coder-iq1_m (same GGUF shards)",
+    "kv": "int8",
+    "context": 4096,
+    "expert_cache": "800 blobs (~1.5 GB at 1.88 MB/blob). `auto` fills the card and is not comparable.",
+    "speculation": "--spec 4 --spec-min-p 0.5 (required for a native IQ pack: T >= 2)",
+    "prefix_reuse": "one resident sequence + conversation checkpoint (SLOT_PREFIX_MIN 512)"
+  }
+}
