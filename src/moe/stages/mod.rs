@@ -9,7 +9,7 @@ mod gpu;
 mod preload;
 mod route;
 
-pub(crate) use cpu_miss::CpuMiss;
+pub(crate) use cpu_miss::{fused_decode, CpuMiss};
 pub(crate) use dma_miss::DmaMiss;
 pub(crate) use gpu::Gpu;
 pub(crate) use preload::Preload;

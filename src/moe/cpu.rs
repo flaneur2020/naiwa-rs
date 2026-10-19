@@ -1,11 +1,12 @@
 //! CPU routed experts.
 //!
-//! `CpuExperts` owns the model's host weights, the fused decode path and the optional
-//! prefill-stream attachment. The cache provider uses it for the MTP head, for layers with no
-//! cache slots, and for every layer when the cache budget is zero.
+//! `CpuExperts` owns the model's host weights and the optional prefill-stream attachment; its
+//! decode-sized path calls the fused decode in `stages/cpu_miss.rs`. The cache provider uses it
+//! for the MTP head, for layers with no cache slots, and when the cache budget is zero.
 
 use std::sync::Arc;
 
+use super::fused_decode;
 use crate::copy_stream::CopyStreams;
 use crate::host_memory::{pin_expert_stacks, PinnedStack};
 use crate::prefill_stream::{PrefillStream, PrefillStreams};
@@ -35,37 +36,6 @@ pub(crate) fn attach_prefill(
 /// and take the fused CPU path; longer ones are prefill chunks, where the generic path's routed
 /// gemvs already amortize their per-call cost.
 pub(crate) const FUSED_MAX_TOKENS: usize = 16;
-
-/// A decode step's routed experts on the CPU in two parallel passes
-/// (`mistralrs_quant::fused_moe_decode`): gate+up+act per distinct (expert, row), then down with
-/// the router-weighted sum. At decode sizes the generic `MoEExperts::forward` - three routed
-/// gemvs with candle ops between them - spends more on its per-call structure than on the dots.
-///
-/// `xs` is `rows x hidden` F32; `ids` and `weights` are row-major `[rows, topk]`, weight-0 slots
-/// skipped. `None` when the generic path must run instead: an activation other than SiLU, experts
-/// that are not GGUF stacks, a dtype or shape the fused path does not serve, or
-pub(crate) fn fused_decode(
-    experts: &MoEExperts,
-    act: Activation,
-    xs: &[f32],
-    ids: &[u32],
-    weights: &[f32],
-    topk: usize,
-) -> candle_core::Result<Option<Vec<f32>>> {
-    static GENERIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
-    let _ = &GENERIC;
-    if !matches!(act, Activation::Silu | Activation::Swish) {
-        return Ok(None);
-    }
-    let Some((gate, up, down)) = experts.expert_qtensors() else {
-        return Ok(None);
-    };
-    let t0 = std::time::Instant::now();
-    let ys = mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk);
-    crate::stats::record_fused_decode(t0, ids, weights, topk);
-    ys
-}
 
 /// Routed experts holding the model's own weights in host memory, run by mistral.rs's own
 /// kernels. MoE steps move activations in and the result back; long prefill chunks run on the

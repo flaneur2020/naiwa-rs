@@ -39,7 +39,7 @@ type StagingKey = ([usize; 3], u8);
 /// The model-wide `--pcie-frac` staging ring (see `STAGING_RING_FIRST`): one bank of slots
 /// past every resident slot, shared by every layer, borrowed round-robin per decode step.
 ///
-/// `acquire(n)` runs under the `CachedMoe` ring lock, so consecutive layers get disjoint slots even
+/// `acquire(n)` runs under the provider's staging-ring lock, so consecutive layers get disjoint slots even
 /// though all steps are on the token thread (the lock also covers a future multi-threaded
 /// caller). Round-robin keeps the reuse distance at one full revolution of the ring: by the
 /// time the cursor returns to a slot, several layers' readers have long recorded their fences,

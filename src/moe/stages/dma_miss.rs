@@ -51,7 +51,7 @@ fn stage_misses(
     };
     // Lazily create the ring at the first decode step that has misses to stream (model
     // load is over by then, so the allocation is not fighting load-time fragmentation).
-    let Some(ring) = layer.cached_moe().staging().ring(
+    let Some(ring) = layer.staging().ring(
         cs,
         &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
         layer.slot_device(),

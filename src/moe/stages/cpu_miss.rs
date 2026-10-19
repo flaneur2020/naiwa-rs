@@ -1,12 +1,45 @@
-//! CPU miss experts: submit the CPU job, upload its result through the result doorbell.
+//! CPU miss experts: the fused decode, submit the CPU job, upload its result through the result
+//! doorbell.
 
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
+use mistralrs_core::layers::Activation;
+use mistralrs_core::MoEExperts;
 
 use crate::executor;
-use crate::moe::fused_decode as offload_fused_decode;
 use crate::moe::CachedLayer;
+
+/// A decode step's routed experts on the CPU in two parallel passes
+/// (`mistralrs_quant::fused_moe_decode`): gate+up+act per distinct (expert, row), then down with
+/// the router-weighted sum. At decode sizes the generic `MoEExperts::forward` - three routed
+/// gemvs with candle ops between them - spends more on its per-call structure than on the dots.
+///
+/// `xs` is `rows x hidden` F32; `ids` and `weights` are row-major `[rows, topk]`, weight-0 slots
+/// skipped. `None` when the generic path must run instead: an activation other than SiLU, experts
+/// that are not GGUF stacks, a dtype or shape the fused path does not serve, or
+pub(crate) fn fused_decode(
+    experts: &MoEExperts,
+    act: Activation,
+    xs: &[f32],
+    ids: &[u32],
+    weights: &[f32],
+    topk: usize,
+) -> candle_core::Result<Option<Vec<f32>>> {
+    static GENERIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
+    let _ = &GENERIC;
+    if !matches!(act, Activation::Silu | Activation::Swish) {
+        return Ok(None);
+    }
+    let Some((gate, up, down)) = experts.expert_qtensors() else {
+        return Ok(None);
+    };
+    let t0 = std::time::Instant::now();
+    let ys = mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk);
+    crate::stats::record_fused_decode(t0, ids, weights, topk);
+    ys
+}
 
 pub(crate) struct CpuPending {
     inner: executor::Pending,
@@ -48,7 +81,7 @@ impl CpuMiss {
                 .to_dtype(DType::F32)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
-            if let Some(ys) = offload_fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)? {
+            if let Some(ys) = fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)? {
                 return Ok(ys);
             }
             let miss_w_t = Tensor::from_vec(ws, (rows, width), &Device::Cpu)?;

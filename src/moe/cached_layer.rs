@@ -1,24 +1,87 @@
-//! `CachedLayer` lifecycle: slots, fills, LRU replacement, lookahead prediction.
+//! Cached layers and the model-wide `Layers` index.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::{DType, Device, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
+use parking_lot::RwLock;
 use tracing::debug;
 
 use crate::copy_stream::{self, CopyStream, ReadFence};
 use crate::host_memory::PinnedStack;
-use crate::prefill_stream::PrefillStream;
+use crate::prefill_stream::{ExpertMemoryLender, PrefillStream};
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, schedule, CachedMoe, LayerState,
-    Projections, Slot, SlotBuf, SlotData,
+    alloc_bank, expert_qtensor_on_device, expert_range, schedule, LayerState, Projections, Slot,
+    SlotBuf, SlotData, StagingRings,
 };
+
+/// Every cached layer of one model, by decoder-layer index.
+/// Weak references: the model owns the layers, not this index.
+pub(crate) struct Layers {
+    layers: RwLock<Vec<Weak<CachedLayer>>>,
+}
+
+impl Default for Layers {
+    fn default() -> Self {
+        Self {
+            layers: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl Layers {
+    pub(crate) fn insert(&self, layer: usize, cached: &Arc<CachedLayer>) {
+        let mut layers = self.layers.write();
+        if layers.len() <= layer {
+            layers.resize_with(layer + 1, Weak::new);
+        }
+        layers[layer] = Arc::downgrade(cached);
+    }
+
+    pub(crate) fn get(&self, layer: usize) -> Option<Arc<CachedLayer>> {
+        self.layers.read().get(layer).and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn all(&self) -> Vec<Arc<CachedLayer>> {
+        self.layers
+            .read()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+}
+
+// Lends the cache's tail slots to the prefill stream while a prompt runs (see
+// `prefill_stream`): each layer gives up an equal share of the bytes asked for.
+impl ExpertMemoryLender for Layers {
+    fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
+        let layers = self.all();
+        let share = bytes.div_ceil(layers.len().max(1));
+        Ok(layers
+            .iter()
+            .map(|l| {
+                let per_slot = l.slot_bytes();
+                if per_slot == 0 {
+                    return 0;
+                }
+                l.lend(share.div_ceil(per_slot)) * per_slot
+            })
+            .sum())
+    }
+
+    fn give_back(&self) -> candle_core::Result<()> {
+        for layer in self.all() {
+            layer.give_back()?;
+        }
+        Ok(())
+    }
+}
 
 /// R2a: the lookahead's per-layer publish channel (GPU -> host). At each MoE entry the
 /// token thread queues ONE kernel that copies this step's activation into mapped memory
@@ -184,7 +247,8 @@ pub(crate) struct CachedLayer {
     pub(crate) cpu: MoEExperts,
     pub(crate) slot_device: Device,
     pub(crate) layer: usize,
-    pub(crate) cached_moe: Arc<CachedMoe>,
+    pub(crate) layers: Arc<Layers>,
+    pub(crate) staging: Arc<StagingRings>,
     pub(crate) hidden: usize,
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
@@ -205,7 +269,7 @@ pub(crate) struct CachedLayer {
     /// `--no-lookahead`: this layer does not predict for the next one.
     pub(crate) lookahead: bool,
     /// `--pcie-frac`: share of a step's misses to stream over PCIe into the model-wide staging
-    /// ring (held by `CachedMoe`, created lazily at the first decode — `stream_pcie`; 0.0
+    /// ring (held by the provider, created lazily at the first decode — `stream_pcie`; 0.0
     /// disables the feature).
     pub(crate) pcie_frac: f32,
     /// Runs long prefill chunks' experts on the GPU (`--prefill-stream`).
@@ -246,7 +310,7 @@ impl RoutedExperts for CachedExperts {
                     st.hit_counts[id as usize] += 1;
                 }
             }
-            if let Some(next) = layer.cached_moe.get(layer.layer + 1) {
+            if let Some(next) = layer.layers.get(layer.layer + 1) {
                 next.spawn_fill();
             }
             layer.spawn_fill();
@@ -320,8 +384,12 @@ impl CachedLayer {
         self.pcie_frac
     }
 
-    pub(crate) fn cached_moe(&self) -> &Arc<CachedMoe> {
-        &self.cached_moe
+    pub(crate) fn layers(&self) -> &Arc<Layers> {
+        &self.layers
+    }
+
+    pub(crate) fn staging(&self) -> &StagingRings {
+        &self.staging
     }
 
     pub(crate) fn layer(&self) -> usize {
@@ -365,7 +433,7 @@ impl CachedLayer {
         let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
             return Ok(());
         };
-        self.cached_moe.staging().ring(
+        self.staging.ring(
             cs,
             &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
             &self.slot_device,

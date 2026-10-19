@@ -34,7 +34,7 @@ impl Preload {
         // hazard (the publish is stream-ordered right after this layer's last kernel,
         // so the worker can never run before the data exists); the old mode switch is
         // obsolete with the channel path.
-        if let Some(next) = layer.cached_moe().get(layer.layer() + 1) {
+        if let Some(next) = layer.layers().get(layer.layer() + 1) {
             if next.router().is_some() {
                 let queued = layer.lookahead();
                 if !layer.slot_device().is_cuda() {

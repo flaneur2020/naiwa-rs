@@ -103,10 +103,10 @@ fn fill_candidate_prefers_hot_unreserved_experts() {
 }
 
 #[test]
-fn cached_moe_does_not_keep_layers_alive() {
-    let cached_moe = CachedMoe::default();
-    assert!(cached_moe.get(3).is_none());
-    assert!(cached_moe.all().is_empty());
+fn layers_does_not_keep_cached_layers_alive() {
+    let layers = Layers::default();
+    assert!(layers.get(3).is_none());
+    assert!(layers.all().is_empty());
 }
 
 #[test]
@@ -186,7 +186,8 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         cpu,
         slot_device: Device::Cpu,
         layer: 0,
-        cached_moe: Arc::default(),
+        layers: Arc::default(),
+        staging: Arc::default(),
         hidden,
         num_experts: e,
         top_k: 2,

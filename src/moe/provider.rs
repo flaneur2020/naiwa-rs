@@ -1,4 +1,5 @@
-//! The `RoutedExpertsProvider` that builds one cached layer per MoE block.
+//! The `RoutedExpertsProvider` that builds one cached layer per MoE block. The provider owns the
+//! model-wide layer index and staging rings; each cached layer borrows both.
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
@@ -13,8 +14,8 @@ use crate::prefill_stream::{ExpertMemoryLender, PrefillStreams};
 use crate::stats;
 
 use super::{
-    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, CachedMoe,
-    LayerState, LookaheadChannel, Slot, SCHEDULE, WAITS_PER_LAYER,
+    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
+    Layers, LookaheadChannel, Slot, StagingRings, SCHEDULE, WAITS_PER_LAYER,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,7 +37,8 @@ struct ProviderInner {
 pub struct GpuCacheMoeProvider {
     cache_gb: f64,
     inner: Mutex<ProviderInner>,
-    cached_moe: Arc<CachedMoe>,
+    layers: Arc<Layers>,
+    staging: Arc<StagingRings>,
     copy_streams: CopyStreams,
     /// `--prefill-stream`: run long prefill chunks' experts on the GPU.
     prefill: Option<PrefillStreams>,
@@ -58,9 +60,10 @@ impl GpuCacheMoeProvider {
     ) -> Self {
         stats::record_cache_installed();
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-        let cached_moe: Arc<CachedMoe> = Arc::default();
+        let layers: Arc<Layers> = Arc::default();
+        let staging: Arc<StagingRings> = Arc::default();
         // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
-        let lender: Arc<dyn ExpertMemoryLender> = cached_moe.clone();
+        let lender: Arc<dyn ExpertMemoryLender> = layers.clone();
         let prefill = prefill.map(|p| p.with_lender(lender));
         Self {
             cache_gb,
@@ -68,7 +71,8 @@ impl GpuCacheMoeProvider {
                 remaining_bytes: total_bytes,
                 bytes_per_layer: None,
             }),
-            cached_moe,
+            layers,
+            staging,
             copy_streams: CopyStreams::default(),
             prefill,
             pcie_frac,
@@ -89,7 +93,7 @@ impl GpuCacheMoeProvider {
     /// resident bank's fixed-grid capture path (always), and the staging rings (only with
     /// `--pcie-frac`, which is where the ~215 MiB belongs). Returns `(captures, rings)`.
     pub fn warmup(&self) -> candle_core::Result<(usize, usize)> {
-        let layers = self.cached_moe.all();
+        let layers = self.layers.all();
         #[cfg(feature = "cuda")]
         if let Some(first) = layers.first() {
             let device = first.slot_device.clone();
@@ -119,7 +123,7 @@ impl GpuCacheMoeProvider {
             for layer in &layers {
                 layer.warmup_staging_ring()?;
             }
-            rings = self.cached_moe.staging().creations();
+            rings = self.staging.creations();
         }
         Ok((captures, rings))
     }
@@ -127,7 +131,7 @@ impl GpuCacheMoeProvider {
     /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
     /// decode has started.
     pub fn ring_creations(&self) -> usize {
-        self.cached_moe.staging().creations()
+        self.staging.creations()
     }
 }
 
@@ -350,7 +354,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             cpu: cpu_experts,
             slot_device,
             layer: layer_idx,
-            cached_moe: Arc::clone(&self.cached_moe),
+            layers: Arc::clone(&self.layers),
+            staging: Arc::clone(&self.staging),
             hidden,
             num_experts,
             top_k: ctx.config.num_experts_per_tok,
@@ -375,7 +380,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             filling: AtomicBool::new(false),
             preload_claimed: AtomicU32::new(0),
         });
-        self.cached_moe.insert(layer_idx, &cached);
+        self.layers.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))
     }
 }
