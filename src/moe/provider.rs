@@ -382,7 +382,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             #[cfg(feature = "cuda")]
             state: Mutex::new(LayerState {
                 doorbell: None,
-                doorbell_seq: 0,
                 slots,
                 hit_counts: vec![0u64; num_experts],
                 tick: 0,

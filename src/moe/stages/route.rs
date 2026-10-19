@@ -33,7 +33,7 @@ impl Route {
         // Step 5 doorbell: lazily acquire (first decode), queue the ring on the same stream the top-k
         // kernels ran on, then spin host-side for the payload — no stream sync, no D2H launch.
         // Falls back to `to_vec2` when unavailable.
-        let ring = if device_flip {
+        let db = if device_flip {
             None
         } else {
             let mut st = layer.state().lock().unwrap();
@@ -44,25 +44,16 @@ impl Route {
                     .flatten()
                     .map(Arc::new);
             }
-            let db = st.doorbell.clone().filter(|db| db.max_n() >= n);
-            match db {
-                Some(db) => match db.publish(topk_ids, topk_weights, n) {
-                    Ok(()) => {
-                        let seq = st.doorbell_seq;
-                        st.doorbell_seq = seq.wrapping_add(1);
-                        Some((db, seq))
-                    }
-                    Err(_) => None,
-                },
-                None => None,
-            }
+            st.doorbell.clone()
         };
-        let (ids_rows, weight_rows): (Vec<Vec<u32>>, Vec<Vec<f32>>);
-        if let Some((db, seq)) = ring {
-            let (_, ids, ws) = db.wait_and_read(seq, n);
-            // W106 sanitation: a garbage id means the doorbell payload was read stale or corrupted;
-            // log everything needed and fall back to the blocking D2H rather than indexing out of
-            // bounds.
+        let read = db
+            .as_ref()
+            .and_then(|db| db.publish_and_read(topk_ids, topk_weights, n).ok());
+        let (ids_rows, weight_rows): (Vec<Vec<u32>>, Vec<Vec<f32>>) = if let Some((ids, ws)) = read
+        {
+            // W106 sanitation: a garbage id means the doorbell payload was read stale or
+            // corrupted; log everything needed and fall back to the blocking D2H rather than
+            // indexing out of bounds.
             if ids.iter().any(|&id| id as usize >= layer.num_experts()) {
                 let bad: Vec<u32> = ids
                     .iter()
@@ -71,26 +62,28 @@ impl Route {
                     .take(8)
                     .collect();
                 candle_core::bail!(
-                "doorbell garbage: layer {} seq {} n {} cap {} rows {} top_k {} ids_shape {:?} bad_ids {:x?}",
-                layer.layer(),
-                seq,
-                n,
-                db.max_n(),
-                rows,
-                layer.top_k(),
-                topk_ids.shape(),
-                bad
-            );
+                    "doorbell garbage: layer {} n {} rows {} top_k {} ids_shape {:?} bad_ids {:x?}",
+                    layer.layer(),
+                    n,
+                    rows,
+                    layer.top_k(),
+                    topk_ids.shape(),
+                    bad
+                );
             }
-            ids_rows = ids.chunks(layer.top_k()).map(<[u32]>::to_vec).collect();
-            weight_rows = ws.chunks(layer.top_k()).map(<[f32]>::to_vec).collect();
+            (
+                ids.chunks(layer.top_k()).map(<[u32]>::to_vec).collect(),
+                ws.chunks(layer.top_k()).map(<[f32]>::to_vec).collect(),
+            )
         } else {
-            ids_rows = topk_ids.reshape((rows, ()))?.to_vec2::<u32>()?;
-            weight_rows = topk_weights
-                .reshape((rows, ()))?
-                .to_dtype(DType::F32)?
-                .to_vec2::<f32>()?;
-        }
+            (
+                topk_ids.reshape((rows, ()))?.to_vec2::<u32>()?,
+                topk_weights
+                    .reshape((rows, ()))?
+                    .to_dtype(DType::F32)?
+                    .to_vec2::<f32>()?,
+            )
+        };
 
         let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];

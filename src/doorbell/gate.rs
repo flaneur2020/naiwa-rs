@@ -72,6 +72,35 @@ impl GateSet {
         Gate { set: self, id }
     }
 
+    /// Stream producer for `(layer, kind)`, without exposing the raw sync id.
+    pub fn publish_stream(
+        &self,
+        stream: sys::CUstream,
+        layer: u32,
+        kind: u32,
+        pass: u32,
+    ) -> Result<()> {
+        self.gate(self.sync_id(layer, kind))
+            .publish_stream(stream, pass)
+    }
+
+    /// Monotonic stream producer for a producer that may be a pass behind.
+    pub fn publish_stream_max(
+        &self,
+        device: &Device,
+        layer: u32,
+        kind: u32,
+        pass: u32,
+    ) -> Result<()> {
+        self.gate(self.sync_id(layer, kind))
+            .publish_stream_max(device, pass)
+    }
+
+    /// Device consumer: wait for `(layer, kind)` on the current stream.
+    pub fn wait(&self, device: &Device, layer: u32, kind: u32) -> Result<()> {
+        self.gate(self.sync_id(layer, kind)).wait(device)
+    }
+
     #[cfg(all(test, feature = "cuda"))]
     pub fn epoch(&self) -> u32 {
         load_u32(self.buf.host().cast())

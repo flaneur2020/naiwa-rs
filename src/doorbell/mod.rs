@@ -4,11 +4,15 @@
 //! Every primitive is one direction. The shared rule is *payload first, then a volatile bump of a
 //! counter, with a fence between*:
 //!
-//! - [`TopkDoorbell`] — device -> host: the router's top-k, so the host read needs no D2H launch.
+//! - [`TopkDoorbell`] — device -> host: the router's top-k. It owns its host sequence;
+//!   call `publish_and_read` and do not track a second seq.
 //! - [`ActivationDoorbell`] — device -> host: the lookahead activation over a slot ring.
+//!   `LookaheadChannel` owns its publish/read seq and backpressure.
 //! - [`ResultDoorbell`] — host -> device: the CPU experts' result over a slot ring.
-//! - [`GateSet`] / [`Gate`] — device-side pass gates: an epoch plus one ready word per gate.
-//!   There is no payload here; CPU results use [`ResultDoorbell`].
+//!   `executor::cuda::Channel` owns its seq allocation.
+//! - [`GateSet`] / `Gate` — device-side pass gates: an epoch plus one ready word per gate.
+//!   `GateSet::publish_stream` / `wait` hide the raw `sync_id`. There is no payload here;
+//!   CPU results use [`ResultDoorbell`].
 //!
 //! The slot index is always derived from the sequence number (`seq % DEPTH`); callers own the
 //! sequence/backpressure policy. [`MappedBuf`](mapped::MappedBuf) is the single allocation owner
@@ -69,5 +73,5 @@ mod payload_ring;
 mod tests;
 
 pub use d2h::{ActivationDoorbell, TopkDoorbell};
-pub use gate::{Gate, GateSet, SYNC_PRELOAD, SYNC_STAGING};
+pub use gate::{GateSet, SYNC_PRELOAD, SYNC_STAGING};
 pub use h2d::ResultDoorbell;

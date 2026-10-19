@@ -13,9 +13,7 @@ fn topk_doorbell_round_trips_ids_and_weights() {
     };
     let ids = Tensor::new(&[3u32, 7, 1, 5], &dev).unwrap();
     let ws = Tensor::new(&[0.5f32, 0.25, 0.125, 0.0625], &dev).unwrap();
-    bell.publish(&ids, &ws, 4).unwrap();
-    let (seq, got_ids, got_ws) = bell.wait_and_read(0, 4);
-    assert_eq!(seq, 1);
+    let (got_ids, got_ws) = bell.publish_and_read(&ids, &ws, 4).unwrap();
     assert_eq!(got_ids, vec![3, 7, 1, 5]);
     assert_eq!(got_ws, vec![0.5, 0.25, 0.125, 0.0625]);
 }

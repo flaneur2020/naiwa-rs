@@ -27,8 +27,12 @@ fn stream_pcie(
     // above it, so a node spinning on the word cannot see it before the data has landed.
     #[cfg(feature = "cuda")]
     if let Some(sched) = schedule() {
-        let id = sched.sync_id(layer.layer() as u32, crate::doorbell::SYNC_STAGING);
-        sched.gate(id).publish_stream(cs.cu_stream(), pass)?;
+        sched.publish_stream(
+            cs.cu_stream(),
+            layer.layer() as u32,
+            crate::doorbell::SYNC_STAGING,
+            pass,
+        )?;
     }
     #[cfg(not(feature = "cuda"))]
     let _ = pass;

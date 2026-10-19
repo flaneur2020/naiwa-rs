@@ -1,6 +1,7 @@
 //! Device-to-host top-k doorbell: the router's ids/weights, so the host read needs no D2H launch.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
@@ -15,6 +16,9 @@ const IDS_OFF: usize = 8;
 pub struct TopkDoorbell {
     buf: MappedBuf,
     max_n: usize,
+    /// Host-side sequence mirror. The device increments the mapped seq; this tracks which
+    /// publish the next `publish_and_read` owns.
+    seq: AtomicU32,
 }
 
 impl TopkDoorbell {
@@ -25,16 +29,31 @@ impl TopkDoorbell {
         let Some(bytes) = max_n.checked_mul(8).and_then(|n| n.checked_add(IDS_OFF)) else {
             return Ok(None);
         };
-        Ok(MappedBuf::alloc_zeroed(device, bytes)?.map(|buf| Self { buf, max_n }))
+        Ok(MappedBuf::alloc_zeroed(device, bytes)?.map(|buf| Self {
+            buf,
+            max_n,
+            seq: AtomicU32::new(0),
+        }))
     }
 
-    pub fn max_n(&self) -> usize {
-        self.max_n
+    /// Queue a publish, wait for its seq, and return the ids/weights. This is the whole public
+    /// round trip: the doorbell owns the sequence, so callers do not carry a parallel `seq`.
+    pub fn publish_and_read(
+        &self,
+        ids: &Tensor,
+        weights: &Tensor,
+        n: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.publish(ids, weights, n)?;
+        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        let (_, ids, ws) = self.wait_and_read(seq, n);
+        Ok((ids, ws))
     }
 
     /// Queue the ring on the device's current stream: copy `n` ids/weights into the mapped buffer,
-    /// then bump seq. Stream-ordered after whatever produced the tensors.
-    pub fn publish(&self, ids: &Tensor, weights: &Tensor, n: usize) -> Result<()> {
+    /// then bump the device seq. Stream-ordered after whatever produced the tensors.
+    fn publish(&self, ids: &Tensor, weights: &Tensor, n: usize) -> Result<()> {
         if n > self.max_n {
             candle_core::bail!(
                 "top-k doorbell publish of {n} exceeds the slot capacity ({})",
@@ -82,7 +101,7 @@ impl TopkDoorbell {
     /// Wait until seq advances past `last_seq`, then copy out the published ids and weights.
     /// No CUDA calls: safe from the token-driving thread. The wait never times out — stale ids
     /// would silently corrupt routing.
-    pub fn wait_and_read(&self, last_seq: u32, n: usize) -> (u32, Vec<u32>, Vec<f32>) {
+    fn wait_and_read(&self, last_seq: u32, n: usize) -> (u32, Vec<u32>, Vec<f32>) {
         assert!(n <= self.max_n, "top-k doorbell read exceeds capacity");
         let want = last_seq.wrapping_add(1);
         // `>=` not `==`: a lagging consumer may see the counter already past `want`.

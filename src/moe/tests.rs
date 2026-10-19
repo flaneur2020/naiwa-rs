@@ -196,7 +196,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         lookahead_chan: None,
         state: Mutex::new(LayerState {
             doorbell: None,
-            doorbell_seq: 0,
             slots: (0..slots).map(|_| Slot::empty()).collect(),
             hit_counts: vec![0; e],
             tick: 0,

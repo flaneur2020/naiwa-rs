@@ -91,14 +91,14 @@ impl ExpertMemoryLender for Layers {
 /// wait) and no way for the prediction to queue late on the stream (the W99 failure that
 /// made an earlier mode switch regress hit 74% -> 38-45%).
 pub(crate) struct LookaheadChannel {
-    pub(crate) chan: Arc<crate::doorbell::ActivationDoorbell>,
+    chan: Arc<crate::doorbell::ActivationDoorbell>,
     /// The seq the last queued GPU publish will bump the counter to (0 before any):
     /// `last_seq + 1` is the value `wait_publish` waits for. Touched only by the token thread.
-    pub(crate) next_seq: std::sync::atomic::AtomicU32,
+    next_seq: std::sync::atomic::AtomicU32,
     /// How many queued publishes the worker has consumed (`wait_publish` returned).
     /// The difference to `next_seq` is the queue depth; publish backpressure keeps
     /// it below the doorbell's ring depth so a lagging job's slot is never overwritten.
-    pub(crate) consumed: std::sync::atomic::AtomicU32,
+    consumed: std::sync::atomic::AtomicU32,
 }
 
 impl LookaheadChannel {
@@ -157,6 +157,20 @@ impl LookaheadChannel {
         self.chan.publish(x, n, next)?;
         self.next_seq.store(next + 1, Ordering::Relaxed);
         Ok(Some((Arc::clone(self), next)))
+    }
+
+    /// Wait for the publish `last_seq`, dropping it when a newer publish has already superseded
+    /// it. Always advances `consumed`, including timeout/stale, so a lost prediction does not
+    /// keep consuming the backpressure budget.
+    pub(crate) fn read(&self, last_seq: u32, n: usize) -> Option<Vec<f32>> {
+        let next = last_seq.wrapping_add(1);
+        if self.next_seq.load(Ordering::Relaxed) > next {
+            self.consumed.fetch_max(next, Ordering::Relaxed);
+            return None;
+        }
+        let out = self.chan.wait_publish(last_seq, n);
+        self.consumed.fetch_max(next, Ordering::Relaxed);
+        out
     }
 }
 
@@ -245,8 +259,6 @@ pub(crate) struct LayerState {
     /// Step 5 doorbell: publishes this layer's top-k into mapped memory so the host read needs
     /// no stream sync or D2H. Acquired lazily at first decode.
     pub(crate) doorbell: Option<Arc<crate::doorbell::TopkDoorbell>>,
-    /// seq the last ring of this layer advanced past (starts 0; first ring -> 1).
-    pub(crate) doorbell_seq: u32,
     pub(crate) slots: Vec<Slot>,
     pub(crate) hit_counts: Vec<u64>,
     /// Decode steps seen by this layer.
@@ -434,9 +446,7 @@ impl CachedLayer {
             return Ok(());
         };
         stats::record_cache_gate_replay();
-        let id = sched.sync_id(self.layer as u32, kind);
-        let gate: crate::doorbell::Gate<'_> = sched.gate(id);
-        gate.wait(&self.slot_device)
+        sched.wait(&self.slot_device, self.layer as u32, kind)
     }
 
     /// v2 M1: create this layer's staging ring now (see `GpuCacheMoeProvider::warmup_rings`).
@@ -737,8 +747,12 @@ impl CachedLayer {
         // Claim then publish: a reader that sees `pass` knows the point is coming.
         if let Some(sched) = schedule() {
             self.preload_claimed.store(pass, Ordering::Release);
-            let id = sched.sync_id(self.layer as u32, crate::doorbell::SYNC_PRELOAD);
-            sched.gate(id).publish_stream_max(&self.slot_device, pass)?;
+            sched.publish_stream_max(
+                &self.slot_device,
+                self.layer as u32,
+                crate::doorbell::SYNC_PRELOAD,
+                pass,
+            )?;
         }
         Ok(())
     }

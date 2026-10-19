@@ -70,17 +70,7 @@ impl Preload {
                             // completion wakes it (W106: the router matmul is 2-3
                             // cores and running it beside a batch measured 10
                             // ms/step slower).
-                            // Stale check: this layer queued a NEWER prediction
-                            // while this job waited — the newer publish carries a
-                            // fresher activation (its `wait_publish` job will do
-                            // the prefetch), so drop this one. Every layer
-                            // resubmits every step; dropping old ones is free.
-                            if sh.next_seq.load(Ordering::Relaxed) > last_seq.wrapping_add(1) {
-                                stats::record_lookahead_job(t0.elapsed().as_secs_f64() * 1e3);
-                                sh.consumed.fetch_max(last_seq + 1, Ordering::Relaxed);
-                                return;
-                            }
-                            if let Some(v) = sh.chan.wait_publish(last_seq, n) {
+                            if let Some(v) = sh.read(last_seq, n) {
                                 let x = Tensor::from_vec(v, (rows, next.hidden()), &Device::Cpu);
                                 if let Err(e) = x.and_then(|x| next.prefetch_predicted(&x, pass)) {
                                     debug!(
@@ -90,12 +80,6 @@ impl Preload {
                                 }
                             }
                             stats::record_lookahead_job(t0.elapsed().as_secs_f64() * 1e3);
-                            // Paid back either way: a timed-out publish's slot must
-                            // stop counting against the backpressure budget.
-                            // `fetch_max`: team threads finish out of order — a
-                            // plain store from an older job would regress the
-                            // counter and wedge the backpressure shut.
-                            sh.consumed.fetch_max(last_seq + 1, Ordering::Relaxed);
                         }));
                     }
                     stats::record_lookahead_step(0.0, true);
