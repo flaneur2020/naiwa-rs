@@ -57,23 +57,29 @@ impl CpuPending {
 ## Files
 
 ```
+src/components/
+  mod.rs          // exports + pipeline order docs
+  route.rs        // RoutePlan, Route::split, hit lookup
+  preload.rs      // LookaheadChannel, Preload::submit, predict/prefetch
+  dma_miss.rs     // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
+  cpu_miss.rs     // CpuMiss::submit, CpuPending::upload, CPU job construction
+  gpu.rs          // GpuExperts::run, run_expert, fused_decode
 src/expert_cache/
-  components/
-    mod.rs        // exports + pipeline order docs
-    route.rs      // RoutePlan, Route::split, hit lookup
-    preload.rs    // LookaheadChannel, Preload::submit, predict/prefetch
-    dma_miss.rs   // DmaMiss::stage, ScratchRing, alloc_bank, LayerRegistry::scratch_ring
-    cpu_miss.rs   // CpuMiss::submit, CpuPending::upload, CPU job construction
-    gpu.rs        // GpuExperts::run, run_expert, fused_decode
+  mod.rs          // #[path = "../components/mod.rs"] mod components;
   decode.rs       // orchestrator only (no stage bodies)
   layer.rs        // CachedLayer lifecycle: admit/replace/load/lend/give_back
   provider.rs     // provider + build/warmup
   registry.rs     // LayerRegistry lookup + lender
-  mod.rs          // private submodules + explicit exports
 ```
 
 `staging.rs` disappears: its scratch-ring and `stream_pcie`/`stage_misses` bodies move into
-`components/dma_miss.rs`.
+`src/components/dma_miss.rs`.
+
+`src/components/` is declared from `expert_cache/mod.rs` with
+`#[path = "../components/mod.rs"] mod components;`, so the components stay descendants of
+`expert_cache` (they need `CachedLayer`/`Slot` private fields) while the files live at the requested
+path. A crate-level `mod components;` would need a narrow `pub(crate)` facade from `expert_cache`;
+that is a larger API change and is not part of this plan.
 
 ## Doorbell ownership
 
@@ -113,7 +119,8 @@ src/expert_cache/
 
 ## Tasks
 
-- [ ] Add `components/mod.rs`, `Hit`, `RoutePlan`, `StagedHits`.
+- [ ] Add `src/components/mod.rs` (declared from `expert_cache` via `#[path]`), `Hit`, `RoutePlan`,
+  `StagedHits`.
 - [ ] Move top-k read and hit/miss split to `route.rs`.
 - [ ] Move `run_hits` / `run_expert` / `fused_decode` to `gpu.rs`.
 - [ ] Move CPU job construction and `Pending` upload to `cpu_miss.rs`.
