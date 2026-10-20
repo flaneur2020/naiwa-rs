@@ -282,7 +282,7 @@ property of the model, not a tune.
 |---|---|---|---|---|
 | prefill (turn 1, 1.7k) | **11.9 s** | 2.4 s | 5× | 4 chunks × 31 GB of layer uploads at 512-token chunks; a bigger chunk divides the upload count |
 | TTFT ≥2 | 2.8–4.4 s | 0.6–1.2 s | 3–7× | the per-turn tail (67–213 tokens) reprinted at 150–285 tok/s, plus the chunk's fixed upload |
-| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | 19 ms GPU chain + **48 × 0.73 ms** of 1-row CPU miss-experts on the per-layer critical path |
+| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | 19 ms GPU chain + **48 × ~1.2 ms of host↔device round trip** (~0.4 ms of GPU work per layer) — *not* the CPU miss-experts, see item 3b |
 | e2e/conv | 44–84 s | 22–40 s | 1.9–2.8× | dominated by turns ≥2 |
 
 **Why TPOT is the term to attack, and what it is made of** (measured in "Next" item 3): with every expert
@@ -379,9 +379,10 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    | `NAIWA_ROUND_STATS` | 1 GB: hit 35.7–38.2% / staged 16.5–17.4% / cpu 45.3–46.9%, ~140 ms of pooled CPU per token |
    | perfect cache (`NAIWA_GPU_ONLY_EXPERTS=1`, lossy) | **18.8 / 19.0 / 24.2 ms** TPOT — faster than strata's 38 ms |
 
-   So: ~19 ms is the GPU chain, ~5 ms is the rest of the host path, and **~35 ms = 48 layers × 0.73 ms of
-   CPU miss-experts** — the GPU blocks on the result publish point for exactly that long, and the host's
-   next-layer top-k read waits behind it. Two things that do *not* move it:
+   So: ~19 ms is the GPU chain and the rest (~36 ms) is host wall time. The attribution below — *"~35 ms =
+   48 × 0.73 ms of CPU miss-experts, the GPU blocks on the publish point for exactly that long"* — was
+   **wrong**, and item 3b (below) shows why: the CPU gemv runs *inside* the route spin and is hidden. Two
+   things that do *not* move the step, which was the observation that pointed at it:
 
    | knob | TPOT (3 turns) | hit rate |
    |---|---|---|
@@ -399,7 +400,9 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    moves ~6.4 MB of IQ1_M weights in 0.73 ms ≈ 9 GB/s, well under what the host can stream, because a 1-row
    dot pays the dequantisation per block and uses each weight once.
 
-4. **Shrink the per-layer CPU gemv — now the only lever that changes the critical path.** 0.73 ms for ~3.4
+4. ⛔ **Withdrawn after item 3b — the CPU gemv is not on the critical path, so shrinking it buys nothing.**
+   Kept for the record (it is still 5× its memory bound, and the numbers are useful if the pool ever *does*
+   land on the path): 0.73 ms for ~3.4
    expert-rows is ~5× its memory bound (~6.4 MB of IQ1_M weights per layer at 1 row → ~0.13 ms). The fused
    two-pass decode is tuned for the np8 batch (8 rows reuse each weight block); at 1 row it streams the same
    weights with none of that reuse. Targets, in order of expected payoff:
@@ -502,6 +505,43 @@ wash; item 6 is the way to get cache back), more staging at 12 GB (a wash — se
 `--no-lookahead` (worse), `--prefix-cache-n 16` at 4096 context, stream+MTP or 2 GB+stream on 12 GB, retrying
 a failed *turn* (startup retries are separate and bounded). And no MoE/GEMM tuning that is not aimed at the
 0.73 ms 1-row CPU path from item 4: the GPU chain is already 19 ms, faster than strata.
+
+### M10.3 item 3b — the miss path is *not* on the critical path (2026-10-21)
+
+Item 3 read `NAIWA_RET_DBG`'s "compute 667–729 µs" as time the GPU spends blocked and concluded that
+48 × 0.73 ms of CPU miss-experts *is* the 35 ms gap. The decisive test: run the same conversation with the
+CPU path removed entirely (`--pcie-frac 1.0` stages every miss over PCIe and multiplies it on the GPU), so
+the CPU pool reports zero.
+
+| config | TPOT (3 turns) | hit / staged / cpu | staged MiB (4-pass window) | `dry` ms/layer |
+|---|---|---|---:|---:|
+| `--pcie-frac 0.2` (CPU computes the misses) | **50.4 / 54.7 / 54.8** | 51.1 / 13.6 / **35.3%** | 514 | 1.209 |
+| `--pcie-frac 1.0` (DMA + GPU) | **50.7 / 55.9 / 53.8** | 58.4 / 41.6 / **0.0%** | 1 573 | 1.186 |
+| `--pcie-frac 1.0 --no-lookahead` | 83.5 / 80.1 / 80.1 | 14.5 / **85.5** / 0.0% | 3 213 | 1.766 |
+
+Removing **149 ms of pooled CPU per window** (35.3% of all experts) changes TPOT by **0 ms** and `dry` by
+**0.02 ms/layer**. The gemv was never on the path: the token thread spins on the top-k doorbell for ~0.7 ms
+per layer, and the rayon pool finishes the previous layer's expert rows inside that spin. `NAIWA_RET_DBG`
+measures *job* time, not *blocking* time — that was the misreading.
+
+**What the step actually is.** `dry 1.2 ms/layer × 48 = 57 ms` ≈ the whole TPOT, with `busy 0.000`: the GPU
+is idle at every layer entry because the host cannot dispatch layer L+1 before it has read L's top-k, and L's
+top-k needs L's router, which needs L−1's output. So it is **one host↔device round trip per layer**, and
+neither the miss path (CPU vs PCIe) nor the launch chain changes it. This also re-reads two earlier results:
+M6 P2 deleted `dispatch_topk`/`DispatchBuf` as "neutral" and M8 found capture on/off identical — both were
+measured at **np8**, where one round trip amortises over 8 rows. At np1 it is the dominant term.
+
+**PCIe budget** (needed before any "misses over PCIe" plan): 393 MiB/token fits (7.1 GB/s at 55 ms/token,
+TPOT unchanged); 803 MiB/token saturates the link (≈14.6 GB/s) and costs +27 ms with `dry` 1.77 ms/layer.
+So at this TPOT the link tops out around **~490 MiB/token**, and the earlier `frac 1.0 → 59.8/67.1/79.1`
+reading was that saturation (1 GB cache ⇒ most experts staged), not the staging path being slow.
+
+**Next candidates, both aimed at the round trip:**
+
+| candidate | how | cost |
+|---|---|---|
+| predictive dispatch | the lookahead already runs the router on the CPU for layer L+1 (the activation is published at L's start), so the host can dispatch L+1 during L and verify instead of waiting | wrong predictions need a check + fallback; touches the doorbell contract |
+| device-side dispatch, one graph per token | M6 P2's `dispatch_topk` shape, re-measured at np1; Strata's log says it decides on the device (`token graph hit path ... decided on the device`) | re-does M6 work that was judged neutral at np8 |
 
 ## Open questions
 
