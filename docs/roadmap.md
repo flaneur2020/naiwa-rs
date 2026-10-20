@@ -51,7 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–2 done | reuse fixed by config (no `--mtp`); prefill stream fixed (11–13 → 147–285 tok/s, `doc` turn 1 151.8 → 11.9 s). e2e now 1.9–2.8×; TPOT (1.6–2.2×) is the open term |
+| **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–3 done | reuse + prefill fixed (e2e 1.9–2.8×); TPOT broken down: 19 ms GPU chain + 48 × 0.73 ms 1-row CPU gemv. That gemv is the last term |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -412,8 +412,10 @@ conversation 4–11×. Two configuration causes were found and fixed: `--mtp` fo
 `SpeculativePrefixReplay::Full` (no reuse at all), and a checkpoint needs a block-aligned prompt step. The
 prefill stream was then fixed too (its expert-cache lend does not return what it credits, and candle's pool
 keeps freed blocks by size): `doc` turn 1 151.8 → 11.9 s, prefill 11–13 → 147–285 tok/s, e2e per conversation
-1.9–2.8×. What is left is TPOT (1.6–2.2×) — the MoE/decode path — and the lender's accounting. Next steps, ordered and
-gated: worklog §"Next (M10.3 items 3–6)".
+1.9–2.8×. What is left is TPOT, now attributed: with every expert resident the same conversation runs at 19 ms/token
+(faster than Strata's 38), and the real 60 ms is 48 layers × 0.73 ms of 1-row CPU expert gemv blocking the
+pipeline. `NAIWA_RET_DBG` says the queue wait is 7 µs, so it is the kernel, not the hand-off. Next steps,
+ordered and gated: worklog §"Next (M10.3 items 3–6)".
 
 ### Why
 

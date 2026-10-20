@@ -1,7 +1,7 @@
 # M10 — multi-round chat: naiwa-rs vs Strata
 
-Status: **M10.1–2 done, M10.3 items 1–2 done (2026-10-19/20)**. Next: "Next (M10.3 items 3–6)" below —
-decode (TPOT 1.6–2.2×) is the open term.
+Status: **M10.1–2 done; M10.3 items 1–3 done (2026-10-19/20)**. The open term is the 1-row CPU gemv
+(0.73 ms/layer, 48 layers); next: "Next" item 4 below.
 Parent: [m9c.md](m9c.md). This is the roadmap's **M10** (`docs/roadmap.md` §M10).
 (`worklogs/m10.md` is the older *MoE naming and ownership* milestone from the pre-rescope numbering; it is
 unrelated and stays.)
@@ -227,7 +227,7 @@ Two limits, measured rather than assumed:
 |---|---|---|---|---|
 | prefill (turn 1, 1.7k) | **11.9 s** | 2.4 s | 5× | 4 chunks × 31 GB of layer uploads at 512-token chunks; a bigger chunk divides the upload count |
 | TTFT ≥2 | 2.8–4.4 s | 0.6–1.2 s | 3–7× | the per-turn tail (67–213 tokens) reprinted at 150–285 tok/s, plus the chunk's fixed upload |
-| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | the miss path: at 42% hit rate 3.4 experts/token run on the CPU (perfect cache → 19 ms) |
+| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | 19 ms GPU chain + **48 × 0.73 ms** of 1-row CPU miss-experts on the per-layer critical path |
 | e2e/conv | 44–84 s | 22–40 s | 1.9–2.8× | dominated by turns ≥2 |
 
 **Why TPOT is the term to attack, and what it is made of** (measured in "Next" item 3): with every expert
@@ -289,37 +289,44 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    print `Arc::strong_count` on each bank inside `CachedLayer::lend` and find the extra owner (candidates:
    a fill-thread clone, `Bank.proj` vs `SlotMemory.tensor`, slots outside `st.usable` sharing the bank).
    *Gate:* `lend` returns ≥ 90% of what it credits, 2 GB cache + stream does not OOM, TPOT back to ≤ 58 ms.
-3. ✅ **Break down the 60 ms step — done. It is the miss path, not the host chain and not the PLE.**
-   Two probes, one `short`-shaped conversation, `max_tokens 64`, 3 turns:
+3. ✅ **Break down the 60 ms step — done. It is the 1-row CPU gemv, on the critical path per layer.**
+   Four probes on the same `short`-shaped conversation (`max_tokens 64`, 3 turns):
 
-   | variant | TPOT per turn |
+   | probe | reading |
    |---|---|
-   | as shipped (1 GB cache, stream, lookahead) | 54.3, 55.4, 65.8 ms |
-   | `--no-lookahead` | 67.2, 65.4, 68.1 ms |
-   | `NAIWA_GPU_ONLY_EXPERTS=1` (perfect cache, **lossy**) | **18.8, 19.0, 24.2 ms** |
-   | perfect cache + `--no-lookahead` | 20.2, 14.0, 16.5 ms |
+   | `NAIWA_STEP_DBG` | `busy 0.000 ms/layer`, `dry 1.17–1.32 ms/layer` × 48 → **the GPU is idle at every layer entry**; the step is host wall time, 56–63 ms |
+   | `NAIWA_RET_DBG` | per CPU job: **queue 7.2–7.5 µs, compute 667–729 µs** — it is the gemv, not the hand-off |
+   | `NAIWA_ROUND_STATS` | 1 GB: hit 35.7–38.2% / staged 16.5–17.4% / cpu 45.3–46.9%, ~140 ms of pooled CPU per token |
+   | perfect cache (`NAIWA_GPU_ONLY_EXPERTS=1`, lossy) | **18.8 / 19.0 / 24.2 ms** TPOT — faster than strata's 38 ms |
 
-   `NAIWA_STEP_DBG=1` on the shipped config says `busy 0.000 ms/layer, dry 1.17–1.32 ms/layer` over 48
-   layers: **the GPU is already idle at every layer entry**, so the token step is host-side wall time, and
-   the line is 48 × ~1.2 = 56–63 ms. Turning the lookahead off does not reduce it (it slightly increases
-   it), so the lookahead thread's CPU matmul is not the cost. Making every expert resident collapses it to
-   **~19 ms, i.e. faster than strata's 38 ms**.
+   So: ~19 ms is the GPU chain, ~5 ms is the rest of the host path, and **~35 ms = 48 layers × 0.73 ms of
+   CPU miss-experts** — the GPU blocks on the result publish point for exactly that long, and the host's
+   next-layer top-k read waits behind it. Two things that do *not* move it:
 
-   Conclusion: the decode machinery is fine; the ~39 ms between 19 and 58 is what the *miss path* costs —
-   CPU expert gemv on 41.9% of the experts and staged DMA on 15.7% (`NAIWA_ROUND_STATS` on the same run:
-   hit 42.4% / staged 15.7% / cpu 41.9%, ~130 ms of CPU work per token summed over the pool). This flips
-   the M6–M9 conclusion for *this* workload: the host chain is not short of launches, it is waiting on
-   experts the 1 GB cache does not hold.
-4. **Attack the miss path — the two levers, in this order.**
-   a. **Hit rate.** 42.4% at a 1 GB cache. Half a gigabyte back (item 2) is the cheapest point available on
-      this card; beyond that a bigger card. Measure the same `short` conversation at 1 / 1.5 / 2 GB
-      (2 GB needs item 2) and report TPOT against hit rate — that curve says whether the CPU path or the
-      cache is the lever.
-   b. **CPU gemv cost.** ~130 ms of pooled CPU per token for ~3.4 miss experts. One expert-row is ~5.7 MB of
-      IQ1_M weights, i.e. ~0.1 ms of memory traffic, so the fused decode is 5–10× off its memory bound at
-      1 row — the same fused path that the np8 numbers praised at 8 rows. A 1-row-specialised kernel, or
-      batching a layer's misses across the verify window, is where the remaining CPU time is.
-   Do (a) before (b): if the hit-rate curve says 2 GB takes TPOT under 40 ms, the gemv work is second order.
+   | knob | TPOT (3 turns) | hit rate |
+   |---|---|---|
+   | cache 1 GB → 1.5 GB | 53.6/57.1/64.4 → 52.5/54.2/70.0 | 35.7–38.2 → 37.2–42.2% |
+   | `--lookahead-swaps` 2 → 4 | 53.5/58.3/65.3 → 58.0/62.4/68.0 | 37.2–38.2 → 43.8% |
+   | `--lookahead-swaps` 0 | 69.2/70.8/62.5 | 20.1% |
+   | `--pcie-frac` 0.2 → 0.5 → 1.0 | 53.5–65.3 → 51.0/52.3/56.1 → 59.8/67.1/79.1 | — |
+   | `--no-lookahead` | 65.4–68.1 | — |
+
+   More cache, more swaps, more staging and less lookahead all fail to help for the same reason: **any miss
+   in a layer pays the whole 0.73 ms round trip**, so the cost is per *layer with a miss*, not per miss.
+   Halving the miss count does not halve the wait; eliminating it does (perfect cache = 19 ms).
+
+4. **Shrink the per-layer CPU gemv — now the only lever that changes the critical path.** 0.73 ms for ~3.4
+   expert-rows is ~5× its memory bound (~6.4 MB of IQ1_M weights per layer at 1 row → ~0.13 ms). The fused
+   two-pass decode is tuned for the np8 batch (8 rows reuse each weight block); at 1 row it streams the same
+   weights with none of that reuse. Targets, in order of expected payoff:
+   a. **A 1-row path** that streams each expert's weights once (single pass over gate/up/down with the
+      activation applied in-line, no intermediate quantize), measured against the 0.73 ms baseline. Gate:
+      TPOT ≤ 40 ms on the same conversation (i.e. beating strata's 38 ms), oracle unaffected (it is the
+      `frac 0 --no-lookahead` path, which also runs CPU experts — byte-identical is the check).
+   b. **Cross-layer batching**: compute layer L's misses with layer L+1's (the ids are known one layer
+      early through the router), so one gemv call serves two layers. Bigger change; only if (a) stalls.
+   c. **Not** more cache or more staging at 12 GB: both measured as a wash (table above). A ≥24 GB card with a
+      4 GB cache would be the real test of "keep them resident", and it is a hardware decision.
 5. **MTP: keep it out of chat, or make it reuse-aware — 0–2 days, fork optional.** Today `--mtp` costs all
    prefix reuse for +45% TPOT on `code` only. Either ship "MTP off for chat" (already the default arm) or
    add draft-aware checkpoints to the fork. *Gate:* if MTP is re-enabled for chat, reuse must stay ≥ 0.7.
@@ -327,9 +334,10 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    cache with the stream (hit rate up, TPOT down), and the PLE residency question; on 12 GB the stream and
    MTP are mutually exclusive and `long` stays at 4096.
 
-**Not now** (measured dead ends for this workload): tuning MoE/GEMM before item 3 names the term; chasing
-the ±10% band while turn 1 is 5× off; `--prefix-cache-n 16` at 4096 context; stream+MTP or 2 GB+stream on
-12 GB; retrying a failed *turn* (startup retries are separate and bounded).
+**Not now** (measured dead ends for this workload): more cache or more staging at 12 GB (a wash — see item 3),
+`--no-lookahead` (worse), `--prefix-cache-n 16` at 4096 context, stream+MTP or 2 GB+stream on 12 GB, retrying
+a failed *turn* (startup retries are separate and bounded). And no MoE/GEMM tuning that is not aimed at the
+0.73 ms 1-row CPU path from item 4: the GPU chain is already 19 ms, faster than strata.
 
 ## Open questions
 
