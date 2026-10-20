@@ -169,6 +169,12 @@ CPU instead of failing the request. Measured with `--expert-cache-gb 1`: one 650
 therefore the cache's own budget; the stream adds its buffers on top and says so when they do not
 fit.
 
+The alternative — Strata's — is to lay the prompt buffers **inside** the cache's own allocation (a
+bump allocation in its tail, re-laid out per chunk, so nothing is ever freed or re-allocated) and to
+adapt the *chunk* to the region instead of the buffer count. That gives the same footprint with ~650
+MiB more cache on this card; it is tracked as "Next" item 6 in
+[`worklogs/m10-chat.md`](worklogs/m10-chat.md), to be done after the CPU-expert gemv work.
+
 ---
 
 ## 5. Performance envelope

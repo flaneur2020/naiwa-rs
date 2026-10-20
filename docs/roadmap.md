@@ -415,7 +415,9 @@ keeps freed blocks by size): `doc` turn 1 151.8 → 11.9 s, prefill 11–13 → 
 1.9–2.8×. What is left is TPOT, now attributed: with every expert resident the same conversation runs at 19 ms/token
 (faster than Strata's 38), and the real 60 ms is 48 layers × 0.73 ms of 1-row CPU expert gemv blocking the
 pipeline. `NAIWA_RET_DBG` says the queue wait is 7 µs, so it is the kernel, not the hand-off. Next steps,
-ordered and gated: worklog §"Next (M10.3 items 3–6)".
+ordered and gated: worklog §"Next (M10.3 items 3–8)" — the 1-row gemv (approved fork work), an
+`--prefill auto`-style chunk bisection, and carving the stream buffers inside the cache (Strata's layout,
+worth ~650 MiB of cache on this card).
 
 ### Why
 
