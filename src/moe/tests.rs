@@ -202,7 +202,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
             usable: slots,
         }),
         copy_stream: None,
-        banks: Vec::new(),
         pcie_frac: 0.0,
         lookahead_swaps: 2,
         lookahead: true,
@@ -217,40 +216,6 @@ fn wait_for_fill(layer: &CachedLayer) {
     while layer.filling.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-}
-
-#[test]
-fn lent_slots_leave_service_and_come_back_refilled() {
-    let layer = cpu_layer(8, 4);
-    for e in [5, 6, 7, 4] {
-        assert!(layer.admit(e, true).unwrap().is_some());
-    }
-    assert_eq!(layer.lend(2), 2);
-    {
-        let st = layer.state.lock().unwrap();
-        assert_eq!(st.usable, 2);
-        assert_eq!(
-            st.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
-            vec![Some(5), Some(6), None, None]
-        );
-        assert!(st.slots[2].buf.is_none() && st.slots[3].buf.is_none());
-        assert_eq!(st.slots.iter().filter(|s| s.buf.is_some()).count(), 2);
-    }
-    // no room while lent: lent slots are not admitted into, nor filled
-    assert!(layer.admit(1, true).unwrap().is_none());
-    assert!(layer.next_fill_candidate().is_none());
-
-    // give back: refilled by routing count (2 and 3 are the hottest non-residents)
-    layer.state.lock().unwrap().hit_counts = vec![0, 1, 9, 8, 0, 0, 0, 0];
-    layer.give_back().unwrap();
-    wait_for_fill(&layer);
-    let st = layer.state.lock().unwrap();
-    assert_eq!(st.usable, 4);
-    assert_eq!(
-        st.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
-        vec![Some(5), Some(6), Some(2), Some(3)]
-    );
-    assert!(st.slots[..4].iter().all(|s| s.buf.is_some()));
 }
 
 #[test]

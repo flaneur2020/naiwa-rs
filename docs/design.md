@@ -150,6 +150,25 @@ asserted frozen across decode. Static addresses keep the steady state allocation
 Banks are per-layer because the model is mixed-quant (7 expert shapes); shared structures carry
 counts/offsets/pointers only.
 
+**The prefill stream owns its VRAM.** Its layer buffers (~650 MiB at IQ1_M) are *not* lent from the
+expert cache: that time-sharing cycle was measured to be unstable — the lend returns whole banks
+(1107 MiB of a 1300 MiB need), the buffers then need the rest from free VRAM, and the
+give-back/re-borrow churn per turn (re-allocating the cache's banks and re-filling them) leaked
+~400 MiB of free memory per conversation until a 3 MiB miss turned the stream off for the rest of
+the run. So the stream reserves once and keeps:
+
+- two buffers if `free ≥ 2 × layer + 768 MiB` (the next layer's upload overlaps this layer's MoE),
+- one buffer if `free ≥ layer + 192 MiB` (uploads serial, ~8% slower on the first turn),
+- otherwise off, with one warning naming the numbers and the flag to lower.
+
+The 768 MiB margin is the chunk's MoE intermediates at `--max-prefill-chunk-tokens 1024`; a smaller
+margin OOMs when the *model's* own allocation (not the stream's) grows. As a safety net, any CUDA
+OOM raised inside the stream's own path drops a buffer (2 → 1 → off) and leaves that layer on the
+CPU instead of failing the request. Measured with `--expert-cache-gb 1`: one 650 MiB buffer, 555 /
+1095 / 3615-token prefill at 195 / 356 / 416 tok/s (CPU path: 11–13 tok/s). `--expert-cache-gb` is
+therefore the cache's own budget; the stream adds its buffers on top and says so when they do not
+fit.
+
 ---
 
 ## 5. Performance envelope

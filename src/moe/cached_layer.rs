@@ -14,11 +14,11 @@ use tracing::debug;
 use crate::copy_stream::{self, CopyDone, CopyStream, ReadFence};
 use crate::doorbell::{PassCell, TopkDoorbell};
 use crate::host_memory::PinnedStack;
-use crate::prefill_stream::{ExpertMemoryLender, PrefillStream};
+use crate::prefill_stream::PrefillStream;
 use crate::stats;
 
 use super::{
-    alloc_bank, expert_qtensor_on_device, expert_range, Projections, Slot, SlotBuf,
+    expert_qtensor_on_device, expert_range, Projections, Slot, SlotBuf,
     SlotData, StagingRings,
 };
 
@@ -55,33 +55,6 @@ impl Layers {
             .iter()
             .filter_map(Weak::upgrade)
             .collect()
-    }
-}
-
-// Lends the cache's tail slots to the prefill stream while a prompt runs (see
-// `prefill_stream`): each layer gives up an equal share of the bytes asked for.
-impl ExpertMemoryLender for Layers {
-    fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
-        let layers = self.all();
-        let share = bytes.div_ceil(layers.len().max(1));
-        let out = layers
-            .iter()
-            .map(|l| {
-                let per_slot = l.slot_bytes();
-                if per_slot == 0 {
-                    return 0;
-                }
-                l.lend(share.div_ceil(per_slot)) * per_slot
-            })
-            .sum();
-        Ok(out)
-    }
-
-    fn give_back(&self) -> candle_core::Result<()> {
-        for layer in self.all() {
-            layer.give_back()?;
-        }
-        Ok(())
     }
 }
 
@@ -294,8 +267,6 @@ pub(crate) struct CachedLayer {
     pub(crate) state: Mutex<LayerState>,
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     pub(crate) copy_stream: Option<Arc<CopyStream>>,
-    /// Copy-stream mode: the banks as `(first slot, len)`, in slot order. Lent whole.
-    pub(crate) banks: Vec<(usize, usize)>,
     /// `--lookahead-swaps`: how many predicted experts may displace residents per row and pass
     /// (`0` means a prediction can only fill an empty slot).
     pub(crate) lookahead_swaps: usize,
@@ -365,9 +336,6 @@ impl RoutedExperts for CachedExperts {
         }
 
         // Decode: single token, split GPU hits / CPU misses.
-        if let Some(ps) = &layer.prefill {
-            ps.note_decode(layer.layer)?;
-        }
         super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
     }
 }
@@ -639,85 +607,6 @@ impl CachedLayer {
             unsafe { cs.queue_async(&buf.fence, &parts)? };
         }
         Ok(Some(Arc::clone(buf)))
-    }
-
-    /// Bytes of one slot: one expert's gate, up and down.
-    pub(super) fn slot_bytes(&self) -> usize {
-        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
-            return 0;
-        };
-        [&gate, &up, &down]
-            .iter()
-            .map(|s| expert_range(s, 0).map_or(0, |r| r.len()))
-            .sum()
-    }
-
-    /// Take at least the top `k` usable slots out of service for the prefill stream (whole banks
-    /// in copy-stream mode): unpublish and empty them, then release their device memory. A free
-    /// is ordered on candle's stream after any kernel already reading the slot. Returns the
-    /// number of slots lent.
-    pub(super) fn lend(&self, k: usize) -> usize {
-        let (from, to, storages) = {
-            let mut st = self.state.lock().unwrap();
-            let to = st.usable;
-            let want = to.saturating_sub(k);
-            // A bank's memory is one allocation: lend from the start of the bank holding `want`.
-            let from = self
-                .banks
-                .iter()
-                .map(|&(first, _)| first)
-                .filter(|&first| first <= want)
-                .max()
-                .unwrap_or(want);
-            for slot in from..to {
-                let s = &mut st.slots[slot];
-                s.expert = None;
-                s.buf = None;
-            }
-            st.usable = from;
-            let storages = st.slots[from..to]
-                .iter()
-                .map(|s| Arc::clone(&s.storage))
-                .collect::<Vec<_>>();
-            (from, to, storages)
-        };
-        for storage in storages {
-            // Waits for an upload into the slot; its result is then discarded.
-            if let Some(buf) = storage.lock().take() {
-                copy_stream::wait_for_readers(&buf);
-            }
-        }
-        to - from
-    }
-
-    /// Put every lent slot back in service, empty (with fresh device memory in copy-stream
-    /// mode), and refill the layer in the background by routing count.
-    pub(super) fn give_back(self: &Arc<Self>) -> candle_core::Result<()> {
-        let (from, to, storages) = {
-            let st = self.state.lock().unwrap();
-            let from = st.usable;
-            let to = st.slots.len();
-            let storages = st.slots[from..to]
-                .iter()
-                .map(|s| Arc::clone(&s.storage))
-                .collect::<Vec<_>>();
-            (from, to, storages)
-        };
-        if from == to {
-            return Ok(());
-        }
-        if let (Some(cs), Some(stacks)) = (&self.copy_stream, self.cpu.expert_qtensors()) {
-            for &(first, len) in self.banks.iter().filter(|&&(first, _)| first >= from) {
-                let bufs = alloc_bank(cs, &stacks, first, len, &self.slot_device)?;
-                for (i, buf) in bufs.into_iter().enumerate() {
-                    *storages[first - from + i].lock() = Some(buf);
-                }
-            }
-            cs.after_device_work()?;
-        }
-        self.state.lock().unwrap().usable = to;
-        self.spawn_fill();
-        Ok(())
     }
 
     /// This layer's predicted experts for `rows` activations `x` (`[rows, hidden]`), by its own

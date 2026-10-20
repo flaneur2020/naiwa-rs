@@ -264,6 +264,15 @@ mod cuda {
         }
     }
 
+    /// Free and total device bytes (the driver's view, after any pool trim).
+    pub fn free_bytes(device: &Device) -> Option<usize> {
+        let Device::Cuda(dev) = device else {
+            return None;
+        };
+        let stream = dev.cuda_stream();
+        stream.context().mem_get_info().ok().map(|(free, _)| free)
+    }
+
     /// Return this device's unused pool blocks to the driver.
     ///
     /// candle allocates through CUDA's stream-ordered pool, which keeps a freed block for reuse
@@ -349,7 +358,7 @@ mod cuda {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use cuda::{free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
@@ -406,6 +415,10 @@ mod stub {
         Ok(())
     }
 
+    pub fn free_bytes(_device: &Device) -> Option<usize> {
+        None
+    }
+
     /// Never constructed without CUDA.
     pub enum CopyStream {}
 
@@ -452,7 +465,7 @@ mod stub {
 }
 
 #[cfg(not(feature = "cuda"))]
-pub use stub::{trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use stub::{free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(test)]
 mod tests {

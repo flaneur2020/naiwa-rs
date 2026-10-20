@@ -10,14 +10,14 @@ use tracing::{debug, info, warn};
 use super::expert::CpuExperts;
 use crate::copy_stream::{CopyDone, CopyStreams};
 use crate::host_memory::{self, pin_expert_stacks, PinnedStack};
-use crate::prefill_stream::{ExpertMemoryLender, PrefillStream, PrefillStreams};
+use crate::prefill_stream::{PrefillStream, PrefillStreams};
 use crate::stats;
 use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
 use mistralrs_core::MoEExperts;
 
 use super::{
-    alloc_bank, loan_bank_slots, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState,
-    Layers, LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
+    alloc_bank, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState, Layers,
+    LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
 };
 
 /// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
@@ -81,9 +81,6 @@ impl GpuCacheMoeProvider {
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let layers: Arc<Layers> = Arc::default();
         let staging: Arc<StagingRings> = Arc::default();
-        // The prefill stream's layer buffers are carved out of this cache while a prompt runs.
-        let lender: Arc<dyn ExpertMemoryLender> = layers.clone();
-        let prefill = prefill.map(|p| p.with_lender(lender));
         Self {
             cache_gb,
             inner: Mutex::new(ProviderInner {
@@ -319,29 +316,16 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         };
 
         // With a copy stream, each slot's memory is allocated once here and every fill overwrites
-        // it in place from the copy stream; otherwise each fill uploads a fresh copy.
-        // The slots are grouped in banks, one allocation per projection, so that a decode step
-        // runs all of a bank's hits in one fused call; with a prefill stream the last bank is
-        // the one lent to it.
-        let tail = if prefill.is_some() {
-            loan_bank_slots(num_experts).min(num_slots)
-        } else {
-            0
-        };
-        let banks: Vec<(usize, usize)> = [(0, num_slots - tail), (num_slots - tail, tail)]
-            .into_iter()
-            .filter(|&(_, len)| len > 0)
-            .collect();
+        // it in place from the copy stream; otherwise each fill uploads a fresh copy. All of a
+        // layer's slots are one bank per projection, so a decode step runs them in one fused call.
         let mut copy_stream = self.copy_streams.get(&slot_device);
         let slots: Vec<Slot> = (0..num_slots).map(|_| Slot::empty()).collect();
         if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
-            for &(first, len) in &banks {
-                for (i, buf) in alloc_bank(cs, &stacks, first, len, &slot_device)?
-                    .into_iter()
-                    .enumerate()
-                {
-                    *slots[first + i].storage.lock() = Some(buf);
-                }
+            for (i, buf) in alloc_bank(cs, &stacks, 0, num_slots, &slot_device)?
+                .into_iter()
+                .enumerate()
+            {
+                *slots[i].storage.lock() = Some(buf);
             }
             cs.after_device_work()?;
         }
@@ -355,9 +339,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // device memory, and allocating the ring's contiguous bank in that window failed on
         // some load orders (W105: 33 MiB at 11.6 GiB free, OOM in 2 of 3 runs). Once load has
         // finished the allocator has large free blocks left, where it fits reliably.
-        // The ring's `first` sits past every resident slot, and it is kept out of
-        // slot storage/banks, so `lend`/`give_back`/`admit`/`replace` never see it; `run_hits`
-        // picks it up only because the injected hits carry its `Arc<Bank>`.
+        // The ring's `first` sits past every resident slot, and it is kept out of slot storage and
+        // banks, so `admit`/`replace` never see it; `run_hits` picks it up only because the
+        // injected hits carry its `Arc<Bank>`.
 
         // Both completion events are created here (the decode path must not allocate a sync
         // object). `staging_done: None` is what disables `--pcie-frac` for a layer whose copies
@@ -394,7 +378,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 usable: num_slots,
             }),
             copy_stream,
-            banks,
             pcie_frac: self.pcie_frac,
             lookahead_swaps: self.lookahead_swaps,
             lookahead: self.lookahead,

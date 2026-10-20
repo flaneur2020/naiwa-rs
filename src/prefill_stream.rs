@@ -17,11 +17,14 @@
 //! shorter ones (`--prefill-stream-min-tokens`) and layers whose stacks are not pinned stay on
 //! the CPU.
 //!
-//! With `--expert-cache-gb`, the two buffers do not add to VRAM: before the first long chunk
-//! the cache lends (frees) about two layers' worth of its tail slots, and after
-//! `GIVE_BACK_AFTER_DECODE_STEPS` decode steps in a row the buffers are freed and the cache
-//! takes the slots back, refilling them in the background. candle frees into a CUDA memory
-//! pool, so both hand-overs synchronize candle's stream once in between.
+//! **The buffers are the stream's own memory.** They used to be lent from the expert cache for
+//! the duration of a long chunk and handed back before decoding, which measured as an unstable
+//! cycle: the lend returns whole banks (1107 MiB of a 1300 MiB need at a 1 GB cache), the buffers
+//! then need the difference from free VRAM, and the give-back/re-borrow churn leaked ~400 MiB of
+//! free memory per conversation until a 3 MiB miss turned the stream off for good. So the stream
+//! now reserves its own VRAM once (checked against the device before the first chunk) and keeps
+//! it: `--expert-cache-gb` is the cache's budget, and the stream adds its two layer buffers on
+//! top. If they do not fit, the stream says so once and prefill stays on the CPU.
 
 use std::sync::{Arc, Mutex};
 
@@ -42,23 +45,11 @@ use crate::copy_stream::{
 /// streams every expert from 1024 tokens).
 pub const DEFAULT_MIN_TOKENS: usize = 1024;
 
-/// Decode steps in a row after which the buffers are given back to the expert cache. Several,
-/// so a server alternating prompts and decodes does not hand two layers back and forth per step.
-const GIVE_BACK_AFTER_DECODE_STEPS: usize = 8;
-
-/// Device memory that can make room for the prefill buffers: the expert cache.
-pub trait ExpertMemoryLender: Send + Sync {
-    /// Free about `bytes` of device memory; returns the bytes actually freed.
-    fn lend(&self, bytes: usize) -> candle_core::Result<usize>;
-    /// Take the memory back (the buffers have been freed).
-    fn give_back(&self) -> candle_core::Result<()>;
-}
-
-#[derive(Default)]
-struct Loan {
-    lent: bool,
-    decode_steps: usize,
-}
+/// Free VRAM the stream keeps for the current chunk's activations and the KV blocks it grows into.
+/// A chunk's MoE intermediates grow with `--max-prefill-chunk-tokens`, so a two-buffer stream wants
+/// a wider margin than a one-buffer one.
+const HEADROOM: usize = 192 << 20;
+const HEADROOM_TWO_BUFFERS: usize = 768 << 20;
 
 /// One layer's host stacks (gate, up, down). Holding them keeps the memory that in-flight
 /// uploads read alive.
@@ -84,9 +75,8 @@ pub struct PrefillStream {
     comm: Arc<Comm>,
     layers: RwLock<Vec<Option<HostStacks>>>,
     bufs: [Mutex<LayerBuf>; 2],
-    /// `None`: the buffers have their own memory and are kept for good.
-    lender: Option<Arc<dyn ExpertMemoryLender>>,
-    loan: Mutex<Loan>,
+    /// Buffers in use (0 = stream off), decided on the first long chunk and kept for good.
+    stride: Mutex<Option<usize>>,
     /// Chunks shorter than this stay on the CPU.
     min_tokens: usize,
 }
@@ -100,7 +90,6 @@ impl PrefillStream {
         top_k: usize,
         act: Activation,
         comm: Arc<Comm>,
-        lender: Option<Arc<dyn ExpertMemoryLender>>,
         min_tokens: usize,
     ) -> candle_core::Result<Option<Self>> {
         let Some(copy) = copy else {
@@ -124,8 +113,7 @@ impl PrefillStream {
             act,
             comm,
             layers: RwLock::default(),
-            lender,
-            loan: Mutex::default(),
+            stride: Mutex::new(None),
             min_tokens,
         }))
     }
@@ -151,94 +139,82 @@ impl PrefillStream {
             .map(|s| s.0.clone())
     }
 
-    /// Bytes of the two buffers: twice the largest registered layer.
-    fn buffer_bytes(&self) -> usize {
-        let largest = self
-            .layers
+    /// Bytes of the largest registered layer: one buffer's worth.
+    fn layer_bytes(&self) -> usize {
+        self.layers
             .read()
             .iter()
             .flatten()
             .map(|s| s.0.iter().map(|t| t.storage_size_in_bytes()).sum::<usize>())
             .max()
-            .unwrap_or(0);
-        2 * largest
+            .unwrap_or(0)
     }
 
-    fn first_layer(&self) -> Option<usize> {
-        self.layers.read().iter().position(Option::is_some)
-    }
-
-    /// Before the buffers are first allocated, have the lender make room for them.
-    fn borrow(&self) -> candle_core::Result<()> {
-        let Some(lender) = &self.lender else {
-            return Ok(());
+    /// How many buffers to use, decided once from free VRAM: `2` (overlap the next layer's upload
+    /// with this layer's MoE), `1` (no overlap, half the memory), or `0` (the stream stays off).
+    ///
+    /// The number of buffers is the only memory decision here, and it is measured rather than
+    /// assumed: two buffers need twice a layer, and on a 12 GB card that is what pushes a
+    /// 1024-token chunk's MoE intermediates over the edge. One buffer still beats the CPU by an
+    /// order of magnitude (the uploads are then serial with the compute instead of hidden).
+    fn reserve(&self) -> candle_core::Result<usize> {
+        if let Some(stride) = *self.stride.lock().unwrap() {
+            return Ok(stride);
+        }
+        let layer = self.layer_bytes();
+        let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
+        let stride = if free >= 2 * layer + HEADROOM_TWO_BUFFERS {
+            2
+        } else if free >= layer + HEADROOM {
+            1
+        } else {
+            0
         };
-        let mut loan = self.loan.lock().unwrap();
-        if loan.lent {
-            return Ok(());
+        let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
+        match stride {
+            2 => info!(
+                "prefill stream: two {:.0} MiB layer buffers reserved, {:.0} MiB free",
+                mib(layer),
+                mib(free)
+            ),
+            1 => info!(
+                "prefill stream: one {:.0} MiB layer buffer reserved (two do not fit: {:.0} MiB \
+                 free); the next layer's upload is not overlapped",
+                mib(layer),
+                mib(free)
+            ),
+            _ => warn!(
+                "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB headroom needed, \
+                 {:.0} MiB free). Lower --expert-cache-gb to leave room for the stream, or drop \
+                 --prefill-stream",
+                mib(layer),
+                mib(HEADROOM),
+                mib(free)
+            ),
         }
-        let need = self.buffer_bytes();
-        let freed = lender.lend(need)?;
-        info!(
-            "prefill stream: borrowed {} MiB of expert-cache slots for {} MiB of layer buffers",
-            freed >> 20,
-            need >> 20
-        );
-        if freed < need {
-            warn!(
-                "prefill stream: the expert cache could lend only {} of {} MiB; the layer \
-                 buffers exceed --expert-cache-gb by the rest",
-                freed >> 20,
-                need >> 20
-            );
-        }
-        // Freed slots go back to candle's memory pool; hand them to the driver, because the pool
-        // only reuses a block at its own size and the buffers below are nothing like a cache
-        // bank's size. `trim_device_pool` synchronises the context first (the free is on cudarc's
-        // dealloc stream).
-        trim_device_pool(&self.device)?;
-        loan.lent = true;
-        loan.decode_steps = 0;
-        Ok(())
+        *self.stride.lock().unwrap() = Some(stride);
+        Ok(stride)
     }
 
-    /// Called by every decode step (one token per sequence). After enough of them in a row,
-    /// free the buffers and give the memory back to the lender.
-    pub fn note_decode(&self, layer: usize) -> candle_core::Result<()> {
-        let Some(lender) = &self.lender else {
-            return Ok(());
-        };
-        if self.first_layer() != Some(layer) {
-            return Ok(());
-        }
-        let mut loan = self.loan.lock().unwrap();
-        if !loan.lent {
-            return Ok(());
-        }
-        loan.decode_steps += 1;
-        if loan.decode_steps < GIVE_BACK_AFTER_DECODE_STEPS {
-            return Ok(());
-        }
-        self.release()?;
-        self.device.synchronize()?;
-        lender.give_back()?;
-        loan.lent = false;
-        loan.decode_steps = 0;
-        info!("prefill stream: gave the layer buffers back to the expert cache");
-        Ok(())
-    }
-
-    /// Free both buffers, each after its last upload (readers are ordered by candle's stream).
-    fn release(&self) -> candle_core::Result<()> {
+    /// Give up a buffer: free everything the stream holds, hand the blocks to the driver, and keep
+    /// going with one buffer fewer (or off). Called when an allocation the stream made was refused
+    /// with a CUDA OOM — the driver's answer is the only reliable statement about what fits, so it
+    /// is used as the signal instead of a size heuristic.
+    fn downgrade(&self, stride: usize) -> candle_core::Result<()> {
+        let next = stride.saturating_sub(1);
+        *self.stride.lock().unwrap() = Some(next);
         for buf in &self.bufs {
             let mut buf = buf.lock().unwrap();
-            if buf.memory.is_some() {
-                buf.ready.wait_on(&self.device)?;
-            }
+            buf.loaded = None;
             buf.experts = None;
             buf.memory = None;
-            buf.loaded = None;
         }
+        trim_device_pool(&self.device)?;
+        warn!(
+            "prefill stream: out of device memory with {stride} layer buffer(s); continuing with \
+             {next} — this chunk's remaining layers and the next chunk's first layers stay on the \
+             CPU"
+        );
         Ok(())
     }
 
@@ -247,11 +223,11 @@ impl PrefillStream {
     ///
     /// A mixed-quant layer whose shape differs from the buffer's frees the old buffer and
     /// allocates the new one; that is where the prefill stream's memory peak comes from.
-    fn load(&self, layer: usize) -> candle_core::Result<bool> {
+    fn load(&self, layer: usize, stride: usize) -> candle_core::Result<bool> {
         let Some(stacks) = self.stacks(layer) else {
             return Ok(false);
         };
-        let mut buf = self.bufs[layer % 2].lock().unwrap();
+        let mut buf = self.bufs[layer % stride.max(1)].lock().unwrap();
         if buf.loaded == Some(layer) {
             return Ok(true);
         }
@@ -324,25 +300,40 @@ impl PrefillStream {
     ) -> candle_core::Result<Option<Tensor>> {
         let (batch, seq, _) = xs.dims3()?;
         if seq == 1 {
-            self.note_decode(layer)?;
             return Ok(None);
         }
-        self.loan.lock().unwrap().decode_steps = 0;
         if batch * seq < self.min_tokens || self.stacks(layer).is_none() {
             return Ok(None);
         }
-        self.borrow()?;
-        if !self.load(layer)? {
+        let mut stride = self.reserve()?;
+        if stride == 0 {
             return Ok(None);
         }
-        // Stream the next layer in while this one computes.
-        if let Err(e) = self.load(layer + 1) {
-            warn!(
-                "prefill stream: could not prefetch layer {}: {e}",
-                layer + 1
-            );
+        let loaded = match self.load(layer, stride) {
+            Ok(loaded) => loaded,
+            Err(e) if is_out_of_memory(&e) => {
+                self.downgrade(stride)?;
+                stride = stride.saturating_sub(1);
+                if stride == 0 {
+                    return Ok(None);
+                }
+                self.load(layer, stride)?
+            }
+            Err(e) => return Err(e),
+        };
+        if !loaded {
+            return Ok(None);
         }
-        let buf = self.bufs[layer % 2].lock().unwrap();
+        // Stream the next layer in while this one computes — only with a second buffer.
+        if stride == 2 {
+            if let Err(e) = self.load(layer + 1, stride) {
+                warn!(
+                    "prefill stream: could not prefetch layer {}: {e}",
+                    layer + 1
+                );
+            }
+        }
+        let buf = self.bufs[layer % stride].lock().unwrap();
         let experts = buf.experts.as_ref().expect("loaded");
         buf.ready.wait_on(&self.device)?;
         let out = experts.forward(xs, topk_weights.clone(), topk_ids);
@@ -355,7 +346,6 @@ impl PrefillStream {
 /// The prefill stream of each CUDA device, created by the first layer that loads on it.
 pub struct PrefillStreams {
     streams: Mutex<Vec<(Device, Arc<PrefillStream>)>>,
-    lender: Option<Arc<dyn ExpertMemoryLender>>,
     min_tokens: usize,
 }
 
@@ -364,15 +354,8 @@ impl PrefillStreams {
     pub fn new(min_tokens: usize) -> Self {
         Self {
             streams: Mutex::default(),
-            lender: None,
             min_tokens,
         }
-    }
-
-    /// Borrow the buffers' memory from `lender` instead of keeping it for good.
-    pub fn with_lender(mut self, lender: Arc<dyn ExpertMemoryLender>) -> Self {
-        self.lender = Some(lender);
-        self
     }
 
     /// Register `experts` (this block's CPU stacks) for streaming and return the device's
@@ -400,7 +383,6 @@ impl PrefillStreams {
                     ctx.config.num_experts_per_tok,
                     ctx.act,
                     Arc::clone(ctx.comm),
-                    self.lender.clone(),
                     self.min_tokens,
                 )?
                 else {
@@ -556,4 +538,10 @@ fn trace_buffer_bytes(device: &Device, layer: usize, stacks: &[Arc<QTensor>; 3])
         "prefill stream: {:.0} MiB buffer for layer {layer} ({free:.0} MiB free before it)",
         (bytes as f64) / (1u64 << 20) as f64
     );
+}
+
+/// A CUDA out-of-memory error, however deep in the wrapper it is.
+fn is_out_of_memory(error: &candle_core::Error) -> bool {
+    let text = error.to_string();
+    text.contains("OUT_OF_MEMORY") || text.contains("out of memory")
 }

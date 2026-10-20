@@ -60,10 +60,3 @@ pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;
 pub(crate) use staging::{StagingRings, STAGING_RING_FIRST};
-
-/// With `--prefill-stream`, each layer keeps its last slots in a separate bank of about its
-/// share of the loan: two layers of experts, spread over the estimated 48 layers, plus a
-/// quarter for layers with smaller slots than the largest one. The loan lends whole banks.
-fn loan_bank_slots(num_experts: usize) -> usize {
-    (2 * num_experts * 5).div_ceil(4 * 48)
-}

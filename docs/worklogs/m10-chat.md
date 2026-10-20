@@ -134,11 +134,13 @@ Per-turn TTFT, `short`, all three arms (turn 1 is the same prompt everywhere):
 | 7 | 66,333 ms | 13,284 ms | 572 ms | – / 0.78 / 0.96 |
 | 8 | 76,894 ms | 5,754 ms | 616 ms | – / 0.89 / 0.97 |
 
-## M10.3 baseline — 2026-10-20 (after items 1 and 2, 3 rounds, all classes)
+## M10.3 baseline — 2026-10-20, lend era (superseded)
 
-Same corpus and protocol as M10.2; `engines/naiwa.json` is now the stream arm (no MTP, 1 GB cache),
-strata unchanged. 132 turns, 0 failed turns, 0 OOMs. Arm `naiwa-mtp` (MTP 4, 1.5 GB, no stream) keeps
-its M10.2 numbers: speculation and the stream cannot both fit on this card.
+Same corpus and protocol as M10.2; `engines/naiwa.json` is the stream arm (no MTP, 1 GB cache), strata
+unchanged. 132 turns, 0 failed turns, 0 OOMs in this run — but the stream then declined in 2 of 3 later
+runs because of the lend churn (see "Next" item 2), which is why the memory model was replaced below.
+Arm `naiwa-mtp` (MTP 4, 1.5 GB, no stream) keeps its M10.2 numbers: speculation and the stream cannot
+both fit on this card.
 
 | class | engine | TTFT t1 | TTFT ≥2 p50 | p90 | TPOT p50 | decode tok/s | reuse p50 | e2e/conv |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -154,6 +156,26 @@ its M10.2 numbers: speculation and the stream cannot both fit on this card.
 Against the pre-fix arm B: `short` TTFT ≥2 **11.4 → 3.2 s**, `code` 16.4 → 4.3 s, `doc` 10.8 → 4.4 s,
 `long` 13.4 → 2.8 s; `doc` turn 1 **151.8 → 11.9 s**; e2e per conversation 4–11× → 1.9–2.8×.
 TPOT edged up 57 → 61 ms: 0.5 GB of the expert cache went to the stream buffers.
+
+## M10.3 baseline — 2026-10-20, final (chunk 1024, stream owns its memory)
+
+3 rounds, 132 turns, 0 failed turns, 0 OOMs; `engines/naiwa.json` unchanged except the chunk size.
+
+| class | engine | TTFT t1 | TTFT ≥2 p50 | p90 | TPOT p50 | decode tok/s | reuse p50 | e2e/conv |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `short` | naiwa | 3,023 ms | **2,749 ms** | 5,193 ms | 58 ms | 17.2 | 0.75 | 61.4 s |
+| `short` | strata | 1,050 ms | 636 ms | 824 ms | 39 ms | 25.5 | 0.95 | 29.9 s |
+| `code` | naiwa | 2,993 ms | 4,420 ms | 5,039 ms | 60 ms | 16.7 | 0.47 | 49.2 s |
+| `code` | strata | 984 ms | 1,165 ms | 1,175 ms | 29 ms | 34.7 | 0.67 | 21.9 s |
+| `doc` | naiwa | **8,387 ms** | 4,343 ms | 5,200 ms | 60 ms | 16.6 | 0.95 | 57.2 s |
+| `doc` | strata | 2,405 ms | 638 ms | 733 ms | 38 ms | 26.5 | 0.99 | 24.3 s |
+| `long` | naiwa | 8,378 ms | 3,062 ms | 3,841 ms | 59 ms | 17.0 | 0.82 | 80.3 s |
+| `long` | strata | 2,241 ms | 1,007 ms | 1,297 ms | 38 ms | 26.1 | 0.89 | 39.5 s |
+
+Against the lend-era run: `doc` turn 1 7.6 → 8.4 s (one buffer instead of two), `doc` e2e 56.3 →
+57.2 s, `short` TTFT ≥2 **4.04 → 2.75 s** and e2e 66.9 → 61.4 s (the cache is no longer emptied during
+prefill). TPOT 58–60 ms unchanged. What remains is item 4: 19 ms of GPU chain + 48 × 0.73 ms of 1-row
+CPU expert gemv.
 
 ## M10.3 item 1 — resolved: two configuration causes, no code change
 
@@ -283,12 +305,35 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    0.8 GB cache). Reuse is unchanged (0.92–0.98) and turns ≥2 are 2.5–5.6 s at both 512 and 1024, so
    `engines/naiwa.json` now uses **1024**. Gate met on the reuse side, missed on turn 1 (5 s); the 2048-row
    forward's memory is the blocker, not the upload.
-2. **Fix the lender's accounting — 0.5–1 day, `src/moe/cached_layer.rs`.** `lend` credits
-   `slots_lent × slot_bytes` (1107–1863 MiB) but returns 0–288 MiB; per layer it does free something
-   (layer 0: 770 → 802 MiB of a 43 MiB credit), so most banks still have a strong reference. First move:
-   print `Arc::strong_count` on each bank inside `CachedLayer::lend` and find the extra owner (candidates:
-   a fill-thread clone, `Bank.proj` vs `SlotMemory.tensor`, slots outside `st.usable` sharing the bank).
-   *Gate:* `lend` returns ≥ 90% of what it credits, 2 GB cache + stream does not OOM, TPOT back to ≤ 58 ms.
+2. ✅ **Memory management — done, by removing the lending instead of fixing it.** With the pool trim
+   inside `Layers::lend` the lend *is* measurable at a 1 GB cache (1107 MiB freed of 1107 credited), so
+   the estimate was not the problem; the **cycle** was. Per turn: borrow → chunk → eight decode steps →
+   give back (re-allocate 1.1 GB of cache banks and re-fill them) → next turn borrows again. Measured
+   free VRAM across one conversation: 1887 → 1787 → 1785 → 1649 → **1489 MiB**, and at 1489 it missed
+   the 1492 MiB requirement by 3 MiB, which latched the stream **off for the rest of the run** (the
+   `long` class then prefilled at 13 tok/s: 135 s for a 1.7k turn, in 2 of 3 rounds).
+
+   The redesign deletes the time-sharing: `ExpertMemoryLender`, `Layers::lend`/`give_back`,
+   `CachedLayer::lend`/`slot_bytes`, the bank-tail split (`loan_bank_slots`) and the lend unit test are
+   gone. The stream reserves its own buffers once, from free VRAM, and keeps them:
+
+   | free VRAM at the first long chunk | choice |
+   |---|---|
+   | ≥ 2 × layer + 768 MiB | two buffers (the next layer's upload overlaps this layer's MoE) |
+   | ≥ layer + 192 MiB | one buffer (uploads serial, ~8% slower on turn 1) |
+   | else | off, one warning with the numbers and the flag to lower |
+
+   The 768 MiB margin is the chunk's MoE intermediates at 1024-token chunks; 512 and 192 MiB margins
+   both OOM'd when the *model's* allocation (not the stream's) grew. As a safety net, a CUDA OOM raised
+   inside the stream's own path downgrades a buffer (2 → 1 → off) and leaves that layer on the CPU
+   rather than failing the request — the driver's own answer is the only reliable statement about what
+   fits, so it is used as the signal instead of a size heuristic.
+
+   Result, 3 rounds, 132 turns: **0 OOMs, the same reservation in every round** ("one 650 MiB layer
+   buffer reserved"), prefill 195–416 tok/s, and the cache is never emptied during prefill any more.
+   The cost is explicit: one buffer instead of two on this card, so `doc` turn 1 is 8.4 s instead of the
+   7.6 s the lend version managed when it did not drift.
+
 3. ✅ **Break down the 60 ms step — done. It is the 1-row CPU gemv, on the critical path per layer.**
    Four probes on the same `short`-shaped conversation (`max_tokens 64`, 3 turns):
 
