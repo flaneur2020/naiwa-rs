@@ -159,6 +159,23 @@ from 56.5 s to 2.2 s (cached 640).
 Both are now in the arm-B configuration and recorded per run. The harness keeps `--mtp` in arm A
 because that is the shipped configuration; **arm B is the configuration to ship for chat**.
 
+### M10.3 item 2 — diagnosed: the prefill stream has no working configuration on this box
+
+Serve-mode prefill is **11–13 tok/s** and `--prefill-stream` changes nothing (951 tokens: 82.0 s with the
+flag off, the same with it on, because it never engages). Three blockers, each measured:
+
+1. **Its threshold is above the prefill step.** `--prefill-stream-min-tokens` defaults to **1024** and
+   `--max-prefill-chunk-tokens` to **512**, so no chunk can qualify; and the checkpoint fix above wants the
+   step at 32. Reaching it needs `--prefill-stream-min-tokens 32 --max-num-batched-tokens 32`.
+2. **Then it does not fit.** With those flags it engages (a 951-token prompt is chunked at 32) and OOMs:
+   `prefill stream: borrowed 1863 MiB of expert-cache slots for 1300 MiB of layer buffers` →
+   `could not prefetch layer 15: CUDA_ERROR_OUT_OF_MEMORY` at a 2 GB cache.
+3. **A bigger cache does not help.** 4 GB + 4096 context + 1 prefix snapshot does not start at all on this
+   12 GB card (OOM while allocating the cache banks), so the "give it room" route is closed here.
+
+So item 2 is engine work — the buffer/lending arithmetic, or the CPU prefill rate itself (11–13 tok/s for
+IQ1_M with 8 threads) — not a flag. Recorded as the first task for whoever picks M10.3 up.
+
 ### What is still missing for parity (the real M10.3 agenda)
 
 | term | naiwa B | strata | gap | where it goes |
@@ -213,7 +230,8 @@ smallest of the three gaps for this workload.
   0.95–0.99. Is that only the assistant-turn re-render, or also the block boundary rule? Measured but not
   explained.
 - `--prefill-stream`'s two contradictory defaults: which one moves, and can the stream run inside a 1.5–2 GB
-  cache on a 12 GB card at all?
+  cache on a 12 GB card at all? (Measured: it borrows 1.86 GB for 1.3 GB of buffers and then OOMs at 2 GB; 4 GB
+  does not load. So: not at 4096 context on this card, unless the lending arithmetic changes.)
 - Strata's startup probe picks `pcie_frac 0.37`; naiwa's `--pcie-frac 0.2` is a hand-tuned constant. Whether
   that matters for chat (it did not for np8) is unmeasured here.
 - Host RSS: naiwa 56.0 GiB vs strata 26.5 GiB. Pinned expert stacks + host PLE gather is the likely cause; not
