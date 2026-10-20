@@ -588,6 +588,48 @@ checkpoint. Next step is a counter on those three gates rather than more guesses
 Until then **MTP stays out of `harness/chat/engines/naiwa.json`**: it buys 36–52 ms TPOT with acceptance, but
 reuse 0% costs 20–30 s of TTFT per `doc`/`long` turn, which is the larger term.
 
+### M10.3 item 7 — why MTP zeroes prefix reuse, and what it takes to fix it (2026-10-21)
+
+Traced with `MISTRALRS_PREFIX_DBG=1` (fork). The constant is not a policy on the *restore* side only — it is
+the input that decides whether a checkpoint exists at all:
+
+```
+replay_for = Full
+  -> clamp_speculative_prefix_cache_hit(cached, 32, Full) = 0
+  -> recurrent_checkpoint_boundary(...) = None                       (prompt_chunks.rs)
+  -> build_prompt_chunk_plan(..., replay, ...) gets no boundary, so the prompt stays one chunk
+  -> snapshot_paged_recurrent_prefix is never called  (no `snapshot` line, ever)
+  -> every restore prints `no_replay_boundary` and stages a recurrent reset
+```
+
+So both halves die at the same `None`. Evidence, same conversation:
+
+| arm | snapshots | restore | prefix hit rate |
+|---|---|---|---|
+| no MTP | seq 2 @32, seq 3 @96 | `no_replay_boundary cached=0` (turns 1, 2) | **33.33%** |
+| MTP, `Full` | none | `no_replay_boundary cached=0/32/96` | 0.00% |
+| MTP, `MISTRALRS_MTP_PREFIX_REPLAY=none` | seq 2 @32, seq 3 @96 | `no_replay_boundary cached=0` | **33.33%** |
+
+`MISTRALRS_MTP_PREFIX_REPLAY=full|none|suffix:<n>` is the fork switch (`builtin_mtp_prefix_replay()`,
+default unchanged at `Full`); `qwen4_exp` is the wrapper this model actually uses, not `qwen3_5`.
+
+**Why `Full` is at least partly over-conservative.** The documented hazard is that a block hash covers target
+tokens only, while a block written during a speculative step can hold draft rows in its tail that later become
+interior. But capture is prompt-only (`is_prompt && !scheduler_visible_prompt_step`) and the boundary is
+`align_down(total_len - 1, 32)` — strictly inside the prompt, where every row is a committed target token;
+the drafts live in the drafter's own paged cache (`drafter_prefill_chunk`, placeholder row `0`). So the
+hazard as stated applies to a capture path this build does not use.
+
+**The open gate is determinism, not the mechanism.** Two runs of the same greedy conversation (turn 1,
+identical prompt, `temperature 0`) produced different text — 90 vs 87 tokens — because the CPU expert path
+reduces in rayon order that varies run to run. Byte-equality therefore cannot separate "reuse restored a
+wrong state" from "fp noise", and that is the one check that matters before promoting the switch. Next step
+is an equivalence gate under a deterministic configuration (all experts on the GPU, `--pcie-frac 1.0`, one
+thread), reuse on vs off, over `short` + `doc`.
+
+Not related: TTFT>=2 in these probes is 5.4 s in *both* arms on a ~120-token prompt, so the `short` TTFT
+regression is the chunk/tail path, not the prefix cache.
+
 ## Open questions
 
 - Should `--mtp` be smarter than `SpeculativePrefixReplay::Full`? The fork's reason is sound (block hashes
