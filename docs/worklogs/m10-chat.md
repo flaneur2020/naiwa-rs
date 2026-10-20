@@ -630,6 +630,24 @@ thread), reuse on vs off, over `short` + `doc`.
 Not related: TTFT>=2 in these probes is 5.4 s in *both* arms on a ~120-token prompt, so the `short` TTFT
 regression is the chunk/tail path, not the prefix cache.
 
+**Equivalence so far (positive, but not the full gate).** In the only configuration that is run-to-run
+deterministic — all experts staged, lookahead off (`--pcie-frac 1.0 --no-lookahead`), same prompt sent
+three times — `full` and `none` produced **byte-identical** repeated outputs (req2 = req3 =
+`fdb5e7ff284f` in both arms, req1 = `ad84f13097dc` in both), so lifting the clamp did not change the result.
+It does not yet *exercise* the reuse path in that config: every restore still logged `cached=0`.
+
+**Two determinism sources had to be found before any gate can mean anything:**
+
+| source | effect |
+|---|---|
+| CPU vs GPU expert path | which one runs depends on the lookahead's *timing*, and the two reduce in different orders, so two runs of the same greedy prompt differ (90 vs 102 tokens) even with `NAIWA_CPU_MOE_THREADS=1`; `--no-lookahead` + `--pcie-frac 1.0` removes it |
+| prompt length | the checkpoint boundary is `align_down(total_len - 1, 32)`, so a prompt of **≤ 33 tokens has no boundary at all** — `short` turns can never checkpoint, which is the same defect seen as the `short` TTFT regression |
+
+The last row is the real remaining design question for chat: most `short` prompts are one partial block, so
+there is nothing to checkpoint even with the replay clamp lifted. Options are to capture at the *end* of the
+prompt when it is block-aligned, or to prefill the prompt as `align_down(total, 32)` + remainder so the
+boundary exists (that costs one extra chunk and restores the whole history for reuse).
+
 ## Open questions
 
 - Should `--mtp` be smarter than `SpeculativePrefixReplay::Full`? The fork's reason is sound (block hashes
