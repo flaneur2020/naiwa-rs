@@ -543,6 +543,51 @@ reading was that saturation (1 GB cache ⇒ most experts staged), not the stagin
 | predictive dispatch | the lookahead already runs the router on the CPU for layer L+1 (the activation is published at L's start), so the host can dispatch L+1 during L and verify instead of waiting | wrong predictions need a check + fallback; touches the doorbell contract |
 | device-side dispatch, one graph per token | M6 P2's `dispatch_topk` shape, re-measured at np1; Strata's log says it decides on the device (`token graph hit path ... decided on the device`) | re-does M6 work that was judged neutral at np8 |
 
+### M10.3 item 6 — chat with MTP: needed, and measured (2026-10-21)
+
+The premise is right and it is the only thing that divides the per-layer round trip: one step of R rows pays
+one round trip for R tokens. Measured on the item-3b conversation (`--mtp --mtp-n-predict 4`, current memory
+config, 3 turns):
+
+| arm | TPOT/token | MTP accept | hit / staged / cpu | `dry` ms/layer |
+|---|---|---|---|---|
+| no MTP | 50.4 / 54.7 / 54.8 | — | 51.1 / 13.6 / 35.3% | 1.209 |
+| MTP, `frac 0.2` | 62.1 / 59.8 / 51.9 | len 2.0–2.2 (25–30%) | 78.1 / 7.0 / 14.9% | **2.266** |
+| MTP, `frac 1.0` | 72.0 / 68.8 / 60.8 | len 2.2–2.6 | 80.9 / 17.6 / 1.5% | 2.435 |
+| MTP, `frac 0.2`, `--max-num-batched-tokens 32` | 61.0 / 52.9 / **35.8** | len 2.6–4.2 (41–80%) | — | — |
+
+Three things this says:
+
+1. **Acceptance is the whole number.** Per token the step costs `48 × dry / accept_len`, so the third row's
+   later turn — 80% accept, len 4.2 — is **35.8 ms, under Strata's 38**, while 25% accept is 62 ms. MTP is
+   not "off for chat", it is "only as good as the acceptance rate".
+2. **The row-proportional host term eats the amortisation.** `dry` = 1.0 + ~0.25 ms per batch row per layer
+   (1 row 1.21, 5 rows 2.27) — the same device-side dispatch item as 3b. Until it is flat, 5 rows cost 5×
+   the host time and the round trip is only half amortised.
+3. **Expert hit rate jumps to 78–81%** with 5 rows (consecutive rows share experts), and with MTP
+   `--pcie-frac 1.0` is *worse* (2 668 MiB staged per window vs 848 → PCIe saturation), so the CPU/PCIe
+   choice from 3b stands: CPU first.
+
+The blocker for turning it on is **prefix reuse, which stays 0.00% with MTP while no-MTP reads 33.33%** on
+the same conversation. Three probes narrow it and none of them fix it:
+
+| probe | result |
+|---|---|
+| `SpeculativePrefixReplay` `Full` → `Suffix(64)` → `Suffix(32)` (fork) | reuse still 0.00%; reverted, the constant is not the gate |
+| `--max-num-batched-tokens` 8192 → 32 (capture at every block boundary) | 0.00% |
+| `--prefill-stream` on → off | 0.00% |
+
+Why the constant is not it: for this model `supports_paged_auxiliary_prefix_state()` returns true only when
+a **dflash** drafter is present (`vision_models/qwen3_5/speculative.rs`), so with builtin `--mtp`
+`uses_auxiliary_state` is false and the policy falls through to `speculative_prefix_replay()` — yet reuse is
+0% even when that is `NotRequired`-like (`Suffix(32)` yields a boundary at 32 of 94 cached tokens). So the
+miss is downstream: capture is gated on `is_prompt && !scheduler_visible_prompt_step && is_hybrid() &&
+accepts_paged_recurrent_prefix()`, and the restore needs `peek_longest_paged_recurrent_prefix` to find the
+checkpoint. Next step is a counter on those three gates rather than more guesses.
+
+Until then **MTP stays out of `harness/chat/engines/naiwa.json`**: it buys 36–52 ms TPOT with acceptance, but
+reuse 0% costs 20–30 s of TTFT per `doc`/`long` turn, which is the larger term.
+
 ## Open questions
 
 - Should `--mtp` be smarter than `SpeculativePrefixReplay::Full`? The fork's reason is sound (block hashes
