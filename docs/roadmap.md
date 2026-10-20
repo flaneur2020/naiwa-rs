@@ -51,7 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M10** | chat workload parity with Strata | 🔶 M10.3 item 1 done | reuse fixed by config (`--mtp` disables it; needs a 32-token prefill step): TTFT 40.6→11.4 s, still 14–60× off; prefill 11–13 tok/s is now the largest gap |
+| **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–2 done | reuse fixed by config (no `--mtp`); prefill stream fixed (11–13 → 147–285 tok/s, `doc` turn 1 151.8 → 11.9 s). e2e now 1.9–2.8×; TPOT (1.6–2.2×) is the open term |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -409,9 +409,10 @@ is the older MoE-naming milestone and unrelated). Harness: `harness/chat/`.
 **Baseline (2026-10-19/20, cache-matched, concurrency 1):** turns ≥2 TTFT `short` 40.6 s vs 0.61 s with the
 shipped `--mtp` (0% reuse), 11.4 s vs 0.61 s without MTP (0.73 vs 0.95 reuse); TPOT 59 vs 38 ms; end-to-end per
 conversation 4–11×. Two configuration causes were found and fixed: `--mtp` forces
-`SpeculativePrefixReplay::Full` (no reuse at all), and a checkpoint needs a 32-token prompt step
-(`--max-num-batched-tokens 32`). The remaining gap is prefill rate (11–13 tok/s vs ~750, 60× on turn 1), then
-last-turn reuse, then decode (1.5×). The MoE/decode path is the smallest of the three.
+`SpeculativePrefixReplay::Full` (no reuse at all), and a checkpoint needs a block-aligned prompt step. The
+prefill stream was then fixed too (its expert-cache lend does not return what it credits, and candle's pool
+keeps freed blocks by size): `doc` turn 1 151.8 → 11.9 s, prefill 11–13 → 147–285 tok/s, e2e per conversation
+1.9–2.8×. What is left is TPOT (1.6–2.2×) — the MoE/decode path — and the lender's accounting.
 
 ### Why
 

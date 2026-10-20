@@ -34,7 +34,9 @@ use mistralrs_quant::Comm;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::copy_stream::{CopyDone, CopyStream, CopyStreams, ReadFence, SlotMemory};
+use crate::copy_stream::{
+    trim_device_pool, CopyDone, CopyStream, CopyStreams, ReadFence, SlotMemory,
+};
 
 /// Default for `--prefill-stream-min-tokens`: chunks shorter than this stay on the CPU (Strata
 /// streams every expert from 1024 tokens).
@@ -190,8 +192,11 @@ impl PrefillStream {
                 need >> 20
             );
         }
-        // Freed slots go back to candle's memory pool; let them land before allocating.
-        self.device.synchronize()?;
+        // Freed slots go back to candle's memory pool; hand them to the driver, because the pool
+        // only reuses a block at its own size and the buffers below are nothing like a cache
+        // bank's size. `trim_device_pool` synchronises the context first (the free is on cudarc's
+        // dealloc stream).
+        trim_device_pool(&self.device)?;
         loan.lent = true;
         loan.decode_steps = 0;
         Ok(())
@@ -262,6 +267,21 @@ impl PrefillStream {
             }
             buf.experts = None;
             buf.memory = None;
+            // The old block went back to CUDA's pool, which keeps it for reuse at that exact size.
+            // This model's expert shapes differ per layer group (mixed-quant GGUF), so letting the
+            // pool keep one block per shape defeats the two-buffer design: return the freed block
+            // to the driver before allocating the next shape's. The switch is rare (per shape
+            // change, not per layer) and the synchronize only waits for work already queued.
+            trim_device_pool(&self.device)?;
+            let bytes: usize = stacks.iter().map(|s| s.storage_size_in_bytes()).sum();
+            debug!(
+                "prefill stream: {:.0} MiB buffer for layer {layer} ({:.0} MiB free before the \
+                 reallocation)",
+                (bytes as f64) / (1u64 << 20) as f64,
+                crate::copy_stream::device_free_bytes(&self.device)
+                    .map(|(f, _)| f)
+                    .map_or(-1.0, |f| (f as f64) / (1u64 << 20) as f64)
+            );
             let memory = [
                 self.copy.alloc_like(&stacks[0])?,
                 self.copy.alloc_like(&stacks[1])?,

@@ -64,7 +64,7 @@ impl ExpertMemoryLender for Layers {
     fn lend(&self, bytes: usize) -> candle_core::Result<usize> {
         let layers = self.all();
         let share = bytes.div_ceil(layers.len().max(1));
-        Ok(layers
+        let out = layers
             .iter()
             .map(|l| {
                 let per_slot = l.slot_bytes();
@@ -73,7 +73,8 @@ impl ExpertMemoryLender for Layers {
                 }
                 l.lend(share.div_ceil(per_slot)) * per_slot
             })
-            .sum())
+            .sum();
+        Ok(out)
     }
 
     fn give_back(&self) -> candle_core::Result<()> {

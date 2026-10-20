@@ -26,7 +26,8 @@ milestone. Results belong in the milestone document, not in this directory.
 | **turn 1 is identical on both engines** | it is the only turn whose prompt is comparable byte for byte; the driver records `prompt_tokens` so later turns are compared by reuse ratio and TPOT, not by identical text |
 | **thinking pinned off** | `enable_thinking: false` (naiwa) / `reasoning_effort: "none"` (strata): a reasoning block would change output length, not engine speed |
 | **budget-matched expert cache** | Strata's `auto` fills the card, which is not a comparison. `engines/strata-engine.json` pins 800 blobs ≈ 1.5 GB, matching `--expert-cache-gb 1.5` |
-| **`--max-num-batched-tokens 32`** | mistralrs captures a recurrent prefix checkpoint only when a prompt *step* ends on a 32-token block boundary; at the default 4096 a typical prompt never gets one and every turn re-prefills (141.9 s → 5.6 s for a 1.9k-token turn) |
+| **`--prefill-stream` with `--expert-cache-gb 1`** | the stream needs ~1.3 GB of *free* VRAM (the expert cache's lend does not return what it credits). At 1 GB cache ~2 GB is free and prefill runs at 147–285 tok/s instead of 11–13; at 2 GB it OOMs. Speculation and the stream do not both fit on a 12 GB card |
+| **`--max-num-batched-tokens 512`** | a recurrent prefix checkpoint is captured only when a prompt *step* ends on a 32-token block boundary, and 512 also amortises the stream's per-chunk layer upload. Smaller steps give finer reuse but repeat that upload |
 | **two arms** | `--mtp` sets `SpeculativePrefixReplay::Full`, i.e. no cross-turn reuse at all — a cost, not a bug. `engines/naiwa.json` is the shipped config (MTP on), `engines/naiwa-nospec.json` is the one to ship for chat. Strata cannot run without speculation (native IQ pack needs `--spec T, T >= 2`), so it has no nospec counterpart |
 | **context pinned to 4096 on both** | enough for the corpus (max prompt ≈ 2.5k); see the VRAM note below |
 | **no `src/` change while measuring** | M10.1/M10.2 are measurement-only; the `frac 0` + `--no-lookahead` oracle stays the correctness gate |
@@ -43,8 +44,8 @@ Turn 1 has nothing to reuse, so the headline is turns ≥2.
 corpus.jsonl                one conversation per line; `_constants` on line 1 supplies {{DOC}}
 run.py                      driver: launch, readiness, warmup, replay, timestamps, peaks
 summarize.py                run directory → markdown tables
-engines/naiwa.json          naiwa shipped arm: MTP 4, 1.5 GB cache, frac 0.2, prefix 1
-engines/naiwa-nospec.json   naiwa without speculation, 2 GB cache (naiwa-only arm; the one that reuses)
+engines/naiwa.json          naiwa chat arm: prefill stream on, no MTP, 1 GB cache, prefix 1
+engines/naiwa-mtp.json      naiwa shipped-speculation arm: MTP 4, 1.5 GB cache, stream off
 engines/strata.json         strata shipped arm: --spec 4 (required for a native IQ pack)
 engines/strata-engine.json  the engine config the driver copies per round (port/log/context)
 logs/<engine>-r<N>.log      server stdout for that round
@@ -72,11 +73,10 @@ One conversation per class to start; add lines with new `id`s only where a class
 - `--prefix-cache-n N` on this model is a **recurrent state snapshot** of ~111 MB each, not a few
   blocks of KV: 16 snapshots (the default) need 1.9 GB and do not fit beside a 1.5–2 GB expert
   cache at 4096 context. The harness pins 1.
-- `--prefill-stream` defaults are unreachable in serve mode: `--prefill-stream-min-tokens` defaults
-  to 1024 while `--max-prefill-chunk-tokens` defaults to 512, so no chunk can ever qualify. Forcing
-  it (`--prefill-stream-min-tokens 256 --max-prefill-chunk-tokens 512`) makes it engage and then OOM
-  at a 2 GB cache on this card. Both are open findings, not harness bugs; the shipped arms run
-  without it.
+- `--prefill-stream` defaults are unreachable in serve mode (`--prefill-stream-min-tokens` defaults
+  to 1024 while `--max-prefill-chunk-tokens` defaults to 512), so it never engages; `engines/naiwa.json`
+  pins 64/512. The engine's expert-cache *lend* reports 1107–1863 MiB and frees 0–288 of it, so the
+  buffers come from free VRAM: 1 GB cache works, 2 GB OOMs at 4096 context. Stream + MTP does not fit.
 - Strata additionally runs its own PCIe probe at startup and derives `pcie_frac` from it (0.37
   here), which naiwa cannot match; it is recorded in the round log.
 

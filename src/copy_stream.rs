@@ -264,6 +264,47 @@ mod cuda {
         }
     }
 
+    /// Free and total device bytes, for accounting probes.
+    pub fn device_free_bytes(device: &Device) -> Option<(usize, usize)> {
+        let Device::Cuda(dev) = device else {
+            return None;
+        };
+        let stream = dev.cuda_stream();
+        stream.context().mem_get_info().ok()
+    }
+
+    /// Return this device's unused pool blocks to the driver.
+    ///
+    /// candle allocates through CUDA's stream-ordered pool, which keeps a freed block for reuse
+    /// *at the same size*. A mixed-quant GGUF has one expert shape per layer group, so a caller
+    /// that frees a whole-layer buffer and then allocates the next shape's (the prefill stream)
+    /// accumulates one ~500 MB block per shape and OOMs.
+    ///
+    /// Synchronises the **context** first, not just candle's stream: `cuMemFreeAsync` runs on
+    /// cudarc's dealloc stream, so a free is still pending after `Device::synchronize()` and
+    /// `cuMemPoolTrimTo` would not release it.
+    pub fn trim_device_pool(device: &Device) -> Result<()> {
+        let Device::Cuda(dev) = device else {
+            return Ok(());
+        };
+        let stream = dev.cuda_stream();
+        let context = stream.context();
+        context.synchronize().map_err(Error::wrap)?;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // SAFETY: `context` is live and bound to this device; the pool handle is owned by CUDA.
+        let rc = unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, context.ordinal() as i32) };
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            candle_core::bail!("cuDeviceGetDefaultMemPool failed: {rc:?}");
+        }
+        // SAFETY: `pool` is the live default pool of this context; no block is in use by
+        // construction (the caller synchronised after the free).
+        let rc = unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            candle_core::bail!("cuMemPoolTrimTo failed: {rc:?}");
+        }
+        Ok(())
+    }
+
     /// Completion of an asynchronous upload, recorded on the copy stream.
     pub struct CopyDone {
         event: CudaEvent,
@@ -304,7 +345,7 @@ mod cuda {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use cuda::{device_free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
@@ -356,6 +397,15 @@ mod stub {
         }
     }
 
+    /// Nothing to trim without CUDA.
+    pub fn trim_device_pool(_device: &Device) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn device_free_bytes(_device: &Device) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Never constructed without CUDA.
     pub enum CopyStream {}
 
@@ -402,7 +452,7 @@ mod stub {
 }
 
 #[cfg(not(feature = "cuda"))]
-pub use stub::{CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use stub::{device_free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(test)]
 mod tests {
@@ -410,6 +460,51 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::wait_for_readers;
+
+    /// Does a candle free land back in the driver after `trim_device_pool`, and is the pool
+    /// retention real in the first place?
+    #[test]
+    fn pool_trim_returns_freed_tensors() {
+        use candle_core::quantized::QTensor;
+        use candle_core::quantized::cuda::QCudaStorage;
+        use candle_core::quantized::QStorage;
+        let Ok(dev) = candle_core::Device::new_cuda(0) else {
+            return;
+        };
+        let candle_core::Device::Cuda(cdev) = &dev else {
+            return;
+        };
+        let free = |d: &candle_core::Device| -> usize {
+            let c = d.as_cuda_device().unwrap().cuda_stream().context().clone();
+            c.mem_get_info().unwrap().0
+        };
+        let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+        let bytes = 400 << 20; // ~400 MiB of f16
+        let before = free(&dev);
+        let t = {
+            let s =
+                QCudaStorage::zeros(cdev, bytes / 2, candle_core::quantized::GgmlDType::F16).unwrap();
+            QTensor::new(QStorage::Cuda(s), (bytes / 2,)).unwrap()
+        };
+        let held = free(&dev);
+        drop(t);
+        super::trim_device_pool(&dev).unwrap();
+        let after = free(&dev);
+        println!(
+            "before {:.0} MiB, with tensor {:.0} MiB, after drop+trim {:.0} MiB",
+            mib(before),
+            mib(held),
+            mib(after)
+        );
+        // Compare against the *held* measurement, not `before`: other tests in this binary
+        // allocate on the same card and run in parallel.
+        assert!(
+            after.saturating_sub(held) >= bytes * 3 / 4,
+            "trim returned {:.0} MiB of the {:.0} MiB tensor",
+            mib(after.saturating_sub(held)),
+            mib(bytes)
+        );
+    }
 
     #[test]
     fn wait_for_readers_returns_once_clones_are_dropped() {

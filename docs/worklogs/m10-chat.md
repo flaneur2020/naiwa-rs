@@ -1,6 +1,6 @@
 # M10 — multi-round chat: naiwa-rs vs Strata
 
-Status: **M10.1 done, M10.2 measured, M10.3 item 1 resolved (2026-10-19/20)**. Alignment not started.
+Status: **M10.1–2 done, M10.3 items 1 and 2 done (2026-10-19/20)**. Decode align not started.
 Parent: [m9c.md](m9c.md). This is the roadmap's **M10** (`docs/roadmap.md` §M10).
 (`worklogs/m10.md` is the older *MoE naming and ownership* milestone from the pre-rescope numbering; it is
 unrelated and stays.)
@@ -133,6 +133,27 @@ Per-turn TTFT, `short`, all three arms (turn 1 is the same prompt everywhere):
 | 7 | 66,333 ms | 13,284 ms | 572 ms | – / 0.78 / 0.96 |
 | 8 | 76,894 ms | 5,754 ms | 616 ms | – / 0.89 / 0.97 |
 
+## M10.3 item 2 baseline — 2026-10-20 (post-fix, 3 rounds, all classes)
+
+Same corpus and protocol as M10.2; `engines/naiwa.json` is now the stream arm (no MTP, 1 GB cache),
+strata unchanged. 132 turns, 0 failed turns, 0 OOMs. Arm `naiwa-mtp` (MTP 4, 1.5 GB, no stream) keeps
+its M10.2 numbers: speculation and the stream cannot both fit on this card.
+
+| class | engine | TTFT t1 | TTFT ≥2 p50 | p90 | TPOT p50 | decode tok/s | reuse p50 | e2e/conv |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `short` | naiwa | 3,026 ms | **3,231 ms** | 5,079 ms | 61 ms | 16.5 | 0.78 | 67.0 s |
+| `short` | strata | 1,043 ms | 635 ms | 817 ms | 39 ms | 25.6 | 0.95 | 28.8 s |
+| `code` | naiwa | 2,969 ms | 4,287 ms | 4,700 ms | 61 ms | 16.4 | 0.47 | 43.8 s |
+| `code` | strata | 975 ms | 1,160 ms | 1,170 ms | 28 ms | 35.2 | 0.67 | 21.6 s |
+| `doc` | naiwa | **11,881 ms** | **4,403 ms** | 5,037 ms | 63 ms | 16.0 | 0.94 | 64.1 s |
+| `doc` | strata | 2,400 ms | 628 ms | 731 ms | 38 ms | 26.1 | 0.99 | 24.6 s |
+| `long` | naiwa | 11,844 ms | 2,832 ms | 4,076 ms | 60 ms | 16.6 | 0.83 | 83.6 s |
+| `long` | strata | 2,244 ms | 1,003 ms | 1,299 ms | 38 ms | 26.2 | 0.89 | 39.7 s |
+
+Against the pre-fix arm B: `short` TTFT ≥2 **11.4 → 3.2 s**, `code` 16.4 → 4.3 s, `doc` 10.8 → 4.4 s,
+`long` 13.4 → 2.8 s; `doc` turn 1 **151.8 → 11.9 s**; e2e per conversation 4–11× → 1.9–2.8×.
+TPOT edged up 57 → 61 ms: 0.5 GB of the expert cache went to the stream buffers.
+
 ## M10.3 item 1 — resolved: two configuration causes, no code change
 
 **1. `--mtp` disables cross-turn prefix reuse by policy.** `BUILTIN_MTP_PREFIX_REPLAY =
@@ -159,36 +180,45 @@ from 56.5 s to 2.2 s (cached 640).
 Both are now in the arm-B configuration and recorded per run. The harness keeps `--mtp` in arm A
 because that is the shipped configuration; **arm B is the configuration to ship for chat**.
 
-### M10.3 item 2 — diagnosed: the prefill stream has no working configuration on this box
+### M10.3 item 2 — done: prefill runs on the GPU
 
-Serve-mode prefill is **11–13 tok/s** and `--prefill-stream` changes nothing (951 tokens: 82.0 s with the
-flag off, the same with it on, because it never engages). Three blockers, each measured:
+Serve-mode prefill was **11–13 tok/s** on the CPU experts regardless of `--prefill-stream`; it is now
+**147–285 tok/s** and `doc` turn 1 goes **151.8 s → 11.9 s**. Two independent defects, both measured:
 
-1. **Its threshold is above the prefill step.** `--prefill-stream-min-tokens` defaults to **1024** and
-   `--max-prefill-chunk-tokens` to **512**, so no chunk can qualify; and the checkpoint fix above wants the
-   step at 32. Reaching it needs `--prefill-stream-min-tokens 32 --max-num-batched-tokens 32`.
-2. **Then it does not fit.** With those flags it engages (a 951-token prompt is chunked at 32) and OOMs:
-   `prefill stream: borrowed 1863 MiB of expert-cache slots for 1300 MiB of layer buffers` →
-   `could not prefetch layer 15: CUDA_ERROR_OUT_OF_MEMORY` at a 2 GB cache.
-3. **A bigger cache does not help.** 4 GB + 4096 context + 1 prefix snapshot does not start at all on this
-   12 GB card (OOM while allocating the cache banks), so the "give it room" route is closed here.
+1. **The lender does not return what it reports.** `PrefillStream::borrow` asks the expert cache to
+   lend `2 × largest layer` (1300 MiB) and the lender credits 1107–1863 MiB, but device free memory
+   does not move: at a 2 GB cache, `free before lend 770 MiB → free after lend 770 MiB → 1058 MiB
+   after a context synchronise + `cuMemPoolTrimTo``, i.e. **288 MiB of 1863**; at a 1 GB cache it
+   credits 1107 and returns **0** (2018 → 2018 MiB). So the stream's 1.3 GB of layer buffers has to
+   come from VRAM that is free *before* it starts, not from the cache.
+2. **candle's pool keeps freed blocks by size.** A dropped tensor goes back to CUDA's stream-ordered
+   pool, which reuses it only at the same size; a mixed-quant GGUF changes expert shape per layer
+   group, so reallocating a whole-layer buffer per shape accumulated one ~500 MB block per shape and
+   OOM'd. `copy_stream::trim_device_pool` (context synchronise, then `cuMemPoolTrimTo(0)`) is now
+   called at both hand-overs — the lend and each mixed-quant reallocation. The new unit test
+   `pool_trim_returns_freed_tensors` pins that behaviour: a 400 MiB tensor's memory is gone from
+   `mem_get_info` until the trim runs.
 
-So item 2 is engine work — the buffer/lending arithmetic, or the CPU prefill rate itself (11–13 tok/s for
-IQ1_M with 8 threads) — not a flag. Recorded as the first task for whoever picks M10.3 up.
+The working configuration on this 12 GB card, now in `engines/naiwa.json`:
 
-### What is still missing for parity (the real M10.3 agenda)
+```
+--expert-cache-gb 1                 # leaves ~2 GB free; 2 GB leaves 770 MiB and OOMs
+--prefill-stream --prefill-stream-min-tokens 64
+--max-num-batched-tokens 512 --max-prefill-chunk-tokens 512
+```
 
-| term | naiwa B | strata | gap | where it goes |
-|---|---|---|---|---|
-| reuse at turn ≥2 | 0.73–0.94 | 0.95–0.99 | 5–23 points | block-aligned *last user turn*: one block of slack per turn, plus the assistant turn's re-render |
-| prefill rate | 11–13 tok/s | ~750 tok/s (1.7k in 2.3 s) | **60×** | turn 1 of every conversation: 142–152 s vs 2.2–2.3 s. `--prefill-stream` never engages at its defaults (min 1024 > chunk 512) and OOMs when forced at a 1.5 GB cache |
-| TPOT | 57–60 ms | 27–39 ms | 1.5–2.2× | decode/MoE, the only term the np8 work optimized |
-| e2e/conv | 121–238 s | 21–35 s | 4–11× | dominated by turn 1's prefill |
+Measured prefill with it (single request, `max_tokens 1`): 108 tokens 2.8 s (39 tok/s), 945 tokens
+6.4 s (**147 tok/s**), 1875 tokens 6.6 s (**285 tok/s**). The upload is per *chunk* — every chunk
+streams all 48 layers, ~31 GB — so small chunks pay it repeatedly; 64 tokens is the smallest chunk
+where the stream still wins, and 512 both amortises the upload and keeps every checkpoint boundary
+block-aligned (item 1).
 
-So parity needs, in this order: **a prefill path that runs at GPU speed** (60× on turn 1, and it
-carries every conversation), **reuse of the last turn** (23 points of reuse ≈ 4× TTFT at turn 8),
-and only then **decode** (1.5×). The MoE/decode path that M6–M9 spent five milestones on is the
-smallest of the three gaps for this workload.
+Two limits, measured rather than assumed:
+- **Stream and MTP are mutually exclusive on 12 GB.** At a 1 GB cache, `--mtp` + the stream loads and
+  then OOMs on the first request; at 1.5 GB the stream cannot fit at all. So the paired arm keeps
+  MTP *without* the stream, and the chat arm keeps the stream *without* MTP.
+- **0.5 GB less cache costs decode**: TPOT 57–60 → 60–63 ms (fewer resident experts). That is the
+  price of the 1.3 GB stream buffers on this card.
 
 ## Judging
 
@@ -196,8 +226,8 @@ smallest of the three gaps for this workload.
    written; turn-1 `prompt_tokens` equal across engines (40 = 40, 1723 = 1723); ≥3 rounds for the head-line
    classes; medians; every failure recorded (none).
 2. **M10.2 — honest baseline.** ✅ Table above, no tuning, `spec` arm paired, engine order alternated.
-3. **M10.3 — align** (open): item 1 (prefix reuse) resolved by configuration; items 2–3 (prefill
-   rate, decode) open — see the agenda above.
+3. **M10.3 — align** (open): items 1 (prefix reuse) and 2 (prefill) done; decode (TPOT 1.6–2.2×)
+   is now the open term, and the lender's accounting is the open defect — see the agenda above.
 4. **M10.4 — long context.** `doc` and `long` are measured (1,723–2,491 prompt tokens): strata reuses
    0.99 and holds 620–777 ms TTFT; naiwa reuses 0.92–0.94 and holds 10.8–13.4 s — the residual is the
    prefill rate, not the cache. Deeper contexts stay out of scope until the context/KV budget question in
