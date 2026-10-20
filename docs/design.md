@@ -156,6 +156,13 @@ activations as a 256-token one, and only attention still grows with the chunk (2
 is what lets the plan below buy a large chunk instead of a second buffer — the same "ubatch" trade
 Strata makes.
 
+**A sequence slot costs ~112 MiB of recurrent state** on this hybrid model, and the engine defaults to
+`--max-seqs 32`: ~3.5 GiB of the card for slots a one-request-at-a-time server never uses. A chat server
+sets `--max-seqs 4`, which funds a 3 GB expert cache instead of 1 GB (TPOT 58 → 55 ms). The weights
+themselves are 4.3 GiB on the device (2.8 GiB of it quantized verbatim) — measured with
+`MISTRALRS_VRAM_DUMP=1` (`mistralrs_quant::dump_weights`), which is the way to attribute the footprint
+instead of subtracting from `nvidia-smi`.
+
 **The prefill stream's memory is one decision, taken twice.** `prefill_stream::plan` picks the prompt
 step and the buffer count together from the free VRAM it measures: the largest chunk on the 256-token
 grid whose `stride × layer + activations(chunk) + headroom` fits, where the activation term is

@@ -139,6 +139,12 @@ impl GpuCacheMoeProvider {
                 MAX_DECODE_ROWS * first.hidden(),
             )?;
         }
+        // `MISTRALRS_VRAM_DUMP=1`: what the loader actually put in device memory, by kind and by
+        // module. Run it here, where the model is loaded and nothing else has been allocated yet.
+        #[cfg(feature = "cuda")]
+        if let Some(first) = layers.first() {
+            mistralrs_quant::dump_weights(first.slot_device());
+        }
         // The prefill path's memory plan: one decision, now that the cache, the KV and the mapped
         // buffers exist, from the free VRAM it measures. It picks the prompt step and the stream's
         // buffer count together and publishes the step to the scheduler.

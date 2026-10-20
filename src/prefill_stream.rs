@@ -109,10 +109,13 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(u
     // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
     // run's prefill). An eighth is enough to land on the 1024 the measurements proved.
     // The slack follows the free memory as well: the estimate's error is a share of what is
-    // allocated, and on a big card a fixed 192 MiB would be noise.
+    // allocated, and on a big card a fixed floor would be noise. The floor is 512 MiB because a
+    // prompt step allocates more than the two terms above — the paged-attention scratch and the
+    // step's own buffers grow with `--max-num-batched-tokens`, and 192–227 MiB of slack OOM'd a
+    // 1723-token chunk twice with two buffers resident.
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
-        let head = HEADROOM.max(free / 10);
+        let head = (512 << 20).max(free / 8);
         free >= stride * layer_bytes + act + act / 8 + head
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
@@ -574,7 +577,7 @@ mod tests {
         let layer = 650 << 20;
         let gb = |g: usize| g << 30;
         let act = |c: usize| activation_bytes(c);
-        let head = |free: usize| (192 << 20).max(free / 10);
+        let head = |free: usize| (512 << 20).max(free / 8);
         let fits = |free: usize, chunk: usize, stride: usize| {
             let a = act(chunk);
             free >= stride * layer + a + a / 8 + head(free)
@@ -590,8 +593,10 @@ mod tests {
         // A big card: ceiling, both buffers.
         assert_eq!(plan(gb(12), layer, 8192).unwrap(), (2, 8192));
 
-        // This 12 GB card: warmup has ~2050 MiB and the first chunk ~1887, one buffer.
-        assert_eq!(plan(2050 << 20, layer, 8192).unwrap(), (1, 8192));
+        // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
+        assert_eq!(plan(2049 << 20, layer, 8192).unwrap(), (1, 8192));
+        // 2400 MiB is the edge where the second buffer just fits (2399 needed).
+        assert_eq!(plan(2400 << 20, layer, 8192).unwrap(), (2, 8192));
 
         // The operator's ceiling is a ceiling, not a target.
         assert_eq!(plan(gb(12), layer, 512).unwrap().1, 512);
@@ -605,11 +610,14 @@ mod tests {
             }
             free
         };
+        // With the 512 MiB floor, a 12 GB card's ~2.3 GiB buys one buffer at the ceiling and
+        // 8 GiB buys two; the floor is what keeps a prompt step's own scratch out of the way.
+        assert_eq!(plan(gb(8), layer, 8192).unwrap(), (2, 8192));
         let just = need2(gb(1));
         assert_eq!(plan(just, layer, 8192).unwrap(), (2, 8192));
         // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
-        assert_eq!(plan(just * 7 / 10, layer, 8192).unwrap().0, 1);
-        assert_eq!(plan(just * 7 / 10, layer, 8192).unwrap().1, 8192);
+        assert_eq!(plan(just * 8 / 10, layer, 8192).unwrap().0, 1);
+        assert_eq!(plan(just * 8 / 10, layer, 8192).unwrap().1, 8192);
 
         // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
         assert_eq!(plan(layer, layer, 1024), None);

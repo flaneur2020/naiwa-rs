@@ -435,35 +435,41 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    1024 on this card, and on a card with ~3 GB free it would pick 2560, on 12 GB free 8192 with two
    buffers. Gate met apart from the one-machine part of it (this card cannot demonstrate the larger
    chunks).
-6. ✅ **Memory → speed without carving: row-batched prefill, so the chunk stops costing memory.**
-   The premise first, measured: a `trim_device_pool` at warmup frees **0 MiB** ("device pool trimmed,
-   2050 → 2050 MiB free"), so there is no reclaimable pool memory and the 650 MiB buffer really is extra
-   VRAM. Carving it *inside* the cache (Strata's `relayout`) is then unreachable in this architecture:
-   our buffer is one whole layer (`[E=128, N, K]` × 3 projections, 650 MiB) because `MoEExperts::
-   from_qtensors` multiplies the stacked tensors, while a cache bank holds 11–22 shape-specific
-   experts. Strata's buffers are slot-shaped only because its prefill path is *blob-granular* (a ring of
-   whole expert blobs reused across layers, with an MMQ kernel that multiplies as they stream in);
-   sharing would mean rewriting our prefill MoE as a blob-ring kernel — a compute project, not a
-   memory change.
+6. ✅ **The resident footprint, itemized — and the pool that was eating 3.5 GiB.** Two findings, both
+   from a new diagnostic: `MISTRALRS_VRAM_DUMP=1` makes the fork's GGUF weight source record every
+   tensor it materializes (source type, output type, bytes, device) and `dump_weights(device)` prints
+   the totals at warmup.
 
-   What the memory bought instead: **the prompt step now runs its layers in row batches of 256**
-   (`SUB_ROWS`), so the MoE activation footprint stops scaling with the chunk (840 MiB at 1024 tokens →
-   330 MiB at any chunk), which is the "ubatch" effect Strata's docs describe. The plan then picks a
-   much bigger chunk — the ceiling, 8192 — and only *attention* still grows with it, which the plan
-   prices at 24 KiB a token. That term exists because the first attempt at 8192 with two buffers and
-   65 MiB to spare OOM'd **outside** the stream (in attention), where the downgrade cannot see it:
+   **What the weights cost** (cache 1 GB, `--max-seqs 32`): **1,115 tensors, 4,300 MiB on the GPU** —
+   2,838 MiB quantized *verbatim* (attention q/k/v 20–25 MiB each, `embed_tokens` 322, `lm_head` 497),
+   1,337 MiB dense BF16 (the tensors the loader builds by slice/concat/transpose, plus norms), 120 MiB
+   BF16→BF16, ~5 MiB transformed. 144 tensors / **23,981 MiB stayed on the host** (the routed expert
+   stacks). So the loader does *not* expand the quantized weights, which is what the "our resident part
+   is 8.7 GB, strata's is 1.4" note above assumed — that note was wrong, see below.
 
-   | | before | now |
+   **Where the rest went: the recurrent state pool.** This hybrid model keeps a GDN state per sequence
+   slot, **~112 MiB each**, and `--max-seqs` defaults to 32: `free after startup` is 2,273 MiB at 32,
+   **4,963 MiB at 8** — 112 MiB a slot, ~3.5 GiB for slots a one-request-at-a-time server never uses.
+   Strata needs none of this (one sequence behind a FIFO).
+
+   So the harness config is now `--max-seqs 4 --expert-cache-gb 3` (from 1 GB), 3 rounds / 132 turns,
+   0 OOMs:
+
+   | | 1 GB cache, 32 seqs | 3 GB cache, 4 seqs |
    |---|---|---|
-   | plan | chunk 1024, 1 buffer (1682 of 1858 MiB) | **chunk 8192, 1 buffer** (1364 of 1856 MiB) |
-   | prefill 915 / 1815 / 3615 tokens | 190 / 357 / 419 tok/s | **188 / 341 / 576 tok/s** |
-   | `doc` turn 1, `long` turn 1 | 8.5 s, 8.5 s | **6.1 s, 6.0 s** |
-   | e2e/conv `short` / `long` / `doc` | 61.2 / 81.6 / 51.3 s | **56.1 / 54.9 / 57.3 s** |
-   | TPOT | 58–60 ms | 58–60 ms |
+   | TPOT | 58–60 ms | **55–56 ms** |
+   | `doc` e2e / turn 1 | 57.3 s / 6.1 s | **52.1 s** / 6.1 s |
+   | `long` e2e | 54.9 s | 53.5 s |
+   | `code` e2e | 53.1 s | 50.4 s |
+   | `short` TTFT ≥2 / e2e | 3.39 s / 56.1 s | **4.57 s / 63.6 s** |
 
-   3 rounds / 132 turns, **0 OOMs**, and the oracle stays byte-identical in **both** variants — the row
-   batching does not change the arithmetic. `doc`'s e2e moved the other way because its turns are
-   decode-dominated (96 tokens × 60 ms) and the turn-1 gain is 2.4 s against that variance.
+   `short` got worse and the reason is not yet known — the only difference on its path is
+   `--max-num-batched-tokens 8192` (a bigger prompt-admission window) and 4 sequence slots; it is the
+   open question below. TPOT, the term this item was about, improved 7%.
+
+   The plan also needed a floor: with a 8192-token chunk and two buffers resident, 192–227 MiB of
+   slack OOM'd a 1723-token chunk **twice**, in the model's own scratch where the stream's downgrade
+   cannot see it, so the plan now keeps `max(512 MiB, free / 8)` headroom.
 
 7. **MTP: keep it out of chat, or make it reuse-aware — 0–2 days, fork optional.** Today `--mtp` costs all
    prefix reuse for +45% TPOT on `code` only. Either ship "MTP off for chat" (already the default arm) or
