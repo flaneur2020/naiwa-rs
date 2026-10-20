@@ -150,6 +150,12 @@ asserted frozen across decode. Static addresses keep the steady state allocation
 Banks are per-layer because the model is mixed-quant (7 expert shapes); shared structures carry
 counts/offsets/pointers only.
 
+**A prompt step runs in row batches of 256** (`SUB_ROWS` in `prefill_stream.rs`), so the MoE
+activation footprint is set by the batch and not by the chunk: an 8192-token chunk costs the same
+activations as a 256-token one, and only attention still grows with the chunk (24 KiB a token). That
+is what lets the plan below buy a large chunk instead of a second buffer — the same "ubatch" trade
+Strata makes.
+
 **The prefill stream's memory is one decision, taken twice.** `prefill_stream::plan` picks the prompt
 step and the buffer count together from the free VRAM it measures: the largest chunk on the 256-token
 grid whose `stride × layer + activations(chunk) + headroom` fits, where the activation term is

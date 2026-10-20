@@ -75,12 +75,23 @@ pub(crate) struct Plan {
     pub chunk: usize,
 }
 
-/// Device bytes a prompt step of `chunk` tokens needs for its MoE activations, beyond the stream's
-/// own buffers. A chunk's intermediates scale with its token count, and this is Strata's measured
-/// form (`160 MiB + 680 MiB per 1024 tokens`, `src/program/generate.cpp:3216`); our own numbers
-/// agree — a 1024-token chunk blew a 512 MiB margin and fits in 768 MiB.
+/// Rows one MoE call sees. A prompt step runs its layers in row batches of this size, so the
+/// activation footprint is bounded by the batch and not by `--max-prefill-chunk-tokens` — the
+/// "ubatch" effect: a bigger chunk then costs PCIe uploads only, never activation memory.
+pub(crate) const SUB_ROWS: usize = 256;
+
+/// Device bytes a prompt step of `chunk` tokens needs **on top of** the stream's own buffers.
+///
+/// Two terms. The MoE's is Strata's measured form (`160 MiB + 680 MiB per 1024 tokens`,
+/// `src/program/generate.cpp:3216`, and our numbers agree — a 1024-token call blew a 512 MiB margin
+/// and fits in 768 MiB) applied to the *batch* one call sees, which the row batching caps at
+/// `SUB_ROWS`, so it does not grow with the chunk. Everything else in a prompt step — attention's
+/// QKV/output, the gathered PLE rows, the copy-stream staging — does grow with the chunk, and this
+/// second term is its measured envelope: 24 KiB a token is ~3 × hidden × 2 bytes at this model.
 pub(crate) fn activation_bytes(chunk: usize) -> usize {
-    (160 << 20) + (680 << 20) * chunk / 1024
+    let moe = (160 << 20) + (680 << 20) * chunk.min(SUB_ROWS) / 1024;
+    let rest = chunk * (24 << 10);
+    moe + rest
 }
 
 /// The whole prefill memory decision, in one pure function: the largest prompt step that fits, in
@@ -97,9 +108,12 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(u
     // The activation term is an estimate, so it carries slack: on this card the formula alone would
     // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
     // run's prefill). An eighth is enough to land on the 1024 the measurements proved.
+    // The slack follows the free memory as well: the estimate's error is a share of what is
+    // allocated, and on a big card a fixed 192 MiB would be noise.
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
-        free >= stride * layer_bytes + act + act / 8 + HEADROOM
+        let head = HEADROOM.max(free / 10);
+        free >= stride * layer_bytes + act + act / 8 + head
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
     let (mut lo, mut hi, mut best) = (1usize, (ceiling.min(8192) / GRID).max(1), 0usize);
@@ -551,7 +565,7 @@ mod tests {
         Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
     }
 
-    use super::{activation_bytes, plan};
+    use super::{activation_bytes, plan, SUB_ROWS};
 
     /// The plan is the only memory judgement the prefill path makes, so pin it: the chunk is as
     /// large as the free bytes allow, and the second buffer is taken only at the same chunk.
@@ -560,30 +574,42 @@ mod tests {
         let layer = 650 << 20;
         let gb = |g: usize| g << 30;
         let act = |c: usize| activation_bytes(c);
+        let head = |free: usize| (192 << 20).max(free / 10);
+        let fits = |free: usize, chunk: usize, stride: usize| {
+            let a = act(chunk);
+            free >= stride * layer + a + a / 8 + head(free)
+        };
 
-        // Plenty: the biggest chunk and both buffers.
-        let (stride, chunk) = plan(gb(12), layer, 8192).unwrap();
-        assert_eq!(chunk, 8192);
-        assert_eq!(stride, 2);
+        // The MoE part stops at one row batch; the rest of the step still grows with the chunk.
+        assert_eq!(
+            act(8192) - act(SUB_ROWS),
+            (8192 - SUB_ROWS) * (24 << 10),
+            "only the attention term may scale"
+        );
 
-        // 3 GB: one buffer. The activation term dominates — 4096 tokens alone want 2880 MiB.
-        let (stride, chunk) = plan(gb(3), layer, 8192).unwrap();
-        assert_eq!(stride, 1);
-        assert_eq!(chunk, 2560);
+        // A big card: ceiling, both buffers.
+        assert_eq!(plan(gb(12), layer, 8192).unwrap(), (2, 8192));
 
-        // 1855 MiB is this 12 GB card's free VRAM at a 1 GB cache: one buffer, 1024 tokens.
-        let (stride, chunk) = plan(1855 << 20, layer, 8192).unwrap();
-        assert_eq!((stride, chunk), (1, 1024));
+        // This 12 GB card: warmup has ~2050 MiB and the first chunk ~1887, one buffer.
+        assert_eq!(plan(2050 << 20, layer, 8192).unwrap(), (1, 8192));
 
         // The operator's ceiling is a ceiling, not a target.
-        let (_, chunk) = plan(gb(12), layer, 512).unwrap();
-        assert_eq!(chunk, 512);
+        assert_eq!(plan(gb(12), layer, 512).unwrap().1, 512);
 
-        // Two buffers at the same chunk when the bytes are there and the chunk is the one that fits.
-        let slack = |c: usize| act(c) / 8;
-        let need2 = 2 * layer + act(2048) + slack(2048) + (192 << 20);
-        assert_eq!(plan(need2, layer, 2048).unwrap(), (2, 2048));
-        assert_eq!(plan(need2 - 1, layer, 2048).unwrap(), (1, 2048));
+        // The second buffer only when the same chunk affords it.
+        let need2 = |free_guess: usize| {
+            // Solve for the free memory where two buffers at 8192 just fit.
+            let mut free = free_guess;
+            while !fits(free, 8192, 2) {
+                free += 8 << 20;
+            }
+            free
+        };
+        let just = need2(gb(1));
+        assert_eq!(plan(just, layer, 8192).unwrap(), (2, 8192));
+        // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
+        assert_eq!(plan(just * 7 / 10, layer, 8192).unwrap().0, 1);
+        assert_eq!(plan(just * 7 / 10, layer, 8192).unwrap().1, 8192);
 
         // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
         assert_eq!(plan(layer, layer, 1024), None);
@@ -728,4 +754,34 @@ fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
 fn is_out_of_memory(error: &candle_core::Error) -> bool {
     let text = error.to_string();
     text.contains("OUT_OF_MEMORY") || text.contains("out of memory")
+}
+
+/// One layer's MoE over a prompt step, in row batches of `SUB_ROWS`.
+///
+/// The routing is row-independent, so slicing the rows changes nothing but the GEMM shapes; it is
+/// what keeps a 8192-token chunk's activations inside the same memory a 256-token one needs. Only
+/// one sequence is sub-batched: with several sequences in the step the rows of one batch would have
+/// to be interleaved, and a prompt step in this server is one sequence.
+fn forward_batched(
+    experts: &MoEExperts,
+    xs: &Tensor,
+    topk_weights: &Tensor,
+    topk_ids: &Tensor,
+    batch: usize,
+    seq: usize,
+) -> candle_core::Result<Tensor> {
+    if batch != 1 || seq <= SUB_ROWS {
+        return experts.forward(xs, topk_weights.clone(), topk_ids);
+    }
+    let mut parts = Vec::with_capacity(seq.div_ceil(SUB_ROWS));
+    let mut start = 0;
+    while start < seq {
+        let len = SUB_ROWS.min(seq - start);
+        let x = xs.narrow(1, start, len)?;
+        let w = topk_weights.narrow(0, start, len)?;
+        let i = topk_ids.narrow(0, start, len)?;
+        parts.push(experts.forward(&x, w, &i)?);
+        start += len;
+    }
+    Tensor::cat(&parts, 1)
 }

@@ -435,16 +435,36 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    1024 on this card, and on a card with ~3 GB free it would pick 2560, on 12 GB free 8192 with two
    buffers. Gate met apart from the one-machine part of it (this card cannot demonstrate the larger
    chunks).
-6. **Carve the buffers inside the cache — 1–2 days, own repo, after the CPU gemv work (open).** A layer buffer
-   is exactly the `[E, N, K]` stack a cache bank holds, so the stream's buffer could *be* a bank:
-   allocated as a bank when the stream is first needed, used as the `MoEExperts` stack (what `load`
-   already does), and handed back to the cache as slots between prompts. Then the 650 MiB stops being
-   extra VRAM — on this card the cache goes from 1 GB to ~1.65 GB at the same footprint, and Strata
-   measured that owning vs borrowing costs nothing on decode (58.4 vs 58.5 tok/s). Risks: candle
-   cannot mint a `QCudaStorage` over a foreign pointer, so the bank must be allocated *as* a bank from
-   the start; the mixed-quant shape changes must not re-enter the CUDA-pool trap (`trim_device_pool`).
-   *Gate:* same prefill tok/s as today, +650 MiB of cache slots measured, TPOT ≤ 57 ms, oracle
-   identical with `--prefill-stream`.
+6. ✅ **Memory → speed without carving: row-batched prefill, so the chunk stops costing memory.**
+   The premise first, measured: a `trim_device_pool` at warmup frees **0 MiB** ("device pool trimmed,
+   2050 → 2050 MiB free"), so there is no reclaimable pool memory and the 650 MiB buffer really is extra
+   VRAM. Carving it *inside* the cache (Strata's `relayout`) is then unreachable in this architecture:
+   our buffer is one whole layer (`[E=128, N, K]` × 3 projections, 650 MiB) because `MoEExperts::
+   from_qtensors` multiplies the stacked tensors, while a cache bank holds 11–22 shape-specific
+   experts. Strata's buffers are slot-shaped only because its prefill path is *blob-granular* (a ring of
+   whole expert blobs reused across layers, with an MMQ kernel that multiplies as they stream in);
+   sharing would mean rewriting our prefill MoE as a blob-ring kernel — a compute project, not a
+   memory change.
+
+   What the memory bought instead: **the prompt step now runs its layers in row batches of 256**
+   (`SUB_ROWS`), so the MoE activation footprint stops scaling with the chunk (840 MiB at 1024 tokens →
+   330 MiB at any chunk), which is the "ubatch" effect Strata's docs describe. The plan then picks a
+   much bigger chunk — the ceiling, 8192 — and only *attention* still grows with it, which the plan
+   prices at 24 KiB a token. That term exists because the first attempt at 8192 with two buffers and
+   65 MiB to spare OOM'd **outside** the stream (in attention), where the downgrade cannot see it:
+
+   | | before | now |
+   |---|---|---|
+   | plan | chunk 1024, 1 buffer (1682 of 1858 MiB) | **chunk 8192, 1 buffer** (1364 of 1856 MiB) |
+   | prefill 915 / 1815 / 3615 tokens | 190 / 357 / 419 tok/s | **188 / 341 / 576 tok/s** |
+   | `doc` turn 1, `long` turn 1 | 8.5 s, 8.5 s | **6.1 s, 6.0 s** |
+   | e2e/conv `short` / `long` / `doc` | 61.2 / 81.6 / 51.3 s | **56.1 / 54.9 / 57.3 s** |
+   | TPOT | 58–60 ms | 58–60 ms |
+
+   3 rounds / 132 turns, **0 OOMs**, and the oracle stays byte-identical in **both** variants — the row
+   batching does not change the arithmetic. `doc`'s e2e moved the other way because its turns are
+   decode-dominated (96 tokens × 60 ms) and the turn-1 gain is 2.4 s against that variance.
+
 7. **MTP: keep it out of chat, or make it reuse-aware — 0–2 days, fork optional.** Today `--mtp` costs all
    prefix reuse for +45% TPOT on `code` only. Either ship "MTP off for chat" (already the default arm) or
    add draft-aware checkpoints to the fork. *Gate:* if MTP is re-enabled for chat, reuse must stay ≥ 0.7.

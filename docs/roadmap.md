@@ -415,10 +415,12 @@ keeps freed blocks by size): `doc` turn 1 151.8 → 11.9 s, prefill 11–13 → 
 1.9–2.8×. What is left is TPOT, now attributed: with every expert resident the same conversation runs at 19 ms/token
 (faster than Strata's 38), and the real 60 ms is 48 layers × 0.73 ms of 1-row CPU expert gemv blocking the
 pipeline. `NAIWA_RET_DBG` says the queue wait is 7 µs, so it is the kernel, not the hand-off. Next steps,
-ordered and gated: worklog §"Next (M10.3 items 3–8)" — the 1-row gemv (approved fork work), and carving
-the stream buffers inside the cache (Strata's layout, worth ~650 MiB of cache on this card). An
-`--prefill auto`-style chunk plan is in: warmup + first-chunk bisection publishes the prompt step
-(1280 → corrected to 1024 here), with the CLI flags as ceilings.
+ordered and gated: worklog §"Next (M10.3 items 3–8)" — the 1-row gemv (approved fork work), and, behind it, whatever
+the CPU expert path needs next. Prefill memory is settled: a warmup + first-chunk plan publishes the
+prompt step from measured free VRAM, and row batching (256 rows a call) keeps the chunk's activation
+footprint flat, so it picks the 8192 ceiling here (turn 1 8.5 → 6.0 s). Carving the buffers inside the
+cache is not reachable in this architecture — it needs Strata's blob-ring prefill kernel; the measured
+reason is in the worklog.
 
 ### Why
 

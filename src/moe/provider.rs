@@ -110,6 +110,22 @@ impl GpuCacheMoeProvider {
     /// `--pcie-frac`, which is where the ~215 MiB belongs). Returns `(captures, rings)`.
     pub fn warmup(&self) -> candle_core::Result<(usize, usize)> {
         let layers = self.layers.all();
+        // Loading freed every weight shard it copied out of, and CUDA's pool keeps those blocks at
+        // their (load-time) sizes. The cache, the prefill buffers and the KV want that memory, in
+        // sizes the pool will never match, so hand it back to the driver once, here, and report it:
+        // this is the difference between a 1 GB cache and whatever the card really has left.
+        #[cfg(feature = "cuda")]
+        if let Some(first) = layers.first() {
+            let before = crate::copy_stream::free_bytes(first.slot_device()).unwrap_or(0);
+            crate::copy_stream::trim_device_pool(first.slot_device())?;
+            let after = crate::copy_stream::free_bytes(first.slot_device()).unwrap_or(0);
+            info!(
+                "warmup: device pool trimmed, {:.0} -> {:.0} MiB free (+{:.0})",
+                (before as f64) / (1u64 << 20) as f64,
+                (after as f64) / (1u64 << 20) as f64,
+                ((after.saturating_sub(before)) as f64) / (1u64 << 20) as f64,
+            );
+        }
         // Every mapped buffer is sized and allocated here, once: the top-k doorbell per layer (for
         // the largest decode window) and the engine-wide CPU-result ring. A staging ring is only
         // built with `--pcie-frac` (that is where its ~215 MiB belongs).
