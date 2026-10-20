@@ -51,7 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M10** | chat workload parity with Strata | 🔶 M10.1–2 done | chat gap is TTFT (28–265×), not decode (1.4–1.6×): naiwa has no cross-turn prefix reuse and 13 tok/s prefill |
+| **M10** | chat workload parity with Strata | 🔶 M10.3 item 1 done | reuse fixed by config (`--mtp` disables it; needs a 32-token prefill step): TTFT 40.6→11.4 s, still 14–60× off; prefill 11–13 tok/s is now the largest gap |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
 lookahead thread, rayon experts, device-epoch sync. **No per-layer graphs and no attention
@@ -406,10 +406,12 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
 is the older MoE-naming milestone and unrelated). Harness: `harness/chat/`.
 
-**Baseline (2026-10-19, 3 rounds short/code + 1 round doc/long, paired `spec` arm, cache-matched):** turns ≥2
-TTFT `short` 40.6 s vs 0.61 s, `doc` 164 s vs 0.62 s; TPOT 59 vs 38 ms; end-to-end per conversation 5–51×.
-Strata reuses 95–99% of the prompt, naiwa reports 0%. M10.3 is re-scoped by that: prefix reuse across turns,
-then a prefill path that runs, then draft acceptance — not the MoE/decode path.
+**Baseline (2026-10-19/20, cache-matched, concurrency 1):** turns ≥2 TTFT `short` 40.6 s vs 0.61 s with the
+shipped `--mtp` (0% reuse), 11.4 s vs 0.61 s without MTP (0.73 vs 0.95 reuse); TPOT 59 vs 38 ms; end-to-end per
+conversation 4–11×. Two configuration causes were found and fixed: `--mtp` forces
+`SpeculativePrefixReplay::Full` (no reuse at all), and a checkpoint needs a 32-token prompt step
+(`--max-num-batched-tokens 32`). The remaining gap is prefill rate (11–13 tok/s vs ~750, 60× on turn 1), then
+last-turn reuse, then decode (1.5×). The MoE/decode path is the smallest of the three.
 
 ### Why
 

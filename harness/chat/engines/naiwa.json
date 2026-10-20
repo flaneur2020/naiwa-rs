@@ -20,6 +20,10 @@
     "~/bench-rel/mtp/mtp-component.gguf",
     "--mtp-n-predict",
     "4",
+    "--max-num-batched-tokens",
+    "32",
+    "--max-prefill-chunk-tokens",
+    "512",
     "--pa-context-len",
     "4096",
     "--prefix-cache-n",
@@ -40,6 +44,7 @@
     "expert_cache": "1.5 GB",
     "pcie_frac": 0.2,
     "speculation": "MTP --mtp-n-predict 4",
-    "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)"
+    "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)",
+    "prefill_chunking": "--max-num-batched-tokens 32 (one PA block) --max-prefill-chunk-tokens 512: the recurrent prefix checkpoint is only captured when a prompt *step* ends on a 32-token block boundary, so a one-shot prompt never gets one. A 32-token step makes every boundary restorable and costs no measurable prefill throughput (11-13 tok/s either way). Measured: 1.9k-token chat turn prompt_ms 141,871 -> 5,557; 641-token turn 56,471 -> 2,242."
   }
 }

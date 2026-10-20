@@ -372,13 +372,33 @@ def conversation_messages(conv: dict, upto: int, answers: list[str]) -> list[dic
 
 
 def run_round(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, args) -> None:
+    # A load-time CUDA OOM on a 12 GB card is intermittent (the model's PLE table falls back to a
+    # host gather and the allocator fragments); that is not a measurement, so startup is retried.
+    for attempt in range(args.start_retries + 1):
+        try:
+            _run_round_once(cfg, convs, out_dir, round_no, args)
+            return
+        except StartupFailed as e:
+            if attempt == args.start_retries:
+                raise
+            print(f"  {cfg['name']}: startup failed ({e}); retry {attempt + 1}", flush=True)
+
+
+class StartupFailed(RuntimeError):
+    pass
+
+
+def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, args) -> None:
     engine = Engine(cfg, out_dir, round_no)
     sampler = Sampler(lambda: os.getpgid(engine.proc.pid) if engine.proc else None)
     print(f"[{time.strftime('%H:%M:%S')}] round {round_no}: {cfg['name']} on :{engine.port}", flush=True)
     engine.start()
     sampler.start()
     try:
-        model = engine.wait_ready(args.ready_timeout)
+        try:
+            model = engine.wait_ready(args.ready_timeout)
+        except SystemExit as e:
+            raise StartupFailed(str(e)) from e
         print(f"  ready in {engine.load_s:.1f}s ({model})", flush=True)
 
         def request(messages: list[dict], max_tokens: int) -> dict:
@@ -476,6 +496,7 @@ def main() -> int:
     ap.add_argument("--classes", default=None, help="comma-separated class filter, e.g. short,code")
     ap.add_argument("--timeout", type=float, default=900.0, help="per-request HTTP timeout")
     ap.add_argument("--ready-timeout", type=float, default=900.0, help="server start → /v1/models")
+    ap.add_argument("--start-retries", type=int, default=2, help="retries when the engine fails to start")
     args = ap.parse_args()
 
     corpus_path = expand(args.corpus)

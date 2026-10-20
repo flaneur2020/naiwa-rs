@@ -60,9 +60,11 @@ def main() -> int:
     if not turns:
         raise SystemExit(f"{out}: no turns")
 
-    engines = [e["name"] for e in run["engines"]]
-    arms = {e["name"]: e.get("arm", e["name"]) for e in run["engines"]}
-    classes = run["classes"]
+    # A run directory may hold several invocations (e.g. short+code for 3 rounds, then doc+long
+    # for 1); `run.json` describes the last one, so the index comes from the turns themselves.
+    engines = sorted({t["engine"] for t in turns}, key=lambda e: [t for t in turns if t["engine"] == e][0]["round"])
+    classes = sorted({t["class"] for t in turns})
+    rounds_run = sorted({t["round"] for t in turns})
     failed = [t for t in turns if t.get("error")]
     first = [t for t in turns if t["turn"] == 1]
     later = [t for t in turns if t["turn"] > 1]
@@ -72,8 +74,10 @@ def main() -> int:
 
     print(f"# M10.2 — multi-round chat, naiwa-rs vs Strata\n")
     print(f"- run: `{out}` · corpus `{run['corpus_sha256'][:12]}` · classes {classes} · "
-          f"{run['rounds']} round(s) · concurrency {run['concurrency']}")
-    print(f"- engines: " + ", ".join(f"**{e['name']}** ({e.get('arm', '?')})" for e in run["engines"]))
+          f"rounds {rounds_run} · concurrency {run['concurrency']}")
+    run_engines = {e["name"]: e for e in run["engines"]}
+    print(f"- engines: " + ", ".join(
+        f"**{name}** ({run_engines.get(name, {}).get('arm', '?')})" for name in engines))
     if failed:
         print(f"- **{len(failed)} failed turn(s)**: " + ", ".join(
             f"{t['engine']}/{t['conv']}/t{t['turn']} {t['error']}" for t in failed[:5]))
@@ -149,13 +153,18 @@ def main() -> int:
 
     # 5. comparability ---------------------------------------------------------------------------
     print("### Comparability record\n")
-    for e in run["engines"]:
-        print(f"**{e['name']}** (arm `{e.get('arm')}`, port {e['port']})")
+    for name in engines:
+        e = run_engines.get(name)
+        if e is None:
+            print(f"**{name}**: configured in an earlier invocation of this directory")
+            print()
+            continue
+        print(f"**{name}** (arm `{e.get('arm')}`, port {e['port']})")
         for key, value in (e.get("record") or {}).items():
             print(f"- {key}: {value}")
         print()
     print(f"- request body extras: " + ", ".join(
-        f"{e['name']} {e.get('body') or '{}'}" for e in run["engines"]))
+        f"{name} {run_engines.get(name, {}).get('body') or '{}'}" for name in engines))
     print(f"- warmup: {run['warmup_turns']} discarded turns per round, before the corpus")
     return 0
 
