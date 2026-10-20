@@ -130,6 +130,35 @@ baseline (got 4 396 vs 3 670 ms). Two separate causes, both now measured:
 | turn-1 prefill with MTP | 6.06 → **9.53 s** (284 → 181 tok/s) on `doc` | the drafter prompt path: the chunk plan still picks 8192 (log confirms), so it is not chunking; candidate is the speculative prompt chunk forcing the unpacked attention policy |
 | row-proportional host term | `dry = 1.00 + 0.25 × rows` ms/layer | item 4: at 5 rows the round trip is only half amortised, and it is what keeps TPOT at 43 instead of ~20 |
 
+## Turn-1 prefill: decomposed (2026-10-21)
+
+A 1,725-token `doc` turn 1, one request, `--prefill-stream --prefill-stream-min-tokens 64`, MTP on, timed through
+`PREFIX_DBG` (`prefill:` per chunk, `prefill_step:` per step, `drafter_prefill:` inside the drafter):
+
+| piece | time | rate | note |
+|---|---:|---:|---|
+| target forward, 1,696 rows | 3.50 s | 485 tok/s | same as the no-MTP arm (3.48 s) — unaffected by MTP |
+| **drafter prefill, 1,696 rows** | **2.73–4.01 s** | 424–620 tok/s | `mtp_forward`; embed 6 ms, hidden/positions µs |
+| tail chunk, 29 rows | 2.32–2.63 s | ~12 tok/s | below `--prefill-stream-min-tokens`, so it is a CPU prefill; the **no-MTP arm pays this too** |
+| total | 9.0–10.4 s | 166–190 tok/s | vs the no-MTP 6.1 s (3.48 + 2.3) |
+
+Three separate causes, and the accounting matters because they are paid differently:
+
+1. **The drafter prefill is a CPU MoE, once per conversation.** The MTP head's experts are always loaded to the
+   host (`moe/provider.rs`: `if ctx.site.is_mtp` returns `CpuExperts` before `attach_prefill` runs, so it never
+   gets a prefill stream either — `prefill_stream.rs::attach` also excludes `is_mtp`). For a prompt chunk it
+   falls through to `MoEExperts::forward` → `FastExpertsWeights::forward_gather`, which on the CPU pays one
+   weight-block read **per (token, expert) pair**: 1 696 × 8 × ~2.6 MB ≈ **35 GB** at the ~9–10 GB/s the
+   one-row kernel gets. That is the whole 3–4 s. A grouped CPU kernel (one GEMM per expert, ~26 rows each)
+   would read the same 1.35 GB once: **≈ 0.2 s**.
+2. **It is paid once, not per turn.** With reuse enabled, a repeated request restored 1 696 tokens and its
+   drafter prefill covered only the 29 new rows (`mtp_forward` 50–65 ms). So this is a cold-conversation cost:
+   −4 s on `e2e/conv` for `doc`/`long`, not on TTFT≥2.
+3. **The 29-row tail is a pre-existing defect, not MTP's.** `align_down(total, 32)` splits 1 725 as
+   1 696 + 29, and a 29-row chunk touches ~all 128 experts of every layer, so it is expensive either way
+   (CPU 2.63 s at `min-tokens 64`; stream 2.32 s at `min-tokens 8` — 128 experts × 1.88 MB × 48 layers ≈
+   11.5 GB of PCIe). It exists in the no-MTP arm too and is the bulk of the M10 "TTFT≥2 3.67 s" number.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
@@ -142,9 +171,11 @@ baseline (got 4 396 vs 3 670 ms). Two separate causes, both now measured:
 
 ## Next
 
-1. **Turn-1 prefill under MTP**: 6.06 → 9.53 s is the largest single number in the table. Find whether the
-   speculative prompt chunk disables packed/non-causal prefill, and price `--mtp` against it (the drafter's
-   own prefill is one layer and should be ~1/48 of the chunk).
+1. **Grouped CPU MoE for prefill chunks** (the decomposed cost above): `FastExpertsWeights::forward_gather`
+   reads each expert's weights once per (token, expert). Grouping the rows per expert makes the MTP head's
+   1 696-row prefill read 1.35 GB instead of 35 GB — 4 s → ~0.2 s, and the same kernel serves every layer that
+   keeps its prefill on the CPU (uncached layers, the stream's decline path). Gate: `mtp_forward` ≤ 300 ms for
+   1 696 rows, identical logits on the oracle path, 3-round `doc`/`long` e2e −4 s.
 2. **Item 4, the row term**: `dry` must stop scaling with rows, or MTP's amortisation stays capped at
    `1.0/(1.0+0.25·R)`. This is the M10 3b device-dispatch work, now with a measured payoff curve.
 3. Then re-run the 3-round corpus against strata for the class-level gate.
