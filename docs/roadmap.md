@@ -412,7 +412,8 @@ conversation 4–11×. Two configuration causes were found and fixed: `--mtp` fo
 `SpeculativePrefixReplay::Full` (no reuse at all), and a checkpoint needs a block-aligned prompt step. The
 prefill stream was then fixed too (its expert-cache lend does not return what it credits, and candle's pool
 keeps freed blocks by size): `doc` turn 1 151.8 → 11.9 s, prefill 11–13 → 147–285 tok/s, e2e per conversation
-1.9–2.8×. What is left is TPOT (1.6–2.2×) — the MoE/decode path — and the lender's accounting.
+1.9–2.8×. What is left is TPOT (1.6–2.2×) — the MoE/decode path — and the lender's accounting. Next steps, ordered and
+gated: worklog §"Next (M10.3 items 3–6)".
 
 ### Why
 

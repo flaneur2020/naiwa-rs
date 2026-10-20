@@ -1,6 +1,7 @@
 # M10 — multi-round chat: naiwa-rs vs Strata
 
-Status: **M10.1–2 done, M10.3 items 1 and 2 done (2026-10-19/20)**. Decode align not started.
+Status: **M10.1–2 done, M10.3 items 1–2 done (2026-10-19/20)**. Next: "Next (M10.3 items 3–6)" below —
+decode (TPOT 1.6–2.2×) is the open term.
 Parent: [m9c.md](m9c.md). This is the roadmap's **M10** (`docs/roadmap.md` §M10).
 (`worklogs/m10.md` is the older *MoE naming and ownership* milestone from the pre-rescope numbering; it is
 unrelated and stays.)
@@ -96,7 +97,7 @@ Three arms, concurrency 1, thinking off, medians. Raw runs: `~/bench-rel/m10/202
 | arm | naiwa | strata | why |
 |---|---|---|---|
 | **A** paired | `--mtp --mtp-n-predict 4`, 1.5 GB cache | `--spec 4`, 800 blobs | each engine's shipped speculation; strata requires it for a native IQ pack |
-| **B** no speculation | no `--mtp`, 2 GB cache | *(cannot run)* | measures what speculation costs a chat session |
+| **B** no speculation | no `--mtp`, 2 GB cache | *(cannot run)* | measures what speculation costs a chat session. Superseded by the stream arm below (`engines/naiwa.json`) |
 
 ```bash
 python3 harness/chat/run.py --engines naiwa,strata   --rounds 3 --classes short,code --out ~/bench-rel/m10/2026-10-19
@@ -133,7 +134,7 @@ Per-turn TTFT, `short`, all three arms (turn 1 is the same prompt everywhere):
 | 7 | 66,333 ms | 13,284 ms | 572 ms | – / 0.78 / 0.96 |
 | 8 | 76,894 ms | 5,754 ms | 616 ms | – / 0.89 / 0.97 |
 
-## M10.3 item 2 baseline — 2026-10-20 (post-fix, 3 rounds, all classes)
+## M10.3 baseline — 2026-10-20 (after items 1 and 2, 3 rounds, all classes)
 
 Same corpus and protocol as M10.2; `engines/naiwa.json` is now the stream arm (no MTP, 1 GB cache),
 strata unchanged. 132 turns, 0 failed turns, 0 OOMs. Arm `naiwa-mtp` (MTP 4, 1.5 GB, no stream) keeps
@@ -220,26 +221,46 @@ Two limits, measured rather than assumed:
 - **0.5 GB less cache costs decode**: TPOT 57–60 → 60–63 ms (fewer resident experts). That is the
   price of the 1.3 GB stream buffers on this card.
 
+### What is still missing for parity (updated after item 2)
+
+| term | naiwa | strata | gap | where it goes |
+|---|---|---|---|---|
+| prefill (turn 1, 1.7k) | **11.9 s** | 2.4 s | 5× | 4 chunks × 31 GB of layer uploads at 512-token chunks; a bigger chunk divides the upload count |
+| TTFT ≥2 | 2.8–4.4 s | 0.6–1.2 s | 3–7× | the per-turn tail (67–213 tokens) reprinted at 150–285 tok/s, plus the chunk's fixed upload |
+| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | decode; now the largest term |
+| e2e/conv | 44–84 s | 22–40 s | 1.9–2.8× | dominated by turns ≥2 |
+
+**Why TPOT is a fixed-cost problem, not a GEMM problem.** The np8 round is ~170 ms for 8 tokens
+(21 ms/token), while one chat token costs 60 ms: an 8-row step and a 1-row step differ by ~25 ms, so a
+step costs roughly **50 ms fixed + ~15 ms per row**. A single-stream chat pays the fixed part on every
+token, which is why the M6–M9 work on the compute path (and on the host launch chain) does not show up
+here. Whatever fixes chat has to cut per-*step* cost: PLE host gather (28 GB table, gathered on the host
+every step), CPU expert dispatch at a 1 GB cache, or a synchronisation on the step path.
+
 ## Judging
 
-1. **M10.1 — reproducible harness.** ✅ Same corpus + config → same schema and turn count; 138/138 turns
-   written; turn-1 `prompt_tokens` equal across engines (40 = 40, 1723 = 1723); ≥3 rounds for the head-line
-   classes; medians; every failure recorded (none).
+1. **M10.1 — reproducible harness.** ✅ Same corpus + config → same schema and turn count; 270 turns written
+   across three runs (138 before the prefill fix, 132 after), none failed; turn-1 `prompt_tokens` equal
+   across engines (40 = 40, 1723 = 1723); 3 rounds for every class after the prefill fix (1 round for
+   `doc`/`long` before it, labelled); medians throughout.
 2. **M10.2 — honest baseline.** ✅ Table above, no tuning, `spec` arm paired, engine order alternated.
 3. **M10.3 — align** (open): items 1 (prefix reuse) and 2 (prefill) done; decode (TPOT 1.6–2.2×)
    is now the open term, and the lender's accounting is the open defect — see the agenda above.
 4. **M10.4 — long context.** `doc` and `long` are measured (1,723–2,491 prompt tokens): strata reuses
-   0.99 and holds 620–777 ms TTFT; naiwa reuses 0.92–0.94 and holds 10.8–13.4 s — the residual is the
-   prefill rate, not the cache. Deeper contexts stay out of scope until the context/KV budget question in
-   "Open questions" is settled.
+   0.89–0.99 and holds 0.6–1.0 s TTFT; naiwa reuses 0.83–0.94 and holds 2.8–4.4 s, with an 11.8 s turn 1.
+   The residual is the chunk upload, not the cache. Contexts beyond 4096 stay out of scope until the
+   KV budget question in "Open questions" is settled.
 
 ## Gates (executed)
 
-- Harness: 3 rounds for `short`/`code`, 1 for `doc`/`long` (labelled), medians, order alternated, 0 failed
-  turns in 138. Model load is intermittently OOM on this 12 GB card (the PLE host-gather fallback fragments
-  the allocator); the driver retries *startup* up to twice and never retries a turn.
-- Engine untouched: no `src/` change; `frac 0` + `--no-lookahead` oracle is unaffected and was last verified at
-  `21cd122`.
+- Harness: 3 rounds for `short`/`code` (1 for `doc`/`long` before the prefill fix, 3 after), medians, order
+  alternated, 0 failed turns in 270, 0 OOMs after the fix. Model load is intermittently OOM on this 12 GB
+  card (the PLE host-gather fallback fragments the allocator); the driver retries *startup* up to twice and
+  never retries a turn.
+- Engine changed in item 2 only (`prefill_stream.rs`, `copy_stream.rs`), and the oracle was re-verified after
+  it: `frac 0` + `--no-lookahead` byte-identical to `harness/m1/reference.oracle.txt` at `d0ef46d`; 35/35 tests
+  (the new `pool_trim_returns_freed_tensors` included); 0 naiwa warnings. Items 1 and 2 of M10.3 touched no
+  engine code except that fix.
 - Every number above carries the comparability record in `run.json` and is reproduced by
   `harness/chat/summarize.py`.
 
@@ -247,9 +268,41 @@ Two limits, measured rather than assumed:
 
 - `harness/chat/corpus.jsonl`, `run.py` (stdlib-only driver: launch by PID, readiness, warmup, SSE timestamps,
   VRAM/RSS samplers, per-round config copy for strata), `summarize.py`, `README.md`.
-- `harness/chat/engines/{naiwa,naiwa-nospec,strata,strata-engine}.json` — launch configs with a `record` block;
-  `naiwa-nospec` exists but was not run (strata cannot pair it).
+- `harness/chat/engines/{naiwa,naiwa-mtp,strata,strata-engine}.json` — launch configs with a `record` block;
+  `naiwa` is the chat arm (stream, no MTP, 1 GB cache), `naiwa-mtp` the shipped-speculation reference
+  (MTP 4, 1.5 GB, no stream; strata has no nospec counterpart because a native IQ pack requires `--spec`).
 - This table, generated by `summarize.py`, not by hand.
+
+## Next (M10.3 items 3–6)
+
+Ordered by payoff per unit of work. Each item states its gate; none of them may run inside the same
+measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
+
+1. **Chunk-size sweep — 0.5 h, configuration only.** The upload is per chunk (48 layers × ~650 MB,
+   ~31 GB), so 1.7k prompt at 512-token chunks = 4 uploads ≈ 10 s of the 11.9 s turn 1. Try 512/1024/2048
+   and report turn 1, TTFT ≥2 and reuse. *Gate:* `doc`/`long` turn 1 ≤ 5 s with reuse ≥ 0.85.
+2. **Fix the lender's accounting — 0.5–1 day, `src/moe/cached_layer.rs`.** `lend` credits
+   `slots_lent × slot_bytes` (1107–1863 MiB) but returns 0–288 MiB; per layer it does free something
+   (layer 0: 770 → 802 MiB of a 43 MiB credit), so most banks still have a strong reference. First move:
+   print `Arc::strong_count` on each bank inside `CachedLayer::lend` and find the extra owner (candidates:
+   a fill-thread clone, `Bank.proj` vs `SlotMemory.tensor`, slots outside `st.usable` sharing the bank).
+   *Gate:* `lend` returns ≥ 90% of what it credits, 2 GB cache + stream does not OOM, TPOT back to ≤ 58 ms.
+3. **Break down the 60 ms step — 0.5 h, measurement only.** `NAIWA_STEP_DBG=1 NAIWA_ROUND_STATS=1` on one
+   `short` conversation, split dry/busy/wait per layer and read the PLE gather and CPU-dispatch counters.
+   *Gate:* a table that accounts for the 60 ms and names the largest term. This decides item 4.
+4. **Act on the largest term of item 3 — 1–3 days, engine work.** If it is the PLE gather, the answer may
+   be scope (the 28 GB table needs a bigger card or a smaller quant), not a kernel; say so before writing
+   code. If it is CPU dispatch, item 2's half gigabyte is the first fix. If it is a wait on the step path,
+   re-read M8's conclusion with chat numbers.
+5. **MTP: keep it out of chat, or make it reuse-aware — 0–2 days, fork optional.** Today `--mtp` costs all
+   prefix reuse for +45% TPOT on `code` only. Either ship "MTP off for chat" (already the default arm) or
+   add draft-aware checkpoints to the fork. *Gate:* if MTP is re-enabled for chat, reuse must stay ≥ 0.7.
+6. **Scope and hardware — needs a decision.** A ≥24 GB card would allow stream+MTP, 8k `long`, and the PLE
+   residency question; on 12 GB the two are mutually exclusive and `long` stays at 4096.
+
+**Not now** (measured dead ends for this workload): tuning MoE/GEMM before item 3 names the term; chasing
+the ±10% band while turn 1 is 5× off; `--prefix-cache-n 16` at 4096 context; stream+MTP or 2 GB+stream on
+12 GB; retrying a failed *turn* (startup retries are separate and bounded).
 
 ## Open questions
 
@@ -259,9 +312,13 @@ Two limits, measured rather than assumed:
 - The last-turn slack: reuse stops one block before the prompt end, so 0.73–0.94 instead of strata's
   0.95–0.99. Is that only the assistant-turn re-render, or also the block boundary rule? Measured but not
   explained.
-- `--prefill-stream`'s two contradictory defaults: which one moves, and can the stream run inside a 1.5–2 GB
-  cache on a 12 GB card at all? (Measured: it borrows 1.86 GB for 1.3 GB of buffers and then OOMs at 2 GB; 4 GB
-  does not load. So: not at 4096 context on this card, unless the lending arithmetic changes.)
+- `--prefill-stream`'s defaults contradict each other (`--prefill-stream-min-tokens` 1024 >
+  `--max-prefill-chunk-tokens` 512, so it never engages in serve mode). The benchmark pins 64/512; the
+  defaults themselves should move, and the "1024" comment claims Strata streams from 1024 — with strata's
+  2.4 s turn 1 that claim is worth re-checking.
+- Where is the strong reference that keeps a lent bank alive? `lend` credits 1107–1863 MiB and returns
+  0–288; per layer it frees some (770 → 802 MiB for a 43 MiB credit), so most banks are still owned
+  elsewhere. Answering this gives 0.5 GB back to the cache (item 2 of "Next").
 - Strata's startup probe picks `pcie_frac 0.37`; naiwa's `--pcie-frac 0.2` is a hand-tuned constant. Whether
   that matters for chat (it did not for np8) is unmeasured here.
 - Host RSS: naiwa 56.0 GiB vs strata 26.5 GiB. Pinned expert stacks + host PLE gather is the likely cause; not
