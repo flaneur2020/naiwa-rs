@@ -310,10 +310,14 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    | `--lookahead-swaps` 0 | 69.2/70.8/62.5 | 20.1% |
    | `--pcie-frac` 0.2 → 0.5 → 1.0 | 53.5–65.3 → 51.0/52.3/56.1 → 59.8/67.1/79.1 | — |
    | `--no-lookahead` | 65.4–68.1 | — |
+   | `NAIWA_CPU_MOE_THREADS` 1 → 2 → 4 → 8 (default) | job 3.22 → 1.70 → 1.24 → **0.73 ms**, TPOT 129 → 82 → 65 → 55 ms | — |
 
    More cache, more swaps, more staging and less lookahead all fail to help for the same reason: **any miss
    in a layer pays the whole 0.73 ms round trip**, so the cost is per *layer with a miss*, not per miss.
-   Halving the miss count does not halve the wait; eliminating it does (perfect cache = 19 ms).
+   Halving the miss count does not halve the wait; eliminating it does (perfect cache = 19 ms). Thread
+   scaling (last row) says the gemv itself is the cost and that 8 threads is still the right pool: the kernel
+   moves ~6.4 MB of IQ1_M weights in 0.73 ms ≈ 9 GB/s, well under what the host can stream, because a 1-row
+   dot pays the dequantisation per block and uses each weight once.
 
 4. **Shrink the per-layer CPU gemv — now the only lever that changes the critical path.** 0.73 ms for ~3.4
    expert-rows is ~5× its memory bound (~6.4 MB of IQ1_M weights per layer at 1 row → ~0.13 ms). The fused
