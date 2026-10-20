@@ -403,7 +403,9 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
+Worklog: [`worklogs/m16-mtp-reuse.md`](worklogs/m16-mtp-reuse.md) — M16 (chat with MTP: prefix reuse
+under speculation; TPOT 55 → 43/44/52 ms, reuse restored to 0.76–0.96, turn-1 prefill 6.06 → 9.53 s is the
+open cost). Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
 is the older MoE-naming milestone and unrelated). Harness: `harness/chat/`.
 
 **Baseline (2026-10-19/20, cache-matched, concurrency 1):** turns ≥2 TTFT `short` 40.6 s vs 0.61 s with the

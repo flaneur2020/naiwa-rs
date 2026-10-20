@@ -24,6 +24,11 @@
     "8192",
     "--max-seqs",
     "4",
+    "--mtp",
+    "--mmproj",
+    "~/bench-rel/mtp/mtp-component.gguf",
+    "--mtp-n-predict",
+    "4",
     "--pa-context-len",
     "4096",
     "--prefix-cache-n",
@@ -44,9 +49,12 @@
     "expert_cache": "3 GB",
     "pcie_frac": 0.2,
     "prefill": "--prefill-stream --prefill-stream-min-tokens 64 (prefill 147-285 tok/s vs 11-13 on the CPU)",
-    "speculation": "none",
-    "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)",
+    "speculation": "MTP --mtp-n-predict 4, one round trip per layer per step instead of per token (M16). MISTRALRS_MTP_PREFIX_REPLAY=none lifts the builtin-MTP Full replay, which otherwise kills both the snapshot and the restore; equivalence gated in M16 item 2",
+    "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB), checkpoint at align_down(prompt, 32) since M16 item 1",
     "prefill_chunking": "--max-num-batched-tokens 8192 --max-prefill-chunk-tokens 8192 are *ceilings*: the prefill path plans the step at warmup from the free VRAM it measures (chunk, and 1 or 2 layer buffers, from 160 MiB + 680 MiB per 1024 tokens of activations, Strata's formula, with an eighth of slack) and publishes it to the scheduler. On this card it lands on 1024 with one buffer",
     "max_seqs": "4: the hybrid model reserves a ~112 MiB recurrent state per sequence slot, so the default 32 cost 3.5 GiB of VRAM for slots a one-request-at-a-time server never uses. At 4 the same card affords a 3 GB expert cache instead of 1 GB"
+  },
+  "env": {
+    "MISTRALRS_MTP_PREFIX_REPLAY": "none"
   }
 }

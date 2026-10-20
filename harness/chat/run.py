@@ -204,6 +204,9 @@ class Engine:
             fill["config"] = config_path
         args = [ospath(str(x).format(**fill)) for x in cfg["args"]]
         self.args = [ospath(cfg["exe"])] + args
+        # Read-only env probes (design.md: env switches are probes, real knobs are flags). Recorded in the
+        # launch line so a run can be reproduced from its own log.
+        self.env = {str(k): str(v).format(**fill) for k, v in (cfg.get("env") or {}).items()}
         log_dir = out_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"{cfg['name']}-r{round_no}.log"
@@ -212,11 +215,13 @@ class Engine:
 
     def start(self) -> None:
         self.log = open(self.log_path, "w")
-        self.log.write("# " + " ".join(self.args) + "\n")
+        env = " ".join(f"{k}={v}" for k, v in sorted(self.env.items()))
+        self.log.write("# " + (env + " " if env else "") + " ".join(self.args) + "\n")
         self.log.flush()
         self.proc = subprocess.Popen(
             self.args,
             cwd=str(expand(self.cfg["cwd"])),
+            env={**os.environ, **self.env} if self.env else None,
             stdout=self.log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
