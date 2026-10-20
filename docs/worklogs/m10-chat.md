@@ -279,10 +279,11 @@ np8: `--no-lookahead` does not reduce it) and not the PLE gather.
   alternated, 0 failed turns in 270, 0 OOMs after the fix. Model load is intermittently OOM on this 12 GB
   card (the PLE host-gather fallback fragments the allocator); the driver retries *startup* up to twice and
   never retries a turn.
-- Engine changed in item 2 only (`prefill_stream.rs`, `copy_stream.rs`), and the oracle was re-verified after
-  it: `frac 0` + `--no-lookahead` byte-identical to `harness/m1/reference.oracle.txt` at `d0ef46d`; 35/35 tests
-  (the new `pool_trim_returns_freed_tensors` included); 0 naiwa warnings. Items 1 and 2 of M10.3 touched no
-  engine code except that fix.
+- Engine changed in items 2 and 3 only (`prefill_stream.rs`, `copy_stream.rs`, and the lend removal in
+  `moe/`). The oracle was re-verified after each: `frac 0` + `--no-lookahead` byte-identical to
+  `harness/m1/reference.oracle.txt` — and, after the memory rework, **also with `--prefill-stream`**, which
+  is the first time that path is covered by the oracle (it exercises one-buffer prefill and, at the oracle's
+  2 GB cache, the *decline* path). 34/34 tests, 0 naiwa warnings.
 - Every number above carries the comparability record in `run.json` and is reproduced by
   `harness/chat/summarize.py`.
 
