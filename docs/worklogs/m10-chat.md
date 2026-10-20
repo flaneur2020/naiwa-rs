@@ -440,12 +440,31 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
    tensor it materializes (source type, output type, bytes, device) and `dump_weights(device)` prints
    the totals at warmup.
 
-   **What the weights cost** (cache 1 GB, `--max-seqs 32`): **1,115 tensors, 4,300 MiB on the GPU** —
+   **What the weights cost** (cache 1 GB, `--max-seqs 4`): **1,115 tensors, 4,300 MiB on the GPU** —
    2,838 MiB quantized *verbatim* (attention q/k/v 20–25 MiB each, `embed_tokens` 322, `lm_head` 497),
-   1,337 MiB dense BF16 (the tensors the loader builds by slice/concat/transpose, plus norms), 120 MiB
-   BF16→BF16, ~5 MiB transformed. 144 tensors / **23,981 MiB stayed on the host** (the routed expert
-   stacks). So the loader does *not* expand the quantized weights, which is what the "our resident part
-   is 8.7 GB, strata's is 1.4" note above assumed — that note was wrong, see below.
+   1,337 MiB dense BF16, 120 MiB BF16→BF16, ~5 MiB transformed. 144 tensors / **23,981 MiB stayed on
+   the host** (the routed expert stacks). So the loader does *not* expand the quantized weights, which is
+   what the "our resident part is 8.7 GB, strata's is 1.4" note above assumed — that note was wrong.
+
+   **And the 1,337 MiB cannot be shrunk either**: the dump now prints the GGUF source dtype of every
+   materialized dense tensor, and 1,299.4 MiB of it (364 tensors: `hc_*` hyper-connections,
+   `ssm_alpha/beta`, `ple_key/value`, norms) are **BF16 in the file** — 2 bytes on disk, 2 bytes in VRAM,
+   nothing to gain. The other 37.5 MiB are packed/transformed sources. So the 4,300 MiB is at the file's
+   own cost, and the "staying quantized would save ~0.9 GiB" reading was wrong: our dense is not
+   quantized-in-the-file-but-expanded, it is BF16-in-the-file.
+
+   | on the GPU | MiB | what it is |
+   |---|---:|---|
+   | quantized, verbatim | 2,838 | attention q/k/v, `embed_tokens` 322, `lm_head` 497, shared experts |
+   | dense, BF16 source | 1,299 | `hc_*`, `ssm_alpha/beta`, `ple_*`, norms |
+   | BF16→BF16 (optional tensors) | 120 | the same, through `vb.get` |
+   | packed/transformed | 42 | 37.5 dense + 5 other |
+
+   Against Strata's logged `7.3 GiB used` (1,406 MiB pack weights + 1.98 GiB cache that *contains* the
+   1.68 GiB prompt borrow + 74 MiB windows + its one-sequence state, KV and drafter), the remaining VRAM
+   difference is ~1.3 GiB and comes from two things: the 322 MiB embedding is in **host-mapped** memory
+   there and in VRAM here, and the 650 MiB prefill buffer sits **inside** the cache there. Both are
+   entry 6's blob-ring / loader work, not a dtype policy.
 
    **Where the rest went: the recurrent state pool.** This hybrid model keeps a GDN state per sequence
    slot, **~112 MiB each**, and `--max-seqs` defaults to 32: `free after startup` is 2,273 MiB at 32,
