@@ -19,9 +19,9 @@
     "--prefill-stream-min-tokens",
     "64",
     "--max-num-batched-tokens",
-    "512",
+    "1024",
     "--max-prefill-chunk-tokens",
-    "512",
+    "1024",
     "--pa-context-len",
     "4096",
     "--prefix-cache-n",
@@ -44,6 +44,6 @@
     "prefill": "--prefill-stream --prefill-stream-min-tokens 64 (prefill 147-285 tok/s vs 11-13 on the CPU)",
     "speculation": "none",
     "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)",
-    "prefill_chunking": "--max-num-batched-tokens 512 --max-prefill-chunk-tokens 512: a recurrent checkpoint is captured only when a prompt step ends on a 32-token block boundary (512 qualifies), and the stream needs chunks this large to amortise a 650 MB per-layer upload"
+    "prefill_chunking": "--max-num-batched-tokens 1024 --max-prefill-chunk-tokens 1024: half the per-chunk layer uploads of 512 (doc turn 1 11.9 -> 7.4 s) with reuse unchanged; 2048 OOMs (the 2048-row MoE forward needs the memory the stream buffers occupy, even at a 0.8 GB cache)"
   }
 }

@@ -314,7 +314,7 @@ def stream_turn(base: str, body: dict, timeout: float) -> dict:
         e2e = t_last - t0
     else:
         # An answer that produced no content delta: keep the failure visible, do not invent a number.
-        ttft = decode = e2e = None
+        ttft = decode = tpot = e2e = None
         itls = []
     cached = None
     prompt_tokens = None
@@ -436,6 +436,10 @@ def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, 
                                 conversation_messages(conv, i, answers), turn["max_tokens"]
                             )
                         )
+                        if rec["n_deltas"] == 0:
+                            # The server closed the stream without a token: an OOM or an engine
+                            # error, not a short answer. Data, but the round cannot continue.
+                            raise RuntimeError(f"no content delta (finish {rec['finish']!r})")
                     except Exception as e:  # noqa: BLE001 - a failed turn is data, not a crash
                         rec["error"] = f"{type(e).__name__}: {e}"
                         sink.write(json.dumps(rec) + "\n")

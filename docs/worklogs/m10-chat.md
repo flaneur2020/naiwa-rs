@@ -227,15 +227,15 @@ Two limits, measured rather than assumed:
 |---|---|---|---|---|
 | prefill (turn 1, 1.7k) | **11.9 s** | 2.4 s | 5× | 4 chunks × 31 GB of layer uploads at 512-token chunks; a bigger chunk divides the upload count |
 | TTFT ≥2 | 2.8–4.4 s | 0.6–1.2 s | 3–7× | the per-turn tail (67–213 tokens) reprinted at 150–285 tok/s, plus the chunk's fixed upload |
-| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | decode; now the largest term |
+| **TPOT** | 60–63 ms | 28–39 ms | **1.6–2.2×** | the miss path: at 42% hit rate 3.4 experts/token run on the CPU (perfect cache → 19 ms) |
 | e2e/conv | 44–84 s | 22–40 s | 1.9–2.8× | dominated by turns ≥2 |
 
-**Why TPOT is a fixed-cost problem, not a GEMM problem.** The np8 round is ~170 ms for 8 tokens
-(21 ms/token), while one chat token costs 60 ms: an 8-row step and a 1-row step differ by ~25 ms, so a
-step costs roughly **50 ms fixed + ~15 ms per row**. A single-stream chat pays the fixed part on every
-token, which is why the M6–M9 work on the compute path (and on the host launch chain) does not show up
-here. Whatever fixes chat has to cut per-*step* cost: PLE host gather (28 GB table, gathered on the host
-every step), CPU expert dispatch at a 1 GB cache, or a synchronisation on the step path.
+**Why TPOT is the term to attack, and what it is made of** (measured in "Next" item 3): with every expert
+resident the same conversation runs at **~19 ms/token** — faster than strata's 38 — and `NAIWA_STEP_DBG`
+shows the GPU already idle at every layer entry (`busy 0.000`, `dry 1.2 ms/layer` × 48 = the whole step).
+So the step is host-side wall time spent on the **miss path**: 42.4% hits / 15.7% staged / 41.9% CPU at a
+1 GB cache, i.e. ~3.4 experts per token computed on the CPU. It is not the launch chain (M8 was right for
+np8: `--no-lookahead` does not reduce it) and not the PLE gather.
 
 ## Judging
 
@@ -278,27 +278,54 @@ every step), CPU expert dispatch at a 1 GB cache, or a synchronisation on the st
 Ordered by payoff per unit of work. Each item states its gate; none of them may run inside the same
 measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
 
-1. **Chunk-size sweep — 0.5 h, configuration only.** The upload is per chunk (48 layers × ~650 MB,
-   ~31 GB), so 1.7k prompt at 512-token chunks = 4 uploads ≈ 10 s of the 11.9 s turn 1. Try 512/1024/2048
-   and report turn 1, TTFT ≥2 and reuse. *Gate:* `doc`/`long` turn 1 ≤ 5 s with reuse ≥ 0.85.
+1. ✅ **Chunk-size sweep — done, configuration only.** `doc` turn 1: **512 → 11.9 s, 1024 → 7.4 s,
+   2048 → OOM** (the 2048-row MoE forward needs the memory the stream buffers occupy: it also OOMs at a
+   0.8 GB cache). Reuse is unchanged (0.92–0.98) and turns ≥2 are 2.5–5.6 s at both 512 and 1024, so
+   `engines/naiwa.json` now uses **1024**. Gate met on the reuse side, missed on turn 1 (5 s); the 2048-row
+   forward's memory is the blocker, not the upload.
 2. **Fix the lender's accounting — 0.5–1 day, `src/moe/cached_layer.rs`.** `lend` credits
    `slots_lent × slot_bytes` (1107–1863 MiB) but returns 0–288 MiB; per layer it does free something
    (layer 0: 770 → 802 MiB of a 43 MiB credit), so most banks still have a strong reference. First move:
    print `Arc::strong_count` on each bank inside `CachedLayer::lend` and find the extra owner (candidates:
    a fill-thread clone, `Bank.proj` vs `SlotMemory.tensor`, slots outside `st.usable` sharing the bank).
    *Gate:* `lend` returns ≥ 90% of what it credits, 2 GB cache + stream does not OOM, TPOT back to ≤ 58 ms.
-3. **Break down the 60 ms step — 0.5 h, measurement only.** `NAIWA_STEP_DBG=1 NAIWA_ROUND_STATS=1` on one
-   `short` conversation, split dry/busy/wait per layer and read the PLE gather and CPU-dispatch counters.
-   *Gate:* a table that accounts for the 60 ms and names the largest term. This decides item 4.
-4. **Act on the largest term of item 3 — 1–3 days, engine work.** If it is the PLE gather, the answer may
-   be scope (the 28 GB table needs a bigger card or a smaller quant), not a kernel; say so before writing
-   code. If it is CPU dispatch, item 2's half gigabyte is the first fix. If it is a wait on the step path,
-   re-read M8's conclusion with chat numbers.
+3. ✅ **Break down the 60 ms step — done. It is the miss path, not the host chain and not the PLE.**
+   Two probes, one `short`-shaped conversation, `max_tokens 64`, 3 turns:
+
+   | variant | TPOT per turn |
+   |---|---|
+   | as shipped (1 GB cache, stream, lookahead) | 54.3, 55.4, 65.8 ms |
+   | `--no-lookahead` | 67.2, 65.4, 68.1 ms |
+   | `NAIWA_GPU_ONLY_EXPERTS=1` (perfect cache, **lossy**) | **18.8, 19.0, 24.2 ms** |
+   | perfect cache + `--no-lookahead` | 20.2, 14.0, 16.5 ms |
+
+   `NAIWA_STEP_DBG=1` on the shipped config says `busy 0.000 ms/layer, dry 1.17–1.32 ms/layer` over 48
+   layers: **the GPU is already idle at every layer entry**, so the token step is host-side wall time, and
+   the line is 48 × ~1.2 = 56–63 ms. Turning the lookahead off does not reduce it (it slightly increases
+   it), so the lookahead thread's CPU matmul is not the cost. Making every expert resident collapses it to
+   **~19 ms, i.e. faster than strata's 38 ms**.
+
+   Conclusion: the decode machinery is fine; the ~39 ms between 19 and 58 is what the *miss path* costs —
+   CPU expert gemv on 41.9% of the experts and staged DMA on 15.7% (`NAIWA_ROUND_STATS` on the same run:
+   hit 42.4% / staged 15.7% / cpu 41.9%, ~130 ms of CPU work per token summed over the pool). This flips
+   the M6–M9 conclusion for *this* workload: the host chain is not short of launches, it is waiting on
+   experts the 1 GB cache does not hold.
+4. **Attack the miss path — the two levers, in this order.**
+   a. **Hit rate.** 42.4% at a 1 GB cache. Half a gigabyte back (item 2) is the cheapest point available on
+      this card; beyond that a bigger card. Measure the same `short` conversation at 1 / 1.5 / 2 GB
+      (2 GB needs item 2) and report TPOT against hit rate — that curve says whether the CPU path or the
+      cache is the lever.
+   b. **CPU gemv cost.** ~130 ms of pooled CPU per token for ~3.4 miss experts. One expert-row is ~5.7 MB of
+      IQ1_M weights, i.e. ~0.1 ms of memory traffic, so the fused decode is 5–10× off its memory bound at
+      1 row — the same fused path that the np8 numbers praised at 8 rows. A 1-row-specialised kernel, or
+      batching a layer's misses across the verify window, is where the remaining CPU time is.
+   Do (a) before (b): if the hit-rate curve says 2 GB takes TPOT under 40 ms, the gemv work is second order.
 5. **MTP: keep it out of chat, or make it reuse-aware — 0–2 days, fork optional.** Today `--mtp` costs all
    prefix reuse for +45% TPOT on `code` only. Either ship "MTP off for chat" (already the default arm) or
    add draft-aware checkpoints to the fork. *Gate:* if MTP is re-enabled for chat, reuse must stay ≥ 0.7.
-6. **Scope and hardware — needs a decision.** A ≥24 GB card would allow stream+MTP, 8k `long`, and the PLE
-   residency question; on 12 GB the two are mutually exclusive and `long` stays at 4096.
+6. **Scope and hardware — needs a decision.** A ≥24 GB card would allow stream+MTP, 8k `long`, a 4 GB expert
+   cache with the stream (hit rate up, TPOT down), and the PLE residency question; on 12 GB the stream and
+   MTP are mutually exclusive and `long` stays at 4096.
 
 **Not now** (measured dead ends for this workload): tuning MoE/GEMM before item 3 names the term; chasing
 the ±10% band while turn 1 is 5× off; `--prefix-cache-n 16` at 4096 context; stream+MTP or 2 GB+stream on

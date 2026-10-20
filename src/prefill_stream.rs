@@ -244,6 +244,9 @@ impl PrefillStream {
 
     /// Queue the upload of `layer` into its buffer, unless it is already there. `false`: the
     /// layer is not registered.
+    ///
+    /// A mixed-quant layer whose shape differs from the buffer's frees the old buffer and
+    /// allocates the new one; that is where the prefill stream's memory peak comes from.
     fn load(&self, layer: usize) -> candle_core::Result<bool> {
         let Some(stacks) = self.stacks(layer) else {
             return Ok(false);
@@ -273,15 +276,7 @@ impl PrefillStream {
             // to the driver before allocating the next shape's. The switch is rare (per shape
             // change, not per layer) and the synchronize only waits for work already queued.
             trim_device_pool(&self.device)?;
-            let bytes: usize = stacks.iter().map(|s| s.storage_size_in_bytes()).sum();
-            debug!(
-                "prefill stream: {:.0} MiB buffer for layer {layer} ({:.0} MiB free before the \
-                 reallocation)",
-                (bytes as f64) / (1u64 << 20) as f64,
-                crate::copy_stream::device_free_bytes(&self.device)
-                    .map(|(f, _)| f)
-                    .map_or(-1.0, |f| (f as f64) / (1u64 << 20) as f64)
-            );
+            trace_buffer_bytes(&self.device, layer, &stacks);
             let memory = [
                 self.copy.alloc_like(&stacks[0])?,
                 self.copy.alloc_like(&stacks[1])?,
@@ -541,4 +536,24 @@ mod tests {
         let want = reference(&ids, &ws, 1);
         assert!(max_diff(&got, &want) < TOL, "subset of top-k diverges");
     }
+}
+
+/// Debug line at a mixed-quant reallocation: how big the buffer is and how much was free.
+fn trace_buffer_bytes(device: &Device, layer: usize, stacks: &[Arc<QTensor>; 3]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let bytes: usize = stacks.iter().map(|s| s.storage_size_in_bytes()).sum();
+    let free = device
+        .as_cuda_device()
+        .ok()
+        .and_then(|d| {
+            let stream = d.cuda_stream();
+            stream.context().mem_get_info().ok()
+        })
+        .map_or(-1.0, |(f, _)| (f as f64) / (1u64 << 20) as f64);
+    debug!(
+        "prefill stream: {:.0} MiB buffer for layer {layer} ({free:.0} MiB free before it)",
+        (bytes as f64) / (1u64 << 20) as f64
+    );
 }

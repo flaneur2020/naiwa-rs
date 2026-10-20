@@ -264,15 +264,6 @@ mod cuda {
         }
     }
 
-    /// Free and total device bytes, for accounting probes.
-    pub fn device_free_bytes(device: &Device) -> Option<(usize, usize)> {
-        let Device::Cuda(dev) = device else {
-            return None;
-        };
-        let stream = dev.cuda_stream();
-        stream.context().mem_get_info().ok()
-    }
-
     /// Return this device's unused pool blocks to the driver.
     ///
     /// candle allocates through CUDA's stream-ordered pool, which keeps a freed block for reuse
@@ -290,17 +281,30 @@ mod cuda {
         let stream = dev.cuda_stream();
         let context = stream.context();
         context.synchronize().map_err(Error::wrap)?;
-        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-        // SAFETY: `context` is live and bound to this device; the pool handle is owned by CUDA.
-        let rc = unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, context.ordinal() as i32) };
+        // Both pools: the device's *default* pool and the one it is currently set to. A stream's
+        // `cuMemAllocAsync` takes blocks from the device's current pool, which is the default
+        // unless something set another; trimming only the default released 288 MiB of 1863 in the
+        // prefill stream's hand-over, so trim both and never guess.
+        let dev = context.ordinal() as i32;
+        let mut pools: [sys::CUmemoryPool; 2] = [std::ptr::null_mut(); 2];
+        // SAFETY: `context` is live and bound to this device; both handles are owned by CUDA.
+        let rc = unsafe { sys::cuDeviceGetDefaultMemPool(&mut pools[0], dev) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             candle_core::bail!("cuDeviceGetDefaultMemPool failed: {rc:?}");
         }
-        // SAFETY: `pool` is the live default pool of this context; no block is in use by
-        // construction (the caller synchronised after the free).
-        let rc = unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+        let rc = unsafe { sys::cuDeviceGetMemPool(&mut pools[1], dev) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            candle_core::bail!("cuMemPoolTrimTo failed: {rc:?}");
+            candle_core::bail!("cuDeviceGetMemPool failed: {rc:?}");
+        }
+        for pool in pools {
+            if pool.is_null() {
+                continue;
+            }
+            // SAFETY: live pool of this context; the caller synchronised, so no block is in use.
+            let rc = unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                candle_core::bail!("cuMemPoolTrimTo failed: {rc:?}");
+            }
         }
         Ok(())
     }
@@ -345,7 +349,7 @@ mod cuda {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{device_free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use cuda::{trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
@@ -402,10 +406,6 @@ mod stub {
         Ok(())
     }
 
-    pub fn device_free_bytes(_device: &Device) -> Option<(usize, usize)> {
-        None
-    }
-
     /// Never constructed without CUDA.
     pub enum CopyStream {}
 
@@ -452,7 +452,7 @@ mod stub {
 }
 
 #[cfg(not(feature = "cuda"))]
-pub use stub::{device_free_bytes, trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
+pub use stub::{trim_device_pool, CopyDone, CopyStream, ReadFence, SlotMemory};
 
 #[cfg(test)]
 mod tests {
