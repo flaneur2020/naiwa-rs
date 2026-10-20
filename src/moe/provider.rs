@@ -123,6 +123,12 @@ impl GpuCacheMoeProvider {
                 MAX_DECODE_ROWS * first.hidden(),
             )?;
         }
+        // The prefill path's memory plan: one decision, now that the cache, the KV and the mapped
+        // buffers exist, from the free VRAM it measures. It picks the prompt step and the stream's
+        // buffer count together and publishes the step to the scheduler.
+        if let Some(prefill) = &self.prefill {
+            prefill.plan();
+        }
         #[allow(unused_mut)]
         let mut captures = 0usize;
         // M9: no segment captures. Measured before the deletion (graphs on/off): 43.5 vs 44.1 tok/s,

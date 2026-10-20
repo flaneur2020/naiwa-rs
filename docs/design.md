@@ -150,7 +150,17 @@ asserted frozen across decode. Static addresses keep the steady state allocation
 Banks are per-layer because the model is mixed-quant (7 expert shapes); shared structures carry
 counts/offsets/pointers only.
 
-**The prefill stream owns its VRAM.** Its layer buffers (~650 MiB at IQ1_M) are *not* lent from the
+**The prefill stream's memory is one decision, taken twice.** `prefill_stream::plan` picks the prompt
+step and the buffer count together from the free VRAM it measures: the largest chunk on the 256-token
+grid whose `stride × layer + activations(chunk) + headroom` fits, where the activation term is
+Strata's `160 MiB + 680 MiB per 1024 tokens` plus an eighth of slack. It runs at warmup and again at
+the first long chunk (which sees ~200 MiB less), publishing the smaller of the two to the scheduler —
+`--max-num-batched-tokens`/`--max-prefill-chunk-tokens` are ceilings, not settings. On this card the
+warmup says 1280 and the first chunk corrects it to 1024. A bigger chunk beats a second buffer
+(both measured), so the second buffer is only taken when the same chunk affords it, and a CUDA OOM
+inside the stream's own path drops one (2 → 1 → off).
+
+Its layer buffers (~650 MiB at IQ1_M) are *not* lent from the
 expert cache: that time-sharing cycle was measured to be unstable — the lend returns whole banks
 (1107 MiB of a 1300 MiB need), the buffers then need the rest from free VRAM, and the
 give-back/re-borrow churn per turn (re-allocating the cache's banks and re-filling them) leaked

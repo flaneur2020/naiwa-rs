@@ -110,6 +110,12 @@ pub async fn run_bench(
     }
     info!("Loading model for benchmarking...");
 
+    crate::prefill_stream::set_prompt_step_ceiling(
+        runtime
+            .max_num_batched_tokens
+            .get()
+            .min(runtime.max_prefill_chunk_tokens.get()),
+    );
     let (builder, model_id) = base_builder(&model, &global)?;
     let builder = builder
         .with_max_seqs(1) // Single sequence for benchmarking

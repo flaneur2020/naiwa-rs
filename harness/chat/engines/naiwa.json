@@ -19,9 +19,9 @@
     "--prefill-stream-min-tokens",
     "64",
     "--max-num-batched-tokens",
-    "1024",
+    "8192",
     "--max-prefill-chunk-tokens",
-    "1024",
+    "8192",
     "--pa-context-len",
     "4096",
     "--prefix-cache-n",
@@ -44,6 +44,6 @@
     "prefill": "--prefill-stream --prefill-stream-min-tokens 64 (prefill 147-285 tok/s vs 11-13 on the CPU)",
     "speculation": "none",
     "prefix_reuse": "--prefix-cache-n 1 (one recurrent snapshot, ~111 MB)",
-    "prefill_chunking": "--max-num-batched-tokens 1024 --max-prefill-chunk-tokens 1024: half the per-chunk layer uploads of 512 (doc turn 1 11.9 -> 7.4 s) with reuse unchanged; 2048 OOMs (the 2048-row MoE forward needs the memory the stream buffers occupy, even at a 0.8 GB cache)"
+    "prefill_chunking": "--max-num-batched-tokens 8192 --max-prefill-chunk-tokens 8192 are *ceilings*: the prefill path plans the step at warmup from the free VRAM it measures (chunk, and 1 or 2 layer buffers, from 160 MiB + 680 MiB per 1024 tokens of activations, Strata's formula, with an eighth of slack) and publishes it to the scheduler. On this card it lands on 1024 with one buffer"
   }
 }

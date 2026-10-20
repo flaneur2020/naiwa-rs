@@ -45,11 +45,79 @@ use crate::copy_stream::{
 /// streams every expert from 1024 tokens).
 pub const DEFAULT_MIN_TOKENS: usize = 1024;
 
-/// Free VRAM the stream keeps for the current chunk's activations and the KV blocks it grows into.
-/// A chunk's MoE intermediates grow with `--max-prefill-chunk-tokens`, so a two-buffer stream wants
-/// a wider margin than a one-buffer one.
+/// The operator's ceiling on the prompt step (`min(--max-num-batched-tokens,
+/// --max-prefill-chunk-tokens)`), published by the commands before the model loads. The plan below
+/// only ever chooses at or below it.
+static PROMPT_STEP_CEILING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `0` clears the ceiling (tests, non-CUDA).
+pub fn set_prompt_step_ceiling(tokens: usize) {
+    PROMPT_STEP_CEILING.store(tokens, std::sync::atomic::Ordering::Release);
+}
+
+fn prompt_step_ceiling() -> usize {
+    match PROMPT_STEP_CEILING.load(std::sync::atomic::Ordering::Acquire) {
+        0 => DEFAULT_MIN_TOKENS * 8,
+        n => n,
+    }
+}
+
+/// Free VRAM kept on top of what the plan below prices: the KV blocks and the copy-stream staging a
+/// prompt step grows into, plus the driver's own bookkeeping.
 const HEADROOM: usize = 192 << 20;
-const HEADROOM_TWO_BUFFERS: usize = 768 << 20;
+
+/// The prefill path's memory decision: how many layer buffers, and the prompt step they were
+/// priced with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Plan {
+    pub stride: usize,
+    pub chunk: usize,
+}
+
+/// Device bytes a prompt step of `chunk` tokens needs for its MoE activations, beyond the stream's
+/// own buffers. A chunk's intermediates scale with its token count, and this is Strata's measured
+/// form (`160 MiB + 680 MiB per 1024 tokens`, `src/program/generate.cpp:3216`); our own numbers
+/// agree — a 1024-token chunk blew a 512 MiB margin and fits in 768 MiB.
+pub(crate) fn activation_bytes(chunk: usize) -> usize {
+    (160 << 20) + (680 << 20) * chunk / 1024
+}
+
+/// The whole prefill memory decision, in one pure function: the largest prompt step that fits, in
+/// tokens, and how many layer buffers go with it.
+///
+/// **A bigger chunk beats the second buffer.** Every chunk streams every layer once (~31 GB of PCIe
+/// at IQ1_M), so doubling the chunk halves the traffic per token, while the second buffer only hides
+/// that upload behind the compute. Measured on this 12 GB card: one buffer at 1024 tokens prefill
+/// 915 / 1815 / 3615 tokens at 201 / 356 / 416 tok/s; two buffers at 512 at 147 / 285. So the search
+/// walks the 256-token grid from `ceiling` down and takes the second buffer only when the *same*
+/// chunk affords it.
+pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(usize, usize)> {
+    const GRID: usize = 256;
+    // The activation term is an estimate, so it carries slack: on this card the formula alone would
+    // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
+    // run's prefill). An eighth is enough to land on the 1024 the measurements proved.
+    let fits = |chunk: usize, stride: usize| {
+        let act = activation_bytes(chunk);
+        free >= stride * layer_bytes + act + act / 8 + HEADROOM
+    };
+    // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
+    let (mut lo, mut hi, mut best) = (1usize, (ceiling.min(8192) / GRID).max(1), 0usize);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid * GRID, 1) {
+            best = mid * GRID;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best == 0 {
+        return None;
+    }
+    let stride = if fits(best, 2) { 2 } else { 1 };
+    Some((stride, best))
+}
 
 /// One layer's host stacks (gate, up, down). Holding them keeps the memory that in-flight
 /// uploads read alive.
@@ -75,8 +143,11 @@ pub struct PrefillStream {
     comm: Arc<Comm>,
     layers: RwLock<Vec<Option<HostStacks>>>,
     bufs: [Mutex<LayerBuf>; 2],
-    /// Buffers in use (0 = stream off), decided on the first long chunk and kept for good.
-    stride: Mutex<Option<usize>>,
+    /// The memory plan in force (buffers and prompt step), from warmup and re-checked at the first
+    /// long chunk. `None` until someone decides; `stride == 0` means the stream is off.
+    plan: Mutex<Option<Plan>>,
+    /// The first long chunk has re-checked the plan against the free VRAM it actually sees.
+    checked: std::sync::atomic::AtomicBool,
     /// Chunks shorter than this stay on the CPU.
     min_tokens: usize,
 }
@@ -113,7 +184,8 @@ impl PrefillStream {
             act,
             comm,
             layers: RwLock::default(),
-            stride: Mutex::new(None),
+            plan: Mutex::new(None),
+            checked: std::sync::atomic::AtomicBool::new(false),
             min_tokens,
         }))
     }
@@ -150,50 +222,86 @@ impl PrefillStream {
             .unwrap_or(0)
     }
 
+    /// Measure now and return what fits, or `None` if nothing does.
+    fn decide(&self) -> Option<(Plan, usize)> {
+        let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
+        let (stride, chunk) = plan(free, self.layer_bytes(), prompt_step_ceiling())?;
+        Some((Plan { stride, chunk }, free))
+    }
+
+    /// The warmup decision: run the plan once the cache, the KV and the mapped buffers exist, keep
+    /// it, and log the arithmetic. Returns the prompt step it chose.
+    pub(super) fn plan(&self) -> Option<usize> {
+        let (decision, free) = self.decide()?;
+        *self.plan.lock().unwrap() = Some(decision);
+        log_plan(self, decision, free, "warmup");
+        Some(decision.chunk)
+    }
+
+    /// The plan in force, or `(stride 0, chunk 0)` if it did not fit.
+    fn current(&self) -> Plan {
+        (*self.plan.lock().unwrap()).unwrap_or(Plan { stride: 0, chunk: 0 })
+    }
+
     /// How many buffers to use, decided once from free VRAM: `2` (overlap the next layer's upload
     /// with this layer's MoE), `1` (no overlap, half the memory), or `0` (the stream stays off).
+    ///
+    /// The warmup plan is an estimate of what the first chunk will see; between it and that chunk
+    /// the staging ring and the KV grow (~200 MiB). So this re-measures once and takes the **worse**
+    /// of the two decisions, publishing a smaller prompt step if that is what it takes — the
+    /// scheduler reads the ceiling every step, so a mid-session shrink is a smaller next chunk, not
+    /// a broken one.
     ///
     /// The number of buffers is the only memory decision here, and it is measured rather than
     /// assumed: two buffers need twice a layer, and on a 12 GB card that is what pushes a
     /// 1024-token chunk's MoE intermediates over the edge. One buffer still beats the CPU by an
     /// order of magnitude (the uploads are then serial with the compute instead of hidden).
     fn reserve(&self) -> candle_core::Result<usize> {
-        if let Some(stride) = *self.stride.lock().unwrap() {
-            return Ok(stride);
+        let first = !self.checked.swap(true, std::sync::atomic::Ordering::AcqRel);
+        if !first {
+            return Ok(self.current().stride);
         }
-        let layer = self.layer_bytes();
-        let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let stride = if free >= 2 * layer + HEADROOM_TWO_BUFFERS {
-            2
-        } else if free >= layer + HEADROOM {
-            1
-        } else {
-            0
-        };
-        let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
-        match stride {
-            2 => info!(
-                "prefill stream: two {:.0} MiB layer buffers reserved, {:.0} MiB free",
-                mib(layer),
-                mib(free)
-            ),
-            1 => info!(
-                "prefill stream: one {:.0} MiB layer buffer reserved (two do not fit: {:.0} MiB \
-                 free); the next layer's upload is not overlapped",
-                mib(layer),
-                mib(free)
-            ),
-            _ => warn!(
-                "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB headroom needed, \
-                 {:.0} MiB free). Lower --expert-cache-gb to leave room for the stream, or drop \
-                 --prefill-stream",
-                mib(layer),
-                mib(HEADROOM),
-                mib(free)
-            ),
+        let previous = self.current();
+        match self.decide() {
+            Some((now, free)) => {
+                // The warmup estimate versus what the first chunk sees: the worse of the two.
+                let decision = Plan {
+                    stride: now.stride.min(previous.stride.max(1)),
+                    chunk: now.chunk.min(match previous.chunk {
+                        0 => now.chunk,
+                        c => c,
+                    }),
+                };
+                *self.plan.lock().unwrap() = Some(decision);
+                log_plan(self, decision, free, "first chunk");
+                if decision.chunk < previous.chunk {
+                    // The scheduler reads this every step: a smaller next chunk, not a broken one.
+                    mistralrs_core::PROMPT_STEP_CEILING
+                        .store(decision.chunk, std::sync::atomic::Ordering::Release);
+                    info!(
+                        "prefill: the prompt step drops from {} to {} tokens for the rest of the \
+                         session",
+                        previous.chunk, decision.chunk
+                    );
+                }
+                Ok(decision.stride)
+            }
+            None => {
+                let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
+                let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
+                warn!(
+                    "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB activations + \
+                     {:.0} MiB headroom does not fit in {:.0} MiB free). Lower --expert-cache-gb to \
+                     leave room for the stream, or drop --prefill-stream",
+                    mib(self.layer_bytes()),
+                    mib(activation_bytes(previous.chunk.max(256))),
+                    mib(HEADROOM),
+                    mib(free),
+                );
+                *self.plan.lock().unwrap() = Some(Plan { stride: 0, chunk: 0 });
+                Ok(0)
+            }
         }
-        *self.stride.lock().unwrap() = Some(stride);
-        Ok(stride)
     }
 
     /// Give up a buffer: free everything the stream holds, hand the blocks to the driver, and keep
@@ -202,7 +310,8 @@ impl PrefillStream {
     /// is used as the signal instead of a size heuristic.
     fn downgrade(&self, stride: usize) -> candle_core::Result<()> {
         let next = stride.saturating_sub(1);
-        *self.stride.lock().unwrap() = Some(next);
+        let chunk = self.current().chunk;
+        *self.plan.lock().unwrap() = Some(Plan { stride: next, chunk });
         for buf in &self.bufs {
             let mut buf = buf.lock().unwrap();
             buf.loaded = None;
@@ -358,6 +467,25 @@ impl PrefillStreams {
         }
     }
 
+    /// Run the memory plan for every device's stream and publish the chunk it chose to the
+    /// scheduler (the smallest across devices). `None`: no stream exists, or no chunk fits.
+    pub fn plan(&self) -> Option<usize> {
+        let streams = self.streams.lock().unwrap();
+        let chunk = streams
+            .iter()
+            .filter_map(|(_, stream)| stream.plan())
+            .min()?;
+        drop(streams);
+        mistralrs_core::PROMPT_STEP_CEILING
+            .store(chunk, std::sync::atomic::Ordering::Release);
+        info!(
+            "prefill: the scheduler's prompt step is capped at {chunk} tokens (from \
+             --max-num-batched-tokens/--max-prefill-chunk-tokens {})",
+            prompt_step_ceiling()
+        );
+        Some(chunk)
+    }
+
     /// Register `experts` (this block's CPU stacks) for streaming and return the device's
     /// stream. `None` for the MTP head, for stacks that are not all page-locked (`pinned`), and
     /// off CUDA: such a layer keeps its prefill on the CPU.
@@ -421,6 +549,44 @@ mod tests {
             .collect();
         let t = Tensor::from_vec(data, (e, n, k), &Device::Cpu).unwrap();
         Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
+    }
+
+    use super::{activation_bytes, plan};
+
+    /// The plan is the only memory judgement the prefill path makes, so pin it: the chunk is as
+    /// large as the free bytes allow, and the second buffer is taken only at the same chunk.
+    #[test]
+    fn plan_spends_memory_on_the_chunk_before_the_second_buffer() {
+        let layer = 650 << 20;
+        let gb = |g: usize| g << 30;
+        let act = |c: usize| activation_bytes(c);
+
+        // Plenty: the biggest chunk and both buffers.
+        let (stride, chunk) = plan(gb(12), layer, 8192).unwrap();
+        assert_eq!(chunk, 8192);
+        assert_eq!(stride, 2);
+
+        // 3 GB: one buffer. The activation term dominates — 4096 tokens alone want 2880 MiB.
+        let (stride, chunk) = plan(gb(3), layer, 8192).unwrap();
+        assert_eq!(stride, 1);
+        assert_eq!(chunk, 2560);
+
+        // 1855 MiB is this 12 GB card's free VRAM at a 1 GB cache: one buffer, 1024 tokens.
+        let (stride, chunk) = plan(1855 << 20, layer, 8192).unwrap();
+        assert_eq!((stride, chunk), (1, 1024));
+
+        // The operator's ceiling is a ceiling, not a target.
+        let (_, chunk) = plan(gb(12), layer, 512).unwrap();
+        assert_eq!(chunk, 512);
+
+        // Two buffers at the same chunk when the bytes are there and the chunk is the one that fits.
+        let slack = |c: usize| act(c) / 8;
+        let need2 = 2 * layer + act(2048) + slack(2048) + (192 << 20);
+        assert_eq!(plan(need2, layer, 2048).unwrap(), (2, 2048));
+        assert_eq!(plan(need2 - 1, layer, 2048).unwrap(), (1, 2048));
+
+        // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
+        assert_eq!(plan(layer, layer, 1024), None);
     }
 
     /// The fork's `MoEExperts::from_qtensors` computes the routed MoE of the stacks it is
@@ -537,6 +703,24 @@ fn trace_buffer_bytes(device: &Device, layer: usize, stacks: &[Arc<QTensor>; 3])
     debug!(
         "prefill stream: {:.0} MiB buffer for layer {layer} ({free:.0} MiB free before it)",
         (bytes as f64) / (1u64 << 20) as f64
+    );
+}
+
+/// One line with the whole decision, so the numbers are checkable in the log.
+fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
+    let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
+    let layer = stream.layer_bytes();
+    let act = activation_bytes(plan.chunk);
+    info!(
+        "prefill ({when}): chunk {}, {} × {:.0} MiB layer buffer(s) + {:.0} MiB activations + \
+         {:.0} MiB headroom = {:.0} MiB of {:.0} MiB free",
+        plan.chunk,
+        plan.stride,
+        mib(layer),
+        mib(act),
+        mib(HEADROOM),
+        mib(plan.stride * layer + act + HEADROOM),
+        mib(free),
     );
 }
 

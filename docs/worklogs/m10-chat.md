@@ -312,11 +312,12 @@ np8: `--no-lookahead` does not reduce it) and not the PLE gather.
   alternated, 0 failed turns in 270, 0 OOMs after the fix. Model load is intermittently OOM on this 12 GB
   card (the PLE host-gather fallback fragments the allocator); the driver retries *startup* up to twice and
   never retries a turn.
-- Engine changed in items 2 and 3 only (`prefill_stream.rs`, `copy_stream.rs`, and the lend removal in
-  `moe/`). The oracle was re-verified after each: `frac 0` + `--no-lookahead` byte-identical to
+- Engine changed in items 2, 3 and 5 (`prefill_stream.rs`, `copy_stream.rs`, the lend removal in `moe/`,
+  and a 10-line `PROMPT_STEP_CEILING` hook in the fork's scheduler: `mistralrs-core` `cc61c38c`). The oracle was re-verified after each: `frac 0` + `--no-lookahead` byte-identical to
   `harness/m1/reference.oracle.txt` — and, after the memory rework, **also with `--prefill-stream`**, which
   is the first time that path is covered by the oracle (it exercises one-buffer prefill and, at the oracle's
-  2 GB cache, the *decline* path). 34/34 tests, 0 naiwa warnings.
+  2 GB cache, the *decline* path). Re-verified after item 5 as well, both variants. 35/35 tests, 0 naiwa
+  warnings.
 - Every number above carries the comparability record in `run.json` and is reproduced by
   `harness/chat/summarize.py`.
 
@@ -410,17 +411,31 @@ measurement as the baseline (one mechanism per run, `harness/chat/README.md`).
       early through the router), so one gemv call serves two layers. Bigger change; only if (a) stalls.
    c. **Not** more cache or more staging at 12 GB: both measured as a wash (table above). A ≥24 GB card with a
       4 GB cache would be the real test of "keep them resident", and it is a hardware decision.
-5. **Adapt the chunk instead of the buffer count — 0.5 day, own repo.** Take Strata's rule: bisect
-   the chunk on the 256-token grid (ceiling 8192, floor 256) for the largest one whose footprint fits.
-   The footprint is `stride × largest layer + activations(chunk) + HEADROOM`, and `activations(chunk)`
-   is the term we keep guessing at (192 MiB and 512 MiB margins both OOM'd at 1024 tokens). This
-   replaces the hand-set `--max-prefill-chunk-tokens`/`--max-num-batched-tokens 1024` pair, picks up
-   a bigger chunk automatically on a bigger card, and lets the stream *raise* the chunk when memory is
-   freed elsewhere instead of silently staying at 1024. On this 12 GB card it should settle near
-   today's 1024; the point is that it is decided by measurement, per machine, every start.
-   *Gate:* picks ≥1024 here and ≥4096 on a card with ≥16 GB free; prefill tok/s and TPOT unchanged
-   (±5%); oracle identical.
-6. **Carve the buffers inside the cache — 1–2 days, own repo, after the CPU gemv work.** A layer buffer
+5. ✅ **Adapt the chunk instead of the buffer count — done, one decision in one place.**
+   `prefill_stream::plan(free, layer, ceiling)` is a pure function (unit-tested): it bisects the
+   256-token grid for the largest prompt step whose footprint fits, where
+   `footprint = stride × layer + activation_bytes(chunk) × (1 + 1/8) + HEADROOM` and
+   `activation_bytes` is Strata's `160 MiB + 680 MiB per 1024 tokens`. A bigger chunk beats the
+   second buffer (see the measured note in the source), so the second buffer is taken only when the
+   *same* chunk affords it. It runs twice, Strata-style:
+
+   | when | what it sees | decision |
+   |---|---|---|
+   | warmup, once the cache/KV/buffers exist | 2050 MiB free | chunk 1280, one 650 MiB buffer (1852 MiB) |
+   | the first long chunk, which sees ~200 MiB less (staging ring, KV growth) | 1888 MiB free | **chunk 1024**, one buffer (1682 MiB) — publishes the smaller step |
+
+   `--max-num-batched-tokens`/`--max-prefill-chunk-tokens` are now **ceilings** (8192 in the engine
+   config), not settings; the scheduler reads the published step every prompt step, so a mid-session
+   shrink is a smaller next chunk rather than a broken one (a new `PROMPT_STEP_CEILING` atomic in
+   `mistralrs-core/src/paged_attention/scheduler.rs`, clamped with `min`, so a host that never sets
+   it behaves exactly as before). A CUDA OOM inside the stream's own path still drops a buffer.
+
+   3 rounds / 132 turns: **0 OOMs** and the same decision in every round; `doc` turn 1 8.5 s,
+   `doc` TTFT ≥2 3.35 s, TPOT 58–60 ms, `short` e2e 61.2 s — i.e. the plan reproduces the hand-tuned
+   1024 on this card, and on a card with ~3 GB free it would pick 2560, on 12 GB free 8192 with two
+   buffers. Gate met apart from the one-machine part of it (this card cannot demonstrate the larger
+   chunks).
+6. **Carve the buffers inside the cache — 1–2 days, own repo, after the CPU gemv work (open).** A layer buffer
    is exactly the `[E, N, K]` stack a cache bank holds, so the stream's buffer could *be* a bank:
    allocated as a bank when the stream is first needed, used as the `MoEExperts` stack (what `load`
    already does), and handed back to the cache as slots between prompts. Then the 650 MiB stops being

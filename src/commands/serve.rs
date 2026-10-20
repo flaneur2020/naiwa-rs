@@ -21,6 +21,14 @@ pub async fn run_serve(
         install_prometheus_recorder();
     }
 
+    // The prompt step's ceiling: the prefill path plans below it from the free VRAM it measures at
+    // warmup (see `prefill_stream::plan`), so both flags are ceilings here, not settings.
+    crate::prefill_stream::set_prompt_step_ceiling(
+        runtime
+            .max_num_batched_tokens
+            .get()
+            .min(runtime.max_prefill_chunk_tokens.get()),
+    );
     let (builder, model_id) = base_builder(&model, &global)?;
     info!("Loading `{model_id}`");
     let mistralrs = builder
