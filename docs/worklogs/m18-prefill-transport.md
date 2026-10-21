@@ -44,12 +44,16 @@ takes **40 ms at 13.4 GB/s**, and the remaining ~55 ms of the serial measurement
 serial mode forces (the previous readers' event). The "8 GB/s implied rate" in M17 was a modelling artifact:
 chunk time is not copy time.
 
-**What that changes.** There is no transport headroom left - the copies already run at the link's practical
-maximum. The turn-1 floor is *overlap*: per layer with two buffers we measure ~78 ms of which the copy is
-40 ms, so an ideal pipeline would be `max(40, attention+MoE)`; the sum being 78 ms means roughly half the copy
-still is not covered. That is what a buffer count buys, and it is why the second buffer measured -16%
-(4.51 -> 3.78 s) while a third one is expensive: `3 x 650 + 522 + 512 = 2 984 MiB` of free VRAM, i.e. the
-expert cache would drop from 2.3 GB to ~1.2 GB.
+**What that changes.** There is no transport headroom left: the copies run at 11.2-13.4 GB/s, i.e. the link's
+practical maximum, and `dma_wait` is **~1 us in both modes** (1 buffer: 601 ns-1.07 us; 2 buffers: 611 ns-1.08 us),
+so the consumer never waits for the DMA in either. What the second buffer changes is the *width of the overlap
+window*: with one buffer the copy for layer L+1 cannot start until layer L's MoE releases the shared buffer, so
+it can only overlap layer L+1's attention (~38 ms against a 40 ms copy); with two it runs a whole layer ahead.
+That is the measured -16% (4.51 -> 3.78 s), and it is also why a third buffer would buy nothing - the copy is
+already hidden - while costing `3 x 650 + 522 + 512 = 2 984 MiB` of free VRAM (cache 2.3 -> ~1.2 GB).
+
+So the transport work is one decision, not a project: **take the second buffer**. After it, turn-1 is
+compute (`attention + hc`, 0.46 ms/row), which is a different milestone.
 
 ## Why 8 GB/s and not 13.4 (superseded by the measurement above)
 
@@ -91,12 +95,10 @@ against ~10% fewer cache slots (a tail-hit difference of a few percent, per M17)
 1. ~~Transport probe~~ - **built, and it retired the premise.** The copies are at 13.4 GB/s (the link's practical
    rate, calibrated with `cargo test h2d_bandwidth` / `h2d_three_parts` / `h2d_second_stream`); the "8 GB/s"
    was chunk time divided by bytes. `NAIWA_STREAM_SYNC=1` remains as the instrument for copy-vs-fence time.
-2. **Close the overlap gap instead of raising the rate.** Per layer with two buffers: ~78 ms total, 40 ms copy,
-   so the ideal is `max(40, rest)`. Options, cheapest first: (a) prefetch *deeper* than one layer (a third
-   buffer costs 2 984 MiB of free VRAM, i.e. cache 2.3 -> ~1.2 GB); (b) split the layer's copy so its second
-   half starts after the first half's fence instead of after all three blobs; (c) check that the fence is
-   recorded as early as it could be (it is recorded after the MoE, not after the last kernel that reads the
-   buffer). Gate: `doc` turn-1 <= 2.6 s (from 3.78 s with two buffers) with the oracle unchanged.
+2. ~~Close the overlap gap~~ - **not a gap.** `dma_wait` is ~1 us with one buffer and with two, so the DMA is
+   hidden in both; the second buffer's -16% comes from widening the overlap window, and a third would add
+   nothing (it would cost 2 984 MiB of free VRAM for no measurable change). No further transport work unless
+   the layer's own kernels get slower.
 3. **Sell the second buffer to the plan.** Decide between cache 1.85 GB (two buffers, -0.73 s per turn-1) and
    2.3 GB (one buffer, more slots) with a 3-round corpus, since M10 measured the cache as TPOT-neutral there.
    Gate: `doc` turn-1 <= 3.8 s at no `TTFT>=2` or TPOT regression.
