@@ -326,6 +326,26 @@ What the milestone leaves behind, all reusable:
 Next lever for turn-1 is therefore not memory: it is the per-row compute (`attention + hc`, 0.46 ms/row) that
 M17 identified, or a bigger card.
 
+## Is there any memory reuse left? (inventory, 2026-10-21)
+
+After the trim removal (M18) the answer is: the *expensive* kind - moving bytes on the critical path - is
+exhausted. What remains, with prices:
+
+| item | bytes | verdict |
+|---|---:|---|
+| prefill buffer <-> expert cache (this milestone) | 650-1 300 MiB | refuted: 7 shape groups make movable slots cost more capacity than they return |
+| prefill activations during decode | 522 MiB | no consumer: they are fp32/bf16 `[rows, hidden]` scratch, not expert blobs |
+| drafter pool (MTP head, Q2_0) | 675 MiB | in use on **both** phases, no idle window to lend |
+| staging ring (`--pcie-frac`) | 33 MiB | noise |
+| KV cache BF16 -> int8 | 118 -> 59 MiB | real but tiny, and it changes numerics |
+| dense weights BF16 -> 8-bit (`--isq` style) | 1 299 -> ~650 MiB | the only large one, but it **breaks the oracle** (the 1 299 MiB are BF16 *in the file*, so this is a requantisation, not a layout change) |
+| zeroing a fresh buffer (`QCudaStorage::zeros` on every shape change) | 500 MiB x 35 per chunk | ~18 ms (~0.5% of a chunk); would need a non-zeroed allocator in candle |
+| recurrent-state slots | 115 MiB each, allocated lazily | single-user already peaks at 1-2 slots, so `--max-seqs 1` buys runtime headroom, not speed |
+
+So the remaining *large* lever is requantising the dense part, which is a numerics decision (a new oracle), and
+everything else is either refuted or a rounding error. The fast wins left are not memory: TPOT's per-layer host
+round trip (45 -> 39 ms) and the per-row attention/hc work (0.46 ms/row) that M17 priced.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
