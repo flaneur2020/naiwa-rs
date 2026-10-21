@@ -71,6 +71,55 @@ and long prompts only.
   commit-to-boundary trick and still leaves a ≤31-row tail.
 - **A 28 GB PLE table with a lookup table on the SSD**, prefetched, instead of a per-row host gather.
 
+## The tail: what the reference does, and what we measured (2026-10-21)
+
+strata's prefill is chunked the same way (`Prefill`: "the prompt's positions [pos0, pos0 + n) are processed in
+chunks of `chunk` tokens through all 48 layers"), but it has **no alignment tail**: its per-session KV is dense,
+so `conversation_kv_save/restore(upto)` snapshots the turn's exact end. Its last chunk is an ordinary remainder
+(`n % chunk`, hundreds of rows at `chunk` = 1,024), not a <=31-row fragment.
+
+For small chunks it switches mechanism at a measured threshold:
+
+| chunk | path |
+|---|---|
+| >= `stream_all_min()` = **1024** tokens | "every non-resident expert of every layer streams in a fixed order through a `ring_slots()`-slot ring (**nearly all 512 are routed at such a chunk**)" |
+| < 1024 (and the last chunk) | MMQ + an **8-slot `STAGE` ring**, experts grouped by expert (`mmq_resident_sort_rows`): **resident ones read from the VRAM tier**, the rest streamed; buffers sized for `stream_all_min() - 1` |
+| optional | `STRATA_PREFILL_CPU_SHARE` hands the CPU pool the non-resident experts few tokens route to - "**-20..-35% at 512 and 1000 tokens**", on by default below 1,024 |
+
+So the shape is "one expert-supply mechanism, two selection granularities": whole-layer for big chunks, routed
+for small ones. Ours is currently split the other way: the prefill stream (big) is whole-layer but **cache-blind**,
+and the decode split (small) is cache-aware but sends its misses to the CPU.
+
+### Three measurements that changed the plan
+
+All on the same 3-turn `doc` conversation, `--expert-cache-gb 1.8`, alignment on (E2):
+
+| `--pcie-frac` | turn 2 TTFT | turn 3 TTFT | staged / cpu |
+|---|---:|---:|---|
+| 0.0 (all CPU) | 2.24 s | 1.61 s | 0 / 38.7% |
+| 0.2 (today) | 1.38 s | 1.18 s | 14.1 / 28.8% |
+| 1.0 | **1.23 s** | **1.12 s** | 36.4 / 4.3% |
+
+so staging more of a small chunk's misses *does* help it (my RAM-bandwidth argument that the CPU path must
+win was wrong) - but the effect is small, and it is not free:
+
+| ring slots (`NAIWA_STAGING_SLOTS`) | turn 2 | turn 3 |
+|---|---:|---:|
+| 16 (default) | 1.31 s | 2.56 s |
+| 128 | 1.22 s | **5.49 s** |
+| 512 | - | server would not start (1 062 MiB of ring + cache + buffers) |
+
+A deeper ring drags 8x more DMA per layer (256 MiB x 48 per step) and starves the next steps; 512 slots does
+not fit. And `--pcie-frac 1.0` over a full 3-round corpus is a net loss: `TTFT>=2` 1 153 -> 1 023 ms but
+**TPOT 45 -> 56-61 ms**, because every decode step now stages more misses too.
+
+**Conclusion: the tail is not a staging problem.** At ~50 rows it needs ~all 256 experts of every layer
+(50 x 10 = 500 lookups), i.e. the 23 GiB pass again, and our existing split - a 16-slot ring staging the
+high-weight few, the CPU pool taking the bulk at ~27 GB/s from RAM - is already the better operating point
+(strata's own CPU-share default says the same thing). What is left is to **make the tail smaller**, which is
+what E2 already did (restore point at the previous turn's last block), or to stop needing a tail at all,
+which is a KV-layout question (dense per-session KV), not a scheduling one.
+
 ## Work items
 
 1. **Let the big chunk warm the expert cache, so the tail hits.** The prefill stream DMAs a layer's experts
@@ -86,8 +135,9 @@ and long prompts only.
 4. **The decode host term** (`dry = 1.0 + 0.25 ms x rows`, M16 item 4): the only lever left on TPOT
    (45 ms against strata's 39).
 
-Order: 1 (cheapest, and it is the same cache mechanism M16 already uses), then 2, then 4. Item 3 is 1 done
-properly and should be designed with it.
+Order: **2** (the per-row tax) first now that 1 is ruled out, then 4 (the TPOT host term). Item 3 stays open
+but needs a *design*: "read only the misses" is exactly what the small-chunk path already does, and the
+measurements above say the win is not in the transport but in needing fewer bytes at all.
 
 ## Gates
 
