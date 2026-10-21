@@ -558,7 +558,51 @@ Two candidate causes, and they lead to different designs:
 | **the cache fill shares the link** during streamed prefill (`spawn_fill` issues PCIe copies on the same copy stream) | `NAIWA_NO_PREFILL_FILL=1` skips the chunk path's fills (probe written) | remove or defer the fill, keep the link for the buffer: ~40-45 ms/layer, ~1.9-2.2 s/chunk |
 | **the copy contends with attention for HBM bandwidth** (the DMA writes 499 MiB to HBM while attention streams KV) | `nvidia-smi utilization.memory` during a chunk, and the same chunk with attention artificially cheap (short prompt, large chunk) | no overlap trick helps; the floor is 50-60 ms/layer and the ring design should optimise *bytes*, not overlap |
 
-### The design, if the contention is removable
+### The minimal design: rename `layer` to `round` and keep everything else
+
+The three-stage sketch below is more machinery than the problem needs. `PrefillStream` already *is* a
+two-slice ping-pong: `bufs[0..stride]`, each with its own `released`/`ready`, and `forward(layer)` prefetches
+`layer + 1` before computing `layer`. The only thing that makes it layer-shaped is the index it uses.
+
+**Minimal version: index the ping-pong by a *global round counter* instead of by layer.**
+
+```
+rounds: (layer, expert subset) in layer order, across the whole chunk
+slice  = round % 2                      # the two slices are the group's slots, halved
+load(round + 1) into slice ^ 1          # already what `stride == 2` does, one level down
+compute(round) from slice               # already what `forward` does, on `hits` of that subset
+```
+
+That is it. No new fence types, no per-ring bookkeeping, no explicit cross-layer stage: because the round counter
+runs across layers, **the last round of layer L prefetches the first round of layer L+1 by construction**, which
+is exactly the cross-layer lead the three stages below were building. The two slices alternate globally, so the
+copy engine never waits for a layer boundary.
+
+Sizing: `ring = group_slots / 2`, `rounds per layer = ceil(256 / ring)`.
+
+| shape group | group slots | ring (per slice) | rounds/layer | DMA per slice | compute per slice |
+|---|---:|---:|---:|---:|---:|
+| 481 MiB | 510 | 255 | 2 | 36 ms | 9 ms |
+| 531 MiB | 420 | 210 | 2 | 33 ms | 9 ms |
+| 568 MiB | 252 | 126 | 3 | 21 ms | 6 ms |
+| 368 MiB | 220 | 110 | 3 | 12 ms | 6 ms |
+| 418 MiB | 117 | 58 | 5 | 7 ms | 4 ms |
+| 456 MiB | 35 | 17 | 16 | 2 ms | 1 ms |
+| 650 MiB | 25 | 12 | 22 | 2 ms | 1 ms |
+
+Because the slices alternate, in steady state a layer costs `max(DMA 40, compute 18) = 40 ms` (the small groups
+just have more, smaller slices of the same totals): **1.92 s/chunk at 13.4 GB/s, and ~2.9 s if the copy stays at
+the measured 8 GB/s** - which is the same fork in the road as before, and the reason the cheap NAIWA_NO_PREFILL_FILL
+probe comes first.
+
+Two implementation notes, both small:
+
+- the per-round expert subset is exactly what the cache already computes for a decode step (`hits` with their
+  weights), so a round's compute is a `Gpu::submit`-shaped call, not a new kernel path;
+- the slices are borrowed group slots, so "who owns them" is the `SlotArena` watermarks plus the `borrowed` mark -
+  no view over the bank is needed, since a slice is just a set of slot indices.
+
+### The fuller design (kept for the record, superseded by the above)
 
 Three stages, each adding one lead:
 
