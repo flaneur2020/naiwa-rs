@@ -21,7 +21,37 @@ So the two numbers disagree in an interesting way: with two buffers the per-laye
 DMA is fully hidden, yet a chunk whose DMA cannot be hidden (150 new rows, little attention to overlap with)
 runs at 8 GB/s, not 13.4. **A second buffer buys overlap; it does not buy rate.**
 
-## Why 8 GB/s and not 13.4
+## The probe, built: the copies are already at line rate (2026-10-21)
+
+`NAIWA_STREAM_DBG` now prints a per-layer transport line (`copy`, `GB/s`, `MiB x copies`), and a new
+`NAIWA_STREAM_SYNC=1` makes the upload blocking so the copy's own wall time is visible rather than the
+queue-side latency (`CopyDone::wait_on` only *enqueues* a stream wait, it does not block the host - the first
+version of this probe measured 6-29 GB/s at random because of that).
+
+Serial copies of one layer (481 MiB in 3 blobs): **92-109 ms, i.e. 4.6-5.5 GB/s**. That looked like a 2.5x
+transport loss, so the box itself was calibrated (`cargo test h2d_bandwidth`, 512 MiB copies):
+
+| case | rate |
+|---|---:|
+| pageable host memory | 10.6 GB/s |
+| `cuMemHostRegister` (what `pin_stack` does) | **13.4 GB/s** |
+| 3 blobs of 170 MiB instead of one 512 MiB blob | 13.4 GB/s |
+| after `advise_huge_pages` | 13.4 GB/s |
+| on a second stream, built like `CopyStream` | 13.4 GB/s |
+
+So the link, the blob shape, the huge-page advice and the separate copy stream are all fine: a layer's copy
+takes **40 ms at 13.4 GB/s**, and the remaining ~55 ms of the serial measurement is the **fence wait** that
+serial mode forces (the previous readers' event). The "8 GB/s implied rate" in M17 was a modelling artifact:
+chunk time is not copy time.
+
+**What that changes.** There is no transport headroom left - the copies already run at the link's practical
+maximum. The turn-1 floor is *overlap*: per layer with two buffers we measure ~78 ms of which the copy is
+40 ms, so an ideal pipeline would be `max(40, attention+MoE)`; the sum being 78 ms means roughly half the copy
+still is not covered. That is what a buffer count buys, and it is why the second buffer measured -16%
+(4.51 -> 3.78 s) while a third one is expensive: `3 x 650 + 522 + 512 = 2 984 MiB` of free VRAM, i.e. the
+expert cache would drop from 2.3 GB to ~1.2 GB.
+
+## Why 8 GB/s and not 13.4 (superseded by the measurement above)
 
 Candidates, cheapest to check first:
 
@@ -58,12 +88,15 @@ against ~10% fewer cache slots (a tail-hit difference of a few percent, per M17)
 
 ## Work items
 
-1. **Transport probe (build first).** `NAIWA_STREAM_DBG` grows a per-layer line: bytes, copies, copy wall time,
-   GB/s, `wait_for_readers`, `ready.wait_on`. Gate: it accounts for >= 90% of the layer's MoE time with no
-   unexplained residual, at both 150-row and 1 725-row chunks.
-2. **Raise the rate toward the link.** Whatever the probe blames: bigger copies (whole-layer single blob if the
-   pinned stacks allow it), fewer fence waits per layer, or an unpinned fallback. Gate: >= 11 GB/s on the
-   150-row (DMA-bound) chunk, i.e. 23 GiB in <= 2.1 s, with the oracle unchanged.
+1. ~~Transport probe~~ - **built, and it retired the premise.** The copies are at 13.4 GB/s (the link's practical
+   rate, calibrated with `cargo test h2d_bandwidth` / `h2d_three_parts` / `h2d_second_stream`); the "8 GB/s"
+   was chunk time divided by bytes. `NAIWA_STREAM_SYNC=1` remains as the instrument for copy-vs-fence time.
+2. **Close the overlap gap instead of raising the rate.** Per layer with two buffers: ~78 ms total, 40 ms copy,
+   so the ideal is `max(40, rest)`. Options, cheapest first: (a) prefetch *deeper* than one layer (a third
+   buffer costs 2 984 MiB of free VRAM, i.e. cache 2.3 -> ~1.2 GB); (b) split the layer's copy so its second
+   half starts after the first half's fence instead of after all three blobs; (c) check that the fence is
+   recorded as early as it could be (it is recorded after the MoE, not after the last kernel that reads the
+   buffer). Gate: `doc` turn-1 <= 2.6 s (from 3.78 s with two buffers) with the oracle unchanged.
 3. **Sell the second buffer to the plan.** Decide between cache 1.85 GB (two buffers, -0.73 s per turn-1) and
    2.3 GB (one buffer, more slots) with a 3-round corpus, since M10 measured the cache as TPOT-neutral there.
    Gate: `doc` turn-1 <= 3.8 s at no `TTFT>=2` or TPOT regression.

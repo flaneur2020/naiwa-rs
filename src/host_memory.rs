@@ -230,3 +230,185 @@ mod tests {
         assert!(pin_stack(&Device::Cpu, Arc::new(qt)).unwrap().is_none());
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod h2d_probe {
+    //! `cargo test --release h2d_bandwidth -- --nocapture`: what this box's host-to-device copy actually
+    //! reaches, registered (`cuMemHostRegister`, our expert stacks) against plain pageable memory. The
+    //! prefill stream measured 4.6-5.5 GB/s on 481 MiB copies; that is either the link or our path, and this
+    //! says which.
+
+    use candle_core::cuda::cudarc::driver::sys;
+
+    const MIB: usize = 512;
+
+    fn rate(label: &str, bytes: &[u8], registered: bool) {
+        let device = candle_core::Device::new_cuda(0).expect("cuda device");
+        let cuda = device.as_cuda_device().expect("cuda");
+        let stream = cuda.cuda_stream();
+        let mut dst = unsafe { cuda.alloc::<u8>(bytes.len()) }.expect("device buffer");
+        if registered {
+            unsafe {
+                let r = sys::cuMemHostRegister_v2(
+                    bytes.as_ptr() as *mut std::ffi::c_void,
+                    bytes.len(),
+                    sys::CU_MEMHOSTREGISTER_PORTABLE,
+                );
+                assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "host register");
+            }
+        }
+        // One warm-up copy so the first-touch/paging costs are not in the measurement.
+        stream.memcpy_htod(bytes, &mut dst).expect("warmup copy");
+        stream.synchronize().expect("sync");
+        let start = std::time::Instant::now();
+        const ROUNDS: usize = 4;
+        for _ in 0..ROUNDS {
+            stream.memcpy_htod(bytes, &mut dst).expect("copy");
+        }
+        stream.synchronize().expect("sync");
+        let elapsed = start.elapsed().as_secs_f64() / ROUNDS as f64;
+        let gbs = bytes.len() as f64 / elapsed / 1e9;
+        eprintln!(
+            "H2D {label:10} {:4} MiB: {:.1} ms, {gbs:.1} GB/s",
+            bytes.len() >> 20,
+            elapsed * 1e3
+        );
+        if registered {
+            unsafe {
+                sys::cuMemHostUnregister(bytes.as_ptr() as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    /// The prefill stream's real shape: one layer is three separate stacks (gate/up/down), copied as three
+    /// `memcpy`s in one batch, from THP-advised and registered buffers.
+    fn rate_parts(label: &str, parts: &[Vec<u8>], registered: bool, advise_huge: bool) {
+        let device = candle_core::Device::new_cuda(0).expect("cuda device");
+        let cuda = device.as_cuda_device().expect("cuda");
+        let stream = cuda.cuda_stream();
+        let mut dsts: Vec<_> = parts
+            .iter()
+            .map(|p| unsafe { cuda.alloc::<u8>(p.len()) }.expect("device buffer"))
+            .collect();
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        if advise_huge {
+            for p in parts {
+                super::advise_huge_pages(p);
+            }
+        }
+        if registered {
+            for p in parts {
+                unsafe {
+                    let r = sys::cuMemHostRegister_v2(
+                        p.as_ptr() as *mut std::ffi::c_void,
+                        p.len(),
+                        sys::CU_MEMHOSTREGISTER_PORTABLE,
+                    );
+                    assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "host register");
+                }
+            }
+        }
+        let mut copy = |dsts: &mut Vec<_>| {
+            for (dst, src) in dsts.iter_mut().zip(parts) {
+                stream.memcpy_htod(src, dst).expect("copy");
+            }
+            stream.synchronize().expect("sync");
+        };
+        copy(&mut dsts);
+        let start = std::time::Instant::now();
+        const ROUNDS: usize = 4;
+        for _ in 0..ROUNDS {
+            copy(&mut dsts);
+        }
+        let elapsed = start.elapsed().as_secs_f64() / ROUNDS as f64;
+        eprintln!(
+            "H2D {label:22} {:4} MiB x {}: {:.1} ms, {:.1} GB/s",
+            total >> 20,
+            parts.len(),
+            elapsed * 1e3,
+            total as f64 / elapsed / 1e9
+        );
+        if registered {
+            for p in parts {
+                unsafe {
+                    sys::cuMemHostUnregister(p.as_ptr() as *mut std::ffi::c_void);
+                }
+            }
+        }
+    }
+
+    /// Same bytes, same 3-part shape, registered: candle's default stream against a second stream built the
+    /// way `CopyStream` builds one. The prefill stream copies on that second stream and measures 4.6-5.5 GB/s
+    /// where the default stream reaches 13.4.
+    #[test]
+    fn h2d_second_stream() {
+        let device = candle_core::Device::new_cuda(0).expect("cuda device");
+        let cuda = device.as_cuda_device().expect("cuda");
+        let third = (MIB << 20) / 3;
+        let parts: Vec<Vec<u8>> = (0..3).map(|_| vec![7u8; third]).collect();
+        for p in &parts {
+            unsafe {
+                let r = sys::cuMemHostRegister_v2(
+                    p.as_ptr() as *mut std::ffi::c_void,
+                    p.len(),
+                    sys::CU_MEMHOSTREGISTER_PORTABLE,
+                );
+                assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "host register");
+            }
+        }
+        let mut dsts: Vec<_> = parts
+            .iter()
+            .map(|p| unsafe { cuda.alloc::<u8>(p.len()) }.expect("device buffer"))
+            .collect();
+        let second = cuda.cuda_stream().context().new_stream().expect("second stream");
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let default = cuda.cuda_stream().clone();
+        for (label, stream) in [("default", &default), ("second", &second)] {
+            let copy = |dsts: &mut Vec<_>| {
+                for (dst, src) in dsts.iter_mut().zip(&parts) {
+                    stream.memcpy_htod(src, dst).expect("copy");
+                }
+                stream.synchronize().expect("sync");
+            };
+            copy(&mut dsts);
+            let start = std::time::Instant::now();
+            const ROUNDS: usize = 4;
+            for _ in 0..ROUNDS {
+                copy(&mut dsts);
+            }
+            let elapsed = start.elapsed().as_secs_f64() / ROUNDS as f64;
+            eprintln!(
+                "H2D {label:8} stream {:4} MiB x 3: {:.1} ms, {:.1} GB/s",
+                total >> 20,
+                elapsed * 1e3,
+                total as f64 / elapsed / 1e9
+            );
+        }
+        for p in &parts {
+            unsafe {
+                sys::cuMemHostUnregister(p.as_ptr() as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    #[test]
+    fn h2d_three_parts() {
+        let third = (MIB << 20) / 3;
+        let parts: Vec<Vec<u8>> = (0..3).map(|_| vec![7u8; third]).collect();
+        rate_parts("3 parts pageable", &parts, false, false);
+        rate_parts("3 parts registered", &parts, true, false);
+        rate_parts("3 parts reg+huge", &parts, true, true);
+    }
+
+    #[test]
+    fn h2d_bandwidth() {
+        let pageable = vec![7u8; MIB << 20];
+        rate("pageable", &pageable, false);
+        drop(pageable);
+        // Same size, same content, registered: the shape of our expert stacks.
+        let mut pinned = vec![7u8; MIB << 20];
+        rate("registered", &pinned, true);
+        pinned.fill(9);
+        rate("registered2", &pinned, true);
+    }
+}

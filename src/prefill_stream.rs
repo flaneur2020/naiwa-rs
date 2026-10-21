@@ -143,6 +143,11 @@ struct HostStacks([Arc<QTensor>; 3]);
 struct LayerBuf {
     /// The layer uploaded (or being uploaded) into this buffer.
     loaded: Option<usize>,
+    /// Transport probe: what the last upload moved and when it was queued, so the consumer's wait can report
+    /// the copy's own wall time and rate rather than the whole layer's time.
+    queued: Option<std::time::Instant>,
+    bytes: usize,
+    copies: usize,
     memory: Option<[SlotMemory; 3]>,
     experts: Option<MoEExperts>,
     /// Recorded on candle's stream after the kernels that read this buffer.
@@ -186,6 +191,9 @@ impl PrefillStream {
         let buf = || -> candle_core::Result<Mutex<LayerBuf>> {
             Ok(Mutex::new(LayerBuf {
                 loaded: None,
+                queued: None,
+                bytes: 0,
+                copies: 0,
                 memory: None,
                 experts: None,
                 released: ReadFence::new(device)?,
@@ -402,8 +410,10 @@ impl PrefillStream {
             )?);
             buf.memory = Some(memory);
         }
-        let memory = buf.memory.as_ref().expect("allocated above");
         let data = [stacks[0].data()?, stacks[1].data()?, stacks[2].data()?];
+        buf.bytes = data.iter().map(|d| d.len()).sum();
+        buf.copies = data.len();
+        let memory = buf.memory.as_ref().expect("allocated above");
         let parts = [
             (&memory[0], &data[0][..]),
             (&memory[1], &data[1][..]),
@@ -411,7 +421,16 @@ impl PrefillStream {
         ];
         // SAFETY: registered stacks are page-locked, and `self.layers` keeps them alive and
         // unmodified for as long as this stream exists (`Drop` waits for the copies).
-        unsafe { self.copy.upload_async(&buf.released, &parts, &buf.ready)? };
+        let queued = std::time::Instant::now();
+        if std::env::var_os("NAIWA_STREAM_SYNC").is_some() {
+            // Serial probe: the blocking upload waits for the copies, so the line above reports the copy's own
+            // wall time and rate instead of the queue-side latency (`wait_on` only *enqueues* a stream wait).
+            // It also removes every overlap, so this mode measures throughput and nothing else.
+            self.copy.upload(&buf.released, &parts)?;
+        } else {
+            unsafe { self.copy.upload_async(&buf.released, &parts, &buf.ready)? };
+        }
+        buf.queued = Some(queued);
         buf.loaded = Some(layer);
         Ok(true)
     }
@@ -466,11 +485,21 @@ impl PrefillStream {
         let waited = t_wait.elapsed();
         let t_compute = std::time::Instant::now();
         let out = experts.forward(xs, topk_weights.clone(), topk_ids);
+        let transport = buf.queued.map(|queued| {
+            let copy = queued.elapsed();
+            let gbs = buf.bytes as f64 / copy.as_secs_f64().max(1e-9) / 1e9;
+            format!(
+                " copy={copy:?} {gbs:.1} GB/s {} MiB x {}",
+                buf.bytes >> 20,
+                buf.copies
+            )
+        });
         crate::dbg_note(
             "prefill_stream",
             &format!(
-                "layer {layer} stride {stride} dma_wait={waited:?} compute={:?}",
-                t_compute.elapsed()
+                "layer {layer} stride {stride} dma_wait={waited:?} compute={:?}{}",
+                t_compute.elapsed(),
+                transport.unwrap_or_default()
             ),
         );
         // Fence even on error: kernels reading the buffer may already be queued.
