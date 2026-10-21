@@ -403,7 +403,9 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m16-mtp-reuse.md`](worklogs/m16-mtp-reuse.md) — M16 (chat with MTP: prefix reuse
+Worklog: [`worklogs/m17-prefill-cost.md`](worklogs/m17-prefill-cost.md) — M17 (what a prompt chunk costs:
+`chunk ≈ 2.93 s + 0.46 ms × rows`, i.e. 23 GiB of expert reads per chunk plus a per-row PLE/attention tax;
+the ≤31-row checkpoint tail is the same term one size down). Worklog: [`worklogs/m16-mtp-reuse.md`](worklogs/m16-mtp-reuse.md) — M16 (chat with MTP: prefix reuse
 under speculation; TPOT 55 → 43/44/52 ms, reuse restored to 0.76–0.96, turn-1 prefill 6.06 → 9.53 s is the
 open cost). Worklog: [`worklogs/m10-chat.md`](worklogs/m10-chat.md) (multi-round chat harness + baseline; `worklogs/m10.md`
 is the older MoE-naming milestone and unrelated). Harness: `harness/chat/`.
