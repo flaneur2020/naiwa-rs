@@ -132,6 +132,34 @@ Two follow-ups that do *not* work, both measured:
   `--max-seqs` (115 MiB per slot): 4 -> 1 plus the smaller chunk would fit, at the cost of serving one
   sequence at a time. That is a concurrency decision, not a free lunch, and it is out of scope here.
 
+## The shape-change trim was 40% of a chunk (found and removed, 2026-10-21)
+
+While answering "how should the prefill claim be measured", the stream's per-layer probe showed **35 layer-shape
+changes in one 1 725-token chunk**, each costing **42-47 ms** in the `!fits` path: free the old buffer, call
+`trim_device_pool` (a context synchronise plus a pool trim), allocate the next shape's. That is **~1.5 s of a
+3.7 s chunk**, and it is pure overhead: the model's GGUF mixes quants per layer, so it has seven layer shapes.
+
+`trim_device_pool` is now **off** in that path (`NAIWA_SHAPE_TRIM=1` restores it for an A/B). The re-allocation
+becomes a pool hit - **median 31 us**, min 1 ms - with no OOM and the plan's free VRAM unchanged (1 983 MiB at
+cache 2.3, 2 559 MiB at 1.8), i.e. the pool does not hoard the way the original comment feared.
+
+| measurement | with trim | without trim |
+|---|---:|---:|
+| re-allocation, median | 43 ms | **31 us** |
+| `doc` turn-1, two buffers | 3.71 s | **3.24 s** |
+| `doc` turn-1, one buffer | 4.51 s | **4.05 s** |
+
+3 rounds, medians, shipped config (cache 2.3, one buffer):
+
+| class | TTFT t1 | TTFT >= 2 | TPOT | reuse | e2e | before |
+|---|---:|---:|---:|---:|---:|---|
+| doc | **3 882 ms** | 1 132 ms | **42 ms** | 0.98 | **31.4 s** | 4 431 / 1 153 / 45 / 34.4 |
+| long | **3 762 ms** | 1 145 ms | 45 ms | 0.97 | **41.0 s** | 4 286 / 1 062 / 46 / 52.9* |
+| short | 1 034 ms | **921 ms** | 46 ms | 0.89 | **34.0 s** | 1 065 / 1 185 / 46 / 38.3* |
+
+So turn-1 is -12% on `doc` and `long` for a two-line change, with TPOT unchanged and the oracle byte-identical
+(both variants) and 42/42 tests.
+
 ## Gates
 
 - Oracle unchanged (`frac 0 + --no-lookahead`, with and without `--prefill-stream`), 36/36 tests.

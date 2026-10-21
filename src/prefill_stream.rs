@@ -380,6 +380,7 @@ impl PrefillStream {
                 .all(|(m, s)| m.tensor().dtype() == s.dtype() && m.tensor().shape() == s.shape())
         });
         if !fits {
+            let t_realloc = std::time::Instant::now();
             if buf.memory.is_some() {
                 // The old memory is freed in candle's stream order; an upload into it may still
                 // be in flight on the copy stream, so order the free after it.
@@ -392,7 +393,15 @@ impl PrefillStream {
             // pool keep one block per shape defeats the two-buffer design: return the freed block
             // to the driver before allocating the next shape's. The switch is rare (per shape
             // change, not per layer) and the synchronize only waits for work already queued.
-            trim_device_pool(&self.device)?;
+            // The trim is **off** by default: it costs a context sync, and this model has seven layer shapes,
+            // so a chunk pays it ~35 times (measured 42-47 ms each, ~1.5 s of a 3.7 s chunk). Dropping it makes
+            // the re-allocation a pool hit (median 31 us) and measured turn-1 3.71 -> 3.24 s with two buffers
+            // and 4.51 -> 4.05 s with one, with no OOM and the plan's free VRAM unchanged - so the pool does
+            // not hoard the way the original comment feared.
+            // `NAIWA_SHAPE_TRIM=1` restores it for an A/B.
+            if std::env::var_os("NAIWA_SHAPE_TRIM").is_some() {
+                trim_device_pool(&self.device)?;
+            }
             trace_buffer_bytes(&self.device, layer, &stacks);
             let memory = [
                 self.copy.alloc_like(&stacks[0])?,
@@ -416,6 +425,10 @@ impl PrefillStream {
                 self.act,
             )?);
             buf.memory = Some(memory);
+            crate::dbg_note(
+                "prefill_realloc",
+                &format!("layer {layer} shape change took {:?}", t_realloc.elapsed()),
+            );
         }
         let data = [stacks[0].data()?, stacks[1].data()?, stacks[2].data()?];
         buf.bytes = data.iter().map(|d| d.len()).sum();
