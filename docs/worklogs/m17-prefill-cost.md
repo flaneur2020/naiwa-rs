@@ -139,6 +139,41 @@ Order: **2** (the per-row tax) first now that 1 is ruled out, then 4 (the TPOT h
 but needs a *design*: "read only the misses" is exactly what the small-chunk path already does, and the
 measurements above say the win is not in the transport but in needing fewer bytes at all.
 
+## PLE: no residency, memory map only (done, 2026-10-21)
+
+Per the decision that PLE's per-row cost has little headroom and that it should simply be "memory, else disk",
+the two ways of reaching the device were deleted (`mistralrs-core`, 295 lines removed, 20 added):
+
+| removed | what it was |
+|---|---|
+| `PleTable::make_resident` + `ResidentTable` + `copy_iq4_nl` + `quantize_shards` | a device copy of the 28 GB table "if it fits", in a gather-kernel layout |
+| `PleTable::device_index` + `device_reads_pageable_memory` | a pointer table so the GPU could gather rows straight out of the host mapping |
+| `PleLayer::gathers_on_device` (now `false`) | the switch that chose between them; it also gated decode-graph capture, which a host gather can never replay |
+
+What replaced them is nothing: `load` keeps the memory map (`TableSource::Gguf`), `prepare_table` only calls
+`advise_random_access`, and `gather_host` reads the rows - out of the page cache when it holds them, off the
+disk when it does not. Startup now says so once:
+
+```
+Qwen4-Exp PLE rows are gathered from the memory-mapped table on the host (page cache, else disk)
+```
+
+**Baseline with `PLE_DBG=1`** (the probe already existed; it sits on the host gather, so it covers prefill):
+
+| measurement | value |
+|---|---|
+| per gather call | **5.7 ms** |
+| rows per call | 638 (average over a mixed run) |
+| share of `doc` turn-1 | 48 layers x 5.7 ms ~= **0.27 s of 4.5 s (~6%)** |
+| decode | **not gathered at all** - PLE runs on the prefill path only, as `design.md` says |
+
+So the 0.46 ms/row term is *not* PLE-dominated: at ~0.16 ms/row for PLE, the remaining ~0.3 ms/row is the QSA
+attention and the `hc_*` hyper-connections. That reverses the guess this document opened with, and it is why
+item 2 below is no longer the top of the list.
+
+Oracle re-verified after the deletion (byte-identical, both variants), 36/36 tests, `doc` turn-1 4.58 s
+(unchanged, i.e. removing the residency attempt cost nothing - it had always fallen back).
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
