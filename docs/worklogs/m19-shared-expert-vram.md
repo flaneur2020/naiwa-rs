@@ -44,6 +44,27 @@ arithmetic would allow (`1983 - 1300 - 402 - 50`). Freeing the only other lever 
 owns, which is strata's `borrow` exactly ("the top slots of the expert cache"). That is the milestone, and the
 phases below are ordered around it rather than around a static reservation.
 
+## Single-user (decided 2026-10-21): what it simplifies, and what it does not
+
+The engine only has to serve one user, so concurrency needs no consideration. That removes the hardest part of
+the loan design - there is no decode step to protect while another request prefills, and the loan can be held
+for the whole prompt phase (as strata does) instead of being released per chunk or per admission epoch.
+
+It does **not** hand us the VRAM, which was worth checking: `--max-seqs` looked like the obvious lever (M10
+measured 112 MiB per sequence slot at runtime), but the recurrent-state pool is allocated **lazily**, so it is
+not a plan-time budget:
+
+| `--max-seqs` | free VRAM at the warmup plan |
+|---|---:|
+| 1 | 2 338 MiB |
+| 4 | 2 335 MiB |
+| 16 | (same shape; the pool grows on the first decode, not at load) |
+
+and the first chunk sees 1 983-1 986 MiB in all cases. `--max-seqs 1` also changes nothing about the buffer
+decision: chunk 3072 needs `1 300 + 402 + 50 + 512 = 2 264 MiB` and the plan still granted one buffer.
+
+So single-user is a *simplification* of the loan, not a substitute for it. The borrow stays the plan.
+
 ## What strata does, verbatim
 
 ```cpp
