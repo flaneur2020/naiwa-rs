@@ -461,8 +461,18 @@ impl PrefillStream {
         }
         let buf = self.bufs[layer % stride].lock().unwrap();
         let experts = buf.experts.as_ref().expect("loaded");
+        let t_wait = std::time::Instant::now();
         buf.ready.wait_on(&self.device)?;
+        let waited = t_wait.elapsed();
+        let t_compute = std::time::Instant::now();
         let out = experts.forward(xs, topk_weights.clone(), topk_ids);
+        crate::dbg_note(
+            "prefill_stream",
+            &format!(
+                "layer {layer} stride {stride} dma_wait={waited:?} compute={:?}",
+                t_compute.elapsed()
+            ),
+        );
         // Fence even on error: kernels reading the buffer may already be queued.
         buf.released.record_reads(&self.device)?;
         out.map(Some)

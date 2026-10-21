@@ -13,6 +13,14 @@ mod moe;
 mod prefill_stream;
 mod stats;
 
+/// `NAIWA_STREAM_DBG=1`: the prefill stream's per-layer DMA wait against its compute, so a slow
+/// prefill chunk can be attributed instead of guessed at.
+pub(crate) fn dbg_note(site: &str, msg: &str) {
+    if std::env::var_os("NAIWA_STREAM_DBG").is_some() {
+        eprintln!("STREAM_DBG {site}: {msg}");
+    }
+}
+
 use anyhow::Result;
 use clap::Parser;
 use mistralrs_core::{

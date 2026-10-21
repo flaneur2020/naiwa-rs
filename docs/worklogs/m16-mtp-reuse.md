@@ -299,6 +299,48 @@ within rounding — so there is no 2x slot-size difference to chase. The totals 
 they are per *layer* (expert count x per-expert bytes = 500 MiB either way): a full-layer read is still 24 GB
 for 48 layers, our 2.3 GB cache is ~1 178 slots (~24.5/layer, 9.6% of 256), and strata's 1 028 is ~21/layer ""(8.4%).
 
+## What a prompt chunk actually costs, and why strata's 0.63 s is not 37 GB/s (measured, 2026-10-21)
+
+The earlier guess in this file — that strata's `doc` turn 2 implied ~37 GB/s — was wrong twice over: it assumed
+both engines prefilled the same number of new tokens, and that a chunk must read the whole layer. The paired
+run says otherwise:
+
+| class / turn | engine | prompt | cached | **new rows** | TTFT |
+|---|---|---:|---:|---:|---:|
+| doc 2 | naiwa | 1 846 | 1 696 | **150** | 5.24 s |
+| doc 2 | strata | 1 846 | 1 818 | **28** | 0.72 s |
+| doc 3 | naiwa | 1 965 | 1 824 | 141 | 3.19 s |
+| doc 3 | strata | 1 957 | 1 932 | **25** | 0.64 s |
+
+strata restores **past the prompt end**, into the assistant's previous answer, so its next turn reuses 98% where
+we reuse 92%.
+
+`NAIWA_STREAM_DBG=1` (new) then splits a chunk's cost per layer: `dma_wait` is **~600 ns** — the DMA is fully
+hidden by the second buffer — and the streamed MoE compute is 0.5–11 ms/layer. Fitting two measured chunks
+(1 725 rows -> 3.73 s, 150 rows -> 3.00 s, cache 1.8 GB, two buffers) gives a clean two-term model that
+reproduces both exactly:
+
+| term | value | what it is |
+|---|---:|---|
+| fixed per chunk | **2.93 s** | reading ~all 256 experts of every layer: 23 GiB at **8.0 GB/s** |
+| per row | **0.46 ms** (9.7 us/row/layer) | attention + PLE host gather + the `hc_*` hyper-connections |
+
+So `TTFT>=2` is the fixed term (150 rows already saturate the 256 experts: 150 x 10 = 1 500 lookups), and
+turn-1 adds the per-row term on top. strata's 0.63 s is not a faster link: with 28 new rows its *distinct*
+expert count is roughly half (28 x 10 = 280 lookups, ~120 distinct), and its prompt path borrows the cache
+slots it already holds ("prompt path borrows 874 CUDA0 cache slots"), so it reads a fraction of the layer where
+we re-read all of it.
+
+Two levers follow, in payoff order:
+
+1. **Reuse past the prompt end.** Restoring into the previous answer turns 150 new rows into ~25, which halves
+   the distinct-expert count and therefore the fixed term. Ours stops at `align_down(prompt, 32)` because
+   checkpoints are only captured at prompt-step boundaries; the code's stated reason (a chat template
+   re-renders a finished assistant turn differently than it was generated) only makes such a checkpoint
+   *unreachable* for other clients, not wrong — our own live transcript replays the text verbatim.
+2. **Read only the misses.** The prefill stream re-reads every routed expert per chunk; the cache's residents
+   are ignored. Serving the resident ones from their slots would remove the share they cover.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
