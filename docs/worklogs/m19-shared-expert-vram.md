@@ -396,6 +396,51 @@ change, not a stream change.
 | per-expert QTensor views over a byte arena | 768 tiny allocations per buffer (256 experts x 3 projections); ~5 us each = ~4 ms/layer, and it thrashes the pool |
 | plain views over one arena | needs a raw-pointer `CudaSlice`, which cudarc does not expose (private fields + `Drop`) |
 
+## Two refinements from the user, priced (2026-10-21)
+
+### (1) Split the ring in half: compute from one half while the other DMAs
+
+Inside one layer there is almost nothing to hide the DMA behind: per layer the chunk spends **~40 ms on the DMA**,
+**~16 ms on attention + hc**, and only **~2 ms on the MoE compute** (measured, 1 725 rows). Attention *produces*
+the MoE's input, so it cannot overlap this layer's expert DMA, and overlapping the DMA with 2 ms of MoE compute
+saves at most 2 ms/layer (~0.1 s/chunk) - noise.
+
+Double buffering pays only **across layers** (fill layer L+1's slots during layer L's attention), which is exactly
+what the current two-buffer stream does (-16%, M18). In the ring variant that needs two layers' worth of slots -
+which only the two biggest groups can nearly afford (below).
+
+### (2) Borrow the other same-shape layers' slots: this is the idea that makes rounds disappear
+
+A slot is only interchangeable **inside its shape group**, and the groups are unevenly sized:
+
+| shape group | layers | slots/layer | **group slots** | group bytes | one whole layer (256 slots)? |
+|---|---:|---:|---:|---:|---|
+| 481 MiB | 15 | 26 | **390** | 0.72 GiB | **yes**, plus 134 spare |
+| 531 MiB | 14 | 23 | **322** | 0.65 GiB | **yes**, plus 66 spare |
+| 568 MiB | 9 | 22 | 198 | 0.43 GiB | no - 77% of a layer |
+| 368 MiB | 5 | 34 | 170 | 0.24 GiB | no - 66% |
+| 418 MiB | 3 | 30 | 90 | 0.14 GiB | no - 35% |
+| 456 MiB | 1 | 27 | 27 | 0.05 GiB | no - 11% |
+| 650 MiB | 1 | 19 | 19 | 0.05 GiB | no - 7% |
+| | | | **1 216** | 2.3 GiB | **29 of 48 layers (60%) need no rounds at all** |
+
+So borrowing turns the ring into a whole-layer buffer for 60% of the layers (one DMA, exactly today's copy
+shape), and leaves rounds of 2-10 only for the other 40%. The 134/66 spare slots in the two big groups are enough
+to *start* the cross-layer double buffering of (1) for a third of the layers.
+
+**Price**: borrowing the bottom of a group evicts that group's residents, so a chunk that prefills every group
+costs a refill of up to the whole cache - **2.3 GiB ~ 171 ms per turn** at 13.4 GB/s. Against that, the 650 MiB
+buffer reservation disappears and becomes **+333 cache slots (+28%)**, which at M18's measured slope (231 slots =
+6 ms TPOT) is worth about **-8 ms TPOT, i.e. ~5 s per conversation** - so the trade is positive, and it also
+removes the "plan declines and prefill falls back to the CPU" failure mode entirely.
+
+**Implementation shape**: one bank per shape group (7 allocations, `group_slots x slot_bytes`), each layer owning
+a contiguous range **at the top** of its group's bank, and the prefill borrowing **the bottom** of the group it is
+currently prefilling. No views are needed - everything stays slot-addressed inside the group's own `QTensor`
+(`Bank { first }` plus the kernels' `local = slot - first`), which is why this version works where the movable-slot
+arena could not. What is still missing is the refill policy (the evicted slots come back as empty) and the
+per-group eviction bookkeeping.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
