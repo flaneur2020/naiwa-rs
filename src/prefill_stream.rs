@@ -113,9 +113,16 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(u
     // prompt step allocates more than the two terms above — the paged-attention scratch and the
     // step's own buffers grow with `--max-num-batched-tokens`, and 192–227 MiB of slack OOM'd a
     // 1723-token chunk twice with two buffers resident.
+    // `NAIWA_PREFILL_SLACK_MIB` (probe): the free-VRAM slack the plan keeps beyond the buffers and the
+    // activations. The 512 MiB floor is what M10 measured as safe, and it is also the only thing standing
+    // between one buffer and two at this card's free VRAM, so it is worth calibrating instead of trusting.
+    let slack_override = std::env::var("NAIWA_PREFILL_SLACK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mib| mib << 20);
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
-        let head = (512 << 20).max(free / 8);
+        let head = slack_override.unwrap_or_else(|| (512 << 20).max(free / 8));
         free >= stride * layer_bytes + act + act / 8 + head
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.

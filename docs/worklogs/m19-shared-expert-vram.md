@@ -25,6 +25,25 @@ Prefill and decode alternate, so **2.4 GiB of buffer is idle during decode and 2
 prefill**. Sharing them would give decode 1 208 -> ~2 200 slots (+83%) *and* keep two prefill buffers, instead
 of choosing.
 
+## The static shortcut, measured and refuted (2026-10-21)
+
+Before the arena: can the second buffer simply be *reserved* from free VRAM? The plan's formula says it fits if
+the 512 MiB slack floor drops. It does not - `NAIWA_PREFILL_SLACK_MIB` was added to test exactly that:
+
+| config | plan says | free | outcome |
+|---|---:|---:|---|
+| chunk 3072, slack 192 MiB, 2 buffers | 1 894 MiB needed | 1 983 MiB (**89 MiB margin**) | **`CUDA_ERROR_OUT_OF_MEMORY`** |
+| chunk 2816, slack 192 MiB, 2 buffers | 1 888 MiB needed | 1 985 MiB (**97 MiB margin**) | **`CUDA_ERROR_OUT_OF_MEMORY`** |
+
+So the formula's `activations + activations/8` under-counts the peak by **more than 89 MiB** at these chunks (the
+paged-attention scratch and the step's own buffers are not in it), and the true slack is above the 231 MiB the
+arithmetic would allow (`1983 - 1300 - 402 - 50`). Freeing the only other lever - `--max-seqs 4 -> 2` returns
+229 MiB - lands on a knife edge with no margin, and `--max-seqs 1` is a concurrency decision.
+
+**Therefore the second buffer cannot be funded from free VRAM at all.** It has to be memory the cache already
+owns, which is strata's `borrow` exactly ("the top slots of the expert cache"). That is the milestone, and the
+phases below are ordered around it rather than around a static reservation.
+
 ## What strata does, verbatim
 
 ```cpp
@@ -88,23 +107,28 @@ VRAM for experts (one budget, decided at startup)
 
 ### Three phases, each with its own gate
 
-**P1 — the arena, no behaviour change.** Allocate the cache, the borrow region, the staging ring and the
-drafter pool from one arena; log the partition at startup; `plan` consumes the borrow region's size instead of
-`free`. Gate: `MISTRALRS_VRAM_DUMP` shows the same tensors, oracle byte-identical (both variants), 36/36 tests,
-3-round corpus within noise of M18's baseline (4 431 / 1 153 / 45 on `doc`).
+**P1 — the borrow region out of the cache's slots, no behaviour change.** Allocate one bank for the borrow
+region *inside* what the cache budget would have owned: `--expert-cache-gb 2.3` yields 1 208 slots today; the
+partition takes the top `ceil(region_bytes / slot_bytes)` = ~340 slots (~660 MiB) out of that count and hands
+them to the stream as one contiguous `[slots, N, K]` range, aliased as `[E, N, K]` for the prefill layer.
+`plan` sizes the chunk from the region instead of `free`, so it can no longer decline. Gate: the startup line
+prints `cache N slots | borrow M MiB | ring K | drafter D`; `MISTRALRS_VRAM_DUMP` unchanged in total; oracle
+byte-identical both variants; 36/36 tests; 3-round corpus within noise of M18's baseline
+(4 431 / 1 153 / 45 on `doc`) with **one** buffer (behaviour must not change yet).
 
-**P2 — spend the headroom on buffers.** With the borrow region no longer competing with `free`, the 512 MiB
-"headroom" floor can drop to a measured slack (~128 MiB, the amount that actually OOMed in M10), and the
-region can hold **two** layer buffers plus activations: `2 x 531 + 522 + 65 + 128 = 1 777 MiB`, which the
-current `free` (1 983 MiB) funds at startup. Gate: `plan` grants 2 buffers with `--expert-cache-gb 2.3`
-untouched, `doc` turn-1 <= 3.7 s **and** TPOT <= 46 ms - i.e. the M18 trade undone.
+**P2 — spend the region on two buffers.** With the region sized by measurement rather than the formula (the
+`act + act/8` terms under-count by >89 MiB, above), hold two layer buffers plus the chunk activations:
+`2 x 650 + 402 + 50 + slack(measured ~280) = 2 032 MiB`, i.e. the region takes ~1 040 slots' worth (~2.0 GB) of
+the budget - which the cache absorbs by having that many fewer slots *while a prompt is being prefilled*, and
+gets them back afterwards. Gate: `plan` grants 2 buffers, `doc` turn-1 <= 3.7 s **and** TPOT <= 46 ms, no OOM
+across a 3-round corpus (the static version OOM'd on the first turn).
 
-**P3 — lend the region back to the cache.** Between prefills the region becomes `531 MiB / 1.95 MiB = 272`
-extra slots for its shape's layer (a "loan" flag makes the LRU and the lookahead fill treat them as normal
-slots; the prefill stream takes them back with a fence, and they are refilled afterwards like strata does).
-Gate: cache slots +~270 (1 208 -> ~1 480, +22%) with TPOT <= 45 ms, and the refill cost measured per turn
-(expect ~50-100 ms of DMA on the first decode step after a prefill) - if the refill eats the gain, keep P2 and
-stop.
+**P3 — give the region back between prefills.** With no prompt in flight the region is `region_bytes /
+slot_bytes` = ~340 (P1) to ~1 040 (P2) extra slots for its shape's layer, i.e. decode sees the *full* 1 208
+slots again. The loan needs a flag the LRU, the hit path and `Layers::spawn_fill` all honour, plus a fence when
+the stream takes the range back and a re-fill like strata's ("refilled after it", ~1.4 GiB of DMA, ~100 ms).
+Gate: decode slot count restored to 1 208 with TPOT <= 45 ms, re-fill cost measured and under ~150 ms; if it
+eats the gain, ship P2 with the cache permanently short and stop.
 
 ### What each phase buys, in the numbers we already have
 
