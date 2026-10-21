@@ -346,6 +346,56 @@ So the remaining *large* lever is requantising the dense part, which is a numeri
 everything else is either refuted or a rounding error. The fast wins left are not memory: TPOT's per-layer host
 round trip (45 -> 39 ms) and the per-row attention/hc work (0.46 ms/row) that M17 priced.
 
+## Reuse angles that survive the shape problem (brainstorm, 2026-10-21)
+
+The milestone's original angle (a movable slot pool) died on seven shapes. Four other angles reuse the *same
+VRAM* without needing movable slots, and two of them look worth prototyping:
+
+### 3b. Stream the experts **through the layer's own cache slots**, in rings - no buffer at all
+
+The layer's bank already is `[num_slots, n, k]` of that layer's exact shape, and the decode path already knows
+how to DMA a *subset* of experts into slots (`DmaMiss`) and how to compute a subset with weights (`Gpu::submit`
+over `hits`). So a prompt chunk could run as a sequence of rounds: DMA the next `num_slots` (25) experts of this
+layer into its own slots, compute the `(row, expert)` pairs that round owns, accumulate.
+
+| | value |
+|---|---|
+| rounds per layer | `256 / 25` = **10** |
+| DMA total | unchanged (~499 MiB/layer, the whole expert set) |
+| **VRAM saved** | **the whole 650 MiB buffer** -> **+333 cache slots (+28%)** |
+| cost 1 | MoE calls per chunk: 48 -> **491** (small grouped GEMMs) |
+| cost 2 | the layer's residents are clobbered; refill after the prompt = 48 x 49 MiB = **2.3 GiB ~171 ms** |
+
+This is the user's "cache grows one way, prefill the other" idea *without* needing contiguous runs or movable
+slots, because the rounds are addressed inside each layer's own bank. Cheap prototype: set `--pcie-frac 1.0`
+and a **256-slot staging ring** (650 MiB, same as today's buffer) and route prompt chunks through the decode
+split (raise `PREFILL_THRESHOLD` past the chunk size). That tests the *mechanism* - round overhead and the
+subset compute - at the same VRAM; if it holds, the ring becomes "the layer's own slots" and the 650 MiB comes
+back as cache.
+
+### 1. Promote the hottest experts from the stream's buffer into the cache (D2D, not PCIe)
+
+After a layer's chunk compute, the buffer holds that layer's whole expert set in VRAM. Copying the top
+`num_slots` (by routing count) into the layer's cache slots is a **device-to-device** copy at ~1 TB/s:
+25 x 1.95 MiB = 49 MiB -> **~0.05 ms/layer, ~2 ms/chunk**, versus the lookahead fill that fetches the same
+experts over PCIe later. It fills the cache for the *next* decode with exactly the experts this conversation
+uses, at copy speed, and takes load off the link that the tail and the staging ring need.
+
+### 3c. No tail at all (KV layout)
+
+The <=31-row tail exists only because the recurrent checkpoint must sit on a block boundary. A dense per-session
+KV (strata's `conversation_kv_save(upto)`) removes the split, and with it the tail's 0.8 s; it is a KV-layout
+change, not a stream change.
+
+### Rejected on the numbers
+
+| angle | why not |
+|---|---|
+| stream into a *spare* bank of the dominant shape | the spare serves only its own shape group (15 of 48 layers), and 256 slots of it = 481 MiB |
+| re-layout the host stacks so all layers share one shape (strata's pack) | host 23.4 -> 31.2 GiB (+33%) **and** device slots become uniform (-23% cache capacity, M19's uniform measurement) |
+| per-expert QTensor views over a byte arena | 768 tiny allocations per buffer (256 experts x 3 projections); ~5 us each = ~4 ms/layer, and it thrashes the pool |
+| plain views over one arena | needs a raw-pointer `CudaSlice`, which cudarc does not expose (private fields + `Drop`) |
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
