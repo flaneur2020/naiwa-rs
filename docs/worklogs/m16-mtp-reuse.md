@@ -290,10 +290,14 @@ instead of over PCIe (measured 10 GB/s vs 13.4). The threshold only moves traffi
 both bounded by the same read. Reverted; the constant stays at 32.
 
 Closing that gap requires the conversation's experts to be resident (cache size, or a resident set that
-survives the turn) or a faster path than either — not a dispatch knob. One number worth checking next:
-strata's log reports `1028 slots, 1.98 GiB`, i.e. **1.93 MiB per expert slot, half our 3.9 MiB** for the same
-model, which would halve its bytes on exactly this path; that difference is unexplained and is the first thing
-to look at if this line is picked up again.
+survives the turn) or a faster path than either — not a dispatch knob.
+
+**Correction to the numbers above, and to an earlier note in this file**: the model has **256 experts per
+layer** (`qwen4exp.expert_count = 256`, `expert_used_count = 10`, `expert_feed_forward_length = 640`), not 128.
+An expert is `500 MiB / 256 = 1.95 MiB`, which is strata's `1028 slots, 1.98 GiB` -> 1.93 MiB per slot to
+within rounding — so there is no 2x slot-size difference to chase. The totals in this file stay right because
+they are per *layer* (expert count x per-expert bytes = 500 MiB either way): a full-layer read is still 24 GB
+for 48 layers, our 2.3 GB cache is ~1 178 slots (~24.5/layer, 9.6% of 256), and strata's 1 028 is ~21/layer ""(8.4%).
 
 ## Gates
 
