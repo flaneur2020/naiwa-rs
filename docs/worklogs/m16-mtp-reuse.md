@@ -270,6 +270,31 @@ it is cheap. Two things had to change with it:
 Whole milestone so far: `doc` turn-1 9.5 → 4.4 s, TTFT≥2 4.4 → 3.0 s, e2e 50.7 → 40.7 s; TPOT 43 → 42 with
 `doc` at 40–42 ms against strata's 39.
 
+## The mid-size chunk is a bandwidth floor, not a threshold (measured, 2026-10-21)
+
+The remaining `TTFT>=2` gap (3.0 s vs strata's 0.63 s) has the same shape as item 6 one size up: a turn's new
+tokens are ~70-200 rows, so they take the chunk path and must read ~all 128 experts of every layer
+(128 x 3.9 MiB x 48 = 24 GB). The obvious knob is the threshold: route those rows through the decode split,
+which reads only what the cache does not hold.
+
+`PREFILL_THRESHOLD` 32 -> 256, same 3-turn `doc` conversation on one binary each:
+
+| threshold | turn 1 | turn 2 (86 new rows) | turn 3 | `ROUND_STATS` hit / staged / cpu |
+|---|---:|---:|---:|---|
+| 32 | 4.57 s | **4.11 s** | 3.83 s | 68.8 / 9.9 / 21.4% |
+| 256 | 4.59 s | **4.08 s** | 3.86 s | 66.3 / 10.7 / 23.0% |
+
+**No change, and no wonder**: the hit rate barely moves (the cache holds ~12 slots/layer against 128 experts,
+so ~90% of the *distinct* experts are still cold), and the miss side then pays the same 24 GB — on the CPU
+instead of over PCIe (measured 10 GB/s vs 13.4). The threshold only moves traffic between two paths that are
+both bounded by the same read. Reverted; the constant stays at 32.
+
+Closing that gap requires the conversation's experts to be resident (cache size, or a resident set that
+survives the turn) or a faster path than either — not a dispatch knob. One number worth checking next:
+strata's log reports `1028 slots, 1.98 GiB`, i.e. **1.93 MiB per expert slot, half our 3.9 MiB** for the same
+model, which would halve its bytes on exactly this path; that difference is unexplained and is the first thing
+to look at if this line is picked up again.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
@@ -289,9 +314,6 @@ Whole milestone so far: `doc` turn-1 9.5 → 4.4 s, TTFT≥2 4.4 → 3.0 s, e2e 
    `1.0/(1.0+0.25·R)`. This is the M10 3b device-dispatch work, now with a measured payoff curve.
 3. ~~The drafter's experts~~ — done above; resident Q2_0 removes the drafter from both phases.
 4. ~~The 29-row tail~~ — done above.
-5. **The remaining TTFT≥2 gap is the same shape one size up** (3.0 s vs strata's 0.63 s). A turn's *new*
-   tokens are ~70–200 rows; that is still wider than `PREFILL_THRESHOLD`, so it takes the chunk path, whose
-   per-layer expert upload is ~all 128 experts (24 GB of reads for a few hundred rows, ~1.8 s). Strata serves
-   this from its expert cache (47% hit). The experiment is to raise the threshold to 128–256 and price the
-   decode split's CPU miss work against the upload: measured hits decide it, not the arithmetic.
+5. ~~The remaining TTFT≥2 gap via the threshold~~ — measured, no effect (see above); it is a read floor.
+   The open lead there is strata's **1.93 MiB per expert slot against our 3.9 MiB** for the same model.
 6. Re-run the 3-round **paired** corpus against strata (this item was measured naiwa-only).
