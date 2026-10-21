@@ -107,14 +107,22 @@ VRAM for experts (one budget, decided at startup)
 
 ### Three phases, each with its own gate
 
-**P1 — the borrow region out of the cache's slots, no behaviour change.** Allocate one bank for the borrow
+**Ordering correction (2026-10-21).** An earlier sketch had P1 take the region out of the cache *permanently*
+(`--expert-cache-gb` unchanged, cache slots reduced by the region) and P3 lend it back later. That ordering is
+wrong: taking it permanently is exactly the M18 trade in a different costume - cache 1 208 -> ~950 slots, which
+measured +6 ms TPOT for a prefill gain worth less. The loan has to be *dynamic from the start*: the cache keeps
+all 1 208 slots, the stream takes the range only while a prompt is in flight, and the range is refilled
+afterwards. So the phases below run P1 = loan infrastructure, P2 = spend the loan, P3 = the refill economics.
+
+**P1 — the loan infrastructure, no behaviour change.** Allocate one bank for the borrow
 region *inside* what the cache budget would have owned: `--expert-cache-gb 2.3` yields 1 208 slots today; the
 partition takes the top `ceil(region_bytes / slot_bytes)` = ~340 slots (~660 MiB) out of that count and hands
 them to the stream as one contiguous `[slots, N, K]` range, aliased as `[E, N, K]` for the prefill layer.
-`plan` sizes the chunk from the region instead of `free`, so it can no longer decline. Gate: the startup line
-prints `cache N slots | borrow M MiB | ring K | drafter D`; `MISTRALRS_VRAM_DUMP` unchanged in total; oracle
-byte-identical both variants; 36/36 tests; 3-round corpus within noise of M18's baseline
-(4 431 / 1 153 / 45 on `doc`) with **one** buffer (behaviour must not change yet).
+`plan` sizes the chunk from the region instead of `free`, so it can no longer decline. The cache keeps its
+1 208 slots: the range is *loaned* for the duration of a prompt (`Prefill::relayout`-style) and returned after.
+Gate: the startup line prints `cache N slots | borrow M MiB | ring K | drafter D`; `MISTRALRS_VRAM_DUMP`
+unchanged in total; oracle byte-identical both variants; 36/36 tests; 3-round corpus within noise of M18's
+baseline (4 431 / 1 153 / 45 on `doc`) with **one** buffer (behaviour must not change yet).
 
 **P2 — spend the region on two buffers.** With the region sized by measurement rather than the formula (the
 `act + act/8` terms under-count by >89 MiB, above), hold two layer buffers plus the chunk activations:
