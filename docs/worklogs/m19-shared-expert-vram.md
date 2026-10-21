@@ -65,6 +65,44 @@ decision: chunk 3072 needs `1 300 + 402 + 50 + 512 = 2 264 MiB` and the plan sti
 
 So single-user is a *simplification* of the loan, not a substitute for it. The borrow stays the plan.
 
+## The layout blocks the loan (analysis, 2026-10-21)
+
+Working through P1 in the code found the real obstacle, and it is not the plumbing - it is how the cache is laid
+out:
+
+| fact | number |
+|---|---:|
+| one prefill buffer (a layer's whole expert set) | 650 MiB = **333 cache slots** |
+| one cache bank (one layer, `--expert-cache-gb 2.3`) | 25 slots |
+| banks per model | 48, one allocation each, per-layer shape |
+
+`CopyStream::alloc_bank(stack, slots)` allocates **one allocation per layer**, shaped `[slots, N, K]` for *that*
+layer, and the stream's buffers come from `alloc_like(stack)` - an allocation shaped `[E, N, K]`. So a region
+that could be lent back to the cache has to be *one contiguous same-shape range*:
+
+- borrowing one layer's own bank gives 25 slots = 49 MiB, 13x too small for a layer buffer;
+- allocating a "spare bank" of 333 slots (650 MiB) works as a buffer, but it can only ever serve cache slots
+  for **the one layer whose shape it was built for** - about 1/48 of the decode misses. That is not the +83%
+  slot win the milestone is after;
+- taking the 333 slots out of the cache *permanently* is worse than the M18 trade (M18 gave up 231 slots for
+  -18% turn-1 and measured a net loss).
+
+So the loan needs a **shape-agnostic pool**: slots that any layer can use for residency, addressable as one
+contiguous range when the stream wants a layer buffer. Two layouts can do it:
+
+| layout | how | cost |
+|---|---|---|
+| **A. one pool + an index map** | one allocation sized `total_slots x max_slot_bytes`; a per-layer map from its expert ids to pool slot indices (the cache's `Bank.first`/`Slot` indirection already has this shape, it is just per layer today) | an index translation on every hit and every fill; slot bytes rounded up to the max shape |
+| **B. one pool, uniform slot size** | same allocation, every layer's slot padded to the max shape's bytes | simpler (no map), but a 481 MiB layer's slots waste ~8% |
+
+Layout A is the honest version of strata's "top slots of the expert cache" (their cache is a flat slot pool:
+`ExpertCache::open(n_slots, n_layers, n_expert, blob_bytes)` - one `blob_bytes` for all layers, which is exactly
+layout B, with their generic MMAQ kernels not caring which layer a slot came from).
+
+**Their layout is B**, and that is worth noting: `blob_bytes` is a single number for the whole pool, so a slot
+is a slot for any layer, and a contiguous range of them can be any layer's buffer. That is why `borrow` is a
+one-line proposition for them and a refactor for us.
+
 ## What strata does, verbatim
 
 ```cpp
