@@ -92,6 +92,25 @@ eviction list, which keeps the policy testable), with six unit tests pinning the
 fills top-down, the stream only ever grows its run, eviction is coldest-first, release makes the run refillable,
 and the watermarks never cross. `6/6` passing.
 
+### The API constraint found while integrating (2026-10-21)
+
+`QTensor::new(storage, shape)` takes a whole `QStorage`, and candle exposes **no way to build a `QTensor` over
+a sub-range of a `QCudaStorage`** (no `slice`/`narrow`/offset constructor on the CUDA quantized storage). So
+"one arena, and every layer gets a `QTensor` view into it" is not expressible: a `[total, N, K]` bank can only
+be a `QTensor` for one shape.
+
+Two consequences for the plan:
+
+- the arena has to be built **per shape group** (`[total_group, n, k]`, one allocation per group; this model has
+  two groups), and a layer's range inside its group's arena is addressed by `SlotMemory` views - which *are*
+  offset-able (`ptr + i * stride`) and are what the fill path already uses;
+- a layer's compute path must therefore keep building its per-expert/hit views from `SlotMemory`, not from the
+  group's `QTensor` - which is what `expert_qtensor_on_device` already does, so this is a check rather than a
+  change.
+
+That is the remaining unknown for step 1 below: whether every consumer of a layer's `Bank` can work from
+`SlotMemory` alone. It is checkable by inspection before any code moves, and it is the first thing to do next.
+
 ### What integration still needs (P1's remaining work)
 
 1. **One uniform pool**: replace the per-layer `alloc_bank` allocations with a single allocation of
