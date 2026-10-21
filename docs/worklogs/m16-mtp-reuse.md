@@ -411,6 +411,41 @@ Recommendation: **B is the fix, A is a stopgap.** A's ceiling is bounded by draf
 the property we cannot control; B removes the condition instead of gambling on it. The measured 1.08-1.33 s
 (and the 0.81 s tail chunk below it) is what `TTFT>=2` would look like once it always lands.
 
+### Attempt: cap the proposal depth to the boundary (blocked, reverted)
+
+Design A above was tried first because it touches one function: in `qwen4_exp::speculative_propose`, cap
+the depth to `distance_to_next_boundary - 1` so a fully accepted step lands on the boundary. It cannot work
+there: **the step's verify window is fixed by the plan before the proposer runs**, so proposing fewer drafts
+than `ctx.proposal_len` trips
+
+```
+Model failed: MTP proposal length 3 is outside the configured range 1..=1
+```
+
+(depth 1 is a captured graph shape, 3 is not the plan's depth). The depth is a *plan* decision - the
+autotuner's `speculative_depth_candidates` is per-model, not per-step - so alignment would have to be a
+per-step plan choice, which no hook exposes today. Reverted; the tree is back to item 7's capture.
+
+### What design B would really take, after reading both codebases
+
+strata's `conversation_kv_save/restore(upto)` is cheap for strata because its per-session KV is a **dense
+buffer** (`QsaState`): saving `upto` rows is a straight copy. Ours is a **paged** cache: the restore path is
+hash-keyed and requires `cached_tokens % block_size == 0` throughout, and the last block's rows beyond the
+length belong to a shared/COW slot, so restoring at an arbitrary length is not a small change - it is a
+KV-layout question, not a cache-entry one.
+
+Within the paged layout, three ways to get an always-aligned checkpoint, in increasing cost:
+
+| option | mechanism | determinism | cost |
+|---|---|---|---|
+| keep item 7 as is | capture when a step happens to end on a boundary | ~50-75% of turns | none |
+| **E2: commit to the boundary** | after verification, if the commit crosses a boundary, commit only up to it; the dropped (≤3) tokens are re-verified next step from the same prefix, so the emitted tokens do not change | **always** | one extra step per 32 tokens (~+8% steps), plus surgery in the verify/commit path (`keep_len`/`keep_rows`) |
+| E3: non-aligned paged restore | store the tail at the exact length and restore it | always | partial-block COW + dropping the block-alignment invariant across the restore path; a layout change |
+
+Recommendation: **E2**, then re-measure. It is the only option that is both deterministic and contained in the
+existing layout, and the measured prize is the item-7 numbers (TTFT>=2 2.65 -> 1.1-1.3 s, with the 0.81 s tail
+chunk as the floor).
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
