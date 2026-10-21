@@ -504,6 +504,35 @@ hold, use the layer's own slots only as ring capacity, and run as many rounds as
 layer's own residents unless the group cannot cover one layer without them, and every borrowed slot is marked for
 return and comes back empty.
 
+## Sizing: 2 GB, 3 GB, 4 GB (2026-10-21)
+
+The same analysis at each cache size, with the borrow in place (the 650 MiB buffer reservation is gone, so the only
+thing that still needs *genuinely* free VRAM is the chunk's activations plus the measured slack, ~868 MiB at chunk
+8 192):
+
+| cache | slots | 481-group slots / borrowable | layers needing >1 round | extra MoE calls | free VRAM left | feasible |
+|---|---:|---|---:|---:|---:|---|
+| 2.0 GB | 1 043 | 330 / 308 | 19/48 | 49 | ~2 290 MiB | yes |
+| 2.3 GB (today) | 1 216 | 390 / 364 | 19/48 | 42 | ~1 983 MiB | yes |
+| **3.0 GB** | **1 579** | 510 / 476 | 19/48 | 37 | ~1 266 MiB | **yes - the ceiling** |
+| 3.5 GB | ~1 840 | 595 / 555 | 19/48 | 31 | ~754 MiB | no (needs ~868) |
+| 4.0 GB | 2 122 | 675 / 630 | 5/48 | 15 | ~242 MiB | **no** |
+
+Two things fall out of it:
+
+1. **The number of multi-round layers does not move between 2.0 and 3.0 GB** (19 of 48). It is set by the *small*
+   shape groups, whose total scales with their own layer count: the 456 and 650 MiB groups are single layers (23
+   and 16 slots at 2 GB, 35 and 25 at 3 GB), and the 418 MiB group is three. What improves with size is the *round
+   count of those few layers* (16 -> 11, 12 -> 8, 4 -> 3), not which layers.
+2. **The 29 layers of the three big groups get single-round prefills from 2.0 GB upward**, because 330 and 280 group
+   slots already exceed the 256 a layer needs. So the ring machinery is needed only for the 19 small-group layers
+   and is cheap there (49 extra small MoE calls per chunk at 2 GB, ~30 ms, ~1%).
+
+**4 GB is not reachable on this card** with the borrow design alone: the activations are `[rows, hidden]` float
+tensors, not expert-shaped slots, so they cannot be carved from the slot pool; ~868 MiB of real free VRAM has to
+stay, and 4 GB leaves 242 MiB. **3.0 GB is the practical ceiling**, and it buys 1 579 slots - **+30% over today's
+1 208** - with the same round profile as 2.3 GB.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
