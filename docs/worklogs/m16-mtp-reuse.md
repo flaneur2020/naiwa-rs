@@ -159,6 +159,37 @@ Three separate causes, and the accounting matters because they are paid differen
    (CPU 2.63 s at `min-tokens 64`; stream 2.32 s at `min-tokens 8` — 128 experts × 1.88 MB × 48 layers ≈
    11.5 GB of PCIe). It exists in the no-MTP arm too and is the bulk of the M10 "TTFT≥2 3.67 s" number.
 
+## Drafter prefill: the grouped CPU kernel was tried and is *not* the answer (2026-10-21)
+
+The plan was a grouped CPU kernel: `gemv` groups by (expert, activation row), so an expert serving 33 rows
+has its block read 33 times — 45 GiB of reads for 1.35 GiB of unique weights. A variant that groups by expert
+only (one read, exact f32 dots, 4-way unrolled, rayon over experts) was implemented behind the same dispatch
+and pinned by a new test against the dequantized reference (Q4_0/Q8_0/Q4K/Q6K, all within 1e-4).
+
+It made the prefill **slower**, 2.73 s → **5.82 s**, which settles what the kernel is actually bound by:
+
+| kernel | reads | arithmetic | time | rate |
+|---|---:|---:|---:|---|
+| per-slot `gemv` (grouped by (expert, row)) | 45 GiB | 167 GFLOP | 2.73 s | 17.7 GB/s **and** 61 GFLOPS (int8 `vec_dot`) |
+| grouped by expert (one read, f32 dots) | 1.35 GiB | 167 GFLOP | 5.82 s | 28.6 GFLOPS — compute-bound |
+| to reach 0.2 s | — | 167 GFLOP | — | **834 GFLOPS** — out of reach on 6 cores |
+
+The drafter's prompt prefill is **167 GFLOP for one layer** (1696 rows × 10 experts × 3 matrices × 640 ×
+2560). For scale: the *whole* 48-layer target prefill is 32 TFLOP and takes 3.5 s, i.e. **9.1 TFLOPS on the
+GPU**. So the drafter prefill belongs on the GPU by two orders of magnitude — the earlier "grouped CPU kernel"
+recommendation was wrong, and the code was reverted (`mistralrs-quant/src/gguf/cpu.rs` is unchanged).
+
+What the GPU path needs, from reading the stream (`src/prefill_stream.rs`):
+
+1. `moe/provider.rs`: the `is_mtp` early return keeps the head out of `attach_prefill`; route it through the
+   same 0-slot path (`CpuExperts` + prefill stream) so decode still runs on the CPU.
+2. `prefill_stream.rs::attach`: the `ctx.site.is_mtp` exclusion.
+3. The stream assumes one expert count: `PrefillStream::new` stores `num_experts`/`top_k` from the first
+   attached layer and `MoEExperts::from_qtensors` is built with them, so a 512-expert head behind a 128-expert
+   model needs the counts stored per layer. The buffer is allocated per layer via `alloc_like`, so it has to be
+   re-allocated when the MTP layer's stride (1.35 GiB) exceeds the main layers' (650 MiB), and
+   `prefill_stream::plan` must reserve `max(stride)` rather than the main-layer stride.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
@@ -171,11 +202,9 @@ Three separate causes, and the accounting matters because they are paid differen
 
 ## Next
 
-1. **Grouped CPU MoE for prefill chunks** (the decomposed cost above): `FastExpertsWeights::forward_gather`
-   reads each expert's weights once per (token, expert). Grouping the rows per expert makes the MTP head's
-   1 696-row prefill read 1.35 GB instead of 35 GB — 4 s → ~0.2 s, and the same kernel serves every layer that
-   keeps its prefill on the CPU (uncached layers, the stream's decline path). Gate: `mtp_forward` ≤ 300 ms for
-   1 696 rows, identical logits on the oracle path, 3-round `doc`/`long` e2e −4 s.
+1. ~~Grouped CPU MoE for prefill chunks~~ — **falsified by measurement**, see the section above: the kernel is
+   compute-bound (167 GFLOP), so the drafter prefill has to run on the GPU. Next item is that GPU path, which
+   needs the three changes listed there.
 2. **Item 4, the row term**: `dry` must stop scaling with rows, or MTP's amortisation stays capped at
    `1.0/(1.0+0.25·R)`. This is the M10 3b device-dispatch work, now with a measured payoff curve.
 3. Then re-run the 3-round corpus against strata for the class-level gate.
