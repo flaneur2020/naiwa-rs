@@ -403,6 +403,8 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m18-prefill-transport.md`](worklogs/m18-prefill-transport.md) — M18 (the prefill stream's
+transport: ~8 GB/s against a 13.4 GB/s link, a second buffer worth -16%, and the probe that has to say why).
 Worklog: [`worklogs/m17-prefill-cost.md`](worklogs/m17-prefill-cost.md) — M17 (what a prompt chunk costs:
 `chunk ≈ 2.93 s + 0.46 ms × rows`, i.e. 23 GiB of expert reads per chunk plus a per-row PLE/attention tax;
 the ≤31-row checkpoint tail is the same term one size down). Worklog: [`worklogs/m16-mtp-reuse.md`](worklogs/m16-mtp-reuse.md) — M16 (chat with MTP: prefix reuse
