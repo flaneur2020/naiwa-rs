@@ -341,6 +341,43 @@ Two levers follow, in payoff order:
 2. **Read only the misses.** The prefill stream re-reads every routed expert per chunk; the cache's residents
    are ignored. Serving the resident ones from their slots would remove the share they cover.
 
+## item 7 — checkpoints during generation, so a turn restores into the previous answer (done, 2026-10-21)
+
+`doc`/`long` turn 2 used to restore 1 696 of 1 846 tokens (reuse 0.92) because checkpoints were captured only
+at prompt-step boundaries; strata restores 1 818 (0.98) and therefore prefills 28 new rows against our 150 —
+which, with the two-term model above, is roughly half the distinct experts and half the fixed 2.93 s.
+
+The capture in `engine/mod.rs` is no longer gated on `is_prompt`: a block boundary reached **during
+generation** is captured too, so the next turn's prompt — which contains the previous answer — restores past
+the prompt's edge. The old comment's objection (a chat template re-renders a finished assistant turn
+differently than it was generated) makes such a key *unreachable* for that client, which costs nothing since
+`--prefix-cache-n` evicts by count; it never makes the key wrong, and a client that replays the text verbatim
+(a live transcript) reaches it.
+
+| measurement | before | after |
+|---|---:|---:|
+| `doc` turn-2 reuse | 0.92 | 0.96 |
+| `long` turn-2 reuse | 0.89 | **0.96** |
+| `short` reuse p50 | 0.74 | **0.89** |
+
+3 rounds, medians, naiwa only, cache 2.3 GB:
+
+| class | TTFT t1 | TTFT ≥2 | TPOT p50 | reuse | e2e/conv | before |
+|---|---:|---:|---:|---:|---:|---|
+| doc | 4 396 ms | **2 650 ms** | 43 ms | 0.96 | **35.1 s** | 4 400 / 2 984 / 42 / 40.7 |
+| long | 4 229 ms | **2 712 ms** | 45 ms | **0.96** | **38.1 s** | 4 300 / 3 106 / 44 / 42.0 |
+| short | 1 040 ms | **1 100 ms** | 43 ms | **0.89** | **33.8 s** | 1 076 / 2 792 / 48 / 53.8 |
+
+Against the paired strata numbers from M10.2 (`doc` 20.1 s, `long` 39.9 s, `short` 29.1 s e2e): `long` is now
+**faster than strata** (38.1 vs 39.9 s), `short` is close (33.8 vs 29.1 s), `doc` still trails (35.1 vs 20.1 s).
+
+**It is not reliable yet, and the reason is mechanical**: a snapshot must sit exactly on a 32-token boundary,
+but an MTP step advances 2-3 tokens, so a step lands on a multiple of 32 only about half the time — one
+`doc` run restored 1 760 tokens (TTFT 1.35 s, 51 new rows) and the next restored 1 696 (2.91 s) purely on
+that luck. Making it deterministic needs either block-aligned step lengths or the ability to snapshot the
+state as of an earlier length, neither of which exists; the code path is kept because when it lands it is free
+(no extra work on the turns where it does not) and correctness is unchanged (see the gates below).
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
