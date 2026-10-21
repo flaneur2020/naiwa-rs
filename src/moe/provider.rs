@@ -185,19 +185,39 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         if ctx.layer_device.is_cpu() {
             return Ok(None);
         }
-        // The MTP head's experts run on the CPU like an uncached layer's. Returning `None` would
-        // load all of them onto the GPU (512 Q4_0 experts, ~1.35 GB), which the cache needs.
+        // The MTP head is the drafter's whole working set: 512 experts that a prompt chunk routes ~33
+        // rows to *each*, so there is nothing to cache or stage — the layer *is* its experts. Resident,
+        // compressed to Q2_0 (`moe::resident`): 675 MiB instead of the Q4_0 stack's 1.35 GB, and both
+        // prefill and decode then run on the GPU through the ordinary expert kernels.
         if ctx.site.is_mtp {
             let experts = ctx.load_builtin(Device::Cpu)?;
             host_memory::advise_expert_stacks(&experts)?;
-            return Ok(Some(Arc::new(CpuExperts::new(
-                experts,
+            let resident = super::resident::build(
+                &experts,
+                ctx.layer_device,
+                ctx.config.num_experts,
+                ctx.config.num_experts_per_tok,
+                ctx.comm,
                 ctx.act,
-                ctx.layer_device.clone(),
-                ctx.site.layer,
-                None,
-                Vec::new(),
-            ))));
+            )?;
+            // The host stacks are only needed to build the pool; dropping them returns 1.35 GiB of RAM.
+            drop(experts);
+            return match resident {
+                Some(pool) => Ok(Some(pool)),
+                // Not a GGUF-quantized stack (e.g. a dense safetensors build): keep the CPU path.
+                None => {
+                    let experts = ctx.load_builtin(Device::Cpu)?;
+                    host_memory::advise_expert_stacks(&experts)?;
+                    Ok(Some(Arc::new(CpuExperts::new(
+                        experts,
+                        ctx.act,
+                        ctx.layer_device.clone(),
+                        ctx.site.layer,
+                        None,
+                        Vec::new(),
+                    ))))
+                }
+            };
         }
 
         let cpu_experts = ctx.load_builtin(Device::Cpu)?;

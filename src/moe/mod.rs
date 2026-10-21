@@ -37,6 +37,7 @@ mod cached_layer;
 mod decode;
 mod expert;
 mod provider;
+mod resident;
 mod slot;
 mod stages;
 mod staging;

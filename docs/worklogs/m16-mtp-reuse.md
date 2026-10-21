@@ -190,6 +190,49 @@ What the GPU path needs, from reading the stream (`src/prefill_stream.rs`):
    re-allocated when the MTP layer's stride (1.35 GiB) exceeds the main layers' (650 MiB), and
    `prefill_stream::plan` must reserve `max(stride)` rather than the main-layer stride.
 
+## item 5 — the drafter's experts resident in Q2_0 (done, 2026-10-21)
+
+Implemented as `src/moe/resident.rs`: the MTP head's 512 experts are re-quantized at load to **Q2_0**
+(2.25 bit/weight, 1,382,400 bytes per expert, **675 MiB** for the layer — byte-for-byte the size and format
+strata reserves for its `MtpDrafter`) and kept on the GPU, computed through the ordinary expert kernels for
+both phases. `provider.rs`'s `is_mtp` branch builds that pool instead of returning `CpuExperts`; the CPU
+path remains as the fallback for non-`QTensor` weights. The host copies are dropped afterwards, which also
+returns 1.35 GiB of RAM.
+
+Two details worth recording:
+
+1. **candle cannot quantize Q2_0** (`GgmlDType::cpu_zeros` is `unreachable!` for it) and its
+   `QStorage::from_data` refuses Q2_0 on CUDA, so the packing lives here
+   (`quantize_q2_0`, pinned by a test that round-trips through the fork's
+   `gguf::q2_0::dequantize`), and the upload goes through the fork's `q2_0::storage_for_device`.
+2. **The naive block-max scale wastes the format.** Codes decode to `{-1, 0, +1, +2} x d`, so a block-max
+   `d` spends one code on an unreachable range and quantizes half the block to zero. The scale is searched
+   over `amax / {1.0, 1.25, 1.5, 1.75, 2.0}` per block, keeping the smallest squared error. That is what
+   decides acceptance: 50.8% with the Q4_0 drafter, 44.2% with the naive Q2_0 pack, **51.6%** with the
+   ladder — i.e. the format is free at the acceptance level once the scale is chosen properly.
+
+| measurement | before (Q4_0 drafter, CPU) | after (Q2_0, resident) |
+|---|---:|---:|
+| drafter prefill, 1,696 rows (`mtp_forward`) | 2.73–4.01 s | **10.4 ms** |
+| drafter forward, decode (`NAIWA_MTP_DBG head_us`) | 1.0–2.4 ms | **0.55 ms** |
+| drafter weights: VRAM / host | 0 / 1.35 GiB | **675 MiB / 0** |
+| `MTP accept` (3 rounds) | 50.8% | 51.6% |
+| output vs the no-MTP arm (deterministic config, 3 requests) | `09cc90a793cd` | `09cc90a793cd` — identical |
+
+3 rounds, `short`+`doc`+`long`, naiwa only, medians, cache 2.3 GB:
+
+| class | TTFT t1 | TTFT ≥2 | TPOT p50 | reuse | e2e/conv | before this item |
+|---|---:|---:|---:|---:|---:|---|
+| doc | **6 266 ms** | 4 765 ms | **40 ms** | 0.95 | **48.5 s** | 9 528 / 4 396 / 43 / 50.7 |
+| long | **6 092 ms** | 3 765 ms | 47 ms | 0.90 | 47.7 s | 9 084 / 3 560 / 44 / 46.6 |
+| short | 3 015 ms | **2 819 ms** | 52 ms | 0.73 | **53.3 s** | 3 050 / 4 439 / 52 / 60.5 |
+
+**The 675 MiB has to come out of the main cache.** With `--expert-cache-gb 3` the pool left too little free
+VRAM, `prefill_stream::plan` declined, and the whole main prefill fell back to the CPU (13 tok/s, 133 s for
+one turn). `engines/naiwa.json` now uses **2.3 GB**: the log's plan line confirms chunk 8192 on 1 984 MiB
+free. This is the cheap end of the trade because M10 measured main-cache size 1 → 3 GB as TPOT-neutral at
+chat.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
@@ -207,4 +250,9 @@ What the GPU path needs, from reading the stream (`src/prefill_stream.rs`):
    needs the three changes listed there.
 2. **Item 4, the row term**: `dry` must stop scaling with rows, or MTP's amortisation stays capped at
    `1.0/(1.0+0.25·R)`. This is the M10 3b device-dispatch work, now with a measured payoff curve.
-3. Then re-run the 3-round corpus against strata for the class-level gate.
+3. ~~The drafter's experts~~ — done above; resident Q2_0 removes the drafter from both phases.
+4. **The 29-row tail** (~2.3 s of every `doc`/`long` turn-1): `align_down(prompt, 32)` splits it off and a
+   29-row chunk touches every expert of every layer. Options are to hand the tail to the decode path (its
+   expert cache is already warm for that prompt) or to stop splitting when the remainder is below the
+   stream's `min_tokens`.
+5. Re-run the 3-round **paired** corpus against strata (this item was measured naiwa-only).
