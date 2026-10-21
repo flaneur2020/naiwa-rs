@@ -164,15 +164,68 @@ Qwen4-Exp PLE rows are gathered from the memory-mapped table on the host (page c
 |---|---|
 | per gather call | **5.7 ms** |
 | rows per call | 638 (average over a mixed run) |
-| share of `doc` turn-1 | 48 layers x 5.7 ms ~= **0.27 s of 4.5 s (~6%)** |
-| decode | **not gathered at all** - PLE runs on the prefill path only, as `design.md` says |
+| **layers carrying a PLE** | **one** (`ple_cfg.layer_idx`), not one per decoder layer |
+| share of `doc` turn-1 | one gather of 1 725 rows ~= **5.7 ms of 4.5 s (0.1%)** |
+| decode | one call per step (one row), on the same host path |
 
-So the 0.46 ms/row term is *not* PLE-dominated: at ~0.16 ms/row for PLE, the remaining ~0.3 ms/row is the QSA
-attention and the `hc_*` hyper-connections. That reverses the guess this document opened with, and it is why
-item 2 below is no longer the top of the list.
+**Correcting this document's own first guess**: PLE is ~0.1% of a turn, not the bulk of the per-row term. The
+0.46 ms/row is therefore the QSA attention and the `hc_*` hyper-connections, and the PLE item is closed rather
+than deferred - there is nothing to win there, which is also what the decision to leave it on the memory map
+rests on.
 
 Oracle re-verified after the deletion (byte-identical, both variants), 36/36 tests, `doc` turn-1 4.58 s
 (unchanged, i.e. removing the residency attempt cost nothing - it had always fallen back).
+
+## naiwa vs strata: architecture and performance (2026-10-21)
+
+### Performance, 3 rounds, medians
+
+| metric | naiwa | strata | ratio |
+|---|---:|---:|---:|
+| `doc` turn-1 TTFT | 4 431 ms | 2 430 ms | 1.8x |
+| `doc` TTFT >= 2 | 1 153 ms | 631 ms | 1.8x |
+| `long` turn-1 TTFT | 4 286 ms | 2 273 ms | 1.9x |
+| `long` TTFT >= 2 | 1 062 ms | 1 018 ms | 1.04x |
+| `short` turn-1 TTFT | 1 065 ms | 1 035 ms | 1.03x |
+| `short` TTFT >= 2 | 1 185 ms | 625 ms | 1.9x |
+| TPOT (all classes) | 45-46 ms | 39 ms | 1.15-1.18x |
+| prefix reuse `doc`/`long` | 0.98 | 0.99 | parity |
+| `e2e`/conv, `long` | 38.1 s | 39.9 s | **faster** |
+
+So: reuse is at parity, `long` and `short` turn-1 are at parity, `long` end-to-end is faster, and what is left
+is the first-turn prefill (1.8-1.9x on `doc`), the per-turn prefill (`doc`/`short` 1.8x), and TPOT (1.15x).
+
+### Architecture, dimension by dimension
+
+| dimension | naiwa | strata |
+|---|---|---|
+| language / stack | Rust on a `mistralrs` fork; candle CUDA kernels; our thread and stream discipline (doorbell rings, one copy stream per device, rayon expert pool) | C++/CUDA, hand-written kernels (MMQ, fused MoE, WMMA GEMM), captured graphs (`moe_grouped_gemm_*`, `s2_expert_grouped`, `mmq_resident_sort_rows`) |
+| weights on the device | 4 300 MiB, at the file's own cost (verified by `MISTRALRS_VRAM_DUMP`: 2 838 quantized verbatim + 1 299 dense that are BF16 *in the file*) | pack weights 1 406 MiB loaded from its own pack + 708 MB of drafter experts |
+| prefill chunking | step ceiling from `--max-num-batched-tokens`/`--max-prefill-chunk-tokens` (8 192), free-VRAM plan picks the largest chunk that fits, rows sub-batched at 256, plus a split at the checkpoint boundary | "auto chunk scan" over a byte budget (`set_ring_budget`), `stream_all_min()` = 1 024 selects MMQ vs the fused walk, last chunk is an ordinary remainder |
+| prefill expert supply | prefill stream: whole-layer DMA into one or two 650 MiB scratch buffers on a copy stream, **cache-blind** | resident experts read from the VRAM tier, the rest streamed through a ring (8 slots below 1 024 tokens, `ring_slots()` above), **grouped by expert**; optional CPU share below 1 024 (-20..-35%) |
+| decode expert supply | per-layer slot cache (LRU + hit counts) with lookahead prediction, 16-slot staging ring for `--pcie-frac`, CPU rayon pool for the rest | expert cache 1 028 slots / 1.98 GiB, hits on the device ("decided on the device"), 47.3% decode hit rate, 261 experts per token read over PCIe, CPU pool for the rest |
+| prediction | one lookahead thread per model: the CPU router runs on the published activation and prefetches the next layer's experts | per-layer "foresight" prefetch of the next layer's slots (`foresight swap: N slots per layer`) |
+| drafter (MTP) | built-in MTP head; its 512 experts **resident in Q2_0 (675 MiB)** since M16, GPU for both phases, host copy dropped | MTP layer with its **512 experts resident (708 MB, 2.25 bit)**, Q8_0 projections, dense attention over seen cells, grouped hit kernels, draft-vocab subset, optional `--mtp-q4` |
+| prefix reuse | recurrent snapshot at paged **block boundaries**, captured during prefill and (since M16) during generation, alignment forced by committing the verify step to the boundary; restore is hash-keyed and block-aligned | **dense per-session KV** + `conversation_kv_save/restore(upto)`: any length, so the turn's exact end is the checkpoint and there is no alignment tail |
+| PLE | 28 GB table memory-mapped from the GGUF, gathered on the host once per step (single PLE layer, 5.7 ms/chunk, 0.1% of turn-1) | the table lives on the **SSD** with an asynchronous per-token pipeline (`ple_issue_token` / `ple_finish_token`: issue the next token's rows while the current one is consumed, H2D after) |
+| KV cache | paged, 32-token blocks, BF16, recurrent (GDN) state per sequence slot (114.8 MiB/slot, `--max-seqs` caps it) | per-session dense QSA pools + indexer, `--kv int8` available, elastic sizing |
+| scheduling | mistralrs scheduler: `--max-seqs`, 8 decode steps before a prefill, `--prefix-cache-n` snapshots | own session/plan: `--max-context`, `--spec`, elastic KV growth, batched slots |
+| specialization | one model (Qwen3.8-Flash-Next) end to end, so every path can assume it | same, but exposed as a general engine with several model families |
+
+### What that says about the two remaining gaps
+
+1. **First-turn prefill (1.8-1.9x).** Both engines read the same ~23 GiB (a chunk above ~26 rows spans every
+   expert). We do it as whole-layer DMA at ~8 GB/s (cache-blind, one buffer on this card); strata does it as a
+   grouped, resident-aware walk with a bigger ring, and its CPU share takes the tail. That is a *transport and
+   selection* difference inside the same physical floor - our measured 2.93 s fixed term is 23 GiB at 8 GB/s,
+   and 13.4 GB/s would make it 1.75 s.
+2. **TPOT (1.15x).** Ours carries `dry = 1.0 + 0.25 ms x rows` of host time per layer (one round trip per layer,
+   the row-proportional part being dispatch). strata decides residency on the device and replays a captured
+   token graph, so it has no per-layer host round trip at all. This is M16 item 4 / M17 item 4, and it is the
+   only lever left on TPOT.
+3. **Why `doc`/`short` per-turn prefill is still 1.8x**: the tail. Our checkpoint needs a block boundary, so a
+   turn ends with a <=31-row fragment that must read a layer's experts again; strata's dense KV needs no such
+   fragment. Fixing that is a KV-layout decision, not a scheduling one.
 
 ## Gates
 
