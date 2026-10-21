@@ -441,6 +441,40 @@ currently prefilling. No views are needed - everything stays slot-addressed insi
 arena could not. What is still missing is the refill policy (the evicted slots come back as empty) and the
 per-group eviction bookkeeping.
 
+## Borrow policy: the current layer is the primary (decided 2026-10-21)
+
+Not all borrowed slots are equal. Right after a chunk, the decode steps consume **the same layer's** experts for
+the new tokens, so layer L's own residents are the hottest thing in the cache - evicting them to make room for L's
+own prefill would defeat the point. The policy therefore is:
+
+1. **empty slots first** (nothing resident, free to use);
+2. **other layers of the same shape group**, coldest first;
+3. **only then** L's own slots, and those are the ones marked `borrowed` for the earliest return.
+
+"Borrowed" is a per-slot mark: the slot is ours from the claim until `release`, it is skipped by the hit path, the
+LRU and `spawn_fill`, and on release it goes back as **empty** (the cache refills, it does not restore).
+
+At a 4 GiB pool this is enough to never touch the current layer for almost every layer:
+
+| shape group | group slots | L's own | borrowable from others | 256 without touching L? |
+|---|---:|---:|---:|---|
+| 481 MiB | 675 | 45 | 630 | **yes** |
+| 531 MiB | 574 | 41 | 533 | **yes** |
+| 568 MiB | 342 | 38 | 304 | **yes** |
+| 368 MiB | 295 | 59 | 236 | short 20 |
+| 418 MiB | 156 | 52 | 104 | short 152 - rounds |
+| 456 MiB | 47 | 47 | 0 | rounds |
+| 650 MiB | 33 | 33 | 0 | rounds |
+
+So **42 of 48 layers (87.5%) prefill without evicting a single one of their own residents**, 5 layers (368 group)
+sacrifice ~20 of their own slots, and 5 layers of the two single-layer groups run in rounds. What decode gets back
+is exactly the locality that matters: the experts the prompt just routed stay resident for the first decode steps,
+which is where the turn's TTFT tail is paid.
+
+Bookkeeping it needs, on top of `SlotArena`: a `layer` tag per slot (to know what "other layers" means) and a
+`borrowed` set per claim (to skip in hit/LRU/fill and to release). Both live where `Slot` already lives, next to
+`expert`/`buf`/`last_use`.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
