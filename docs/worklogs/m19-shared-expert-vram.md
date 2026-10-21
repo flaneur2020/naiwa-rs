@@ -625,6 +625,25 @@ the other 10 in 2-8 rounds. If the copy stays at 8 GB/s, the same design lands a
 remaining loss is HBM, not scheduling - in which case the right move is fewer bytes (which is what `--expert-cache-gb
 3` plus the borrow already gives, by raising the hit rate).
 
+## What the chunk is actually bound by (measured, 2026-10-21) - the overlap question closes
+
+Four measurements, run in this order, killed the overlap design as a *speed* lever:
+
+| probe | result | reads as |
+|---|---|---|
+| `NAIWA_NO_PREFILL_FILL=1` (skip the cache fill during a streamed chunk) | turn-1 3.94 s -> **4.03 s** | the fill is *not* competing for the link |
+| `nvidia-smi` during a chunk | `utilization.gpu` **100%**, `utilization.memory` **16-24%**, PCIe Gen3 | the chunk is **SM-bound**, not HBM- or PCIe-bound |
+| `MISTRALRS_LAYER_DBG=1` (new: per-layer time inside the model forward) | 1.0-2.6 ms per layer, two 84/167 ms outliers on layers 0 and 3 | the host only measures *enqueue* time (CUDA is async); the outliers are first-touch module loads. Not usable to decompose GPU time |
+| same 1 725-token prompt, one chunk vs two | **3.22 s vs 7.07 s** | the cost is **per chunk, not per row**: two chunks of the same 1 725 rows cost 2.2x, so the pass over each layer's expert set dominates and the row count barely matters |
+
+Consequences:
+
+- The minimal overlap design is **already implemented** at one round per layer: today's `stride = 2` stream prefetches a whole layer ahead, `dma_wait` is ~700 ns, and the copy is hidden. Making rounds smaller cannot help, because there is no exposed DMA to hide.
+- The chunk's 3.2 s is the **expert-set pass**: 48 layers x (499 MiB of experts + their quantized compute), and it is SM-bound. Overlap, buffer counts, ring sizes and borrow policies cannot reduce it; only *fewer experts per chunk* can, which is bounded by the cache's residency (9.9% today, ~17% at 3 GB) and by the fact that a chunk saturates the 256 experts above ~26 rows.
+- So the ring-batching design stays a **memory** instrument (it removes the 650 MiB reservation and lets the cache grow), not a speed one, and its cost/benefit is the one priced earlier: roughly neutral on turn-1, positive on capacity.
+
+The overlap question this document spent three sections on is therefore answered: **there is nothing to overlap.** The remaining prefill levers are the MoE kernel's efficiency on a saturated expert set (a quantized grouped-GEMM question, the one strata answers with MMQ/fused kernels) and the per-row attention/hc tax.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
