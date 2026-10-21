@@ -446,6 +446,42 @@ Recommendation: **E2**, then re-measure. It is the only option that is both dete
 existing layout, and the measured prize is the item-7 numbers (TTFT>=2 2.65 -> 1.1-1.3 s, with the 0.81 s tail
 chunk as the floor).
 
+### E2 implemented: commit to the boundary (2026-10-21)
+
+`finish_verified_step` stops verifying once the committed length reaches the next paged block boundary
+(`MISTRALRS_ALIGN_CHECKPOINTS=1`, enabled in `engines/naiwa.json`). Two details mattered:
+
+- **The first attempt also dropped the continuation token** and measured **+35% TPOT** (74.5/53.1/52.8 vs
+  53.9/39.9/38.2) because the next step lost its drafts entirely. Sampling the continuation as usual and only
+  shortening the *commit* costs nothing measurable (57.5/39.2/43.4 vs 56.5/48.9/53.4) and keeps the
+  acceptance rate.
+- The dropped drafts are re-proposed next step from the same prefix, so with `temperature 0` the emitted
+  tokens are unchanged: `eq3` output identical with the switch on and off, oracle byte-identical both
+  variants, 36/36 tests.
+
+Aligned captures became deterministic (3/3 runs restore 1 760 on `doc` turn 2, against 3/4 before), and
+`reuse` reaches **0.98** on `doc` and `long` — strata's number.
+
+3 rounds, medians, naiwa only, cache 2.3 GB:
+
+| class | TTFT t1 | TTFT ≥2 | TPOT p50 | reuse | e2e/conv | before E2 |
+|---|---:|---:|---:|---:|---:|---|
+| doc | 4 431 ms | **1 153 ms** | 45 ms | **0.98** | 34.4 s | 4 396 / 2 650 / 43 / 0.96 / 35.1 |
+| long | 4 286 ms | **1 062 ms** | 46 ms | **0.98** | 52.9 s* | 4 229 / 2 712 / 45 / 0.96 / 38.1 |
+| short | 1 065 ms | 1 185 ms | 46 ms | 0.89 | 38.3 s* | 1 040 / 1 100 / 43 / 0.89 / 33.8 |
+
+\* `e2e` is not comparable across runs when the generated lengths differ: this round the `long` conversations
+hit the 400-token cap on two of three turns (400/378 vs fewer before), and `short` likewise. `TTFT`, `TPOT`
+and `reuse` are the comparable columns.
+
+So `TTFT>=2` went **2 650 -> 1 153 ms (doc)** and **2 712 -> 1 062 ms (long)**, at a measured **+2-3 ms TPOT**
+(the truncation shortens one step in ~eight). Per conversation that is ~1.5 s of TTFT saved per turn against
+~0.5 s of decode cost per 200 generated tokens, and `short` is unchanged because its turns are dominated by
+their tail chunk.
+
+Remaining gap to strata's 0.63 s is now the same two terms as before: our 0.81 s tail chunk and the
+per-row 0.46 ms.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
