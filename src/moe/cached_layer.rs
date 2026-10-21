@@ -329,10 +329,15 @@ impl RoutedExperts for CachedExperts {
                     st.hit_counts[id as usize] += 1;
                 }
             }
-            if let Some(next) = layer.layers.get(layer.layer + 1) {
-                next.spawn_fill();
+            // `NAIWA_NO_PREFILL_FILL=1` (probe): the fills below issue PCIe copies on the *same* copy stream the
+            // prefill stream's layer buffers use, so a chunk's DMA competes with them for the link. When the
+            // stream is serving this layer, its experts are already on the device and the fill is redundant.
+            if std::env::var_os("NAIWA_NO_PREFILL_FILL").is_none() {
+                if let Some(next) = layer.layers.get(layer.layer + 1) {
+                    next.spawn_fill();
+                }
+                layer.spawn_fill();
             }
-            layer.spawn_fill();
             if let Some(ps) = &layer.prefill {
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
                     return Ok(out);

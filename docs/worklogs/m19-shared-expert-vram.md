@@ -533,6 +533,54 @@ tensors, not expert-shaped slots, so they cannot be carved from the slot pool; ~
 stay, and 4 GB leaves 242 MiB. **3.0 GB is the practical ceiling**, and it buys 1 579 slots - **+30% over today's
 1 208** - with the same round profile as 2.3 GB.
 
+## Overlap design for ring batching, and the measurement it hinges on (2026-10-21)
+
+### The model
+
+Per layer of a 1 725-row chunk: **DMA 499 MiB = 40 ms** at the link's 13.4 GB/s, **attention + hc = 16 ms**, **MoE
+compute = 2 ms**. The floor is therefore `max(40, 18) = 40 ms/layer = 1.92 s/chunk`, and the measured per-layer
+times imply how much of it we are losing:
+
+| measured | ms/layer | of which "DMA segment" | implied copy rate |
+|---|---:|---:|---:|
+| 1 buffer, with the trim | 94 ms | 76 ms | 6.4 GB/s |
+| 1 buffer, no trim | 81 ms | 63 ms | 7.7 GB/s |
+| 2 buffers, no trim | 78 ms | 60 ms | 8.1 GB/s |
+
+So even with a whole layer of lead time (two buffers) the copy runs at **8 GB/s, not 13.4**. Overlap is not the
+limiting factor yet - the copy *rate* in the pipeline is, and that is what a smarter ring pipeline cannot fix by
+itself.
+
+Two candidate causes, and they lead to different designs:
+
+| hypothesis | test | if true |
+|---|---|---|
+| **the cache fill shares the link** during streamed prefill (`spawn_fill` issues PCIe copies on the same copy stream) | `NAIWA_NO_PREFILL_FILL=1` skips the chunk path's fills (probe written) | remove or defer the fill, keep the link for the buffer: ~40-45 ms/layer, ~1.9-2.2 s/chunk |
+| **the copy contends with attention for HBM bandwidth** (the DMA writes 499 MiB to HBM while attention streams KV) | `nvidia-smi utilization.memory` during a chunk, and the same chunk with attention artificially cheap (short prompt, large chunk) | no overlap trick helps; the floor is 50-60 ms/layer and the ring design should optimise *bytes*, not overlap |
+
+### The design, if the contention is removable
+
+Three stages, each adding one lead:
+
+1. **Per-round ping-pong inside the layer (two rings per group, ring = 128 slots).** Round *i* computes from ring
+   A while the DMA fills ring B with round *i+1*; the next DMA is enqueued at the **end of round *i*, not at the
+   end of the layer** (that is the only host-side discipline the current code lacks - it enqueues one layer ahead).
+   Two rings of 128 slots need 256 group slots, which every big group has at 2.3 GB or more.
+2. **Cross-layer lead for the first round.** Layer L's last round runs while layer L+1's first round is being
+   filled, so the copy engine never idles at a layer boundary. This is the ring's version of the second buffer
+   the stream has today. Same-group layers share the group's slots, which is why *two* rings (not one) are needed.
+3. **Round granularity fences.** Each ring's completion and release must be per-ring, not per-layer, or the
+   ping-pong deadlocks: the copy of B waits on A's readers, and A's next fill waits on B's readers. `CopyDone` /
+   `ReadFence` already exist per buffer today; this is about carrying them per ring.
+
+### What it would be worth
+
+If the copy reaches 13.4 GB/s, ring mode with the three stages lands at ~40 ms/layer (**1.9 s/chunk, -50%** from
+today's 3.88 s), using **borrowed** slots (no 650 MiB reservation) and with 38 of 48 layers in a single round and
+the other 10 in 2-8 rounds. If the copy stays at 8 GB/s, the same design lands at ~60 ms/layer (2.9 s) and the
+remaining loss is HBM, not scheduling - in which case the right move is fewer bytes (which is what `--expert-cache-gb
+3` plus the borrow already gives, by raising the hit rate).
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
