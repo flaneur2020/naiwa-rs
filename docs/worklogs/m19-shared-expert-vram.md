@@ -279,6 +279,53 @@ eats the gain, ship P2 with the cache permanently short and stop.
 - **What we lose if P3 is rejected**: nothing, because P2 alone removes the M18 trade - the milestone is
   ordered so that each phase is independently worth taking.
 
+## Why the borrow cannot pay here (measured shapes, 2026-10-21) - milestone closed
+
+Before writing the pool, the shapes were counted from the stream's own log (seven distinct layer-buffer sizes,
+because the GGUF mixes quants per layer):
+
+| layer buffer | layers |
+|---:|---:|
+| 481 MiB | 15 |
+| 531 MiB | 14 |
+| 568 MiB | 9 |
+| 368 MiB | 5 |
+| 418 MiB | 3 |
+| 456 MiB | 1 |
+| 650 MiB | 1 |
+| **total** | **48 = 23.4 GiB** |
+
+So the cache is not one pool but seven shape groups, and both ways to make slots shareable lose more than the
+borrow can win:
+
+| layout | cost | benefit of lending the prefill run back |
+|---|---|---|
+| **B. uniform slot = max shape** (strata's `blob_bytes` model) | `48 x 650 = 31 200 MiB` for `23 961 MiB` of experts: **-23% capacity** at the same slot count | any layer can use the spare slots |
+| **A. per-shape-group pools** (7 allocations, no padding) | 0% | a spare for the 650 MiB group serves **1 layer**; a spare for the 481 MiB group serves 15 (+16 slots/layer each) |
+
+-23% capacity is worse than the M18 trade (231 of 1 208 slots = -19%) which already measured as a net loss
+(+6 ms TPOT against 0.78 s of turn-1), and layout A's loan buys about a third of the layers a modest number of
+slots. The prefill buffer is 333 slots (650 MiB), so even a *successful* loan only returns the run to the group
+that happens to match it.
+
+**Conclusion: M19 stops here.** The premise - "the same VRAM can be cache and prefill buffer" - is right in the
+abstract and wrong for this model's 7-shape, 23.4 GiB expert set at 2.3 GB of cache: the bookkeeping that makes
+slots movable costs more capacity than the move recovers. The second prefill buffer stays unaffordable on a
+12 GB card, and M18's measured trade (cache for buffers) stays net-negative.
+
+What the milestone leaves behind, all reusable:
+
+- `src/moe/arena.rs` `SlotArena` with six tests - the two-watermark policy (cache from the top, prefill from the
+  bottom, coldest evicted first) is correct and costs nothing to keep for a card where the cache is large enough
+  for one shape group to dominate;
+- the H2D instruments (`cargo test h2d_ -- --ignored --test-threads=1 -- --nocapture`) and the fact that the
+  prefill copies already run at the link's 13.4 GB/s (M18);
+- the measurement that the static reserve OOMs with 89 MiB of formula margin, i.e. the plan's activation terms
+  under-count and must not be trusted for reservations.
+
+Next lever for turn-1 is therefore not memory: it is the per-row compute (`attention + hc`, 0.46 ms/row) that
+M17 identified, or a bigger card.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
