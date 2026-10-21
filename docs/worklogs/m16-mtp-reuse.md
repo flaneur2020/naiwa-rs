@@ -378,6 +378,39 @@ that luck. Making it deterministic needs either block-aligned step lengths or th
 state as of an earlier length, neither of which exists; the code path is kept because when it lands it is free
 (no extra work on the turns where it does not) and correctness is unchanged (see the gates below).
 
+## Making the generation-time checkpoint reliable (design, 2026-10-21)
+
+Item 7's checkpoint lands only when a decode step ends exactly on a 32-token boundary, and an MTP step commits
+2-3 tokens. Four runs of the same 3-turn `doc` conversation (cache 1.8 GB, `--prefix-cache-n 1`):
+
+| run | turn 2 cached / TTFT | turn 3 cached / TTFT |
+|---|---|---|
+| 1 | 1 760 / **1.32 s** | 1 792 / 2.57 s |
+| 2 | 1 760 / **1.30 s** | 1 856 / **1.10 s** |
+| 3 | 1 696 / 2.89 s | 1 824 / 2.46 s |
+| 4 | 1 760 / **1.33 s** | 1 856 / **1.08 s** |
+
+So the payoff when it lands is real and large (`TTFT>=2` 2.65 -> ~1.1-1.3 s, i.e. the 150 new rows become
+~30 = one expert pass instead of a saturated one), and the *ceiling* is strata's 0.63 s minus our 0.8 s
+tail chunk. What varies is only whether a step landed on a boundary: the captures logged were 1 696 / 1 760 /
+1 792 / 1 824 / 1 856 / 1 888 — every one of those is useful, none is guaranteed.
+
+**How the reference does it.** strata does not use block-hash keys for this at all:
+`conversation_kv_save(image, state, g, upto, include_index)` snapshots K/V **at an arbitrary `upto`** and
+`conversation_kv_restore(..., upto, ...)` puts it back, per conversation (`core/conversation_snapshot.hpp`,
+`core/conversation_cache.hpp`). There is no alignment lottery to win: the turn's exact end is the checkpoint.
+
+**Two ways to get there for us.**
+
+| design | mechanism | hit rate | cost |
+|---|---|---|---|
+| A — adaptive draft depth | in `qwen4_exp::speculative_propose`, cap the proposal to `next_boundary - len - 1` when that is <= `n_predict`, so a fully accepted step lands exactly on the boundary. Hooks: `speculative_propose` (depth is already a per-step argument), plus `speculative_depth_candidates`/`speculative_graph_plans` so every depth `0..=n` has a captured graph (`AUTO_DEPTHS`) | probabilistic: a step lands only if *all* the drafts up to the boundary are accepted (~50% per draft, so ~25-50% per attempt, several attempts per turn) | small fork change, slightly fewer drafts on the affected steps |
+| B — conversation-level snapshot | save state + K/V at the turn's exact length (no block alignment), keyed by the prompt prefix, restore on a matching prefix — exactly strata's `conversation_kv_save/restore(upto)` | deterministic | the real work: a non-block-aligned entry in the prefix cacher plus partial-block K/V retention/restore; the restore path currently requires `cached_tokens % block_size == 0` |
+
+Recommendation: **B is the fix, A is a stopgap.** A's ceiling is bounded by draft acceptance, which is exactly
+the property we cannot control; B removes the condition instead of gambling on it. The measured 1.08-1.33 s
+(and the 0.81 s tail chunk below it) is what `TTFT>=2` would look like once it always lands.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
