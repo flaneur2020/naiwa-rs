@@ -83,6 +83,10 @@ sized slots:
 - **`release`** returns the run; those slots are refillable by the cache immediately, and nothing is saved or
   restored because cache contents are copies, not dirty state.
 
+The rate instrument from M18 (`cargo test h2d_ -- --ignored --nocapture --test-threads=1`) still reports
+**13.4 GB/s** for every pinned case when run one at a time; running them in parallel makes the threads contend
+for the link (7.4-8.9 GB/s), which is why they are `#[ignore]`d out of the normal suite.
+
 Implemented as `src/moe/arena.rs` (`SlotArena`, no GPU, no allocation - it only hands out slot indices and the
 eviction list, which keeps the policy testable), with six unit tests pinning the four rules above: the cache
 fills top-down, the stream only ever grows its run, eviction is coldest-first, release makes the run refillable,

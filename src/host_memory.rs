@@ -341,6 +341,7 @@ mod h2d_probe {
     /// way `CopyStream` builds one. The prefill stream copies on that second stream and measures 4.6-5.5 GB/s
     /// where the default stream reaches 13.4.
     #[test]
+    #[ignore = "instrument: cargo test h2d_ -- --ignored --nocapture"]
     fn h2d_second_stream() {
         let device = candle_core::Device::new_cuda(0).expect("cuda device");
         let cuda = device.as_cuda_device().expect("cuda");
@@ -392,6 +393,7 @@ mod h2d_probe {
     }
 
     #[test]
+    #[ignore = "instrument: cargo test h2d_ -- --ignored --nocapture"]
     fn h2d_three_parts() {
         let third = (MIB << 20) / 3;
         let parts: Vec<Vec<u8>> = (0..3).map(|_| vec![7u8; third]).collect();
@@ -401,6 +403,7 @@ mod h2d_probe {
     }
 
     #[test]
+    #[ignore = "instrument: cargo test h2d_ -- --ignored --nocapture"]
     fn h2d_bandwidth() {
         let pageable = vec![7u8; MIB << 20];
         rate("pageable", &pageable, false);
