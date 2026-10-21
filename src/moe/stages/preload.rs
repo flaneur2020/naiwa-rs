@@ -58,9 +58,17 @@ impl Preload {
                     let n = rows * hidden;
                     let next = Arc::clone(&next);
                     let t0 = std::time::Instant::now();
-                    let pub_res = chan.publish(&x2d, n);
+                    // The channel is sized for the widest verify window (np4 + 1 = 5 rows). A prompt
+                    // chunk's tail can be wider than that, and a 5-row prediction could not cover its
+                    // routing anyway — the chunk's own hit counts fill the cache instead. Advisory, so
+                    // skip rather than grow every layer's mapped slot.
+                    let pub_res = if n > chan.max_n() {
+                        None
+                    } else {
+                        chan.publish(&x2d, n)?
+                    };
                     stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
-                    if let Some((sh, last_seq)) = pub_res? {
+                    if let Some((sh, last_seq)) = pub_res {
                         schedule(Box::new(move || {
                             let t0 = std::time::Instant::now();
                             // The GAP is the scheduler's business, not this

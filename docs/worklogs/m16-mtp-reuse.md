@@ -233,6 +233,43 @@ one turn). `engines/naiwa.json` now uses **2.3 GB**: the log's plan line confirm
 free. This is the cheap end of the trade because M10 measured main-cache size 1 → 3 GB as TPOT-neutral at
 chat.
 
+## item 6 — the prompt tail belongs to the decode split (done, 2026-10-21)
+
+The checkpoint boundary is `align_down(prompt, 32)`, so **every** prompt is prefilled as
+`[0, boundary)` plus a remainder of **at most 31 rows**. At `PREFILL_THRESHOLD = 16` that remainder was
+wider than the threshold and took the whole-chunk path — CPU, or the prefill stream — where a handful of rows
+still touches nearly every expert of every layer (128 x 3.9 MiB x 48 = 24 GB of reads for 29 rows). Measured
+2.3 s per `doc`/`long` turn.
+
+`PREFILL_THRESHOLD` is now **32**, so the tail takes the decode split (cache hits on the GPU, staging for
+`--pcie-frac`, the rest on the CPU) — and the cache has just been warmed by the preceding chunk, which is why
+it is cheap. Two things had to change with it:
+
+- `MAX_DECODE_ROWS` follows the threshold, and the **lookahead channel is sized for 5 rows** (the widest
+  verify window). A 29-row chunk made `LookaheadChannel::publish` bail with *"lookahead publish of 74240 f32
+  exceeds the channel slot (40960)"*, which failed the whole request. The publish is now skipped when the
+  chunk is wider than the slot: a 5-row prediction could not cover a chunk's routing anyway, and the chunk's
+  own hit counts fill the cache through `spawn_fill`.
+- Oracle re-verified after the change (the 17-token oracle prompt now takes the decode path instead of the
+  chunk path): byte-identical, both variants.
+
+| measurement | before | after |
+|---|---:|---:|
+| `doc` turn-1 TTFT | 6 266 ms | **4 400 ms** |
+| `doc` tail chunk (29 rows) | 2.3 s | **0.81 s** |
+| `short` turn-1 TTFT | 3 015 ms | **1 076 ms** |
+
+3 rounds, medians, naiwa only, cache 2.3 GB:
+
+| class | TTFT t1 | TTFT ≥2 | TPOT p50 | reuse | e2e/conv | M16 start |
+|---|---:|---:|---:|---:|---:|---|
+| doc | **4 400 ms** | 2 984 ms | 42 ms | 0.96 | **40.7 s** | 9 528 / 4 396 / 43 / 50.7 |
+| long | **4 300 ms** | 3 106 ms | 44 ms | 0.89 | **42.0 s** | 9 084 / 3 560 / 44 / 46.6 |
+| short | **1 076 ms** | 2 792 ms | 48 ms | 0.74 | **53.8 s** | 3 050 / 4 439 / 52 / 60.5 |
+
+Whole milestone so far: `doc` turn-1 9.5 → 4.4 s, TTFT≥2 4.4 → 3.0 s, e2e 50.7 → 40.7 s; TPOT 43 → 42 with
+`doc` at 40–42 ms against strata's 39.
+
 ## Gates
 
 - Oracle unchanged: `frac 0 + --no-lookahead` byte-identical to `harness/m1/reference.oracle.txt`, with and
@@ -251,8 +288,10 @@ chat.
 2. **Item 4, the row term**: `dry` must stop scaling with rows, or MTP's amortisation stays capped at
    `1.0/(1.0+0.25·R)`. This is the M10 3b device-dispatch work, now with a measured payoff curve.
 3. ~~The drafter's experts~~ — done above; resident Q2_0 removes the drafter from both phases.
-4. **The 29-row tail** (~2.3 s of every `doc`/`long` turn-1): `align_down(prompt, 32)` splits it off and a
-   29-row chunk touches every expert of every layer. Options are to hand the tail to the decode path (its
-   expert cache is already warm for that prompt) or to stop splitting when the remainder is below the
-   stream's `min_tokens`.
-5. Re-run the 3-round **paired** corpus against strata (this item was measured naiwa-only).
+4. ~~The 29-row tail~~ — done above.
+5. **The remaining TTFT≥2 gap is the same shape one size up** (3.0 s vs strata's 0.63 s). A turn's *new*
+   tokens are ~70–200 rows; that is still wider than `PREFILL_THRESHOLD`, so it takes the chunk path, whose
+   per-layer expert upload is ~all 128 experts (24 GB of reads for a few hundred rows, ~1.8 s). Strata serves
+   this from its expert cache (47% hit). The experiment is to raise the threshold to 128–256 and price the
+   decode split's CPU miss work against the upload: measured hits decide it, not the arithmetic.
+6. Re-run the 3-round **paired** corpus against strata (this item was measured naiwa-only).

@@ -111,6 +111,11 @@ impl LookaheadChannel {
     /// `last_seq` the worker job needs to wait and read, or `None` when the worker is more
     /// than `depth - 1` publishes behind — the prediction is advisory, so skipping this
     /// publish is cheaper than overwriting an unread slot.
+    /// The widest publish this channel's mapped slot can hold, in `f32` elements.
+    pub(crate) fn max_n(&self) -> usize {
+        self.chan.max_n()
+    }
+
     pub(crate) fn publish(
         self: &Arc<Self>,
         x: &Tensor,
@@ -223,11 +228,17 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
         .min_by_key(|(expert, slot)| (slots[*slot].last_use, *expert))
 }
 
-// Number of prefill tokens above which we skip the cache entirely.
-// Calls with more tokens than this are prefill chunks: every expert runs on the CPU (or the
-// prefill stream). Up to it they take the decode split, which is what a speculative verify step
-// needs (the target runs the n drafts plus one token in one forward).
-const PREFILL_THRESHOLD: usize = 16;
+// Number of rows above which we skip the cache entirely.
+// Calls with more rows than this are prefill chunks: every expert runs on the CPU (or the prefill
+// stream). Up to it they take the decode split, which is what a speculative verify step needs (the
+// target runs the n drafts plus one token in one forward).
+//
+// 32 because of the *tail* of a prompt chunk. The recurrent checkpoint boundary is
+// `align_down(prompt, 32)`, so every prompt is prefilled as `[0, boundary)` followed by a remainder
+// of at most 31 rows — and at 16 those remainders took the whole-chunk CPU path, where a few rows
+// still touch nearly every expert of every layer (measured 2.3 s per `doc`/`long` turn). At 32 they
+// take the decode split instead, whose expert cache the preceding chunk has just warmed.
+const PREFILL_THRESHOLD: usize = 32;
 
 /// The largest decode window the cache serves, i.e. the row count every warmup-sized mapped buffer
 /// and the CPU-result ring must cover. `PREFILL_THRESHOLD` is the same number by construction.
