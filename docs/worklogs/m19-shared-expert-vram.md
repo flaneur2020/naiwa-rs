@@ -475,6 +475,35 @@ Bookkeeping it needs, on top of `SlotArena`: a `layer` tag per slot (to know wha
 `borrowed` set per claim (to skip in hit/LRU/fill and to release). Both live where `Slot` already lives, next to
 `expert`/`buf`/`last_use`.
 
+## When the borrow falls short: the ring takes over (decided 2026-10-21)
+
+The ring is not a separate mode, it is **what is left over**: a prefill round addresses *any set of slot indices*
+inside the group's bank (the kernels take `local = slot - first`, so contiguity is not required), which means the
+ring size is simply `empty + borrowed-from-other-layers + the layer's own slots`, and the rounds are
+`ceil(256 / ring size)`.
+
+At a 4 GiB pool:
+
+| shape group | layers | own | borrowable | ring | rounds | extra MoE calls |
+|---|---:|---:|---:|---:|---:|---:|
+| 481 MiB | 15 | 45 | 630 | 675 | **1** | 0 |
+| 531 MiB | 14 | 41 | 533 | 574 | **1** | 0 |
+| 568 MiB | 9 | 38 | 304 | 342 | **1** | 0 |
+| 368 MiB | 5 | 59 | 236 | 295 | **1** | 0 (20 of its own slots are used, i.e. evicted) |
+| 418 MiB | 3 | 52 | 104 | 156 | **2** | +3 |
+| 456 MiB | 1 | 47 | 0 | 47 | **6** | +5 |
+| 650 MiB | 1 | 33 | 0 | 33 | **8** | +7 |
+
+So **38 of 48 layers prefill in one pass**, 3 layers in two, and only the two single-layer groups (the 456 and
+650 MiB ones) need 6-8 rounds. The total added cost is **15 extra small MoE calls per chunk** (+31% calls, but the
+MoE compute is ~2 ms/layer, i.e. ~1% of a chunk) plus ~2 500 small per-expert copies instead of whole-blob copies
+for those 10 layers (~1%).
+
+The three-tier policy and the ring therefore compose without a switch: borrow what is free, then what other layers
+hold, use the layer's own slots only as ring capacity, and run as many rounds as the ring needs. Nothing evicts a
+layer's own residents unless the group cannot cover one layer without them, and every borrowed slot is marked for
+return and comes back empty.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.
