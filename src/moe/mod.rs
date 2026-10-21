@@ -33,6 +33,7 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
+mod arena;
 mod cached_layer;
 mod decode;
 mod expert;
@@ -45,6 +46,7 @@ mod staging;
 mod tests;
 
 pub use provider::GpuCacheMoeProvider;
+pub(crate) use arena::SlotArena;
 pub(crate) use stages::fused_decode;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from

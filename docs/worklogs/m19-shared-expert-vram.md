@@ -65,6 +65,42 @@ decision: chunk 3072 needs `1 300 + 402 + 50 + 512 = 2 264 MiB` and the plan sti
 
 So single-user is a *simplification* of the loan, not a substitute for it. The borrow stays the plan.
 
+## The allocator: one pool, two watermarks (decided 2026-10-21)
+
+The design of record is not "carve a region at startup" but a **two-sided allocator** over one pool of uniformly
+sized slots:
+
+```
+ slot 0                          prefill_high      gap      cache_low                       total
+ |<------ the stream's run ------->|<--- free --->|<------- the expert cache --------------->|
+```
+
+- **The cache fills from the top down** (`cache_fill`), so its hottest resident sits nearest `total`.
+- **The prefill stream grows from the bottom up** (`borrow`), in whole-layer runs.
+- **When the stream needs more than the gap, the cache gives up its lowest slots first** (`borrow().evict`),
+  which are exactly its coldest - the user's rule, and it means the eviction order *is* the allocation order, so
+  no second policy (no LRU scan, no separate victim selection) is needed.
+- **`release`** returns the run; those slots are refillable by the cache immediately, and nothing is saved or
+  restored because cache contents are copies, not dirty state.
+
+Implemented as `src/moe/arena.rs` (`SlotArena`, no GPU, no allocation - it only hands out slot indices and the
+eviction list, which keeps the policy testable), with six unit tests pinning the four rules above: the cache
+fills top-down, the stream only ever grows its run, eviction is coldest-first, release makes the run refillable,
+and the watermarks never cross. `6/6` passing.
+
+### What integration still needs (P1's remaining work)
+
+1. **One uniform pool**: replace the per-layer `alloc_bank` allocations with a single allocation of
+   `total x slot_bytes(max shape)` (strata's `ExpertCache::open(..., blob_bytes)` shape), so a slot is a slot for
+   any layer and a contiguous run can be a layer buffer.
+2. **Slot ids instead of `Bank.first + index`**: the cache's per-layer bookkeeping becomes a list of slot ids
+   from `cache_fill`, because the arena's evictions take arbitrary (lowest) slots rather than a per-layer tail.
+3. **Prefill borrows**: `plan` turns its footprint into `ceil(footprint / slot_bytes)` slots, calls `borrow`,
+   invalidates `evict`, and aliases the run as `[E, N, K]` for the layer being prefilled; `release` after the
+   prompt.
+4. **Refill**: after `release`, the cache refills the run from the top down as it would after any eviction
+   (~333 slots x 1.95 MiB per layer buffer, ~97 ms of DMA at 13.4 GB/s).
+
 ## The layout blocks the loan (analysis, 2026-10-21)
 
 Working through P1 in the code found the real obstacle, and it is not the plumbing - it is how the cache is laid
