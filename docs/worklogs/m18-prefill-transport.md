@@ -106,6 +106,32 @@ against ~10% fewer cache slots (a tail-hit difference of a few percent, per M17)
    whose ceiling at 2.3 GB is ~10% of one layer pass - M17's finding. Keep it as a reason to prefer item 3's
    cache over item 4's selection, not the other way round.
 
+## Pricing the second buffer: it loses (measured, 2026-10-21)
+
+The trade was a config change (`--expert-cache-gb 2.3 -> 1.85`), 3 rounds each, everything else identical:
+
+| class | turn-1 (1 buffer) | turn-1 (2 buffers) | TTFT>=2 | TPOT | reuse |
+|---|---:|---:|---:|---:|---:|
+| doc | 4 431 ms | **3 654 ms (-18%)** | 1 153 -> 1 111 | **44.9 -> 51.0** | 0.98 |
+| long | 4 286 ms | **3 402 ms (-21%)** | 1 062 -> 1 148 | **45.8 -> 49.2** | 0.98 |
+| short | 1 065 ms | 1 021 ms | 1 185 -> 1 052 | 46 -> 45 | 0.89 -> 0.91 |
+
+The turn-1 gain is real and matches the probe (-16..-21%). The TPOT cost is also real: medians over 18 `doc` turns
+(39.8-49.6 IQR vs 45.0-54.2) with the **acceptance rate unchanged** (50.0% vs 49.2%), so it is the decode expert
+cache losing 231 slots (1 206 -> 975), not the drafter.
+
+Per conversation that is ~0.8 s saved on turn 1 against ~4 s lost on ~650 generated tokens at +6 ms. **Reverted
+to 2.3 GB / one buffer**: at this cache size the 450 MiB is worth more to decode than a second buffer is worth
+to prefill.
+
+Two follow-ups that do *not* work, both measured:
+
+- lowering `--max-num-batched-tokens`/`--max-prefill-chunk-tokens` 8 192 -> 4 096 shrinks the *requirement*
+  (act 522 -> 426 MiB) but not the *free* VRAM, and the plan still sees 1 983 MiB against 2 291 needed;
+- so the only way to have both buffer and cache is to free real VRAM, and the only lever that size is
+  `--max-seqs` (115 MiB per slot): 4 -> 1 plus the smaller chunk would fit, at the cost of serving one
+  sequence at a time. That is a concurrency decision, not a free lunch, and it is out of scope here.
+
 ## Gates
 
 - Oracle unchanged (`frac 0 + --no-lookahead`, with and without `--prefill-stream`), 36/36 tests.
