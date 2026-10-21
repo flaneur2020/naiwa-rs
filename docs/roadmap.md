@@ -403,6 +403,9 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m19-shared-expert-vram.md`](worklogs/m19-shared-expert-vram.md) — M19 (one expert-VRAM
+arena: the prefill stream borrows the expert cache's top slots, strata's `Prefill::init(borrow)`/`relayout`
+shape, so decode gets ~2 200 slots and prefill keeps two buffers instead of trading one for the other).
 Worklog: [`worklogs/m18-prefill-transport.md`](worklogs/m18-prefill-transport.md) — M18 (the prefill stream's
 transport: ~8 GB/s against a 13.4 GB/s link, a second buffer worth -16%, and the probe that has to say why).
 Worklog: [`worklogs/m17-prefill-cost.md`](worklogs/m17-prefill-cost.md) — M17 (what a prompt chunk costs:
