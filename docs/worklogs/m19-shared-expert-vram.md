@@ -1178,3 +1178,43 @@ is byte-identical through the oracle gate and inert, so it can stay as the found
 2. whether the chunk's upload is ordered after *candle's* stream (a decode kernel still reading a slot);
    `CopyStream::after_device_work` exists for exactly that and is not called on this path;
 3. and only then the empty-answer case itself, which needs a captured failing request.
+
+## Investigation: two bugs found and fixed, one defect narrowed but open (2026-10-22)
+
+Chased the intermittent failure properly, with an instrument on the chunk's own output
+(`NAIWA_BORROW_CHECK=1` reports a non-finite chunk output) and the borrow's per-layer debug line.
+
+**Bug 1 (fixed) - the empty was racing a fill.** `admit` reserves a slot (`expert = Some(id)`,
+`buf = None`) *before* the copy and publishes after it. `empty_range` cleared the reservation, the fill
+then published, and the slot came back claiming an expert whose bytes the chunk had already
+overwritten - exactly the garbage that makes a router return an invalid index. `empty_range` now clears
+the slot a *second* time after it has waited for the readers, and the borrow synchronises the copy
+stream after the clear so no fill DMA can land on the chunk's buffer.
+
+**Bug 2 (fixed) - the wait was held under a lock**, deadlocking against a fill that needed the same
+`layer.state` to finish. Take under the lock, wait without it, put back.
+
+**What is left, and why it is now a different failure.** With both fixes the hard CUDA errors stopped:
+the last three reproducer runs each show all 48 layers borrowing (`prefill_borrow: layer 0 ... 47`),
+e.g. `layer 0: borrowed 531 MiB, 305 slots emptied`, `layer 47: borrowed 650 MiB, 360 slots emptied`, and
+the chunk's own output is finite when checked. What remains is that roughly **one conversation in three
+returns no content at all** ("no content delta (finish None)" in the harness) with **no error in the
+server log** - the request simply ends. So the chunk is no longer the suspect; what follows it is.
+
+One hard error was captured once before those fixes and is worth keeping because it names a path:
+`Model failed with error: unexpected rank, expected: 2, got: 3 ([1, 1696, 2560])`. The only rank-2
+consumers here are `Gpu::submit`/`QMatMul` on the decode path, so in that instance the *decode* path was
+handed the chunk's 3-D tensor. How it got there is not established: the chunk branch is guarded by
+`num_tokens > PREFILL_THRESHOLD` and returns, so something re-entered decode with a chunk-shaped
+activation - the MTP verify step and the per-layer `MAX_DECODE_ROWS` ring are the two candidates.
+
+**Verdict**: the borrow mechanism is proven (35 slots/layer, chunk footprint 1 378 -> 866 MiB, turn-1
+TTFT unchanged, borrow lines for all 48 layers) but it is **not shippable**, and it stays behind
+`NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1`. Two of its bugs are fixed and the third is narrowed to
+"something after the chunk ends the turn empty", with the one concrete clue above.
+
+**Next instrument, in order**: (1) dump the first decode step's logits with the borrow on and off for the
+same conversation and compare - an empty answer with healthy logits is a sampler/prefix-cache problem, a
+degenerate argmax is still a data problem; (2) assert the rank at the decode entry (`xs.dims3()` plus a
+check against `MAX_DECODE_ROWS`), which would catch the `[1, 1696, 2560]` case at its source instead of
+in `candle`'s matmul.

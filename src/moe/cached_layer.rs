@@ -93,10 +93,17 @@ impl Layers {
             crate::copy_stream::wait_for_readers(buf);
         }
         let emptied = held.len();
-        // Phase 3: the storages go back where they came from, empty.
+        // Phase 3: the storages go back where they came from, empty - and cleared *again*, because a fill that was
+        // already in flight reserved its slot (expert = Some, buf = None) before phase 1 and publishes after
+        // phase 2. Without the second clear the slot would claim an expert whose bytes the chunk has overwritten,
+        // which is exactly the garbage a decode step then computes on.
         for (li, si, buf) in held {
             let mut state = layers[li].state.lock().unwrap();
-            *state.slots[si].storage.lock() = Some(buf);
+            let slot = &mut state.slots[si];
+            slot.expert = None;
+            slot.buf = None;
+            slot.last_use = 0;
+            *slot.storage.lock() = Some(buf);
         }
         emptied
     }
@@ -407,6 +414,24 @@ impl RoutedExperts for CachedExperts {
             }
             if let Some(ps) = &layer.prefill {
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
+                    // `NAIWA_BORROW_CHECK=1`: a chunk whose output is not finite is the borrow corrupting its own
+                    // buffer; one whose output is finite points the failure at the decode side instead.
+                    if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
+                        let finite = out
+                            .to_dtype(candle_core::DType::F32)?
+                            .to_device(&candle_core::Device::Cpu)?
+                            .to_vec2::<f32>()?
+                            .iter()
+                            .flatten()
+                            .all(|v| v.is_finite());
+                        if !finite {
+                            crate::dbg_note(
+                                "prefill_borrow",
+                                &format!("layer {}: chunk output is NOT finite", layer.layer),
+                            );
+                            eprintln!("BORROW_CHECK layer {}: chunk output not finite", layer.layer);
+                        }
+                    }
                     return Ok(out);
                 }
             }
