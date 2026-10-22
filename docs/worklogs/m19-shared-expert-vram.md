@@ -1146,3 +1146,35 @@ capture run was byte-identical between modes, but its answer was empty, so that 
 
 The reuse differed between those two runs (0.51 vs 0.76 on turn 2), so this is a direction, not a result: the
 mechanism works, and the proper numbers need the 3-round harness against `harness/chat/engines/*.json`.
+
+## The harness gate: the borrow works but is not yet trustworthy (2026-10-22)
+
+Ran the real gate - `harness/chat/run.py --engines naiwa,naiwa-loan --rounds 3`, where `naiwa-loan.json` is
+`naiwa.json` with `--expert-cache-gb 2.95` and `NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1`. **It does not pass
+yet**: the baseline engine completed every conversation, the loan engine dropped one turn per round with
+`no content delta (finish None)` - an empty answer, not an error the server logged. Earlier, in the
+`--pcie-frac 0 --prefix-cache-n 0` configuration, the same path failed with `invalid CUDA top-1 output` (one turn
+in three), which is what a garbage expert does: NaN in a hidden state makes the router's argmax return a bogus
+index.
+
+One real ordering hole was found and fixed on the way: a fill that the previous decode step queued on the copy
+stream is still in flight when the chunk begins, and before the borrow it wrote into memory of its own. Now it
+lands in the borrowed bytes *after* the chunk's upload and corrupts the layer buffer. `borrow_buffers` now
+synchronises the copy stream before it takes the range. That is necessary but not sufficient - the empty answer
+survives it, so there is at least one more hole, and the next step is to catch a failing request with the engine's
+own log rather than to guess.
+
+**What this means for the milestone**: the mechanism is real and measured (27 -> 35 slots, chunk footprint
+1 378 -> 866 MiB, turn-1 TTFT unchanged) but it is **not shippable**, so it stays behind
+`NAIWA_CACHE_SLAB` + `NAIWA_PREFILL_BORROW` and out of `engines/naiwa.json`. The slab on its own is different: it
+is byte-identical through the oracle gate and inert, so it can stay as the foundation.
+
+**Where to look next**, in the order the evidence points:
+
+1. the borrow empties slots while the decode machinery may still hold state for them (the lookahead channel's
+   published batch, `PassCell`'s preload claim, the `--pcie-frac` staging ring's completion event). Fills are
+   skipped when borrowing now, but nothing resets those; a quiescent-point check (borrow only when the layer's
+   tick/claim state is idle) would make the swap safe by construction;
+2. whether the chunk's upload is ordered after *candle's* stream (a decode kernel still reading a slot);
+   `CopyStream::after_device_work` exists for exactly that and is not called on this path;
+3. and only then the empty-answer case itself, which needs a captured failing request.

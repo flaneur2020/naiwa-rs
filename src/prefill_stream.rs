@@ -335,6 +335,11 @@ impl PrefillStream {
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
         let slab = self.slab.as_ref().expect("checked by borrows()");
+        // A fill the last decode step queued on the copy stream is still in flight, and before the borrow it wrote
+        // into memory of its own. Now it lands in these bytes *after* the chunk's upload and corrupts the layer
+        // buffer, which is how garbage weights reached a decode step (the intermittent "invalid CUDA top-1
+        // output", one turn in three). One sync per chunk settles the stream before the borrow starts.
+        self.copy.synchronize()?;
         let mut out = Vec::with_capacity(3);
         let mut offset = 0usize;
         for stack in stacks {
