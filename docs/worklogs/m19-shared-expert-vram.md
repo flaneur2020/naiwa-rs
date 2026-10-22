@@ -896,3 +896,44 @@ past Strata's 39), i.e. ~0.4 s over a 64-token turn, against M19's P3 estimate o
 2 816 rows, and `HEADROOM` is 192 MiB), and whether the -10% holds for `doc`/`long` once they are back to one
 chunk under the loan. The slab itself is mechanical: `alloc_bank` already takes a length and a device, so it needs
 a base offset and a bump/free list, not a new allocator.
+
+## Feasibility check: the cache cannot simply be raised, and why (2026-10-22)
+
+Before judging the slab design, the first question is how much cache the *current* design can afford, since
+`--expert-cache-gb 2.3` was chosen in M10 and has not been re-tuned after the drafter (675 MiB), the checkpoint
+capture and the trim removal moved the memory map. Bisected by starting the engine and reading the plan:
+
+| `--expert-cache-gb` | slots/layer | chunk cap | prefill stream | `doc` turn-1 |
+|---|---:|---:|---|---:|
+| 2.3 (today) | 27 | 8 192 | on | **4.0 s** |
+| 2.8 | 33 | 8 192 | **off** | **132 s** |
+| 2.85 | 33 | 7 168 | off | - |
+| 2.95 | 35 | 2 304 | off | - |
+| 3.0 | 35 | 1 280 | off | - |
+
+Two things fall out, and the second one is the important one:
+
+1. **There is no free headroom.** +0.5 GB (27 -> 33 slots, +22%) already breaks the stream: at 2.8 GB the plan
+   says `off (650 MiB layer buffer + 522 MiB activations + 192 MiB headroom does not fit in 1408 MiB free)`, and
+   the check also adds `act/8`, so the miss is ~20 MiB. 2.3 GB is not a conservative choice, it is the working
+   point.
+2. **The failure is silent and catastrophic.** Nothing crashes: the stream turns itself off, every layer's MoE
+   falls back to the CPU, and turn-1 goes 4.0 s -> **132 s** (33x) with only a WARN in the log. Any design that
+   grows the cache has to treat "the stream must keep its buffers" as an invariant, enforced loudly.
+
+That also explains the earlier `short` result: at 3.0 GB that conversation still ran one chunk (1 034 rows is
+under the new 1 280 cap), which is why its TPOT improved cleanly and its TTFT did not move - it was the only
+config where "more cache" did not also mean "smaller chunk".
+
+So the judgement on the slab design stands, with the ordering fixed by this run:
+
+- the loan is the **only** way to grow the cache, because the 650 MiB buffer is already inside the same budget;
+- **Phase A (overlay the 650 MiB layer buffer only)** is the version to build: it returns the same +22-30% slots
+  the 2.8-3.0 points show, while keeping the chunk at 8 192. Measured value on the slot->TPOT curve: +30% slots
+  is -10% TPOT (`short`: 62.9 -> 56.5 ms, 41.5 -> 37.3), i.e. `doc` 42 -> ~38 ms;
+- **Phase B (the 369-522 MiB of activations)** needs candle's allocator to hand out arena memory, so it is a
+  much larger job for maybe another 5%;
+- and **nothing in this direction touches the turn-1 gap** (+60% against Strata): that is the kernel side.
+
+**Kill criteria, written before building**: turn-1 within 200 ms of today, TPOT <= 38 ms, refill under 150 ms per
+prompt, and the startup check must refuse to start rather than silently drop the stream.
