@@ -1,6 +1,6 @@
 # M17 — what a prompt chunk costs: expert saturation and the per-row tax
 
-Status: **not started** (opened 2026-10-21 to hold the measurement that M16 ended on).
+Status: **closed** (2026-10-21): the cost model and the row cost are measured; no mechanism shipped from it - the chunk cost turned out to be per-chunk, which moved the work to M18/M19.
 Parent: [m16-mtp-reuse.md](m16-mtp-reuse.md).
 One mechanism this milestone: **stop paying for experts a chunk does not need, and stop paying a host
 round trip per prompt row**.

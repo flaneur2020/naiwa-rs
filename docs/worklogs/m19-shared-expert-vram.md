@@ -1,6 +1,6 @@
 # M19 — one VRAM arena: the prefill stream borrows the expert cache
 
-Status: **not started** (opened 2026-10-21).
+Status: **closed** (2026-10-22): one mechanism, four designs priced, all rejected on measurement - the last one (ring batching) was implemented and measured 3.4x slower, so it ships off by default.
 Parent: [m18-prefill-transport.md](m18-prefill-transport.md).
 One mechanism this milestone: **a single expert-VRAM arena, partitioned once at startup, whose prefill region is
 the expert cache when no prompt is being prefilled.**

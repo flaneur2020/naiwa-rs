@@ -1,6 +1,6 @@
 # M18 — the prefill transport: 8 GB/s, one buffer, and what a second one buys
 
-Status: **not started** (opened 2026-10-21).
+Status: **closed** (2026-10-21): one mechanism, shipped - the shape-changing pool trim is gone (turn-1 doc 4 431 -> 3 882 ms); the cache-for-buffer trade was priced and rejected.
 Parent: [m17-prefill-cost.md](m17-prefill-cost.md).
 One mechanism this milestone: **the prefill stream's own transport** — the copy rate, the buffer count, and
 which bytes are chosen — as opposed to M17's question of how many bytes a chunk must read at all.
