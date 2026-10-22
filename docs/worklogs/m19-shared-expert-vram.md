@@ -806,3 +806,45 @@ launches) is the only shape that can beat the 650 MiB buffer.
 runs `MoEExperts::forward` on 1725 rows, so the illegal address can be bisected without the server, the prefix
 cache and the drafter in the same process. That repro is also the microbenchmark that decides the design: 25
 experts vs 256 on the same rows gives the per-launch cost that all of this hinges on.
+
+## Compared with Strata: what it borrows, and what is idle in ours (2026-10-22)
+
+Strata solves the same problem with three mechanisms, and its docs name them: a **streamed ring** of expert slots,
+a **loan** of expert-cache room for the prompt path's *buffers*, and a **chunk chosen to fit both**.
+
+- *Ring*: "Since engine 0.1.39b (#583) the streamed ring is sized in bytes for the pack (a native pack with bigger
+  blobs gets fewer ring slots and keeps more cache slots) and `--prefill auto` picks the largest chunk that keeps
+  that ring full." Its ring is **tens of MiB**, because the prompt's experts are multiplied by the same quantized
+  MMQ kernel the decode uses - the ring is a *slot* of experts, not a layer.
+- *Loan*: "The prompt path **borrows room in the GPU's expert cache for its buffers** and puts those experts back
+  after the prompt."
+- *Chunk*: `--prefill auto` trades ring slots for chunk size only when the old rule capped the chunk at 4,096
+  tokens; "a smaller ring only slowed it" - shrinking the ring to keep cache slots measured **-12%** on the
+  Coder. That is our M18 result, measured independently.
+
+**Where we differ, and why our ring must be 650 MiB.** Our prompt path runs a *grouped* MoE kernel over one
+contiguous 256-expert stack, so the streamed unit is a whole layer. Strata's kernel takes an expert index list, so
+its unit is one slot and its ring can be small. That single difference explains the whole memory gap: 650 MiB vs
+tens of MiB, and it is the same kernel gap M19's last design hit (`CUDA_ERROR_ILLEGAL_ADDRESS`).
+
+**The thing we have been ignoring: during a chunk our expert cache is completely idle.** The chunk runs from the
+layer buffer; the cache's 2.3 GB is untouched (M17 measured that filling it during a chunk changes nothing:
+`NAIWA_NO_PREFILL_FILL=1` 3.94 vs 4.03 s). Meanwhile 522 MiB of activation scratch is squeezed into the leftover
+free VRAM, and `reserve` sizes it for the **cap** (8192 rows) although the chunks actually run are 1725-1900.
+
+Two ways to reuse that, in increasing order of work:
+
+1. **Size the activation reservation for the chunk that runs.** `activation_bytes(chunk) = 160 MiB + 170 MiB +
+   23.4 KiB x rows`; at 8192 it is 522 MiB, at our 1725 rows it is 369 MiB. Letting the reservation follow the
+   plan instead of the cap frees **~150 MiB** for nothing.
+2. **Move the activation scratch into the cache's VRAM during the chunk, and put the displaced experts back.**
+   The cache is idle for exactly that window, so borrowing it costs nothing while the chunk runs; afterwards the
+   ~278 slots the scratch covered (522 MiB / 1.88 MB) are refilled (45 ms of H2D, or simply re-read by the next
+   decode). The arithmetic: prefill's own footprint drops from 650 + 522 + 192 = 1364 MiB to 650 + 192 = 842,
+   which at 2337 MiB free moves the cache ceiling from **2.3 GB to ~3.7 GB (+60% slots, 1208 -> ~1930)**.
+   This is *not* M18's rejected trade: M18 spent cache permanently on a second weight buffer, which does nothing
+   for decode. Here the cache is only unavailable during the prompt, and decode's steady state is untouched.
+
+Both are independent of the kernel work, and (2) is the largest memory win this card still has. It needs an f32
+arena over the cache's banks - a `Tensor` built on an existing device pointer - which is a much smaller job than
+the grouped-kernel indirection that blocks everything else.
