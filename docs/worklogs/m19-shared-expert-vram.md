@@ -1009,3 +1009,51 @@ So:
 That also retires the last open question about Phase A's shape: the borrow does not need to cover "the chunk's
 footprint against the planner's estimate" at all. It needs to cover the chunk, full stop, and the free-VRAM
 reserve is a property of the decode side that does not change with the chunk's size.
+
+## Step 1 done: free-VRAM growth buys nothing measurable (2026-10-22)
+
+Sweeping the cache with both instruments and `NAIWA_PREFILL_STRICT=1` (`doc`, one 1696-row chunk, 64-token
+answers):
+
+| `--expert-cache-gb` | slots | chunk low water | decode low water | turn-1 TPOT | turn-2 TPOT |
+|---|---:|---:|---:|---:|---:|
+| 2.3 | 27 | 607 MiB | 601 MiB | 50.1 ms | 38.8 ms |
+| 2.4 | 28 | 478 MiB | 508 MiB | 49.1 ms | 33.4 ms |
+| 2.5 | 29 | 384 MiB | 382 MiB | 48.5 ms | 37.4 ms |
+| 2.6 | 30 | 222 MiB | - | `CUDA_ERROR_OUT_OF_MEMORY` | - |
+
+Two things: **+7% slots moves turn-1 TPOT by 3%, inside the run-to-run noise** (turn-3 swings 54-57 ms between
+identical configs), so growing the cache out of free VRAM is dead on measurement, not on theory; and the chunk and
+decode low waters **track each other** at every cache size (607/601, 478/508, 384/382), which says the low water
+is not a fixed requirement but "whatever is left" - until 222 MiB, where something else needs more and the OOM
+lands.
+
+**Conclusion: Step 1 closes the free-VRAM avenue.** Everything that is left is the loan, and the loan's value is now
+bounded from both ends: it is worth roughly the -10%-per-30%-slots curve (measured), and it requires the chunk to
+stop consuming free VRAM entirely (measured).
+
+## The obstacle in the loan's foundation: a slab needs a candle change (2026-10-22)
+
+Designing Phase A ran into the one thing the earlier estimates glossed over. The chunk needs its three projection
+stacks **contiguous** (650 MiB total for the largest layer, 217 MiB per projection), and a cache bank is only
+~47 MiB, so the borrow range has to be a byte range carved out of a single big allocation. Carving it needs
+storages that share one allocation, and in this stack there is no such thing:
+
+- `cudarc` 0.19.10's `CudaSlice` **owns its pointer**: `Drop` calls `free_async`/`free_sync`, and `slice()` on it
+  returns a **borrowed `CudaView<'_>`**, not an owned sub-slice. There is no `split` that hands out owned halves.
+- candle's `QCudaStorage { data: PaddedCudaSlice { inner: CudaSlice<u8>, len }, dtype, device }` has **private**
+  fields and owns an owned `CudaSlice`, so neither crate can fabricate a storage over someone else's bytes.
+- CUDA's own answer, VMM (`cuMemCreate` / `cuMemAddressReserve` / `cuMemMap`), exists in `cudarc` **only as raw
+  `sys` bindings**, and would bypass candle's allocator entirely.
+
+So Phase A is not "naiwa-only, ~400 lines". Its foundation is one of:
+
+| option | what it takes | cost | risk |
+|---|---|---|---|
+| **(a) borrowed storage in candle-core** | a `QCudaStorage` variant holding `Arc<CudaSlice<u8>>` + offset + len, with `device_ptr()`/`storage_size_in_bytes()` over it (~40 lines, additive) | small | touches the crate the oracle binary links; additive and inert, but it is a shared dependency |
+| **(b) VMM via `sys`** | one physical allocation mapped twice, cache and chunk get separate virtual ranges | large | deep unsafe CUDA, outside candle's allocator and its fences |
+| **(c) no slab: alias the chunk's own scratch** | find disjoint-lived temporaries inside a chunk (Strata does this: `bo` reuses `emb`, 320 MiB at 32k rows) | medium, naiwa-only | none for numerics; gain is only the scratch side, so maybe +100-300 MiB of cache |
+
+(a) is the shortest path to the +100% and it is what the design wants; (c) is the only one that stays inside
+naiwa. The choice is a scope decision, not a technical unknown, so it is taken deliberately rather than by
+drifting: **(a) needs an explicit yes to touching candle-core**, and until then (c) is the only runnable version.
