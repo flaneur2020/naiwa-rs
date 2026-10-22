@@ -321,6 +321,11 @@ impl RoutedExperts for CachedExperts {
         // next layer in the background, off the token path. This layer is filled too, for the
         // first layer of the stack
         // (no predecessor triggers it); a layer already full or filling is a no-op.
+        // The decode side of the VRAM low-water instrument (`NAIWA_PREFILL_PEAK=1`), once per step: sampling
+        // every layer would be 48 driver calls per token.
+        if layer.layer == 0 && num_tokens <= PREFILL_THRESHOLD && crate::vram_peak::enabled() {
+            crate::vram_peak::note_step(&layer.slot_device);
+        }
         if num_tokens > PREFILL_THRESHOLD {
             let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
             {

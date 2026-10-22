@@ -6,6 +6,7 @@ mod args;
 mod commands;
 mod copy_stream;
 mod doorbell;
+mod vram_peak;
 mod executor;
 mod host_memory;
 mod load;

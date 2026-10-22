@@ -977,3 +977,35 @@ point rather than a conservative choice.
 request needs at its deepest point", which includes the decode/verify side. The peak instrument therefore needs one
 more sample point - the decode step - before Phase A can size anything. That is the next small piece of work, and
 it is cheap: the same free-VRAM sample at the top of a decode step, reported against the same baseline.
+
+## The other half of the peak: decode bottoms out at the same place (2026-10-22)
+
+Added the same sample to the decode path (`NAIWA_PREFILL_PEAK=1`, once per step on layer 0, `src/vram_peak.rs`).
+One `doc` turn at cache 2.3 GB:
+
+```
+prefill peak: chunk 1696 rows, 48 layers, 1378 MiB used (1985 MiB free at start, 607 MiB low water)
+decode peak:  64 steps, 601 MiB lowest free VRAM (601 MiB now)
+```
+
+**The chunk and the decode bottom out within 6 MiB of each other.** That is the answer to "how much is the cache
+allowed to grow": none of that ~600 MiB is spare. It is what the decode side needs once the chunk is done - the
+MTP verify step, the recurrent pool, the checkpoint capture and the pool's own slack - and it explains the 2.6 GB
+OOM exactly: that run finished its chunk with 222 MiB left, i.e. ~380 MiB short of what decode needs, and the OOM
+landed in the post-chunk work rather than in the chunk.
+
+So:
+
+- **growing the cache out of today's free VRAM buys at most ~200 MiB (+7% slots)**, which is inside the noise of
+  the -10%-per-30% curve. That avenue is effectively closed, and it is closed by a *measured* requirement rather
+  than by the formula's 512 MiB guess.
+- **the loan's upside is larger than the earlier estimate**: if the chunk's 1 378 MiB came from the cache instead
+  of from free VRAM, then free VRAM only ever has to cover the decode side, and the cache could take
+  `free_at_load - decode_slack - safety` ≈ 2.3 GB + ~1.7 GB ≈ **4.0 GB (~2 400 slots, +100%)**, with the invariant
+  the instrument now makes checkable: **free VRAM stays above ~600 MiB at all times**, chunk or not.
+- and the loan's sizing rule is now a measurement, not a formula: `cache = free_at_load - 600 MiB - safety`,
+  validated by running the instrument and watching the low water.
+
+That also retires the last open question about Phase A's shape: the borrow does not need to cover "the chunk's
+footprint against the planner's estimate" at all. It needs to cover the chunk, full stop, and the free-VRAM
+reserve is a property of the decode side that does not change with the chunk's size.
