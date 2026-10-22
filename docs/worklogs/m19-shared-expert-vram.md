@@ -644,6 +644,46 @@ Consequences:
 
 The overlap question this document spent three sections on is therefore answered: **there is nothing to overlap.** The remaining prefill levers are the MoE kernel's efficiency on a saturated expert set (a quantized grouped-GEMM question, the one strata answers with MMQ/fused kernels) and the per-row attention/hc tax.
 
+## Ring batching implemented and measured: it is 3.4x slower (2026-10-22)
+
+Built it, ran it, and the plan's prediction was too optimistic by an order of magnitude.
+
+**What exists now** (`NAIWA_PREFILL_RINGS=1`, off by default):
+
+- `src/moe/rings.rs`: the round planner, six unit tests - rounds partition the routing exactly (no pair
+  computed twice, no pair lost, weights preserved), respect `own + lent` capacity, assign the first rounds to the
+  layer's own slots and the rest to a lender, and keep the largest round within 2x of the average by greedy
+  longest-processing-time over expert popularity;
+- `src/moe/rings_exec.rs`: the executor - rents the layer's slots, DMAs each round's experts from the pinned host
+  stacks into them, computes the round's `(row, expert)` pairs with the same fused kernel the decode hits use, and
+  sums the rounds.
+
+**Two ownership bugs on the way, both the same shape**: `wait_for_readers` spins until `Arc::strong_count == 1`,
+so any clone kept alive while waiting deadlocks. The first version cloned the buffer out of `Slot::storage` and
+spun forever; the second cleared `storage` but left `Slot::buf` (the published contents) holding a reference and
+spun again. The fix is to drop *everything* that can hold the buffer - `storage` (taken), `buf`, `expert` -
+before waiting. The W105 comment in `dma_miss.rs` warns about exactly this.
+
+**The measurement** (3-turn `doc`, cache 2.3 GB, own slots only = 10 rounds per layer):
+
+| | turn-1 | turn-2 | turn-3 |
+|---|---:|---:|---:|
+| prefill stream (baseline, same binary) | **4.02 s** | 1.30 s | 2.29 s |
+| ring batching, 10 rounds/layer | **13.48 s** | 1.30 s | 1.01 s |
+
+So **an extra round costs ~1.05 s per chunk** across the 48 layers (9 extra rounds = +9.46 s). The reason is that
+each round is a full stop: a `CopyDone` wait before the round's compute, then a small GEMM, 10 times per layer,
+480 times per chunk, with no overlap between the DMA of round i+1 and the compute of round i.
+
+**Consequence, and why borrowing cannot save it**: even if a lender made every layer 1 round (the best case), the
+cost would be the baseline; at the 2 rounds a 2.3 GB pool affords, the extrapolated cost is ~5 s - still worse
+than the 4.02 s stream. Ring batching therefore **cannot pay for speed on this card**; it only pays in memory
+(-650 MiB of buffer), and M18 already measured what that memory is worth (a net loss at 231 slots).
+
+**Kept in the tree, off by default**, because the planner is correct, tested, and the executor is the shortest
+demonstration of the mechanism - it is the thing to reach for if a future card makes slots plentiful enough for
+1-round prefills *without* a dedicated buffer.
+
 ## Gates
 
 - Oracle `frac 0 + --no-lookahead` byte-identical, with and without `--prefill-stream`; 36/36 tests.

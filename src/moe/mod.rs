@@ -38,6 +38,8 @@ mod cached_layer;
 mod decode;
 mod expert;
 mod provider;
+mod rings;
+pub(crate) mod rings_exec;
 mod resident;
 mod slot;
 mod stages;
@@ -47,6 +49,8 @@ mod tests;
 
 pub use provider::GpuCacheMoeProvider;
 pub(crate) use arena::SlotArena;
+pub(crate) use rings::{plan as plan_rings, RingPlan, Round, RoundSlots};
+pub(crate) use rings_exec as prefill_rings;
 pub(crate) use stages::fused_decode;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from

@@ -338,6 +338,11 @@ impl RoutedExperts for CachedExperts {
                 }
                 layer.spawn_fill();
             }
+            // Ring batching (`NAIWA_PREFILL_RINGS=1`): the chunk's experts in rounds over the layer's own
+            // slots, which is the memory-free version of the prefill stream.
+            if let Some(out) = crate::moe::rings_exec::forward(layer, xs, &topk_weights, topk_ids)? {
+                return Ok(out);
+            }
             if let Some(ps) = &layer.prefill {
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
                     return Ok(out);
