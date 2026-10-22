@@ -39,6 +39,7 @@ mod decode;
 mod expert;
 mod provider;
 mod rings;
+mod slab;
 pub(crate) mod rings_exec;
 mod resident;
 mod slot;

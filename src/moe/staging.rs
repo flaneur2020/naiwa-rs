@@ -128,9 +128,33 @@ pub(super) fn alloc_bank(
     len: usize,
     device: &Device,
 ) -> candle_core::Result<Vec<Arc<SlotBuf>>> {
-    let (gate, gate_views) = cs.alloc_bank(&stacks.0, len)?;
-    let (up, up_views) = cs.alloc_bank(&stacks.1, len)?;
-    let (down, down_views) = cs.alloc_bank(&stacks.2, len)?;
+    alloc_bank_in(cs, None, stacks, first, len, device)
+}
+
+/// The same bank, carved from the cache's slab when one is given: one range per projection, so the layer's bank is
+/// still contiguous and every projection still one `[slots, n, k]` tensor, but the bytes belong to the slab and
+/// can be lent out later. Falls back to its own allocation when the slab cannot take the range.
+pub(super) fn alloc_bank_in(
+    cs: &CopyStream,
+    slab: Option<&super::slab::Slab>,
+    stacks: &(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>),
+    first: usize,
+    len: usize,
+    device: &Device,
+) -> candle_core::Result<Vec<Arc<SlotBuf>>> {
+    let storage = |stack: &QTensor| -> candle_core::Result<candle_core::quantized::cuda::QCudaStorage> {
+        if let Some(slab) = slab {
+            let dims = stack.shape().dims();
+            let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+            if let Some(range) = slab.alloc(len * n * k, stack.dtype(), device)? {
+                return Ok(range);
+            }
+        }
+        cs.bank_storage(stack, len)
+    };
+    let (gate, gate_views) = cs.bank_from_storage(&stacks.0, len, storage(&stacks.0)?)?;
+    let (up, up_views) = cs.bank_from_storage(&stacks.1, len, storage(&stacks.1)?)?;
+    let (down, down_views) = cs.bank_from_storage(&stacks.2, len, storage(&stacks.2)?)?;
     let bank = Arc::new(Bank {
         first,
         proj: Projections { gate, up, down },

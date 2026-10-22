@@ -147,11 +147,33 @@ mod cuda {
             let Device::Cuda(dev) = &self.device else {
                 candle_core::bail!("copy stream on a non-CUDA device");
             };
+            let storage = self.bank_storage(stack, slots)?;
+            self.bank_from_storage(stack, slots, storage)
+        }
+
+        /// A bank's storage as its own allocation, sized and typed from `stack`.
+        pub fn bank_storage(&self, stack: &QTensor, slots: usize) -> Result<QCudaStorage> {
+            let Device::Cuda(dev) = &self.device else {
+                candle_core::bail!("copy stream on a non-CUDA device");
+            };
+            let dims = stack.shape().dims();
+            let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+            QCudaStorage::zeros(dev, slots * n * k, stack.dtype())
+        }
+
+        /// Assemble a bank over a storage someone else chose - the slab, whose range is a view of one allocation.
+        /// Everything else is what `alloc_bank` does: one `[slots, n, k]` quantised tensor per projection, plus a
+        /// `SlotMemory` view per slot so a fill can DMA into one expert.
+        pub fn bank_from_storage(
+            &self,
+            stack: &QTensor,
+            slots: usize,
+            storage: QCudaStorage,
+        ) -> Result<(Arc<QTensor>, Vec<SlotMemory>)> {
             let dims = stack.shape().dims();
             let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
             let dtype = stack.dtype();
             let stride = n * (k / dtype.block_size()) * dtype.type_size();
-            let storage = QCudaStorage::zeros(dev, slots * n * k, dtype)?;
             if storage.storage_size_in_bytes() < slots * stride {
                 candle_core::bail!(
                     "bank of {slots} experts got {} bytes, needs {}",

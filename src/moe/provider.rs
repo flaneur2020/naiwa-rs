@@ -16,7 +16,7 @@ use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpert
 use mistralrs_core::MoEExperts;
 
 use super::{
-    alloc_bank, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState, Layers,
+    staging::alloc_bank_in, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState, Layers,
     LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
 };
 
@@ -67,9 +67,41 @@ pub struct GpuCacheMoeProvider {
     lookahead_swaps: usize,
     /// `--no-lookahead`: the provider's prediction is off (tests only).
     lookahead: bool,
+    /// `NAIWA_CACHE_SLAB=1`: every layer's bank is carved from this one allocation instead of its own, so the
+    /// cache's bytes are a contiguous pool the prefill stream can borrow from.
+    slab: std::sync::OnceLock<Option<Arc<super::slab::Slab>>>,
 }
 
 impl GpuCacheMoeProvider {
+    /// The cache's slab, created on the first layer when `NAIWA_CACHE_SLAB=1`, sized from `--expert-cache-gb`.
+    ///
+    /// A layer whose bank does not fit the remaining slab falls back to its own allocation inside
+    /// `alloc_bank_in`, so a slab that is slightly too small costs nothing but the lending opportunity.
+    fn slab(&self, device: &candle_core::Device) -> Option<Arc<super::slab::Slab>> {
+        self.slab
+            .get_or_init(|| {
+                if !super::slab::Slab::enabled() {
+                    return None;
+                }
+                let bytes = (self.cache_gb * 1e9) as usize;
+                match super::slab::Slab::new(device, bytes) {
+                    Ok(slab) => {
+                        let slab = Arc::new(slab);
+                        info!(
+                            "expert cache: one {:.2} GB slab, banks carved from it (NAIWA_CACHE_SLAB)",
+                            slab.bytes() as f64 / 1e9
+                        );
+                        Some(slab)
+                    }
+                    Err(e) => {
+                        warn!("expert cache: slab allocation failed ({e}); banks allocate individually");
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
     pub fn new(
         cache_gb: f64,
         prefill: Option<PrefillStreams>,
@@ -94,6 +126,7 @@ impl GpuCacheMoeProvider {
             pcie_frac,
             lookahead_swaps,
             lookahead,
+            slab: std::sync::OnceLock::new(),
         }
     }
 
@@ -368,8 +401,10 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // layer's slots are one bank per projection, so a decode step runs them in one fused call.
         let mut copy_stream = self.copy_streams.get(&slot_device);
         let slots: Vec<Slot> = (0..num_slots).map(|_| Slot::empty()).collect();
+        let slab = self.slab(&slot_device);
         if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
-            for (i, buf) in alloc_bank(cs, &stacks, 0, num_slots, &slot_device)?
+            for (i, buf) in
+                alloc_bank_in(cs, slab.as_deref(), &stacks, 0, num_slots, &slot_device)?
                 .into_iter()
                 .enumerate()
             {

@@ -1057,3 +1057,41 @@ So Phase A is not "naiwa-only, ~400 lines". Its foundation is one of:
 (a) is the shortest path to the +100% and it is what the design wants; (c) is the only one that stays inside
 naiwa. The choice is a scope decision, not a technical unknown, so it is taken deliberately rather than by
 drifting: **(a) needs an explicit yes to touching candle-core**, and until then (c) is the only runnable version.
+
+## (a) done: a borrowable storage in candle, and the cache carved from one slab (2026-10-22)
+
+The design's foundation is in, on both sides of the boundary.
+
+**candle (`~/code/candle`, `quantized/cuda.rs`)**: `PaddedCudaSlice` now holds
+`inner: Arc<CudaSlice<u8>>` plus `offset`, `len` and `allocated`, and `QCudaStorage::borrow_from(slab, offset,
+el_count, dtype, device)` returns a storage over a **range of the slab's allocation** - no copy, no ownership,
+and a dtype of its own choosing, because the slab is only bytes. Dropping it frees nothing; the slab's `Arc` is
+what keeps the bytes alive. `allocated_bytes()` exposes the padded size so the slab's cursor can advance by
+exactly what was handed out. The kernel arguments go through `&data.view()`, which is a `CudaView` over
+`offset..offset+allocated` - `cudarc` 0.19 does implement `PushKernelArg` for `&CudaView`, which is what made
+this a ~60-line change instead of a rewrite.
+
+**naiwa (`src/moe/slab.rs`, `staging::alloc_bank_in`, `provider::slab`)**: with `NAIWA_CACHE_SLAB=1` the provider
+allocates one `--expert-cache-gb` slab per device (as `F32`, i.e. block size 1, so it is a byte pool) and every
+layer's bank is a bump-allocated range of it: one range per projection, still one contiguous `[slots, n, k]`
+tensor per projection, still a `SlotMemory` per slot. A layer whose bank does not fit what is left falls back to
+its own allocation, so an undersized slab costs the lending opportunity and nothing else.
+
+**Both verified:**
+
+- `moe::slab::tests::a_borrowed_range_is_a_view_of_the_slab` (device test, `--ignored`): a range starts at its
+  offset, dropping it leaves the slab intact and the address unchanged, and two ranges read as different quantised
+  types;
+- the **oracle gate is byte-identical in slab mode** (`FRAC=0`, `--no-lookahead`,
+  `NAIWA_CACHE_SLAB=1` -> `' Paris. The capital of Japan is Tokyo. The capital of Italy is Rome.'`), and the log
+  confirms the path taken: `expert cache: one 2.00 GB slab, banks carved from it`.
+
+The chat corpus is **not** a correctness oracle here: with `--pcie-frac 0.2` (and adaptive swaps) the first token
+already differs between two runs of the *same* binary, which M16 recorded. That is why the slab is validated by the
+`FRAC=0` gate rather than by diffing chat text.
+
+**What is left of (a)**: the borrow itself. The slab now makes it possible: the low end of the slab is a
+contiguous range whose owners are known banks, so a chunk can (i) mark the slots that live there empty, (ii) build
+its three projection storages with `borrow_from` over that range at the current layer's dtype, (iii) run, and
+(iv) return the range, leaving those slots empty to refill. Everything that needs is now in place except the
+sizing (measured: chunk 1 378 MiB, decode low water ~600 MiB) and the fences.
