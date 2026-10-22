@@ -179,6 +179,24 @@ pub struct PrefillStream {
     checked: std::sync::atomic::AtomicBool,
     /// Chunks shorter than this stay on the CPU.
     min_tokens: usize,
+    /// `NAIWA_PREFILL_PEAK=1`: what a chunk actually costs in VRAM, against what the planner estimates.
+    peak: Mutex<Peak>,
+}
+
+/// One chunk's VRAM footprint, sampled at every layer (`NAIWA_PREFILL_PEAK=1`).
+///
+/// The planner sizes the chunk from `activation_bytes(chunk)`, a formula M19 measured to under-count the peak by
+/// more than 89 MiB at 2 816 rows. This records the number the formula is supposed to be: free VRAM before the
+/// chunk minus the low-water mark during it, i.e. layer buffer + activations + whatever else the step touches.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Peak {
+    /// Free VRAM just before the chunk allocated its layer buffer; 0 until a chunk starts.
+    free_at_start: usize,
+    /// Lowest free VRAM seen inside the chunk.
+    min_free: usize,
+    layers: usize,
+    /// The rows this chunk actually carried (not the plan's ceiling).
+    rows: usize,
 }
 
 impl PrefillStream {
@@ -219,6 +237,7 @@ impl PrefillStream {
             plan: Mutex::new(None),
             checked: std::sync::atomic::AtomicBool::new(false),
             min_tokens,
+            peak: Mutex::new(Peak::default()),
         }))
     }
 
@@ -288,6 +307,59 @@ impl PrefillStream {
     /// assumed: two buffers need twice a layer, and on a 12 GB card that is what pushes a
     /// 1024-token chunk's MoE intermediates over the edge. One buffer still beats the CPU by an
     /// order of magnitude (the uploads are then serial with the compute instead of hidden).
+    /// Sample this layer's free VRAM and, on the chunk's last layer, report the footprint.
+    fn sample_peak(&self, layer: usize, rows: usize) {
+        if std::env::var_os("NAIWA_PREFILL_PEAK").is_none() {
+            return;
+        }
+        let Some(free) = crate::copy_stream::free_bytes(&self.device) else {
+            return;
+        };
+        let total = self.layers.read().len();
+        let mut peak = self.peak.lock().unwrap();
+        if layer == 0 || peak.free_at_start == 0 {
+            // Layer 0 is sampled before the chunk allocates its buffer: that is the chunk's baseline.
+            *peak = Peak {
+                free_at_start: free,
+                min_free: free,
+                layers: 0,
+                rows,
+            };
+            if layer != 0 {
+                return; // a mid-chunk first sample cannot know the baseline
+            }
+        }
+        peak.min_free = peak.min_free.min(free);
+        peak.layers += 1;
+        if total == 0 || peak.layers < total {
+            return;
+        }
+        let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
+        let used = peak.free_at_start.saturating_sub(peak.min_free);
+        let plan = self.current();
+        info!(
+            "prefill peak: chunk {} rows, {} layers, {:.0} MiB used ({:.0} MiB free at start, \
+             {:.0} MiB low water); layer buffer {:.0} MiB, planner estimate {:.0} MiB (act {:.0})",
+            peak.rows,
+            peak.layers,
+            mib(used),
+            mib(peak.free_at_start),
+            mib(peak.min_free),
+            mib(self.layer_bytes() * plan.stride as u64 as usize),
+            mib(activation_bytes(plan.chunk) + HEADROOM),
+            mib(activation_bytes(plan.chunk)),
+        );
+        peak.free_at_start = 0;
+    }
+
+    /// `NAIWA_PREFILL_STRICT=1`: a stream that cannot get its buffer is an error, not a silent fall back to the
+    /// CPU. The measured failure mode is otherwise brutal: at `--expert-cache-gb 2.8` the plan misses by ~20 MiB,
+    /// the stream turns itself off, and `doc` turn-1 goes 4.0 s -> 132 s with one WARN in the log.
+    fn strict() -> bool {
+        static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *STRICT.get_or_init(|| std::env::var_os("NAIWA_PREFILL_STRICT").is_some())
+    }
+
     fn reserve(&self) -> candle_core::Result<usize> {
         let first = !self.checked.swap(true, std::sync::atomic::Ordering::AcqRel);
         if !first {
@@ -330,6 +402,18 @@ impl PrefillStream {
                     mib(HEADROOM),
                     mib(free),
                 );
+                if Self::strict() {
+                    candle_core::bail!(
+                        "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB activations + \
+                         {:.0} MiB headroom does not fit in {:.0} MiB free), and NAIWA_PREFILL_STRICT is \
+                         set. Lower --expert-cache-gb to leave room for the stream, or unset \
+                         NAIWA_PREFILL_STRICT to let the CPU take the chunk (33x slower)",
+                        mib(self.layer_bytes()),
+                        mib(activation_bytes(previous.chunk.max(256))),
+                        mib(HEADROOM),
+                        mib(free),
+                    );
+                }
                 *self.plan.lock().unwrap() = Some(Plan { stride: 0, chunk: 0 });
                 Ok(0)
             }
@@ -341,6 +425,12 @@ impl PrefillStream {
     /// with a CUDA OOM — the driver's answer is the only reliable statement about what fits, so it
     /// is used as the signal instead of a size heuristic.
     fn downgrade(&self, stride: usize) -> candle_core::Result<()> {
+        if Self::strict() {
+            candle_core::bail!(
+                "prefill stream: a buffer was refused with CUDA OOM (stride {stride}) and \
+                 NAIWA_PREFILL_STRICT is set; the stream would otherwise continue with fewer buffers"
+            );
+        }
         let next = stride.saturating_sub(1);
         let chunk = self.current().chunk;
         *self.plan.lock().unwrap() = Some(Plan { stride: next, chunk });
@@ -470,6 +560,7 @@ impl PrefillStream {
         if batch * seq < self.min_tokens || self.stacks(layer).is_none() {
             return Ok(None);
         }
+        self.sample_peak(layer, batch * seq);
         let mut stride = self.reserve()?;
         if stride == 0 {
             return Ok(None);

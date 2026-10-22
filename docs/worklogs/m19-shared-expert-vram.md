@@ -937,3 +937,43 @@ So the judgement on the slab design stands, with the ordering fixed by this run:
 
 **Kill criteria, written before building**: turn-1 within 200 ms of today, TPOT <= 38 ms, refill under 150 ms per
 prompt, and the startup check must refuse to start rather than silently drop the stream.
+
+## Step 0 done: the peak instrument and a loud failure (2026-10-22)
+
+Two small things landed before any allocator work, because both later decisions rest on them.
+
+**`NAIWA_PREFILL_PEAK=1`** samples free VRAM at every layer of a chunk and reports the footprint against the
+planner's estimate. First real numbers (`doc` turn-1, one chunk, cache 2.3 GB):
+
+```
+prefill peak: chunk 1725 rows, 48 layers, 1378 MiB used (1983 MiB free at start, 605 MiB low water);
+              layer buffer 650 MiB, planner estimate 1364 MiB (act 522)
+```
+
+So at this chunk size the formula is **almost exactly right** (1364 vs 1378, 14 MiB under): M19's "under-counts
+by >89 MiB" was a 2 816-row chunk, not this one. The interesting number is the other one - **605 MiB of true low
+water**, i.e. what the plan leaves unused at the deepest point of a chunk. That is the space every "grow the
+cache" idea wants, and it is ~600 MiB, not 0.
+
+**`NAIWA_PREFILL_STRICT=1`** turns "the stream cannot get its buffer" into an error instead of a WARN followed by
+the CPU taking the chunk. It earns its keep immediately: with it set, the next experiment fails loudly where the
+previous one silently took 132 s.
+
+**Sweeping the cache with both flags on** (the point of the exercise):
+
+| `--expert-cache-gb` | plan | first chunk | outcome |
+|---|---:|---|---|
+| 2.3 | 8192 | 1725 rows, used 1378 MiB, low water 605 | **works**, turn-1 4.0 s |
+| 2.6 | 4864 | 1696 rows, used 1442 MiB, low water **222 MiB** | chunk completes, then `CUDA_ERROR_OUT_OF_MEMORY` in `moe experts forward` |
+| 2.8 | off | - | stream refuses the plan (misses by ~20 MiB) |
+
+The 2.6 row is the finding: **the chunk is not what breaks.** Its own peak finished with 222 MiB to spare, and
+the OOM came afterwards - so the unmodelled consumer is the post-chunk work (the MTP verify step, the recurrent
+pool, the prefix-cache checkpoint), not the prefill. The code's 512 MiB `head` floor exists for exactly this
+("192-227 MiB of slack OOM'd a 1723-token chunk twice"), and it is why `--expert-cache-gb 2.3` is the working
+point rather than a conservative choice.
+
+**Consequence for the loan design**: its sizing cannot be "chunk footprint + margin". It has to be "what the whole
+request needs at its deepest point", which includes the decode/verify side. The peak instrument therefore needs one
+more sample point - the decode step - before Phase A can size anything. That is the next small piece of work, and
+it is cheap: the same free-VRAM sample at the top of a decode step, reported against the same baseline.
