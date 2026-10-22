@@ -848,3 +848,51 @@ Two ways to reuse that, in increasing order of work:
 Both are independent of the kernel work, and (2) is the largest memory win this card still has. It needs an f32
 arena over the cache's banks - a `Tensor` built on an existing device pointer - which is a much smaller job than
 the grouped-kernel indirection that blocks everything else.
+
+## The measurement the design was missing: slots do buy TPOT (2026-10-22)
+
+Every memory design in this milestone was rejected on *turn-1* cost, and none of them had the number that
+decides the direction: how much TPOT a slot is worth. Two runs of the `short` conversation (first prompt 1 034
+tokens, so one chunk in both configs - the chunk does not change), 64-token answers:
+
+| `--expert-cache-gb` | slots | turn-1 TPOT | turn-2 TPOT | turn-3 TPOT | turn-1 TTFT |
+|---|---:|---:|---:|---:|---:|
+| 2.3 | 1 208 | 62.9 ms | 41.5 ms | 33.9 ms | 1.30 s |
+| 3.0 | 1 579 | **56.5 ms** | **37.3 ms** | 34.7 ms | 1.32 s |
+
+**+30% slots is worth about -10% TPOT** on the turns where the cache is not yet warm, and nothing on TTFT. The
+gain fades by turn 3 (33.9 -> 34.7), where reuse is 0.79-0.82 and the working set already fits - which is exactly
+where our gap to Strata is smallest.
+
+**And the same run shows why the cache cannot simply be raised.** At 3.0 GB the planner reports
+`prefill: the scheduler's prompt step is capped at 1280 tokens`: the chunk and the cache are paid from one budget,
+so every MiB given to the cache is taken from the chunk. A 1 725-row prompt then needs **two chunks**, and M17
+measured two chunks at 2.2x the cost of one. So a static raise buys -10% TPOT and pays ~2x turn-1 for `doc` and
+`long`. That is the trade M18 rejected, now with a number attached to both sides.
+
+**What that means for the design of record** (the two-sided allocator above): it is the only shape that gets both,
+and its closing argument was wrong in one specific way. M19 closed because "seven shape groups make movable slots
+cost more capacity than they return" - but that refutes *unifying slot sizes*, which the design does not need. The
+borrow region is a **byte range**: the stream writes every byte it borrows, so what it overlays does not care what
+shapes those banks were, and the eviction cost is counted in slots (1.4-2.5 MB each), not in lost capacity.
+
+So the design to build:
+
+1. **One slab, per-layer banks carved from it** (unchanged shapes, unchanged capacities), plus a borrow range at
+   the slab's low end.
+2. **The cache is sized as `free_at_load + chunk footprint`** - at today's numbers `650 + 369 + 192 = 1 211 MiB`
+   for a 1 725-row chunk (the activation term must follow the *plan*, not the 8 192 cap that overstates it by
+   153 MiB), i.e. **`--expert-cache-gb` ~3.5 instead of 2.3, about +52% slots**.
+3. **At prompt time the stream takes the range**, evicting whatever slots live there (~640 at 1.88 MB each, marked
+   empty), runs the chunk, and returns it; decode refills them as it would after any eviction.
+4. Numerics unchanged, so the oracle stays byte-identical: the chunk's bytes are the same bytes at a different
+   address.
+
+**Why it should pay**: the TPOT table above prices +52% slots at roughly -15% TPOT (42 -> ~36 ms on `doc`, at or
+past Strata's 39), i.e. ~0.4 s over a 64-token turn, against M19's P3 estimate of ~100 ms of refill DMA per prompt.
+
+**What has to be measured before it is worth building**: the refill's real cost per turn (M19's estimate was
+1.4 GiB / ~100 ms, never measured), the chunk's true activation peak (the formula under-counted by >89 MiB at
+2 816 rows, and `HEADROOM` is 192 MiB), and whether the -10% holds for `doc`/`long` once they are back to one
+chunk under the loan. The slab itself is mechanical: `alloc_bank` already takes a length and a device, so it needs
+a base offset and a bump/free list, not a new allocator.
