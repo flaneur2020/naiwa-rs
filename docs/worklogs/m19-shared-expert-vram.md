@@ -1257,3 +1257,58 @@ inert, and it is the foundation the borrow needs.
 
 **Next step, precisely**: instrument candidate 1 first - a `dbg_note` on either side of `buf.ready.wait_on` in
 `load` names the hang in one run, and it is the only one of the three that is on the chunk path itself.
+
+## Root cause found: the chunk's kernels outlive the borrow (2026-10-22)
+
+The hang/empty-answer turned out to be neither. Instrumenting `PrefillStream::load` (a `dbg_note` on either side
+of every wait) showed the chunk completing all 48 layers, and the server then logging, one line after the chunk:
+
+```
+ERROR step - Model failed with error: invalid CUDA top-1 output
+```
+
+That error comes from the **sampler** (`mistralrs-core/src/sampler.rs:1584`), which bails when the argmax row is
+not finite - i.e. the first decode step's logits are NaN. The mechanism:
+
+- the layer buffer is a *range of the cache's slab*, so the cache's slots and the chunk's buffer are the same
+  bytes;
+- `PrefillStream::forward` returns as soon as its kernels are **enqueued**; `buf.released.record_reads` only
+  records them on the fence;
+- the next decode step's fills DMA into those same slots in place, and a fill knows nothing about the prefill
+  buffer's fence - so it overwrites the layer buffer while the last layer's kernels still read it.
+
+Hence NaN logits, and hence the intermittency: it needs the decode step to start before the chunk's last kernels
+retire.
+
+**Fix**: when borrowing, `forward` ends with `copy.after_device_work()` + `copy.synchronize()`, i.e. the chunk is
+*finished* before the range is handed back. One sync per chunk, and it makes the aliasing safe by construction
+rather than by timing.
+
+**Gate**: `harness/chat/run.py --engines naiwa,naiwa-loan --rounds 3` → **0 failures** (4 classes, 3 rounds,
+both engines):
+
+| class | engine | TTFT t1 | TTFT ≥2 p50 | TPOT p50 | decode tok/s | e2e/conv |
+|---|---|---:|---:|---:|---:|---:|
+| code | naiwa | 1012 ms | 1284 ms | 35 ms | 28.9 | 27.3 s |
+| code | **loan** | **963 ms** | **1254 ms** | **32 ms** | **31.5** | **25.1 s** |
+| doc | naiwa | 4052 ms | 1049 ms | 43 ms | 23.4 | 29.9 s |
+| doc | **loan** | **3751 ms** | **992 ms** | 43 ms | 23.2 | 44.2 s* |
+| long | naiwa | 3820 ms | 1224 ms | 48 ms | 21.1 | 46.8 s |
+| long | **loan** | 3931 ms | **1128 ms** | **46 ms** | **21.7** | **43.4 s** |
+| short | naiwa | 1039 ms | 979 ms | 51 ms | 19.6 | 42.3 s |
+| short | **loan** | 1071 ms | **926 ms** | **42 ms** | **23.7** | **34.9 s** |
+
+\* one slow conversation in that class; the per-turn table shows doc turn 1 at 3751 vs 4052 and turns 2-5
+faster on every one (`862` vs `1036` at turn 4, `657` vs `859` at turn 5).
+
+So the borrow buys **TPOT 35→32 (code), 51→42 (short), 48→46 (long)** and TTFT ≥2 on every class, which is what
+the slot→TPOT curve predicted, at a turn-1 TTFT that does not regress.
+
+**Still open**: the byte-determinism configuration (`--pcie-frac 0 --prefix-cache-n 0`) fails one turn of three
+with the same `invalid CUDA top-1 output`, while the same configuration without the borrow does not
+(`/tmp/d3-base.log`: 0, `/tmp/d3-loan.log`: 1). So the alias is still not fully fenced in that configuration,
+and until it is, the borrow cannot carry a numeric gate - the same rule the slab met (oracle byte-identical) and
+this does not yet.
+
+**Status**: `engines/naiwa-loan.json` exists and reproduces the table above; `engines/naiwa.json` is unchanged, so
+the default arm still runs the stream. The borrow remains behind both env flags.

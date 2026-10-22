@@ -539,7 +539,9 @@ impl PrefillStream {
             if buf.memory.is_some() {
                 // The old memory is freed in candle's stream order; an upload into it may still
                 // be in flight on the copy stream, so order the free after it.
+                crate::dbg_note("prefill_load", &format!("layer {layer}: waiting for the old upload"));
                 buf.ready.wait_on(&self.device)?;
+                crate::dbg_note("prefill_load", &format!("layer {layer}: old upload settled"));
             }
             buf.experts = None;
             buf.memory = None;
@@ -558,6 +560,7 @@ impl PrefillStream {
                 trim_device_pool(&self.device)?;
             }
             trace_buffer_bytes(&self.device, layer, &stacks);
+            crate::dbg_note("prefill_load", &format!("layer {layer}: allocating ({} bytes/stack)", stacks[0].storage_size_in_bytes()));
             let memory = if self.borrows() {
                 self.borrow_buffers(layer, &stacks)?
             } else {
@@ -601,6 +604,7 @@ impl PrefillStream {
         // SAFETY: registered stacks are page-locked, and `self.layers` keeps them alive and
         // unmodified for as long as this stream exists (`Drop` waits for the copies).
         let queued = std::time::Instant::now();
+        crate::dbg_note("prefill_load", &format!("layer {layer}: queueing {} bytes", buf.bytes));
         if std::env::var_os("NAIWA_STREAM_SYNC").is_some() {
             // Serial probe: the blocking upload waits for the copies, so the line above reports the copy's own
             // wall time and rate instead of the queue-side latency (`wait_on` only *enqueues* a stream wait).
@@ -694,6 +698,16 @@ impl PrefillStream {
         );
         // Fence even on error: kernels reading the buffer may already be queued.
         buf.released.record_reads(&self.device)?;
+        if self.borrows() {
+            // The borrowed bytes are the cache's own: the next decode step's fills DMA into the same slots, and a
+            // fill does not know about this buffer's fence. So the chunk must be *finished* before it returns -
+            // otherwise a fill overwrites the layer buffer while the last layer's kernels still read it, and the
+            // logits come out NaN (the "invalid CUDA top-1 output" one turn in three). Ordering the copy stream
+            // after this one and waiting for it is the blunt way to wait for the kernels, and it costs one sync
+            // per chunk.
+            self.copy.after_device_work()?;
+            self.copy.synchronize()?;
+        }
         out.map(Some)
     }
 }
