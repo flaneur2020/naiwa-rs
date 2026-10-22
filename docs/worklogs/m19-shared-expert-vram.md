@@ -760,3 +760,49 @@ and it would make all three memory designs (rings, borrowing, unified slots) sud
 **Instrument todo, before any further transport work**: `compute` must be measured with a sync (or a recorded
 event) and `copy` from the layer's own completion event, not from a stale `queued` timestamp. The current pair of
 numbers cannot separate PCIe from compute, and both of this milestone's remaining questions are exactly that.
+
+## The contiguous-round design: right idea, and the kernel refuses it (2026-10-22)
+
+The v1 diagnosis ("rings force the decode kernel") suggested a better design, and it is worth recording because
+it is the *only* version of this milestone's mechanism that has the right cost shape:
+
+**Borrow one layer's whole bank, not a few slots.** A layer's `Bank` is one contiguous `[slots, n, k]` QTensor
+per projection (`copy_stream::alloc_bank`) - exactly the layout of the model's expert stack. So a round over a
+whole bank is literally a `MoEExperts::from_qtensors(bank.gate, bank.up, bank.down, slots, top_k, ...)`, and
+`forward(xs, weights, ids)` runs the **prefill grouped kernel** over it. The routing table for a round is just
+the slot index - `ids`, not expert ids. That removes v1's structural penalty: the grouped GEMM costs the true
+pairs, so 11 rounds of 25 experts should cost one pass plus 11 launches, instead of one pass times the padding
+factor.
+
+**It is also what makes borrowing worth doing at all**: with 25 slots a layer needs ~10 rounds, but each round is
+then a *contiguous* 25-expert stack, and rounds can run on slots borrowed from any same-shape layer (`RoundSlots`
+in the planner already models it) with double buffering to overlap the next round's DMA.
+
+**Implemented, and it does not run.** Two attempts:
+
+1. build a `MoEExperts` per round with `top_k` = that round's routing width - the chunk *completes* (48 layers x
+   8-9 rounds logged) but the turn ends in a generic `Internal server error`;
+2. build one per layer (the bank does not change between rounds; only the routing does) and pass the model's
+   `top_k` - fails immediately with what attempt 1 was swallowing:
+
+```
+RINGS_ERR layer 0: moe experts forward
+moe experts fast grouped
+DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, "an illegal memory access was encountered")
+```
+
+An illegal address poisons the CUDA context, which is why attempt 1 only showed up as a late, message-less
+engine error. So the grouped fast path will not take a bank-backed stack and per-round routing as-is. The
+suspects are all inside the fork's kernel rather than the mechanism: the bank's per-expert stride/alignment
+versus what the grouped kernel derives from the stack's own dims (the *decode* path indexes these banks fine,
+one expert at a time), and whether `topk_ids` width must equal the model's `top_k` rather than the round's.
+
+**Status: reverted.** The v1 executor (`NAIWA_PREFILL_RINGS=1`) is what stays in the tree; this design is
+recorded with its blocker because it is the one to pick up when a fork-side grouped kernel accepts an expert
+indirection - the same kernel work the remaining turn-1 gap points at. The cost shape it promises (one pass plus
+launches) is the only shape that can beat the 650 MiB buffer.
+
+**What it would take to finish**: a standalone CUDA repro that builds a 27-slot bank from a real IQ stack and
+runs `MoEExperts::forward` on 1725 rows, so the illegal address can be bisected without the server, the prefix
+cache and the drafter in the same process. That repro is also the microbenchmark that decides the design: 25
+experts vs 256 on the same rows gives the per-launch cost that all of this hinges on.
