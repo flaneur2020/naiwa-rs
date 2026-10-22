@@ -123,9 +123,18 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: b
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| (512 << 20).max(free / 8));
-        // With the borrow the layer buffer is not VRAM of its own: it is a range of the cache's slab.
-        let buffers = if borrowing { 0 } else { stride * layer_bytes };
-        free >= buffers + act + act / 8 + head
+        if borrowing {
+            // The layer buffer is a range of the cache's slab, so it costs nothing here - but the chunk still pays
+            // its activations and the step's scratch out of free VRAM, and that is *more* than the estimate:
+            // measured 866 MiB for a 1696-row chunk whose `act` is 444 (1.95x, and 1.39x without the borrow at
+            // 8192 rows). Zeroing the buffer term while keeping the estimate let the chunk eat the head, which is
+            // the reserve the decode side needs (measured ~600 MiB): at a 2.95 GB cache the chunk left 444 MiB
+            // and about one conversation in three ended with no answer and no error. Price the chunk at twice its
+            // estimate and the reserve survives.
+            free >= act * 2 + head
+        } else {
+            free >= stride * layer_bytes + act + act / 8 + head
+        }
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
     let (mut lo, mut hi, mut best) = (1usize, (ceiling.min(8192) / GRID).max(1), 0usize);

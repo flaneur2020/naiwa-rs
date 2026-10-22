@@ -1218,3 +1218,42 @@ same conversation and compare - an empty answer with healthy logits is a sampler
 degenerate argmax is still a data problem; (2) assert the rank at the decode entry (`xs.dims3()` plus a
 check against `MAX_DECODE_ROWS`), which would catch the `[1, 1696, 2560]` case at its source instead of
 in `candle`'s matmul.
+
+## The bugfix attempt, and where it stops (2026-10-22)
+
+Chased the remaining defect to a **reproducer** instead of a symptom, and it is a hang, not a wrong answer:
+
+```
+prefill_borrow: layer 0: borrowed 531 MiB of the slab, 310 slots emptied
+prefill_stream: layer 0 stride 1 dma_wait=781ns compute=55.46ms copy=55.47ms 10.0 GB/s 531 MiB x 3
+                                     <- layer 1 never logs a borrow; the request stops here
+```
+
+No error is logged, the process stays alive, and the turn returns no content - which is the harness's
+"no content delta (finish None)". It reproduces at `--expert-cache-gb 2.3` as well as 2.95, i.e. it is not a
+sizing problem, and the baseline engine never shows it.
+
+So `PrefillStream::forward` for layer 1 gets past the decline checks (`stacks` present, `stride` non-zero) and
+stops inside `load`, before `borrow_buffers` logs. Three candidates, in order:
+
+1. `buf.ready.wait_on(&self.device)` - the relayout path waits for layer 0's upload completion event;
+2. `empty_range` spinning in `wait_for_readers` for layer 1's banks;
+3. the first decode-side consumer of an emptied bank (the lookahead channel's published batch or `PassCell`'s
+   preload claim) blocking, since layer 0 leaves ~310 slots empty and nothing resets that state.
+
+Fixes applied during this investigation and **kept**, because they are real:
+
+- the fill/empty race (a fill reserved a slot before the clear and published after it, leaving a slot that
+  claimed an expert whose bytes the chunk had overwritten) - `empty_range` now clears again after waiting, and
+  the borrow syncs the copy stream after the clear;
+- the reader wait under `layer.state`, which deadlocked against a fill needing that lock;
+- the sizing hole that let the chunk eat the decode reserve (`act * 2 + head` when borrowing, since a borrowed
+  chunk still pays activations *and* the step's scratch from free VRAM - measured 1.95x `act`).
+
+**Shipped state**: the borrow is parked. `borrows()` logs a warning that it is experimental and known to hang,
+the engine file moved to `harness/chat/engines/naiwa-loan.parked.json` with that status in its `record`, and
+`engines/naiwa.json` is untouched. `NAIWA_CACHE_SLAB` stays: it is byte-identical through the oracle gate and
+inert, and it is the foundation the borrow needs.
+
+**Next step, precisely**: instrument candidate 1 first - a `dbg_note` on either side of `buf.ready.wait_on` in
+`load` names the hang in one run, and it is the only one of the three that is on the chunk path itself.
