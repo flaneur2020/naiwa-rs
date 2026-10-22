@@ -690,3 +690,73 @@ demonstration of the mechanism - it is the thing to reach for if a future card m
 - 3 rounds, medians; `TTFT`/`TPOT`/`reuse` comparable, `e2e` not when generated lengths differ.
 - The partition must be visible in one startup line (`cache N slots | borrow M MiB | ring K slots | drafter D
   MiB`) so a run's own log explains its VRAM, the way M18's plan line does today.
+
+## Reopening the design: what a round really costs, and the instrument that cannot say (2026-10-22)
+
+The ring measurement left one number unexplained: 9 extra rounds cost 9.46 s, i.e. **21.9 ms per layer-round**,
+while a round only moves ~25 experts (47 MiB, 3.5 ms at 13.4 GB/s). If that 18 ms were removable overhead, the
+design would change completely - so before discarding rings, price the gap. It turned out the gap is *compute*,
+and the instrumentation hid it.
+
+**The instrument is broken for this question.** `PrefillStream::forward` reports
+
+```
+compute = experts.forward(...).elapsed()   // returns a Tensor: this is the *enqueue*, not the execution
+copy    = buf.queued.elapsed()             // `queued` is a timestamp from the enqueue of the copies
+```
+
+Both are stopwatch readings around *asynchronous* work. One 1725-row turn-1 chunk, all 48 layers:
+
+| | reported |
+|---|---:|
+| `compute` sum over 48 layers | **0.161 s** |
+| `copy` sum over 48 layers | 0.162 s |
+| bytes | 23 961 MiB (23.4 GiB) |
+| turn-1 wall | **4.04 s** |
+
+48 layers of 256-expert MoE cannot finish in 161 ms; the number is the launch time. Likewise the derived rates are
+meaningless: 45 of the 48 layers report 2000-6900 GB/s, i.e. *481 MiB copied in 100 µs*. Whatever those lanes did,
+it was not PCIe.
+
+**But three layers are honest**, and they are the ones that had to *wait* for their copy - so the wait, not the
+enqueue, dominates the reading:
+
+| layer | bytes | `compute` = `copy` | rate |
+|---|---:|---:|---:|
+| 0 | 531 MiB | 57.4 ms | 9.7 GB/s |
+| 1 | 368 MiB | 37.3 ms | 10.4 GB/s |
+| 17 | 568 MiB | 50.8 ms | 11.7 GB/s |
+
+That is the real cost of streaming one layer: **50-57 ms for 481-650 MiB at 10-12 GB/s**, against the 13.4 GB/s
+the H2D calibration measured. And 2.93 s / 48 layers = **61 ms per layer** of fixed chunk cost - so per layer,
+PCIe (≈55 ms) and compute (≈61 ms) are *the same size*. The chunk is not "SM-bound with PCIe idle"; the two are
+balanced, and a layer's wall time is whichever finishes last. 23.4 GiB / 4.04 s = 6.2 GB/s average, i.e. the bus
+is not saturated but no layer is idle either.
+
+**What that means for the ring design, item by item:**
+
+- **Rounds multiply compute and not bytes.** A round moves the same total experts (each exactly once) but issues
+  10x the MoE calls. In a chunk where compute and PCIe are balanced at ~57 ms/layer, doubling the compute side
+  doubles the layer. Measured: 3.4x. The design cannot be rescued by a better round *plan* - the plan is already
+  pair-optimal (six tests); the loss is in the *execution* granularity.
+- **The cost per round is the decode kernel.** Rings execute with `fused_decode` - the kernel tuned for
+  `rows` of 1-4 - at prefill width, because the cache's slots are scattered `Arc<Bank>`s and the grouped prefill
+  GEMM needs one contiguous stack. So the mechanism's compute penalty is structural: it forces the *decode* kernel
+  for *prefill* work.
+- **Borrowing slots pays in bytes, not compute - and the bytes it saves are small.** A resident expert skips its
+  copy: 25 slots / 256 experts ≈ 10% of a layer's PCIe traffic ≈ 5.7 ms/layer ≈ **-0.27 s/chunk**. But serving the
+  resident experts from the cache bank while the rest come from the stream buffer means a *second* MoE call per
+  layer - the same launch penalty that just lost 9.46 s. Net: zero at best.
+- **Therefore: no ring variant can win on this architecture.** Not because the round count is too high (a lender
+  would fix that) but because (a) the chunk is compute/PCIe balanced, so extra compute is pure loss, and (b) the
+  only kernel that can consume scattered slots is the wrong shape for prefill.
+
+**The one design this leaves open**, recorded so it is not re-derived: rings become viable only if a *single*
+grouped kernel can consume a scattered expert set - i.e. a grouped GEMM with an expert-index indirection into the
+slots. That is a fork-side kernel (the same place the remaining turn-1 gap points, M20's grouped GEMM/MMQ work),
+and it would make all three memory designs (rings, borrowing, unified slots) suddenly affordable. Until then, the
+650 MiB buffer is the price of one contiguous pass over the expert set, and it is not negotiable.
+
+**Instrument todo, before any further transport work**: `compute` must be measured with a sync (or a recorded
+event) and `copy` from the layer's own completion event, not from a stale `queued` timestamp. The current pair of
+numbers cannot separate PCIe from compute, and both of this milestone's remaining questions are exactly that.
