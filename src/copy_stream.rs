@@ -112,6 +112,15 @@ mod cuda {
         pub fn tensor(&self) -> &Arc<QTensor> {
             &self.tensor
         }
+
+        /// The expert's first byte on the device: what a borrow range is compared against.
+        pub fn ptr(&self) -> sys::CUdeviceptr {
+            self.ptr
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
     }
 
     pub struct CopyStream {
@@ -199,6 +208,11 @@ mod cuda {
                 candle_core::bail!("copy stream on a non-CUDA device");
             };
             let storage = QCudaStorage::zeros(dev, stack.shape().elem_count(), stack.dtype())?;
+            self.like_from_storage(stack, storage)
+        }
+
+        /// A `SlotMemory` over a storage someone else chose - the slab's borrow range.
+        pub fn like_from_storage(&self, stack: &QTensor, storage: QCudaStorage) -> Result<SlotMemory> {
             let len = storage.storage_size_in_bytes();
             let ptr = storage.device_ptr()? as sys::CUdeviceptr;
             let tensor = Arc::new(QTensor::new(

@@ -1095,3 +1095,54 @@ contiguous range whose owners are known banks, so a chunk can (i) mark the slots
 its three projection storages with `borrow_from` over that range at the current layer's dtype, (iii) run, and
 (iv) return the range, leaving those slots empty to refill. Everything that needs is now in place except the
 sizing (measured: chunk 1 378 MiB, decode low water ~600 MiB) and the fences.
+
+## The borrow itself: implemented and running (2026-10-22)
+
+`NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1` now makes the chunk's layer buffers *ranges of the cache's slab*.
+Nothing is copied into them from a buffer of their own; the slots the ranges cover are emptied for the chunk and
+come back empty, exactly as after an eviction.
+
+How it fits together:
+
+- `Slab::borrow_at(offset, el_count, dtype)` hands out a range at a fixed offset (0, then each projection's padded
+  size), and `Layers::empty_range(base, end)` empties every slot whose bank overlaps it;
+- `PrefillStream::borrow_buffers` composes the three projection buffers that way and returns them as the same
+  `[SlotMemory; 3]` the ordinary path builds, so `MoEExperts::from_qtensors`, the DMA and the fences are untouched;
+- `plan()` counts the layer buffer as **zero** free VRAM when borrowing (and forces one buffer, since every layer
+  takes the same range), which is what lets a 2.95 GB cache keep the 8 192-token chunk it used to lose at 2.85.
+
+**Measured on `doc`** (cache 2.3 GB without the borrow vs 2.95 GB with it):
+
+| | slots/layer | chunk footprint | turn-1 TTFT |
+|---|---:|---:|---:|
+| no borrow, 2.3 GB | 27 | 1 378 MiB | 3.88-4.01 s |
+| borrow, 2.95 GB | **35** | **866 MiB** | 3.95 s |
+
+The chunk still costs 866 MiB of free VRAM - that is the activation scratch, which lives in candle's pool and not in
+our slab, so it is the part a borrow of *this* kind cannot move. The layer buffer's 650 MiB, which is what made
+2.85 GB refuse the chunk, is gone from the budget.
+
+**Two bugs on the way, both the same family as W105:**
+
+1. `empty_range` waited for slot readers *while holding* `layer.state`; the reader was a background fill that
+   needed that same lock to finish, so the two spun against each other. Fixed by taking the buffers out under the
+   lock, waiting with no lock held, then putting them back.
+2. Even then it spun: the fills legitimately hold slot buffers across a chunk. A borrowing chunk must not race a
+   fill at all, so `spawn_fill` is now skipped when borrowing - which costs nothing, since
+   `NAIWA_NO_PREFILL_FILL` already measured the fills useless during a chunk.
+
+**Open issue, not yet explained**: with `--pcie-frac 0 --prefix-cache-n 0` the borrow run ends in
+`invalid CUDA top-1 output` (one turn out of three), while the same config without the borrow cannot even be
+compared - its chunk falls back to the CPU (130 s/turn) because 2.95 GB leaves the stream no buffers. So the
+borrow's determinism could not be checked against a working baseline in *that* config. The 200-word `FRAC=0`
+capture run was byte-identical between modes, but its answer was empty, so that check is weak.
+
+**Directional numbers, not yet a gate** (one run each, `short`; the earlier spreads on this card are ±15%):
+
+| | turn-1 TPOT | turn-2 TPOT | turn-3 TPOT | turn-2 TTFT |
+|---|---:|---:|---:|---:|
+| no borrow, 2.3 GB | 58.1 ms | 52.9 ms | 36.1 ms | 1.40 s |
+| borrow, 2.95 GB | 57.5 ms | 38.7 ms | 32.8 ms | 0.64 s |
+
+The reuse differed between those two runs (0.51 vs 0.76 on turn 2), so this is a direction, not a result: the
+mechanism works, and the proper numbers need the 3-round harness against `harness/chat/engines/*.json`.

@@ -27,13 +27,15 @@ fn attach_prefill(
     ctx: &ExpertLoadContext<'_>,
     experts: &MoEExperts,
     copy_streams: &CopyStreams,
+    slab: Option<Arc<super::slab::Slab>>,
+    cache: Option<Arc<Layers>>,
 ) -> candle_core::Result<(Vec<PinnedStack>, Option<Arc<PrefillStream>>)> {
     let Some(streams) = prefill else {
         return Ok((Vec::new(), None));
     };
     // Prefill uploads read straight from the stacks, asynchronously: they must be pinned.
     let (pinned, failed) = pin_expert_stacks(experts, ctx.layer_device);
-    let stream = streams.attach(ctx, experts, failed == 0, copy_streams)?;
+    let stream = streams.attach(ctx, experts, failed == 0, copy_streams, slab, cache)?;
     Ok((pinned, stream))
 }
 
@@ -307,8 +309,14 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 ctx.site.layer, slot_bytes, per_layer_budget
             );
             drop(inner);
-            let (pinned, prefill) =
-                attach_prefill(&self.prefill, &ctx, &cpu_experts, &self.copy_streams)?;
+            let (pinned, prefill) = attach_prefill(
+                &self.prefill,
+                &ctx,
+                &cpu_experts,
+                &self.copy_streams,
+                self.slab(&ctx.layer_device),
+                Some(Arc::clone(&self.layers)),
+            )?;
             return Ok(Some(Arc::new(CpuExperts::new(
                 cpu_experts,
                 ctx.act,
@@ -340,6 +348,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         // Page-lock the stacks so slot fills copy from them by DMA (after the huge-page advice:
         // pinned pages can no longer be collapsed).
+        // The cache's slab, if `NAIWA_CACHE_SLAB` is on: banks are carved from it, and with
+        // `NAIWA_PREFILL_BORROW` the stream's buffers come from its low end.
+        let slab = self.slab(&slot_device);
         let (pinned, pin_failed) = host_memory::pin_expert_stacks(&cpu_experts, &slot_device);
         let pinned_bytes: usize = pinned.iter().map(PinnedStack::len).sum();
         debug!(
@@ -359,7 +370,14 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         let prefill = match &self.prefill {
             Some(streams) => {
-                streams.attach(&ctx, &cpu_experts, pin_failed == 0, &self.copy_streams)?
+                streams.attach(
+                    &ctx,
+                    &cpu_experts,
+                    pin_failed == 0,
+                    &self.copy_streams,
+                    slab.clone(),
+                    Some(Arc::clone(&self.layers)),
+                )?
             }
             None => None,
         };
@@ -401,7 +419,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // layer's slots are one bank per projection, so a decode step runs them in one fused call.
         let mut copy_stream = self.copy_streams.get(&slot_device);
         let slots: Vec<Slot> = (0..num_slots).map(|_| Slot::empty()).collect();
-        let slab = self.slab(&slot_device);
         if let (Some(cs), Some(stacks)) = (&copy_stream, cpu_experts.expert_qtensors()) {
             for (i, buf) in
                 alloc_bank_in(cs, slab.as_deref(), &stacks, 0, num_slots, &slot_device)?

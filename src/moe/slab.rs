@@ -61,6 +61,33 @@ impl Slab {
         *self.cursor.lock().unwrap()
     }
 
+    /// Whether the prefill stream borrows the slab's low end (`NAIWA_PREFILL_BORROW=1`).
+    pub(crate) fn borrowing() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("NAIWA_PREFILL_BORROW").is_some())
+    }
+
+    /// The slab's device pointer: the borrow ranges are `[base, base + end)`.
+    pub(crate) fn base(&self) -> candle_core::Result<u64> {
+        Ok(self.storage.device_ptr()? as u64)
+    }
+
+    /// A range at `offset` of `el_count` elements at `dtype`, for a buffer that reuses the low end of the slab
+    /// instead of taking VRAM of its own. Unlike [`Self::alloc`] this does not advance the cursor: the range is
+    /// already owned by whichever cache banks were carved first, and the caller empties those slots.
+    pub(crate) fn borrow_at(
+        &self,
+        offset: usize,
+        el_count: usize,
+        dtype: GgmlDType,
+        device: &Device,
+    ) -> candle_core::Result<QCudaStorage> {
+        let dev = device
+            .as_cuda_device()
+            .map_err(|e| candle_core::Error::Msg(format!("slab needs a CUDA device: {e}")))?;
+        QCudaStorage::borrow_from(&self.storage, offset, el_count, dtype, dev)
+    }
+
     /// A range of `el_count` elements at `dtype`, or `None` when the slab is full.
     pub(crate) fn alloc(
         &self,

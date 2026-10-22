@@ -49,6 +49,58 @@ impl Layers {
         self.layers.read().get(layer).and_then(Weak::upgrade)
     }
 
+    /// Empty every slot whose bank overlaps `[base, end)`, and report how many were emptied.
+    ///
+    /// This is the borrow's half of the deal: the prefill stream is about to write those bytes, so whatever experts
+    /// lived there are gone. The slots keep their storage (the banks are not rebuilt), they simply come back empty
+    /// and refill as after any eviction. The buffer is taken out of the slot before waiting for its readers - a
+    /// reader still holding a clone would make the wait spin forever (the trap `wait_for_readers` sets).
+    pub(crate) fn empty_range(&self, base: u64, end: u64) -> usize {
+        let layers = self.all();
+        // Phase 1: take every overlapping slot's buffer out, holding only the locks that are needed for that. The
+        // wait comes after every lock is released: a background fill holds a clone of the buffer it is filling and
+        // needs `layer.state` to finish, so waiting under that lock deadlocks the two against each other (the
+        // W105 family of hang, and the first version of this function did exactly that).
+        let mut held: Vec<(usize, usize, Arc<SlotBuf>)> = Vec::new();
+        for (li, layer) in layers.iter().enumerate() {
+            let mut state = layer.state.lock().unwrap();
+            for (si, slot) in state.slots.iter_mut().enumerate() {
+                let overlaps = {
+                    let storage = slot.storage.lock();
+                    let Some(buf) = storage.as_ref() else { continue };
+                    let SlotData::Banked { memory, .. } = &buf.data else {
+                        continue;
+                    };
+                    memory.iter().any(|part| {
+                        let start = part.ptr() as u64;
+                        let stop = start + part.len() as u64;
+                        start < end && stop > base
+                    })
+                };
+                if !overlaps {
+                    continue;
+                }
+                let Some(buf) = slot.storage.lock().take() else {
+                    continue;
+                };
+                slot.expert = None;
+                slot.buf = None;
+                held.push((li, si, buf));
+            }
+        }
+        // Phase 2: the fills and reads in flight finish, with no lock held.
+        for (_, _, buf) in &held {
+            crate::copy_stream::wait_for_readers(buf);
+        }
+        let emptied = held.len();
+        // Phase 3: the storages go back where they came from, empty.
+        for (li, si, buf) in held {
+            let mut state = layers[li].state.lock().unwrap();
+            *state.slots[si].storage.lock() = Some(buf);
+        }
+        emptied
+    }
+
     pub(crate) fn all(&self) -> Vec<Arc<CachedLayer>> {
         self.layers
             .read()
@@ -337,7 +389,12 @@ impl RoutedExperts for CachedExperts {
             // `NAIWA_NO_PREFILL_FILL=1` (probe): the fills below issue PCIe copies on the *same* copy stream the
             // prefill stream's layer buffers use, so a chunk's DMA competes with them for the link. When the
             // stream is serving this layer, its experts are already on the device and the fill is redundant.
-            if std::env::var_os("NAIWA_NO_PREFILL_FILL").is_none() {
+            // A borrowing stream writes into the cache's own bytes, so nothing may be filling those slots at the
+            // same time: a background fill would hold a slot buffer (and queue a copy into it) across the chunk.
+            // The fills are worthless during a chunk anyway - measured, `NAIWA_NO_PREFILL_FILL` changes nothing.
+            if std::env::var_os("NAIWA_NO_PREFILL_FILL").is_none()
+                && !crate::moe::slab::Slab::borrowing()
+            {
                 if let Some(next) = layer.layers.get(layer.layer + 1) {
                     next.spawn_fill();
                 }

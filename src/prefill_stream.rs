@@ -103,7 +103,7 @@ pub(crate) fn activation_bytes(chunk: usize) -> usize {
 /// 915 / 1815 / 3615 tokens at 201 / 356 / 416 tok/s; two buffers at 512 at 147 / 285. So the search
 /// walks the 256-token grid from `ceiling` down and takes the second buffer only when the *same*
 /// chunk affords it.
-pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(usize, usize)> {
+pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool) -> Option<(usize, usize)> {
     const GRID: usize = 256;
     // The activation term is an estimate, so it carries slack: on this card the formula alone would
     // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
@@ -123,7 +123,9 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(u
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| (512 << 20).max(free / 8));
-        free >= stride * layer_bytes + act + act / 8 + head
+        // With the borrow the layer buffer is not VRAM of its own: it is a range of the cache's slab.
+        let buffers = if borrowing { 0 } else { stride * layer_bytes };
+        free >= buffers + act + act / 8 + head
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
     let (mut lo, mut hi, mut best) = (1usize, (ceiling.min(8192) / GRID).max(1), 0usize);
@@ -139,7 +141,9 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize) -> Option<(u
     if best == 0 {
         return None;
     }
-    let stride = if fits(best, 2) { 2 } else { 1 };
+    // Two buffers double-buffer the upload against the compute. The borrow has only one range (every layer takes
+    // the same bytes), so it is one buffer by construction.
+    let stride = if !borrowing && fits(best, 2) { 2 } else { 1 };
     Some((stride, best))
 }
 
@@ -181,6 +185,10 @@ pub struct PrefillStream {
     min_tokens: usize,
     /// `NAIWA_PREFILL_PEAK=1`: what a chunk actually costs in VRAM, against what the planner estimates.
     peak: Mutex<Peak>,
+    /// `NAIWA_PREFILL_BORROW=1`: the layer buffers are ranges of the cache's slab instead of VRAM of their own, and
+    /// the cache slots that live in those bytes are emptied for the chunk.
+    slab: Option<Arc<crate::moe::slab::Slab>>,
+    cache: Option<Arc<crate::moe::Layers>>,
 }
 
 /// One chunk's VRAM footprint, sampled at every layer (`NAIWA_PREFILL_PEAK=1`).
@@ -209,6 +217,8 @@ impl PrefillStream {
         act: Activation,
         comm: Arc<Comm>,
         min_tokens: usize,
+        slab: Option<Arc<crate::moe::slab::Slab>>,
+        cache: Option<Arc<crate::moe::Layers>>,
     ) -> candle_core::Result<Option<Self>> {
         let Some(copy) = copy else {
             return Ok(None);
@@ -238,6 +248,8 @@ impl PrefillStream {
             checked: std::sync::atomic::AtomicBool::new(false),
             min_tokens,
             peak: Mutex::new(Peak::default()),
+            slab,
+            cache,
         }))
     }
 
@@ -276,7 +288,7 @@ impl PrefillStream {
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let (stride, chunk) = plan(free, self.layer_bytes(), prompt_step_ceiling())?;
+        let (stride, chunk) = plan(free, self.layer_bytes(), prompt_step_ceiling(), self.borrows())?;
         Some((Plan { stride, chunk }, free))
     }
 
@@ -307,6 +319,46 @@ impl PrefillStream {
     /// assumed: two buffers need twice a layer, and on a 12 GB card that is what pushes a
     /// 1024-token chunk's MoE intermediates over the edge. One buffer still beats the CPU by an
     /// order of magnitude (the uploads are then serial with the compute instead of hidden).
+    /// Whether this stream's layer buffers come from the cache's slab.
+    fn borrows(&self) -> bool {
+        crate::moe::slab::Slab::borrowing() && self.slab.is_some() && self.cache.is_some()
+    }
+
+    /// Three projection buffers over the slab's low end, and the cache slots that lived there emptied.
+    ///
+    /// The layout is the same as `alloc_like` would produce - one range per projection, the layers' shapes and
+    /// dtypes as they come - but the bytes belong to the cache's slab, so the chunk costs no VRAM of its own and
+    /// the cache can be that much bigger. The slots the ranges cover come back empty, exactly as after an eviction.
+    fn borrow_buffers(
+        &self,
+        layer: usize,
+        stacks: &[Arc<QTensor>; 3],
+    ) -> candle_core::Result<[SlotMemory; 3]> {
+        let slab = self.slab.as_ref().expect("checked by borrows()");
+        let mut out = Vec::with_capacity(3);
+        let mut offset = 0usize;
+        for stack in stacks {
+            let dims = stack.shape().dims();
+            let el_count = stack.shape().elem_count();
+            let _ = dims;
+            let storage = slab.borrow_at(offset, el_count, stack.dtype(), &self.device)?;
+            offset += storage.allocated_bytes();
+            out.push(self.copy.like_from_storage(stack, storage)?);
+        }
+        let base = slab.base()?;
+        if let Some(cache) = self.cache.as_ref() {
+            let emptied = cache.empty_range(base, base + offset as u64);
+            crate::dbg_note(
+                "prefill_borrow",
+                &format!(
+                    "layer {layer}: borrowed {:.0} MiB of the slab, {emptied} slots emptied",
+                    (offset as f64) / (1u64 << 20) as f64
+                ),
+            );
+        }
+        Ok([out.remove(0), out.remove(0), out.remove(0)])
+    }
+
     /// Sample this layer's free VRAM and, on the chunk's last layer, report the footprint.
     fn sample_peak(&self, layer: usize, rows: usize) {
         if std::env::var_os("NAIWA_PREFILL_PEAK").is_none() {
@@ -493,11 +545,15 @@ impl PrefillStream {
                 trim_device_pool(&self.device)?;
             }
             trace_buffer_bytes(&self.device, layer, &stacks);
-            let memory = [
-                self.copy.alloc_like(&stacks[0])?,
-                self.copy.alloc_like(&stacks[1])?,
-                self.copy.alloc_like(&stacks[2])?,
-            ];
+            let memory = if self.borrows() {
+                self.borrow_buffers(layer, &stacks)?
+            } else {
+                [
+                    self.copy.alloc_like(&stacks[0])?,
+                    self.copy.alloc_like(&stacks[1])?,
+                    self.copy.alloc_like(&stacks[2])?,
+                ]
+            };
             // The allocations are queued on candle's stream: the copy waits for them.
             self.copy.after_device_work()?;
             let bytes: usize = stacks.iter().map(|s| s.storage_size_in_bytes()).sum();
@@ -662,6 +718,8 @@ impl PrefillStreams {
         experts: &MoEExperts,
         pinned: bool,
         copy_streams: &CopyStreams,
+        slab: Option<Arc<crate::moe::slab::Slab>>,
+        cache: Option<Arc<crate::moe::Layers>>,
     ) -> candle_core::Result<Option<Arc<PrefillStream>>> {
         if ctx.site.is_mtp || !pinned || experts.expert_qtensors().is_none() {
             return Ok(None);
@@ -679,6 +737,8 @@ impl PrefillStreams {
                     ctx.act,
                     Arc::clone(ctx.comm),
                     self.min_tokens,
+                    slab,
+                    cache,
                 )?
                 else {
                     return Ok(None);
