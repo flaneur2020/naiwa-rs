@@ -723,6 +723,11 @@ impl PrefillStream {
                 }
             }
         }
+        if self.borrows() && std::env::var_os("NAIWA_BORROW_BARRIER").is_some() {
+            // Probe: everything settled before the compute touches the buffer.
+            self.copy.after_device_work()?;
+            self.copy.synchronize()?;
+        }
         let t_compute = std::time::Instant::now();
         let out = experts.forward(xs, topk_weights.clone(), topk_ids);
         let transport = buf.queued.map(|queued| {

@@ -85,6 +85,18 @@ impl GpuCacheMoeProvider {
                 if !super::slab::Slab::enabled() {
                     return None;
                 }
+                // The borrow is only correct with the lookahead off, and with it off decode loses the prefetch
+                // that hides its misses: measured on `short`, turn-1 TPOT 59.0 ms with the lookahead and no borrow
+                // against 104.9 ms with the borrow and no lookahead. So the borrow has no configuration in which it
+                // pays - refuse it rather than corrupt a chunk or hand back a slower engine (M19).
+                if super::slab::Slab::borrowing() && self.lookahead {
+                    warn!(
+                        "NAIWA_PREFILL_BORROW is disabled: with the lookahead on it corrupts the prefill chunk \
+                         (non-finite outputs), and with it off decode is slower than the slots are worth \
+                         (TPOT 104.9 vs 59.0 ms on `short`). The slab itself stays on."
+                    );
+                    return None;
+                }
                 let bytes = (self.cache_gb * 1e9) as usize;
                 match super::slab::Slab::new(device, bytes) {
                     Ok(slab) => {

@@ -1578,3 +1578,37 @@ So the efficient way to finish this is not another hypothesis on the engine; it 
    Every bisect in this milestone that used a single multi-turn chat run produced at least one contradictory result.
 3. Then, and only then, `compute-sanitizer --tool memcheck` on the reproducer with a synchronous allocator, where
    the flashinfer KV-write false positives are absent and the report is small enough to read.
+
+## The borrow has no configuration in which it pays - refuted, with a rate (2026-10-23)
+
+Built the rate meter the earlier bisects needed: the same process sends the 1725-token prompt **twelve times**
+(no prefix cache, so every request runs a full chunk) and counts failed requests and non-finite chunk outputs.
+One run is **~45 s**, and the failure rate is high enough to bisect on:
+
+| configuration | failed | non-finite chunk outputs |
+|---|---:|---:|
+| borrow, lookahead (default) | **10/12** | 155 |
+| borrow, barrier before the compute | 4/12 | 62 |
+| borrow, `--max-seqs 1` | 8/12 | 124 |
+| borrow, upload gate made authoritative in `upload_in_place` | 6/12 | 93 (0 fills refused) |
+| borrow, **`--no-lookahead`** | **0/12** | **0** |
+| **no borrow** | **0/12** | **0** |
+
+So: the lookahead is necessary for the corruption, no fill is refused or observed inside the window, and
+`CUDA_LAUNCH_BLOCKING=1` makes it vanish - the cause is an ordering interaction with the lookahead that the gates
+this milestone added do not cover.
+
+**And that decides the milestone**: the borrow is only correct with the lookahead off, and the lookahead is worth
+far more than the slots. `short`, same 64-token answers, TPOT by turn:
+
+| | turn-1 | turn-2 | turn-3 |
+|---|---:|---:|---:|
+| lookahead on, no borrow (default) | **59.0 ms** | **39.9 ms** | **34.8 ms** |
+| borrow, `--no-lookahead` | 104.9 ms | 61.7 ms | 56.0 ms |
+
+The borrow buys ~+30% cache slots, worth ~-10% TPOT; the lookahead buys ~-45% TPOT. There is no configuration in
+which the trade goes the borrow's way.
+
+**Shipped**: the borrow is now **refused at startup** when the lookahead is on (a warning says why), so the
+corrupting path cannot be reached; the slab stays. M19's deliverable is the slab, its instruments, and three
+refutations (the earlier ones on capacity and rounds, and this one on the trade).

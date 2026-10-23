@@ -772,8 +772,15 @@ impl CachedLayer {
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
         if super::slab::borrowed() {
-            // A borrowed chunk owns the slab's low end right now; a fill landing there corrupts its layer buffer.
-            eprintln!("WRITE_DURING_BORROW layer {} expert {expert_id} sync={sync}", self.layer);
+            // A borrowed chunk owns the slab's low end right now: this slot may *be* part of the chunk's buffer, so
+            // the upload must not happen at all. Checking only at `admit`/`replace` was not enough - a fill already
+            // inside this function when the borrow began still queued its DMA (measured as ~83% of iterations
+            // producing non-finite chunk outputs). The slot keeps its reservation and simply has no published
+            // buffer, so the hit path treats it as a miss.
+            if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
+                eprintln!("UPLOAD_REFUSED layer {} expert {expert_id}", self.layer);
+            }
+            return Ok(None);
         }
         if sync {
             cs.upload(&buf.fence, &parts)?;
