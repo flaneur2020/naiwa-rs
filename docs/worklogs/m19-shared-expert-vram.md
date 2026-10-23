@@ -1679,3 +1679,47 @@ The arithmetic says why: the borrow moves the **layer buffer** (650 MiB) off fre
 above the baseline the scratch would have to move too - Phase B, the candle-allocator half that was never built.
 So the borrow is now **correct and worth nothing on its own**, which is a much better place to leave it than
 incorrect: it is the foundation Phase B needs, and it is validated.
+
+## Phase B's premise is proven, and the path is VMM (2026-10-23)
+
+Before building anything, the mechanism Phase B depends on was tested on its own - a device test, no model:
+
+```
+VMM: 256 MiB reserved; free after map 11256 MiB, after unmap+release 11512 MiB (+256)
+VMM: cuMemAllocAsync of 256 MiB from the pool: ok
+VMM: remapped at the same address and read back 5a
+```
+
+A **virtual** range is reserved once (`cuMemAddressReserve`), its physical memory is created and mapped into it
+(`cuMemCreate` + `cuMemMap`), and then:
+
+1. **unmapping and releasing the handle returns the physical memory to the driver exactly** (+256 MiB measured);
+2. **the driver's stream-ordered pool - where every activation tensor comes from - allocates from it immediately**
+   (`cuMemAllocAsync` of 256 MiB, no trim, no fallback);
+3. **the range can be mapped again at the same address and is fully usable** (write/read round-trip).
+
+That is the whole of Phase B's premise. The cache's tensors keep their addresses forever (the reservation never
+moves), and the physical pages behind the *tail* of the slab can be handed to the driver while a chunk runs - so a
+chunk's activations can live in VRAM that is cache slots the rest of the time.
+
+Why VMM rather than "teach candle's allocator to use our arena": the interception point is `std::alloc` inside
+**cudarc** (`CudaStream::alloc` calls `cuMemAllocAsync`), a third-party crate, and this candle has no allocator
+abstraction left to hook. VMM needs no allocator change at all - the driver's own pool does the work.
+
+The integration, in the order it has to happen (this is the 3-5 days the earlier estimate was about):
+
+1. **`QCudaStorage` over a raw VA**: one more candle constructor (`from_va(va, len, dtype, device)`), owning
+   nothing, since the VMM registry owns the pages - the same shape as `borrow_from`, which is already in;
+2. **`Slab` becomes a VMM reservation**: a list of (handle, offset, len) segments instead of one `CudaSlice`; carve
+   banks out of the VA as today, unchanged;
+3. **`lend(bytes)` / `reclaim()`**: unmap+release the tail segments (marking their slots empty) and map fresh
+   segments back at the same VA. Contents are lost by design - the slots in that region are exactly the ones the
+   chunk's buffer occupied;
+4. **The planner counts it**: `cache = free_at_load + scratch_estimate`, and a chunk lends `scratch` before it
+   runs. The `usable` high-water per layer becomes the thing the hit path, the LRU and the fills honour, which is
+   the field that already exists;
+5. **Fences**: the lend must be ordered after every reader of those slots and the reclaim after the chunk's last
+   kernel - the `lock_access` discipline that fixed the borrow's TOCTOU applies unchanged.
+
+**Expected**: cache 2.0-2.3 GB -> ~2.9-3.2 GB (+45%), i.e. ~-13% TPOT by the measured curve, at zero numerics
+risk (the bytes do not change, only which pages back them).

@@ -188,3 +188,132 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod vmm_tests {
+    use candle_core::cuda::cudarc::driver::{result, sys};
+
+    fn gran(dev: i32) -> usize {
+        let mut g = 0usize;
+        // SAFETY: the option and the out pointer are valid.
+        let rc = unsafe {
+            sys::cuMemGetAllocationGranularity(
+                &mut g,
+                &prop(dev),
+                sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        };
+        assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "granularity");
+        g
+    }
+
+    fn prop(dev: i32) -> sys::CUmemAllocationProp {
+        let mut p: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        p.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        p.location = sys::CUmemLocation {
+            type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+            id: dev,
+        };
+        p
+    }
+
+    fn free_bytes() -> (usize, usize) {
+        let mut f = 0usize;
+        let mut t = 0usize;
+        // SAFETY: out pointers are valid.
+        let rc = unsafe { sys::cuMemGetInfo_v2(&mut f, &mut t) };
+        assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "mem info");
+        (f, t)
+    }
+
+    /// `NAIWA_VMM_DBG=1 cargo test --release --features cuda -- --ignored --test-threads=1 vmm`
+    ///
+    /// The premise of "elastic banks": a reserved *virtual* range can have its physical memory handed back to the
+    /// driver and taken again, at the same address, while the driver's stream-ordered pool - which is what every
+    /// activation tensor comes from - picks the freed memory up in between. If this holds, the expert cache can be
+    /// sized as `free_at_load + scratch` and give the scratch back only while a chunk runs.
+    #[test]
+    #[ignore = "needs a CUDA device; run with --ignored --test-threads=1"]
+    fn a_reserved_range_can_lend_its_physical_memory_to_the_pool() {
+        let dev = 0i32;
+        // A candle device first: it initialises the context and binds it to this thread, which the raw driver calls
+        // below need (cuMemGetInfo without a current context returns CUDA_ERROR_INVALID_CONTEXT).
+        let device = candle_core::Device::new_cuda(0).expect("cuda");
+        let g = gran(dev);
+        let size: usize = 256 << 20; // 256 MiB, a stand-in for the scratch (~866 MiB in the real run)
+        let size = size.div_ceil(g) * g;
+
+        // Reserve the virtual range once: this is the address the cache's tensors will live at, forever.
+        let mut va: sys::CUdeviceptr = 0;
+        // SAFETY: out pointer is valid; no address hint, no flags.
+        let rc = unsafe { sys::cuMemAddressReserve(&mut va, size, 0, 0, 0) };
+        assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "address reserve");
+
+        let map_all = |va: sys::CUdeviceptr| -> sys::CUmemGenericAllocationHandle {
+            let mut handle: sys::CUmemGenericAllocationHandle = 0;
+            // SAFETY: size is granular; the property is a device-pinned allocation.
+            let rc = unsafe { sys::cuMemCreate(&mut handle, size, &prop(dev), 0) };
+            assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "cuMemCreate");
+            // SAFETY: the handle is live and the range is reserved.
+            let rc = unsafe { sys::cuMemMap(va, size, 0, handle, 0) };
+            assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "cuMemMap");
+            let mut access: sys::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+            access.location = prop(dev).location;
+            access.flags = sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            // SAFETY: one descriptor, valid for the whole mapped range.
+            let rc = unsafe { sys::cuMemSetAccess(va, size, &access, 1) };
+            assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "cuMemSetAccess");
+            handle
+        };
+
+        let handle = map_all(va);
+        let (free_mapped, _) = free_bytes();
+
+        // Give the physical memory back: unmap the range and release the handle. The *virtual* address stays
+        // reserved, so nothing that points into it has to move.
+        // SAFETY: the range is mapped and the handle is live.
+        assert_eq!(unsafe { sys::cuMemUnmap(va, size) }, sys::CUresult::CUDA_SUCCESS, "unmap");
+        assert_eq!(unsafe { sys::cuMemRelease(handle) }, sys::CUresult::CUDA_SUCCESS, "release");
+        let (free_released, _) = free_bytes();
+        let returned = free_released.saturating_sub(free_mapped);
+        println!(
+            "VMM: {:.0} MiB reserved; free after map {:.0} MiB, after unmap+release {:.0} MiB (+{:.0})",
+            size as f64 / 1048576.0,
+            free_mapped as f64 / 1048576.0,
+            free_released as f64 / 1048576.0,
+            returned as f64 / 1048576.0,
+        );
+        assert!(
+            returned + (32 << 20) >= size,
+            "unmapping should return the physical memory to the driver"
+        );
+
+        // The stream-ordered pool every activation comes from must be able to take it.
+        let stream = device.as_cuda_device().expect("dev").cuda_stream();
+        let block = unsafe { stream.alloc::<u8>(size) }.expect("malloc_async from the freed memory");
+        println!("VMM: cuMemAllocAsync of {:.0} MiB from the pool: ok", size as f64 / 1048576.0);
+        drop(block); // returns to the pool
+
+        // And the cache can have its range back, at the same address.
+        let handle = map_all(va);
+        // Write through the restored mapping and read it back, so the mapping is proven live, not just returned.
+        let host = vec![0x5au8; 4096];
+        // SAFETY: 4 KiB at the start of the mapped range.
+        let rc = unsafe {
+            sys::cuMemcpyHtoD_v2(va, host.as_ptr() as *const _, host.len())
+        };
+        assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "memcpy H2D into the restored mapping");
+        let mut back = vec![0u8; 4096];
+        // SAFETY: the same 4 KiB.
+        let rc = unsafe { sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut _, va, back.len()) };
+        assert_eq!(rc, sys::CUresult::CUDA_SUCCESS, "memcpy D2H out of the restored mapping");
+        assert_eq!(back, host, "the restored mapping must be usable");
+        println!("VMM: remapped at the same address and read back {:02x}", back[0]);
+
+        // Clean up.
+        // SAFETY: the range is mapped and the handle is live.
+        let _ = unsafe { sys::cuMemUnmap(va, size) };
+        let _ = unsafe { sys::cuMemRelease(handle) };
+        let _ = unsafe { sys::cuMemAddressFree(va, size) };
+    }
+}
