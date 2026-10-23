@@ -23,6 +23,12 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("NAIWA_PREFILL_PEAK").is_some())
 }
 
+/// `NAIWA_BORROW_CHECK=1`: check whether a decode step's output is finite (a diagnostic, not a probe for runs).
+pub(crate) fn checking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NAIWA_BORROW_CHECK").is_some())
+}
+
 /// Sample free VRAM once per decode step and report the low-water mark periodically.
 ///
 /// `free_at_start` is the value the model had when it was ready to serve; passing it lets the report say how much

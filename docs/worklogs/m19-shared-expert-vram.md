@@ -1312,3 +1312,36 @@ this does not yet.
 
 **Status**: `engines/naiwa-loan.json` exists and reproduces the table above; `engines/naiwa.json` is unchanged, so
 the default arm still runs the stream. The borrow remains behind both env flags.
+
+## Where the borrow actually stands after the fix (2026-10-23)
+
+The chunk-outliving-its-buffer fix (a synchronise at the end of a borrowed chunk) took the **chat** configuration
+from "one turn in three dies" to **3/3 harness rounds with zero failures**, and the borrow is faster there (TPOT
+35->32 `code`, 51->42 `short`, 48->46 `long`; TTFT >= 2 better on all four classes). That is the configuration the
+milestone measures, and it holds.
+
+The **byte-determinism** configuration (`--pcie-frac 0 --prefix-cache-n 0`) does not hold, and the sweep shows why
+it is not simply "the borrow is unfenced":
+
+| cache | borrow | chunk | outcome |
+|---|---|---|---|
+| 2.3 GB | off | 8192 | 3 turns, no error |
+| 2.3 GB | on | 8192 | 3 turns, no error (twice) |
+| 2.6 GB | on | 8192 | **hangs**, no error, no chunk log |
+| 2.95 GB | on | 5632 | **`unexpected rank, expected: 2, got: 3 ([1, 1725, 2560])`**, deterministically |
+
+So with the borrow the prompt path in that configuration needs roughly the free VRAM it had at 2.3 GB, and both
+2.6 and 2.95 fall off a cliff in different ways: a hang at 2.6, and a rank-2 consumer being handed the prompt's
+3-D tensor at 2.95. Neither is the aliasing bug fixed above (that one produced NaN logits in the sampler and is
+gone from the chat configuration), and neither reproduces at 2.3.
+
+**Honest reading**: the borrow's *mechanism* is sound and its *benefit* is real, but its safe operating point in
+the deterministic configuration is "no cache growth at all", which makes it useless there; and the chat
+configuration's 3/3 is at a size (2.95 GB) where the deterministic configuration falls over. Until those two
+agree, the borrow cannot carry a numeric gate.
+
+**What that leaves**: `engines/naiwa.json` unchanged (the measured arm), `engines/naiwa-loan.json` present as an
+experimental arm at 2.95 GB whose numbers are **not** gated, the borrow behind both env flags, and the three
+problems to solve written down here: the prompt path's real VRAM requirement in the FRAC=0 configuration, the
+rank-2 consumer that receives a 3-D prompt tensor (the one concrete clue, and now reproducible on demand at
+2.95 GB + borrow), and the hang at 2.6 GB.

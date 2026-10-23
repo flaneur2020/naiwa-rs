@@ -444,7 +444,26 @@ impl RoutedExperts for CachedExperts {
         }
 
         // Decode: single token, split GPU hits / CPU misses.
-        super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
+        let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
+        // `NAIWA_BORROW_CHECK=1`: the first layer whose decode output is not finite is where garbage entered; a
+        // borrowed chunk empties the whole cache, so a decode step right after it reads slots that must be refilled.
+        if crate::vram_peak::checking() {
+            let finite = out
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|v| v.is_finite());
+            if !finite {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    eprintln!("DECODE_NAN layer {} (rows {num_tokens})", layer.layer);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
