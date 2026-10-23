@@ -1488,3 +1488,36 @@ per-layer decode finiteness), `WRITE_DURING_BORROW` (a fill reaching the upload 
 3/3 rounds clean there, but it is not correct in general and stays behind both env flags with
 `engines/naiwa.json` untouched. The defect is documented to the level where the next session starts from evidence
 rather than from a suspicion.
+
+## It is a race, and every logical bisect has to be read with that caveat (2026-10-23)
+
+Added the canary - `QTensor::read_bytes_at` in candle, and the borrow path copies 256 bytes of each projection
+right after the upload and again right before the compute. With the canary on (`NAIWA_BORROW_CANARY=1`):
+
+```
+CANARY_MISMATCH: 0
+chunkNaN = 0
+```
+
+**The failure disappeared**, and the canary never fired. That single result reorganises everything above:
+the 256-byte D2H per layer forces a synchronisation that the failing runs do not have, so the defect is a **race**,
+not a logic error. It also explains why the bisects disagreed with each other (alias+lookahead bad, lookahead off
+good, canary good, `--max-seqs 1` still bad): each of them changed the timing as much as the code path.
+
+What that means for the record:
+
+- the earlier "the corruption needs the alias and the lookahead" is still true, but its mechanism is a race between
+  whatever a lookahead decode leaves in flight and the chunk's first use of the same bytes;
+- no write was observed inside the window and the addresses are right, so the in-flight operation is either a
+  *read* by a kernel that the fences do not cover, or a DMA whose completion the borrow does not wait for;
+- `--pcie-frac 0.2` (the chat arm) is clean because its decode path has different timing, not because it is
+  logically safe - which is exactly why a green gate there is not evidence of correctness.
+
+**Next tool, not another hypothesis**: `compute-sanitizer --tool racecheck` on the failing configuration. The
+borrow's fences are hand-rolled (`ReadFence`, `CopyDone`, `queue_async`), so a racecheck run will name the pair of
+operations rather than leaving it to inference. That is the right way to finish this, and it is a session of its
+own.
+
+**State**: the borrow stays behind `NAIWA_CACHE_SLAB` + `NAIWA_PREFILL_BORROW`, `engines/naiwa.json` untouched, the
+slab shipped and byte-identical, and the instruments (`ALIAS`, `BORROW_CHECK`, `CANARY`, `WRITE_DURING_BORROW`,
+`BORROW_STILL`, `LOG_INTERNAL`, `RANK_DBG`) documented above so the next session starts from evidence.

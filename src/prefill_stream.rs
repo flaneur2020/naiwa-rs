@@ -689,6 +689,34 @@ impl PrefillStream {
         let t_wait = std::time::Instant::now();
         buf.ready.wait_on(&self.device)?;
         let waited = t_wait.elapsed();
+        // Canary (`NAIWA_BORROW_CANARY=1`): the chunk's bytes as they were after the upload; compared again right
+        // before the compute. A difference proves someone wrote inside the window and names the offset.
+        let canary = if self.borrows() && std::env::var_os("NAIWA_BORROW_CANARY").is_some() {
+            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
+            buf.memory.as_ref().map(|m| {
+                m.iter()
+                    .map(|mem| mem.tensor().read_bytes_at(0, 256).unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        if let Some(before) = &canary {
+            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
+            if let Some(m) = buf.memory.as_ref() {
+                for (i, mem) in m.iter().enumerate() {
+                    if let Ok(now) = mem.tensor().read_bytes_at(0, 256) {
+                        if now != before[i] {
+                            let at = now.iter().zip(&before[i]).position(|(a, b)| a != b).unwrap_or(0);
+                            eprintln!(
+                                "CANARY_MISMATCH layer {layer} proj {i} first byte {at}: was {:02x} now {:02x}",
+                                before[i][at], now[at]
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let t_compute = std::time::Instant::now();
         let out = experts.forward(xs, topk_weights.clone(), topk_ids);
         let transport = buf.queued.map(|queued| {
