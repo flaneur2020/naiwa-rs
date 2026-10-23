@@ -1429,3 +1429,33 @@ the staging path per layer (`staging_done: None`), and decoding then fills synch
 of DMA-ing into the staging ring - which is exactly the code that also writes into cache slots of the borrowed
 range. That is the next thing to instrument: either `admit(sync = true)`'s blocking upload is racing the borrow,
 or the two configurations differ in which slots are resident when a chunk starts.
+
+## Bisect: the corruption needs the alias *and* the lookahead (2026-10-23)
+
+Four runs, all at `--expert-cache-gb 2.3 --pcie-frac 0 --prefix-cache-n 0`, four turns of `doc`, with
+`NAIWA_BORROW_CHECK` counting non-finite chunk outputs and `NAIWA_LOG_INTERNAL` showing the real error:
+
+| alias | lookahead | chunk NaN | errors |
+|---|---:|---:|---:|
+| off (chunk gets its own memory) | on | **0** | 0 |
+| on | **off** | **0** | 0 |
+| on | on | 32-62 | 1-3 |
+| on | on, `--max-seqs 1` | 32 | 3 |
+
+So the corruption needs **both** the alias and the lookahead, and neither alone is enough. Everything that writes
+into cache slots is gated now - `admit`/`replace` return `Ok(None)` while `slab::borrowed()`, the fills are skipped,
+and a check after every empty reports `BORROW_STILL 0 slots still resident in the borrow range`. The gate also
+removed the *decode* NaNs (they were downstream of the chunk's). What is left writes through none of those paths.
+
+Narrowed further on the way: the first non-finite layer varies (17 in one run, 0 in another) and the layer's *input*
+is finite when its output is not, so the garbage appears in the layer's own MoE over the borrowed buffer, not in
+attention.
+
+Instruments added and kept: `NAIWA_BORROW_ALIAS` (use the alias or not, everything else identical - this is the
+probe that separated "the alias is wrong" from "the bookkeeping is wrong"), the `BORROW_STILL` assertion, and an
+input-finiteness check beside the output one.
+
+**Next step, concrete**: a canary. Write a known pattern into the borrowed range right after the upload and read it
+back right before the compute; a difference proves a write inside the window, and its position names the writer.
+If the canary survives, the read path is wrong instead (an offset/length in the range arithmetic), which is the
+other half of the hypothesis and just as cheap to check.

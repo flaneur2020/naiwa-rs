@@ -350,10 +350,22 @@ impl PrefillStream {
             let dims = stack.shape().dims();
             let el_count = stack.shape().elem_count();
             let _ = dims;
-            let storage = slab.borrow_at(offset, el_count, stack.dtype(), &self.device)?;
-            offset += storage.allocated_bytes();
-            out.push(self.copy.like_from_storage(stack, storage)?);
+            let _ = el_count;
+            if std::env::var_os("NAIWA_BORROW_ALIAS").is_some() {
+                let storage = slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?;
+                offset += storage.allocated_bytes();
+                out.push(self.copy.like_from_storage(stack, storage)?);
+            } else {
+                // Probe: keep everything else (the empty, the sync, the gate) but give the chunk memory of its
+                // own, to tell "the alias is wrong" from "the bookkeeping around it is wrong".
+                let mem = self.copy.alloc_like(stack)?;
+                offset += mem.len();
+                out.push(mem);
+            }
         }
+        // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
+        // write into them. Cleared at the end of `forward`, after the synchronise.
+        crate::moe::slab::set_borrowed(true);
         let base = slab.base()?;
         if let Some(cache) = self.cache.as_ref() {
             let emptied = cache.empty_range(base, base + offset as u64);
@@ -707,6 +719,9 @@ impl PrefillStream {
             // per chunk.
             self.copy.after_device_work()?;
             self.copy.synchronize()?;
+            // The gate stays up: the next layer of this chunk borrows the same bytes, and the lookahead worker
+            // for layer L+1 runs *between* layers - clearing it here would let that worker fill into the range
+            // while the next layer computes (measured: 31 non-finite chunk outputs per run without this).
         }
         out.map(Some)
     }

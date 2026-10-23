@@ -93,6 +93,30 @@ impl Layers {
             crate::copy_stream::wait_for_readers(buf);
         }
         let emptied = held.len();
+        // After emptying, no slot in the range may still claim an expert: if one does, some path re-published it
+        // (or never cleared it) and the chunk is about to overwrite bytes a decode step would trust.
+        let mut still = 0usize;
+        for layer in self.all() {
+            let state = layer.state.lock().unwrap();
+            for slot in state.slots.iter() {
+                let overlaps = {
+                    let storage = slot.storage.lock();
+                    let Some(buf) = storage.as_ref() else { continue };
+                    let SlotData::Banked { memory, .. } = &buf.data else { continue };
+                    memory.iter().any(|part| {
+                        let start = part.ptr() as u64;
+                        let stop = start + part.len() as u64;
+                        start < end && stop > base
+                    })
+                };
+                if overlaps && slot.expert.is_some() {
+                    still += 1;
+                }
+            }
+        }
+        if still > 0 {
+            eprintln!("BORROW_STILL {still} slots still resident in the borrow range");
+        }
         // Phase 3: the storages go back where they came from, empty - and cleared *again*, because a fill that was
         // already in flight reserved its slot (expert = Some, buf = None) before phase 1 and publishes after
         // phase 2. Without the second clear the slot would claim an expert whose bytes the chunk has overwritten,
@@ -413,6 +437,18 @@ impl RoutedExperts for CachedExperts {
                 return Ok(out);
             }
             if let Some(ps) = &layer.prefill {
+                if crate::vram_peak::checking() {
+                    let finite_in = xs
+                        .to_dtype(DType::F32)?
+                        .to_device(&Device::Cpu)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                        .iter()
+                        .all(|v| v.is_finite());
+                    if !finite_in {
+                        eprintln!("BORROW_IN layer {}: chunk INPUT not finite", layer.layer);
+                    }
+                }
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
                     // `NAIWA_BORROW_CHECK=1`: a chunk whose output is not finite is the borrow corrupting its own
                     // buffer; one whose output is finite points the failure at the decode side instead.
@@ -446,7 +482,9 @@ impl RoutedExperts for CachedExperts {
             return out.to_device(&layer.slot_device);
         }
 
-        // Decode: single token, split GPU hits / CPU misses.
+        // Decode: single token, split GPU hits / CPU misses. A decode step means the chunk that borrowed the
+        // cache's bytes is over, so the lookahead may fill again.
+        super::slab::set_borrowed(false);
         let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
         // `NAIWA_BORROW_CHECK=1`: the first layer whose decode output is not finite is where garbage entered; a
         // borrowed chunk empties the whole cache, so a decode step right after it reads slots that must be refilled.
@@ -609,6 +647,10 @@ impl CachedLayer {
     /// (slow) copy and published only after it, so concurrent admitters never share a slot
     /// and readers never see a half-written one. `None`: already resident or no empty slot.
     pub(crate) fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
+        if super::slab::borrowed() {
+            // A borrowed chunk owns these bytes right now (see `slab::borrowed`).
+            return Ok(None);
+        }
         let slot = {
             let mut st = self.state.lock().unwrap();
             if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
@@ -634,6 +676,9 @@ impl CachedLayer {
         protect: &[usize],
         sync: bool,
     ) -> candle_core::Result<Option<usize>> {
+        if super::slab::borrowed() {
+            return Ok(None);
+        }
         let slot = {
             let mut st = self.state.lock().unwrap();
             if st.slots.iter().any(|s| s.expert == Some(expert_id)) {

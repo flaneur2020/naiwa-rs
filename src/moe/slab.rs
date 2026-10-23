@@ -10,11 +10,30 @@
 //! This module will hold the allocator (bump/free over the slab, one range per bank). For now it holds the
 //! device test that pins down what the storage guarantees.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use candle_core::quantized::cuda::QCudaStorage;
 use candle_core::quantized::GgmlDType;
 use candle_core::Device;
+
+/// Set while a chunk is computing inside the slab, i.e. while the cache's own bytes are the chunk's layer buffer.
+///
+/// Every writer into cache slots consults it. Without that gate the lookahead's fills (and the preload handoff)
+/// keep DMA-ing into slots of the borrowed range *during* the chunk, which overwrote the layer buffer and made the
+/// chunk's output NaN - measured as 62 non-finite chunk outputs per run at `--pcie-frac 0`, and zero with
+/// `--no-lookahead`.
+static BORROWED: AtomicBool = AtomicBool::new(false);
+
+/// Mark the slab as borrowed (or not) for the duration of one layer's compute.
+pub(crate) fn set_borrowed(on: bool) {
+    BORROWED.store(on, Ordering::Release);
+}
+
+/// Whether a chunk owns the slab's low end right now: writers into cache slots must stand down.
+pub(crate) fn borrowed() -> bool {
+    BORROWED.load(Ordering::Acquire)
+}
 
 /// One VRAM allocation, handed out as byte ranges.
 ///
