@@ -1900,3 +1900,43 @@ already in the tree (`Slab`, `borrow_from`, `copy_range_to`, `read_bytes_at`).
 
 The flags stay (`NAIWA_PREFILL_QUIESCE`, `NAIWA_BORROW_ALIGN`, `NAIWA_BORROW_PAD_MIB`) because each is a cheap,
 correct knob for whoever picks this up, and the quiesce in particular makes the design's assumption explicit.
+
+## Isolation: the borrowed *view* is correct; the defect needs the cache's own bytes (2026-10-23)
+
+Two probes settled what twenty-odd earlier ones could not, by separating "my borrow code" from "the alias".
+
+**`NAIWA_BORROW_PRIVATE=1`** borrows the three projections with exactly the same code - `QCudaStorage::borrow_from`,
+the same offset layout, the same kernels and the same `SlotMemory` views - but from a **private 768 MiB allocation**
+instead of the cache's slab, and therefore with no `empty_range` and no gate:
+
+```
+priv:   0/12 failed, 0 non-finite
+priv2:  0/12 failed, 0 non-finite
+```
+
+So the borrowed *view* is right: offsets, kernel arguments, alignment and the `Arc<CudaSlice>` sharing all work.
+
+**`NAIWA_BORROW_NOEMPTY=1`** borrows from the cache's slab but **skips** `empty_range`, changing nothing else:
+
+```
+noempty:  12/12 failed, 0 non-finite
+noempty2: 12/12 failed, 0 non-finite
+```
+
+A different failure - every iteration, but *no* non-finite chunk output - which is what happens when the decode
+reads slots whose bytes the chunk has overwritten (the chunks are fine, the steps after them are not). So
+`empty_range` is *necessary*, and its absence produces a different symptom than the one being chased.
+
+**What that leaves**: the chunk-NaN defect needs (a) the bytes to be the **cache's own**, (b) `empty_range` to have
+been run, and (c) the lookahead on - with every host-visible writer excluded (`UPLOAD_REFUSED` 0, the publish now
+gated, fills skipped during a chunk, the lookahead quiesced and drained at its start, `device.synchronize()` once
+per chunk). The borrow *mechanism* is proven correct; what is left is something only the aliasing enables.
+
+**The one instrument still worth building**, and the reason it is not another engine probe: log the *addresses of
+every published `SlotBuf.memory`* that fall inside the borrowed range at the moment of publication. `BORROW_STILL`
+checks the slots' `expert` fields, not whether a published buffer still *points into* the range; a publication that
+happens after the last check would be invisible to everything in the tree today.
+
+State: `NAIWA_BORROW_PRIVATE`, `NAIWA_BORROW_NOEMPTY`, `NAIWA_BORROW_ALIGN`, `NAIWA_BORROW_PAD_MIB`,
+`NAIWA_PREFILL_QUIESCE` stay as probes; the borrow stays behind its two env flags; the slab, the gate discipline and
+all diagnostics stay.

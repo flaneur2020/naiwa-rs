@@ -194,6 +194,10 @@ pub struct PrefillStream {
     min_tokens: usize,
     /// `NAIWA_PREFILL_PEAK=1`: what a chunk actually costs in VRAM, against what the planner estimates.
     peak: Mutex<Peak>,
+    /// `NAIWA_BORROW_PRIVATE=1`: borrow the three projections from a private allocation instead of the cache's slab,
+    /// exercising the same `borrow_from` + offset views with no aliasing at all. What it separates: a bug in the
+    /// borrowed *view* versus a bug that needs the bytes to be cache slots.
+    private_slab: Mutex<Option<Arc<candle_core::quantized::cuda::QCudaStorage>>>,
     /// `NAIWA_BORROW_SNAP=1`: two device-side snapshots of each projection's first 4 KiB - one queued right after the
     /// upload, one right after the compute - compared at the end of the layer against each other and the host stacks.
     snap: Mutex<Option<Arc<candle_core::quantized::QTensor>>>,
@@ -261,6 +265,7 @@ impl PrefillStream {
             min_tokens,
             peak: Mutex::new(Peak::default()),
             snap: Mutex::new(None),
+            private_slab: Mutex::new(None),
             slab,
             cache,
         }))
@@ -332,6 +337,45 @@ impl PrefillStream {
     /// assumed: two buffers need twice a layer, and on a 12 GB card that is what pushes a
     /// 1024-token chunk's MoE intermediates over the edge. One buffer still beats the CPU by an
     /// order of magnitude (the uploads are then serial with the compute instead of hidden).
+    /// Borrow the three projections from a private allocation (see `private_slab`).
+    fn borrow_private(&self, stacks: &[Arc<QTensor>; 3]) -> candle_core::Result<[SlotMemory; 3]> {
+        let slab = {
+            let mut slot = self.private_slab.lock().unwrap();
+            if slot.is_none() {
+                let dev = self
+                    .device
+                    .as_cuda_device()
+                    .map_err(|e| candle_core::Error::Msg(format!("private borrow needs CUDA: {e}")))?;
+                // The largest layer's three projections fit comfortably in 768 MiB.
+                let st = candle_core::quantized::cuda::QCudaStorage::zeros(
+                    dev,
+                    (768usize << 20) / 4,
+                    candle_core::quantized::GgmlDType::F32,
+                )?;
+                slot.replace(Arc::new(st));
+            }
+            Arc::clone(slot.as_ref().unwrap())
+        };
+        let dev = self
+            .device
+            .as_cuda_device()
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        let mut out = Vec::with_capacity(3);
+        let mut offset = 0usize;
+        for stack in stacks {
+            let st = candle_core::quantized::cuda::QCudaStorage::borrow_from(
+                &slab,
+                offset,
+                stack.shape().elem_count(),
+                stack.dtype(),
+                dev,
+            )?;
+            offset = (offset + st.allocated_bytes() + 255) & !255;
+            out.push(self.copy.like_from_storage(stack, st)?);
+        }
+        Ok([out.remove(0), out.remove(0), out.remove(0)])
+    }
+
     /// Whether this stream's layer buffers come from the cache's slab.
     fn borrows(&self) -> bool {
         crate::moe::slab::Slab::borrowing() && self.slab.is_some() && self.cache.is_some()
@@ -347,6 +391,9 @@ impl PrefillStream {
         layer: usize,
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
+        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some() {
+            return self.borrow_private(stacks);
+        }
         let slab = self.slab.as_ref().expect("checked by borrows()");
         let mut out = Vec::with_capacity(3);
         let mut offset = 0usize;
@@ -387,7 +434,13 @@ impl PrefillStream {
         // (every launch serialised) does make it vanish, which is what says the cause is cross-stream ordering.
         self.copy.after_device_work()?;
         if let Some(cache) = self.cache.as_ref() {
-            let emptied = cache.empty_range(base, base + offset as u64);
+            // Probe: keep everything identical but skip the emptying, to tell "the chunk writing into the cache's
+            // bytes" from "the cache's slot metadata being cleared".
+            let emptied = if std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
+                0
+            } else {
+                cache.empty_range(base, base + offset as u64)
+            };
             // Everything a fill queued on the copy stream has to land *before* the chunk writes these bytes,
             // otherwise it overwrites the layer buffer. `empty_range` has waited for the fills' buffers, this
             // settles the copies they queued; no new fill starts while the borrow is held.
