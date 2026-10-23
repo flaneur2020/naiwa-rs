@@ -232,7 +232,7 @@ impl Vmm {
 
 /// Spans of physical memory that can be lent as a unit. 64 MiB keeps a lend/reclaim cheap (one unmap + one map per
 /// span) and the granularity comfortably satisfied.
-const SEGMENT: usize = 64 << 20;
+const SEGMENT: usize = 256 << 20;
 
 impl Slab {
     /// `NAIWA_CACHE_SLAB=1` decides whether the provider carves banks from a slab at all.
@@ -278,6 +278,27 @@ impl Slab {
             Some(vmm) => vmm.resident(),
             None => self.bytes,
         }
+    }
+
+    /// `NAIWA_PREFILL_LEND=1`: a chunk lends the cache's tail pages to the driver for the duration of its compute,
+    /// so the chunk's own activation scratch (measured ~866 MiB at 1725 rows, 1.95x the formula's estimate) lives
+    /// in VRAM that is cache slots the rest of the time.
+    pub(crate) fn lending() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("NAIWA_PREFILL_LEND").is_some() && Self::vmm())
+    }
+
+    /// Bytes that can be lent without touching the range the borrow uses (the low end).
+    pub(crate) fn lendable(&self) -> usize {
+        match &self.vmm {
+            Some(vmm) => vmm.resident(),
+            None => 0,
+        }
+    }
+
+    /// Bytes currently lent (reservation minus resident).
+    pub(crate) fn lent(&self) -> usize {
+        self.bytes.saturating_sub(self.resident())
     }
 
     /// Hand `want` bytes of the tail back to the driver, whole segments at a time. Returns what was lent.

@@ -103,7 +103,7 @@ pub(crate) fn activation_bytes(chunk: usize) -> usize {
 /// 915 / 1815 / 3615 tokens at 201 / 356 / 416 tok/s; two buffers at 512 at 147 / 285. So the search
 /// walks the 256-token grid from `ceiling` down and takes the second buffer only when the *same*
 /// chunk affords it.
-pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool) -> Option<(usize, usize)> {
+pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool, lending: bool) -> Option<(usize, usize)> {
     const GRID: usize = 256;
     // The activation term is an estimate, so it carries slack: on this card the formula alone would
     // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
@@ -123,7 +123,11 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: b
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| (512 << 20).max(free / 8));
-        if borrowing {
+        if lending {
+            // The chunk's activation scratch comes from the pages lent at its start, so free VRAM only has to hold
+            // the reserve the decode side needs.
+            free >= head
+        } else if borrowing {
             // The layer buffer is a range of the cache's slab, so it costs nothing here - but the chunk still pays
             // its activations and the step's scratch out of free VRAM, and that is *more* than the estimate:
             // measured 866 MiB for a 1696-row chunk whose `act` is 444 (1.95x, and 1.39x without the borrow at
@@ -301,7 +305,13 @@ impl PrefillStream {
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let (stride, chunk) = plan(free, self.layer_bytes(), prompt_step_ceiling(), self.borrows())?;
+        let (stride, chunk) = plan(
+            free,
+            self.layer_bytes(),
+            prompt_step_ceiling(),
+            self.borrows(),
+            crate::moe::slab::Slab::lending(),
+        )?;
         Some((Plan { stride, chunk }, free))
     }
 
@@ -394,6 +404,72 @@ impl PrefillStream {
             );
         }
         Ok([out.remove(0), out.remove(0), out.remove(0)])
+    }
+
+    /// `NAIWA_PREFILL_LEND=1`: at the start of a chunk, hand the cache's tail pages to the driver for the chunk's
+    /// activation scratch; the cache slots that live there are emptied (they are about to hold activations).
+    fn lend_for_chunk(&self, rows: usize) {
+        if !crate::moe::slab::Slab::lending() {
+            return;
+        }
+        let (Some(slab), Some(cache)) = (self.slab.as_ref(), self.cache.as_ref()) else {
+            return;
+        };
+        if slab.lent() > 0 {
+            return; // already lent: one lend per chunk
+        }
+        // The measured cost of a borrowed chunk is ~1.95x the formula's activation estimate.
+        let want = activation_bytes(rows).saturating_mul(2);
+        let before = slab.resident();
+        let t_lend = std::time::Instant::now();
+        match slab.lend_tail(want) {
+            Ok(lent) if lent > 0 => {
+                if let Ok(base) = slab.base() {
+                    let end = base + before as u64;
+                    let start = end - lent as u64;
+                    let emptied = cache.empty_range(start, end);
+                    crate::dbg_note(
+                        "prefill_lend",
+                        &format!(
+                            "lent {:.0} MiB of the slab's tail ({} slots emptied) for {rows} rows in {:?}",
+                            (lent as f64) / (1u64 << 20) as f64,
+                            emptied,
+                            t_lend.elapsed()
+                        ),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("prefill: lending the slab's tail failed: {e}"),
+        }
+    }
+
+    /// After a chunk, take the pages back and give the driver what it kept from the chunk's scratch. Called once per
+    /// decode step (it is cheap when nothing is lent).
+    pub(crate) fn reclaim_after_chunk(&self) -> candle_core::Result<()> {
+        let Some(slab) = self.slab.as_ref() else {
+            return Ok(());
+        };
+        if slab.lent() == 0 {
+            return Ok(());
+        }
+        // The driver's pool is holding the scratch blocks the chunk allocated in those pages; hand them back before
+        // mapping fresh physical memory over the same addresses.
+        let t = std::time::Instant::now();
+        crate::copy_stream::trim_device_pool(&self.device)?;
+        let t_trim = t.elapsed();
+        let mapped = slab.reclaim()?;
+        if mapped > 0 {
+            crate::dbg_note(
+                "prefill_lend",
+                &format!(
+                    "reclaimed {:.0} MiB of the slab in {:?} (trim {t_trim:?})",
+                    (mapped as f64) / (1u64 << 20) as f64,
+                    t.elapsed()
+                ),
+            );
+        }
+        Ok(())
     }
 
     /// Sample this layer's free VRAM and, on the chunk's last layer, report the footprint.
@@ -666,6 +742,9 @@ impl PrefillStream {
                 );
             }
             return Ok(None);
+        }
+        if layer == 0 {
+            self.lend_for_chunk(batch * seq);
         }
         self.sample_peak(layer, batch * seq);
         let mut stride = self.reserve()?;
@@ -988,24 +1067,24 @@ mod tests {
         );
 
         // A big card: ceiling, both buffers.
-        assert_eq!(plan(gb(12), layer, 8192, false).unwrap(), (2, 8192));
+        assert_eq!(plan(gb(12), layer, 8192, false, false).unwrap(), (2, 8192));
 
         // Borrowing: the layer buffer is a range of the cache's slab, so it is not paid from free VRAM at all -
         // a chunk that would only afford one buffer otherwise still gets the ceiling here. And there is one range
         // (every layer borrows the same bytes), so the stride is one by construction.
-        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 8192));
-        assert_eq!(plan(gb(12), layer, 8192, true).unwrap().0, 1);
+        assert_eq!(plan(2049 << 20, layer, 8192, true, false).unwrap(), (1, 8192));
+        assert_eq!(plan(gb(12), layer, 8192, true, false).unwrap().0, 1);
         // A borrowed chunk still pays its activations from free VRAM, and measured at 1.95x the estimate, so the
         // chunk shrinks where the non-borrow formula would still grant the ceiling.
-        assert!(plan(2049 << 20, layer, 8192, true).unwrap().1 >= 1725);
+        assert!(plan(2049 << 20, layer, 8192, true, false).unwrap().1 >= 1725);
 
         // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
-        assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 8192));
+        assert_eq!(plan(2049 << 20, layer, 8192, false, false).unwrap(), (1, 8192));
         // 2400 MiB is the edge where the second buffer just fits (2399 needed).
-        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (2, 8192));
+        assert_eq!(plan(2400 << 20, layer, 8192, false, false).unwrap(), (2, 8192));
 
         // The operator's ceiling is a ceiling, not a target.
-        assert_eq!(plan(gb(12), layer, 512, false).unwrap().1, 512);
+        assert_eq!(plan(gb(12), layer, 512, false, false).unwrap().1, 512);
 
         // The second buffer only when the same chunk affords it.
         let need2 = |free_guess: usize| {
@@ -1018,15 +1097,15 @@ mod tests {
         };
         // With the 512 MiB floor, a 12 GB card's ~2.3 GiB buys one buffer at the ceiling and
         // 8 GiB buys two; the floor is what keeps a prompt step's own scratch out of the way.
-        assert_eq!(plan(gb(8), layer, 8192, false).unwrap(), (2, 8192));
+        assert_eq!(plan(gb(8), layer, 8192, false, false).unwrap(), (2, 8192));
         let just = need2(gb(1));
-        assert_eq!(plan(just, layer, 8192, false).unwrap(), (2, 8192));
+        assert_eq!(plan(just, layer, 8192, false, false).unwrap(), (2, 8192));
         // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
-        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().0, 1);
-        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().1, 8192);
+        assert_eq!(plan(just * 8 / 10, layer, 8192, false, false).unwrap().0, 1);
+        assert_eq!(plan(just * 8 / 10, layer, 8192, false, false).unwrap().1, 8192);
 
         // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
-        assert_eq!(plan(layer, layer, 1024, false), None);
+        assert_eq!(plan(layer, layer, 1024, false, false), None);
     }
 
     /// The fork's `MoEExperts::from_qtensors` computes the routed MoE of the stacks it is

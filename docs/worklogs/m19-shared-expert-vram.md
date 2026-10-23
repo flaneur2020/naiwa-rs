@@ -1763,3 +1763,38 @@ VMM slab: reclaimed and readable again at the same address
 start and `reclaim` after the chunk's last kernel, with the lent region's slots marked empty and the per-layer
 `usable` high-water lowered while the pages are gone (the field already exists, and the `lock_access` discipline that
 fixed the borrow's TOCTOU is what fences the lend).
+
+## Phase B, built and measured: it works, and it loses (2026-10-23)
+
+Step 5 is in: `NAIWA_PREFILL_LEND=1` (with `NAIWA_SLAB_VMM=1`) lends the slab's tail pages at the start of a chunk
+and reclaims them at the first decode step.
+
+- **It works.** At `--expert-cache-gb 2.9` - the size that OOM'd before - 12 stress iterations at `--pcie-frac 0`
+  and at `0.2` are clean (0 failures, 0 non-finite, 0 OOM), and the harness runs 3 rounds with 0 failures.
+- **The syscalls were the first suspect and were reduced**: 64 MiB segments cost 8.4 ms to lend + 1.9 ms to reclaim
+  per turn; 256 MiB segments cost 2.7 + 1.5 ms.
+- **And it is still slower.** Harness, 3 rounds, medians: TPOT 38/48/49/60 ms against the baseline arm's
+  36/46/46/40, e2e worse in every class, no class better.
+
+**Why, and it is the same reason as M18 and the three earlier refutations**: the lend takes *cache slots*, not free
+memory. `empty_range` empties ~285 slots (536 MiB) per chunk, and the allocator carved banks in **layer order**, so
+the slab's tail is *the last layers*, not the coldest slots - every slot there belongs to one layer, so those layers
+come back with no residents at all and refill ~285 slots on the next decode. **A per-turn refill of 536 MiB costs
+more than +7 slots/layer (26%) is worth.**
+
+That is structural, not a tuning miss: VMM can only lend *contiguous address ranges*, and the cache's addresses are
+laid out by layer. Lending "the coldest slots" would need the slots of every layer to be interleaved in one shared
+pool - which is the unified pool M19 already measured at **-23% capacity** because this model has seven expert
+shapes.
+
+**So the milestone's answer is complete**, and it took four refutations to get there:
+
+| mechanism | verdict |
+|---|---|
+| movable slot pool / unified slots | refuted: -23% capacity for seven shapes |
+| ring batching (rounds over slots) | refuted: 3.4x slower |
+| borrow the layer buffer (Phase A) | correct and neutral, once its TOCTOU race was fixed |
+| lend the scratch pages (Phase B) | **built, correct, and slower**: the refill costs more than the slots are worth |
+
+The one scenario where Phase B would pay is a workload with **long decodes between chunks** (the refill amortises
+over many tokens); this corpus answers in 64 tokens, so it does not.
