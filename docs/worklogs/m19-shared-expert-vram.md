@@ -1521,3 +1521,34 @@ own.
 **State**: the borrow stays behind `NAIWA_CACHE_SLAB` + `NAIWA_PREFILL_BORROW`, `engines/naiwa.json` untouched, the
 slab shipped and byte-identical, and the instruments (`ALIAS`, `BORROW_CHECK`, `CANARY`, `WRITE_DURING_BORROW`,
 `BORROW_STILL`, `LOG_INTERNAL`, `RANK_DBG`) documented above so the next session starts from evidence.
+
+## compute-sanitizer: blocked by a false-positive class, and the recipe that would work (2026-10-23)
+
+Ran the failing configuration under `compute-sanitizer --tool memcheck --target-processes all`. It reports **682
+errors, all from one kernel**: `mistralrs_flashinfer::reshape_and_cache_flashinfer_kernel` - the paged-attention KV
+write - each phrased as *"Access ... is potentially made before memory is allocated"* against an address that is in
+fact inside a known allocation. That is the async-allocator false-positive class: candle allocates through cudarc's
+`cudaMallocAsync` pool (`ctx.has_async_alloc`), and memcheck's shadow map does not see pool allocations as
+"allocated", so every KV write looks suspect.
+
+Two consequences:
+
+- the 682 errors carry no information about the borrow (none of them is in a kernel this milestone touches), and
+  the report is dominated by them;
+- under the sanitizer the server does not reach serving in the time a run gets (the tool is 10-50x slower), so this
+  run could not reproduce the borrow's race either.
+
+**The recipe that would work, for the next session:**
+
+1. run the sanitizer on something that can afford it - a *standalone* reproducer (slab, `borrow_from`, an upload, a
+   compute, and one concurrent filler that mimics the lookahead) rather than the whole engine. That also lets the
+   filler be toggled, which is the variable the bisect says matters;
+2. force the synchronous allocator for the run so the KV writes stop being flagged (cudarc picks the async pool from
+   a device attribute; a synchronous path exists in the same `Drop`/alloc code, so a small patch in candle or an
+   env switch in cudarc would do it);
+3. and keep the canary in the loop: it is the only instrument so far that changes the outcome, which means the race
+   window is small and any tool that serialises will hide it - a reproducer is the only way to hold both.
+
+**Where M19 ends**: the slab is shipped and byte-identical; the borrow is measured and faster in the chat arm (3/3
+rounds clean there) and is a race in the no-prefix-cache configuration; it stays behind both env flags, with
+`engines/naiwa.json` untouched and seven instruments plus this recipe written down.
