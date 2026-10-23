@@ -194,6 +194,9 @@ pub struct PrefillStream {
     min_tokens: usize,
     /// `NAIWA_PREFILL_PEAK=1`: what a chunk actually costs in VRAM, against what the planner estimates.
     peak: Mutex<Peak>,
+    /// `NAIWA_BORROW_SNAP=1`: two device-side snapshots of each projection's first 4 KiB - one queued right after the
+    /// upload, one right after the compute - compared at the end of the layer against each other and the host stacks.
+    snap: Mutex<Option<Arc<candle_core::quantized::QTensor>>>,
     /// `NAIWA_PREFILL_BORROW=1`: the layer buffers are ranges of the cache's slab instead of VRAM of their own, and
     /// the cache slots that live in those bytes are emptied for the chunk.
     slab: Option<Arc<crate::moe::slab::Slab>>,
@@ -257,6 +260,7 @@ impl PrefillStream {
             checked: std::sync::atomic::AtomicBool::new(false),
             min_tokens,
             peak: Mutex::new(Peak::default()),
+            snap: Mutex::new(None),
             slab,
             cache,
         }))
@@ -697,6 +701,48 @@ impl PrefillStream {
         let waited = t_wait.elapsed();
         // Canary (`NAIWA_BORROW_CANARY=1`): the chunk's bytes as they were after the upload; compared again right
         // before the compute. A difference proves someone wrote inside the window and names the offset.
+        let take_snap = self.borrows() && std::env::var_os("NAIWA_BORROW_SNAP").is_some();
+        if take_snap {
+            let shadow = {
+                let mut slot = self.snap.lock().unwrap();
+                if slot.is_none() {
+                    let dev = self.device.as_cuda_device().expect("cuda");
+                    // 2 snapshots x 3 projections x 4 KiB, as F32 (block size 1, so an element is a byte).
+                    let st = candle_core::quantized::cuda::QCudaStorage::zeros(
+                        dev,
+                        2 * 3 * 4096 / 4,
+                        candle_core::quantized::GgmlDType::F32,
+                    )?;
+                    slot.replace(Arc::new(candle_core::quantized::QTensor::new(
+                        candle_core::quantized::QStorage::Cuda(st),
+                        (2 * 3 * 4096 / 4,),
+                    )?));
+                }
+                Arc::clone(slot.as_ref().unwrap())
+            };
+            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
+            if let Some(m) = buf.memory.as_ref() {
+                for (i, mem) in m.iter().enumerate() {
+                    // Queued on the copy stream, right after the upload: no host wait, so the race is untouched.
+                    mem.tensor()
+                        .copy_range_to(&shadow, 0, i * 4096, 4096, self.copy.cuda_stream())?;
+                }
+            }
+        }
+        // `NAIWA_BORROW_SNAP=1`: snapshot the first 4 KiB of each projection right after the upload with a
+        // **device-to-device** copy (queued, never a host wait), then compare at the end of the layer. This is the
+        // one observation that does not itself serialise the race the way a host read does.
+        if self.borrows() && std::env::var_os("NAIWA_BORROW_SNAP").is_some() {
+            let snap = {
+                let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
+                buf.memory.as_ref().map(|m| {
+                    m.iter()
+                        .map(|mem| mem.tensor().read_bytes_at(0, 0).map(|_| ()).ok())
+                        .count()
+                })
+            };
+            let _ = snap;
+        }
         let canary = if self.borrows() && std::env::var_os("NAIWA_BORROW_CANARY").is_some() {
             let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
             buf.memory.as_ref().map(|m| {
@@ -747,6 +793,28 @@ impl PrefillStream {
                 transport.unwrap_or_default()
             ),
         );
+        if take_snap {
+            // B: the same windows again, after the compute - queued on **candle's own stream**, so it reads what
+            // the kernels left behind without adding a cross-stream barrier (the first version ordered the copy
+            // stream after candle's work, and that alone hid the race: 0/12 with all snapshots clean).
+            let shadow = self.snap.lock().unwrap().as_ref().map(Arc::clone);
+            if let Some(shadow) = shadow {
+                let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
+                if let Some(m) = buf.memory.as_ref() {
+                    for (i, mem) in m.iter().enumerate() {
+                        let dev = self.device.as_cuda_device()
+                            .map_err(|e| candle_core::Error::Msg(format!("cuda: {e}")))?;
+                        mem.tensor().copy_range_to(
+                            &shadow,
+                            0,
+                            3 * 4096 + i * 4096,
+                            4096,
+                            &dev.cuda_stream(),
+                        )?;
+                    }
+                }
+            }
+        }
         // Fence even on error: kernels reading the buffer may already be queued.
         buf.released.record_reads(&self.device)?;
         if self.borrows() {
@@ -758,6 +826,32 @@ impl PrefillStream {
             // per chunk.
             self.copy.after_device_work()?;
             self.copy.synchronize()?;
+            if take_snap {
+                let shadow = self.snap.lock().unwrap().as_ref().map(Arc::clone);
+                if let Some(shadow) = shadow {
+                    let host_stacks = self.stacks(layer).unwrap_or_else(|| unreachable!("loaded above"));
+                    for (i, stack) in host_stacks.iter().enumerate() {
+                        let host = stack.data()?;
+                        let want = &host[..4096.min(host.len())];
+                        let a = shadow.read_bytes_at(i * 4096, 4096).unwrap_or_default();
+                        let b = shadow.read_bytes_at(3 * 4096 + i * 4096, 4096).unwrap_or_default();
+                        if a.len() == want.len() && a != want {
+                            let at = a.iter().zip(want).position(|(x, y)| x != y).unwrap_or(0);
+                            eprintln!(
+                                "SNAP_A_MISMATCH layer {layer} proj {i} byte {at}: upload wrote {:02x}, host has {:02x}",
+                                a[at], want[at]
+                            );
+                        }
+                        if a != b {
+                            let at = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
+                            eprintln!(
+                                "SNAP_B_MISMATCH layer {layer} proj {i} byte {at}: after upload {:02x}, after compute {:02x}",
+                                a[at], b[at]
+                            );
+                        }
+                    }
+                }
+            }
             // The gate stays up: the next layer of this chunk borrows the same bytes, and the lookahead worker
             // for layer L+1 runs *between* layers - clearing it here would let that worker fill into the range
             // while the next layer computes (measured: 31 non-finite chunk outputs per run without this).

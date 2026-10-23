@@ -1612,3 +1612,36 @@ which the trade goes the borrow's way.
 **Shipped**: the borrow is now **refused at startup** when the lookahead is on (a warning says why), so the
 corrupting path cannot be reached; the slab stays. M19's deliverable is the slab, its instruments, and three
 refutations (the earlier ones on capacity and rounds, and this one on the trade).
+
+## Every perturbation hides it - the strongest argument against shipping it (2026-10-23)
+
+Two device-to-device snapshot instruments were built to answer the one question left: is the chunk's buffer wrong
+right after its upload (a DMA problem) or does something write it during the compute? `quantized::QTensor::
+copy_range_to` queues a `cuMemcpyDtoDAsync` of a byte range into a shadow storage - **no host wait**, so unlike the
+canary it should not serialise the race. A copy of each projection's first 4 KiB is queued on the copy stream right
+after the upload, another on candle's stream right after the compute, and both are compared at the end of the layer
+against each other and against the host stacks.
+
+Result, twice, with the failing configuration:
+
+```
+RESULT 0/12 failed
+A=0  B=0  NaN=0
+```
+
+**The snapshot itself hides the defect** - and the copies never wait for the host, so it is not the comparison but
+the six extra 4 KiB copies per layer that change the interleaving. That makes three instruments that all remove the
+failure by existing (host canary, `CUDA_LAUNCH_BLOCKING`, device-to-device snapshots), and one that removes it by
+removing the concurrency (no lookahead).
+
+**What that means**: the defect needs a precise interleaving that no observation has yet matched, so a fix cannot be
+validated by "does the test pass" - the test changes the thing it measures. Twenty-odd experiments have not produced
+a deterministic reproduction.
+
+**And the trade is unchanged**: the borrow's only benefit is a bigger cache (+30% slots, worth ~-10% TPOT), and it
+requires the bytes to be private during the compute - which is exactly what a dedicated buffer already gives, for
+the same 650 MiB the cache would have gained. Shipping it would trade a measured -10% for an unquantifiable
+correctness risk.
+
+**Kept**: `copy_range_to` (candle, device-to-device range copy) and `CopyStream::cuda_stream`, both diagnostics with
+no effect unless their env flag is set; the borrow stays refused when the lookahead is on.

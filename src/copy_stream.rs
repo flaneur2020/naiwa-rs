@@ -229,6 +229,11 @@ mod cuda {
 
         /// Order this stream after everything already queued on candle's stream, i.e. the slot
         /// allocations and their zero-fill.
+        /// The raw stream, for a diagnostic that queues a copy of its own.
+        pub fn cuda_stream(&self) -> &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream> {
+            &self.stream
+        }
+
         pub fn after_device_work(&self) -> Result<()> {
             let Device::Cuda(dev) = &self.device else {
                 return Ok(());
