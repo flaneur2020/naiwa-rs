@@ -1863,3 +1863,40 @@ construction, the padding rules out an over-read past the range, and every instr
 combination says the remaining defect is a **device-side ordering** the host cannot observe, and the honest way to
 settle it is `--tool racecheck` on a standalone two-thread reproducer - not another probe on the engine, which is
 what this session has been doing for too long. The probe (`NAIWA_BORROW_PAD_MIB`) and the two fixes stay.
+
+## Enforcing the non-overlap: it is now a fact in the code, and the defect survives (2026-10-23)
+
+The user's framing - prefill and decode do not overlap in time - is right, and it was the correct next move:
+the reason it did not help is that the non-overlap was an *assumption*, never enforced. It is now enforced
+(`NAIWA_PREFILL_QUIESCE=1`):
+
+- at a chunk's first layer the lookahead is **quiesced and its queue drained**
+  (`stages::quiesce(true)`: a flag the worker checks before running a job, plus `LOOKAHEAD_JOBS.clear()`), so no
+  prediction job from the previous decode step survives into the chunk;
+- the device is synchronised once (`device.synchronize()`), so nothing decode left behind is still executing;
+- the gate, the `lock_access` critical section, the double clear and the publish gate remain as they were.
+
+Measured, `12` stress iterations each at `--pcie-frac 0`:
+
+| variant | failed |
+|---|---:|
+| quiesce on | 4/12, 7/12 |
+| quiesce off | 8/12 |
+| publish gate + lock order fixed | 8/12, 8/12 |
+| 256-byte-aligned projection offsets (`NAIWA_BORROW_ALIGN`) | 6/12, 3/12 |
+| 8 / 64 MiB gap after each projection (`NAIWA_BORROW_PAD_MIB`) | 7/12, 8/12 |
+| plain (the state before this round) | 4-10/12 |
+
+**Nothing is clean, and the spread (3-10/12) is the run-to-run noise.** So: every host-visible writer is excluded,
+over-reads past the range are excluded, alignment is excluded, non-overlap is now enforced - and the chunk still
+produces non-finite outputs.
+
+**Assessment, stated plainly**: engine-level probing is exhausted. Twenty-odd variants cannot even hold the failure
+steady enough to compare, which means the remaining cause is something the host cannot see and any change perturbs.
+The next step is not another flag: it is a **standalone two-thread reproducer** (slab + `borrow_from` + upload +
+compute, with one thread doing what the lookahead does) run under `compute-sanitizer --tool racecheck`, where the
+interleaving can be held fixed and the tool names the pair of operations. Everything needed for that reproducer is
+already in the tree (`Slab`, `borrow_from`, `copy_range_to`, `read_bytes_at`).
+
+The flags stay (`NAIWA_PREFILL_QUIESCE`, `NAIWA_BORROW_ALIGN`, `NAIWA_BORROW_PAD_MIB`) because each is a cheap,
+correct knob for whoever picks this up, and the quiesce in particular makes the design's assumption explicit.

@@ -367,6 +367,13 @@ impl PrefillStream {
                 out.push(mem);
             }
         }
+        if std::env::var_os("NAIWA_PREFILL_QUIESCE").is_some() {
+            // Make the non-overlap a fact rather than an assumption: no prediction job runs during a chunk, and the
+            // ones the previous decode step queued are dropped, so nothing the lookahead started can be in flight
+            // when the chunk takes the cache's bytes.
+            crate::moe::quiesce(true);
+            let _ = self.device.synchronize();
+        }
         // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
         // write into them. The lock is held from setting the flag until every copy a fill queued has landed, so a
         // fill cannot slip between the check and its DMA (the TOCTOU that survived until now).

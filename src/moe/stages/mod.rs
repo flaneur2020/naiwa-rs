@@ -12,7 +12,7 @@ mod route;
 pub(crate) use cpu_miss::{fused_decode, CpuMiss};
 pub(crate) use dma_miss::DmaMiss;
 pub(crate) use gpu::Gpu;
-pub(crate) use preload::Preload;
+pub(crate) use preload::{quiesce, Preload};
 pub(crate) use route::{Route, RoutePlan};
 
 pub(crate) type Hit = (std::sync::Arc<crate::moe::SlotBuf>, usize, f32);

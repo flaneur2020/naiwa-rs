@@ -1,7 +1,7 @@
 //! Preload: publish this layer's activation for the next layer's prediction.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -163,10 +163,31 @@ fn take() -> Option<Task> {
     job
 }
 
+/// `NAIWA_PREFILL_QUIESCE=1`: a chunk sets this while it owns the cache's bytes, so no prediction job runs during
+/// it and none survives into it.
+static QUIESCED: AtomicBool = AtomicBool::new(false);
+
+/// Stop (or resume) letting prediction jobs run, and drop everything already queued.
+///
+/// Prefill and decode do not overlap in steady state, but the lookahead is *asynchronous*: jobs queued by the last
+/// decode step of a turn are still here when the next request's chunk begins. This is the enforcement of the
+/// non-overlap: a chunk quiesces the lookahead and drains the queue before it takes the cache's bytes.
+pub(crate) fn quiesce(on: bool) {
+    QUIESCED.store(on, Ordering::Release);
+    if on {
+        LOOKAHEAD_JOBS.lock().unwrap().clear();
+        LOOKAHEAD_LEN.store(0, Ordering::Release);
+    }
+}
+
 fn lookahead_worker() {
     loop {
         while executor::cpu().is_idle() {
             let Some(job) = take() else { break };
+            if QUIESCED.load(Ordering::Acquire) {
+                // A chunk owns the cache's bytes; this job's layer may be one of them.
+                continue;
+            }
             job();
         }
         std::thread::park_timeout(LOOKAHEAD_PARK);

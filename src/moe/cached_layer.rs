@@ -485,6 +485,9 @@ impl RoutedExperts for CachedExperts {
         // Decode: single token, split GPU hits / CPU misses. A decode step means the chunk that borrowed the
         // cache's bytes is over, so the lookahead may fill again.
         super::slab::set_borrowed(false);
+        if layer.layer == 0 {
+            super::quiesce(false);
+        }
         let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
         // `NAIWA_BORROW_CHECK=1`: the first layer whose decode output is not finite is where garbage entered; a
         // borrowed chunk empties the whole cache, so a decode step right after it reads slots that must be refilled.

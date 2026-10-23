@@ -40,6 +40,7 @@ mod expert;
 mod provider;
 mod rings;
 pub(crate) mod slab;
+pub(crate) use stages::quiesce;
 pub(crate) mod rings_exec;
 mod resident;
 mod slot;
