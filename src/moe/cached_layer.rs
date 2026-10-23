@@ -417,12 +417,15 @@ impl RoutedExperts for CachedExperts {
                     // `NAIWA_BORROW_CHECK=1`: a chunk whose output is not finite is the borrow corrupting its own
                     // buffer; one whose output is finite points the failure at the decode side instead.
                     if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
+                        // `flatten_all`, not `to_vec2`: `out` is [batch, seq, hidden] and `to_vec2` requires
+                        // rank 2 - the check itself raised "unexpected rank" until this was fixed, which made a
+                        // diagnostic look like the defect.
                         let finite = out
                             .to_dtype(candle_core::DType::F32)?
                             .to_device(&candle_core::Device::Cpu)?
-                            .to_vec2::<f32>()?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?
                             .iter()
-                            .flatten()
                             .all(|v| v.is_finite());
                         if !finite {
                             crate::dbg_note(

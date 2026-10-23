@@ -1400,3 +1400,32 @@ the chunk is bit-exact, the chat arm (prefix cache 1) passes 3/3 harness rounds 
 streaming engine to be made visible (its errors are not logged by default), and then a second-chunk investigation
 in a configuration whose only purpose was byte-identity. That is a milestone of its own, and M19 has already
 shipped its mechanism - the slab - plus a measured, faster, experimental borrow on top of it.
+
+## The defect, narrowed to one line of evidence (2026-10-23)
+
+Two instruments closed the loop, and one of them was *my own* bug:
+
+- the fork's `ApiError` path now logs an internal error's real cause under `NAIWA_LOG_INTERNAL=1` (the client still
+  gets the generic message). That turned `Internal server error.` into
+  `invalid CUDA top-1 output: max_logit=NaN argmax=NaN` - the sampler's logits are NaN;
+- `NAIWA_BORROW_CHECK` had been calling `to_vec2` on a 3-D tensor, so the check *itself* raised
+  `unexpected rank, expected: 2, got: 3 ([1, 1725, 2560])` and a backtrace showed it inside
+  `CachedExperts::forward` - i.e. **every "rank" error in this milestone was the diagnostic, not the code**. Fixed
+  to `flatten_all().to_vec1()`, the check then did its job.
+
+With the check fixed, the picture is unambiguous:
+
+| configuration | chunk outputs not finite | decode NaN layers | internal errors |
+|---|---:|---:|---:|
+| `--pcie-frac 0.2` (the chat arm, 3 turns) | **0** | **0** | **0** |
+| `--pcie-frac 0` (no prefix cache, 3 turns) | **62** | from layer 9 on | 1-3 per run |
+
+So **the borrowed chunk itself produces NaN weights-outputs in the `--pcie-frac 0` configuration** and is clean in
+the chat configuration - the decode NaNs are downstream of it. That is a much smaller target than "the borrow is
+flaky": one configuration, one layer path, with a counter that fires as soon as it happens.
+
+Why `--pcie-frac 0` and not `0.2` is not yet established. The visible difference is that `pcie_frac = 0` disables
+the staging path per layer (`staging_done: None`), and decoding then fills synchronously on the token path instead
+of DMA-ing into the staging ring - which is exactly the code that also writes into cache slots of the borrowed
+range. That is the next thing to instrument: either `admit(sync = true)`'s blocking upload is racing the borrow,
+or the two configurations differ in which slots are resident when a chunk starts.
