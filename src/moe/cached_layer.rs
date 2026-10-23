@@ -771,12 +771,12 @@ impl CachedLayer {
             (&memory[1], &u[expert_range(&up, expert_id)?]),
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
+        // Under `lock_access`, so the borrow cannot take the range between this check and the copies below.
+        let access = super::slab::lock_access();
         if super::slab::borrowed() {
             // A borrowed chunk owns the slab's low end right now: this slot may *be* part of the chunk's buffer, so
-            // the upload must not happen at all. Checking only at `admit`/`replace` was not enough - a fill already
-            // inside this function when the borrow began still queued its DMA (measured as ~83% of iterations
-            // producing non-finite chunk outputs). The slot keeps its reservation and simply has no published
-            // buffer, so the hit path treats it as a miss.
+            // the upload must not happen at all. The slot keeps its reservation and has no published buffer, so the
+            // hit path treats it as a miss.
             if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
                 eprintln!("UPLOAD_REFUSED layer {} expert {expert_id}", self.layer);
             }
@@ -792,6 +792,7 @@ impl CachedLayer {
             // records the batch's completion on the same stream.
             unsafe { cs.queue_async(&buf.fence, &parts)? };
         }
+        drop(access);
         Ok(Some(Arc::clone(buf)))
     }
 

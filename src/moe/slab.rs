@@ -11,7 +11,7 @@
 //! device test that pins down what the storage guarantees.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use candle_core::quantized::cuda::QCudaStorage;
 use candle_core::quantized::GgmlDType;
@@ -24,6 +24,21 @@ use candle_core::Device;
 /// chunk's output NaN - measured as 62 non-finite chunk outputs per run at `--pcie-frac 0`, and zero with
 /// `--no-lookahead`.
 static BORROWED: AtomicBool = AtomicBool::new(false);
+
+/// Serialises "may a fill write into cache memory right now" against "the borrow is taking the range".
+///
+/// The two sides are *asynchronous*: the lookahead is queued during a decode step and its worker can still be
+/// running when the next request's chunk begins - the two phases are mutually exclusive in steady state, but not
+/// across that boundary. Checking [`borrowed`] alone was a TOCTOU: a fill could pass the check and queue its DMA
+/// after the borrow had taken the range (which is why `WRITE_DURING_BORROW` read 0 while the chunk still came out
+/// NaN). A fill now holds this lock from the check until its copies are queued, and the borrow holds it from
+/// setting the flag until its range is empty and every queued copy has landed.
+static ACCESS: Mutex<()> = Mutex::new(());
+
+/// Held by a fill for the moment it checks the flag and queues its copies.
+pub(crate) fn lock_access() -> MutexGuard<'static, ()> {
+    ACCESS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Mark the slab as borrowed (or not) for the duration of one layer's compute.
 pub(crate) fn set_borrowed(on: bool) {

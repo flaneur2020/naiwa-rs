@@ -1645,3 +1645,37 @@ correctness risk.
 
 **Kept**: `copy_range_to` (candle, device-to-device range copy) and `CopyStream::cuda_stream`, both diagnostics with
 no effect unless their env flag is set; the borrow stays refused when the lookahead is on.
+
+## The race is fixed - a TOCTOU at the phase boundary (2026-10-23)
+
+The observation that broke it open: **prefill and decode are mutually exclusive in steady state**, so the lookahead
+should not be able to touch a chunk. That is true of the *phases* and false of the *threads*: the lookahead is
+asynchronous. The last decode step of a turn queues a publish kernel and a worker job, the turn ends, and the next
+request's chunk begins - the two phases meet exactly there, and the worker can still be running.
+
+Which exposed the actual bug: **the gate was a TOCTOU**. `upload_in_place` checked `slab::borrowed()` and *then*
+queued its copies. Between the two, the borrow could set the flag, so the fill's DMA still landed inside the chunk.
+That is also why `WRITE_DURING_BORROW` always read 0 - at the moment of the check the flag was still down.
+
+The fix is a mutex over exactly that pair of operations (`slab::lock_access`):
+
+- a fill holds it from the gate check until its copies are queued;
+- the borrow holds it from setting the flag until its range is empty and `copy.synchronize()` has returned, so no
+  fill can be in flight or start while the range belongs to the chunk.
+
+**Measured**: 5 runs x 12 stress iterations at `--pcie-frac 0` (0/12, 0/12, 0/12) and `0.2` (0/12, 0/12) - **60
+iterations, 0 failures, 0 non-finite chunk outputs**, against a baseline of 10/12 and ~17% respectively. The harness
+gate passes with 0 failures, and the oracle gate is byte-identical **with the borrow on** (17-token prompt,
+`--no-lookahead`, slab + borrow env). The startup refusal is gone: the borrow can be enabled with the lookahead.
+
+**And the economics are still zero, for a different reason than before.** The chat arm needs the cache at a size
+that leaves the decode/MTP reserve intact: at 2.3 GB it OOMs in round 2 (`CUDA_ERROR_OUT_OF_MEMORY`, not NaN), so
+the loan engine runs 2.0 GB. There, three rounds are clean but it is *neutral* - TPOT 37/44/49/48 ms against the
+default arm's 35/44/46/47, i.e. the 650 MiB the borrow frees for the cache is given back by having 300 MiB less
+cache than the baseline.
+
+The arithmetic says why: the borrow moves the **layer buffer** (650 MiB) off free VRAM, but the chunk's
+**activation scratch is still 866 MiB of free VRAM**, and the MTP decode needs its reserve on top. To raise the cache
+above the baseline the scratch would have to move too - Phase B, the candle-allocator half that was never built.
+So the borrow is now **correct and worth nothing on its own**, which is a much better place to leave it than
+incorrect: it is the foundation Phase B needs, and it is validated.

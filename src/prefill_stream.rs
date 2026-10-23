@@ -368,7 +368,9 @@ impl PrefillStream {
             }
         }
         // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
-        // write into them. Cleared at the end of `forward`, after the synchronise.
+        // write into them. The lock is held from setting the flag until every copy a fill queued has landed, so a
+        // fill cannot slip between the check and its DMA (the TOCTOU that survived until now).
+        let slab_access = crate::moe::slab::lock_access();
         crate::moe::slab::set_borrowed(true);
         let base = slab.base()?;
         // The borrowed bytes are the cache's, so a kernel or a fill the cache queued can still be reading them.

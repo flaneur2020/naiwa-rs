@@ -3,7 +3,7 @@
   "arm": "stream",
   "exe": "~/naiwa-rs/target/release/naiwa-rs",
   "cwd": "~/code/naiwa-rs",
-  "port": 18110,
+  "port": 18111,
   "args": [
     "serve",
     "-m",
@@ -12,7 +12,7 @@
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
     "--cpu-moe",
     "--expert-cache-gb",
-    "2.95",
+    "2.0",
     "--pcie-frac",
     "0.2",
     "--prefill-stream",
@@ -46,7 +46,7 @@
     "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M, both shards (native, not the requant)",
     "kv": "BF16 paged attention, 32-token blocks",
     "context": 4096,
-    "expert_cache": "2.95 GB with the M19 borrow: the chunk's 650 MiB layer buffer is a range of the cache's slab (NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1), so it costs no VRAM of its own and the cache can be 0.65 GB bigger than the 2.3 GB the stream leaves room for",
+    "expert_cache": "2.0 GB with the M19 borrow: the chunk's 650 MiB layer buffer is a range of the cache's slab (NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1), so it costs no VRAM of its own. 2.3 GB OOM'd in the MTP chat config because the borrow changes what the planner can spend; 2.0 GB leaves the decode/verify reserve intact.",
     "pcie_frac": 0.2,
     "prefill": "--prefill-stream --prefill-stream-min-tokens 64 (prefill 147-285 tok/s vs 11-13 on the CPU)",
     "speculation": "MTP --mtp-n-predict 4, one round trip per layer per step instead of per token (M16). MISTRALRS_MTP_PREFIX_REPLAY=none lifts the builtin-MTP Full replay, which otherwise kills both the snapshot and the restore; equivalence gated in M16 item 2",
@@ -55,7 +55,7 @@
     "max_seqs": "4: the hybrid model reserves a ~112 MiB recurrent state per sequence slot, so the default 32 cost 3.5 GiB of VRAM for slots a one-request-at-a-time server never uses. At 4 the same card affords a 3 GB expert cache instead of 1 GB",
     "drafter": "MTP head's experts resident on the GPU in Q2_0 (moe::resident): 675 MiB, 2.25 bit/weight, same format/size strata uses; prefill 1696 rows 2.73 s -> 10.4 ms, draft forward 1.0-2.4 ms -> 0.55 ms",
     "checkpoint_alignment": "MISTRALRS_ALIGN_CHECKPOINTS=1 stops a verify step on the next paged block boundary, so the recurrent prefix checkpoint is taken at the end of every turn instead of only when a step happens to land on a boundary (measured 3/4 turns before). Costs nothing measurable: the dropped drafts are re-proposed next step and the continuation token is still sampled",
-    "status": "EXPERIMENTAL (M19). Passes harness/chat 3/3 rounds and is faster than the default arm (TPOT 35->32 code, 51->42 short, 48->46 long), but it cannot carry a numeric gate yet: the byte-determinism config (--pcie-frac 0 --prefix-cache-n 0) hangs at 2.6 GB and fails with a rank error at 2.95 GB, while it is clean at 2.3 GB. Not a default arm."
+    "status": "Shipped candidate (M19). The borrow's race was a TOCTOU at the prefill/decode boundary: the gate was checked in upload_in_place, but the DMA was queued after the borrow could take the range, and the lookahead is asynchronous across that boundary. Fills now hold a lock from the check until their copies are queued, and the borrow holds it from setting the flag until its range is empty and every queued copy has landed. 60 stress iterations clean (was 10/12 failed), oracle gate byte-identical."
   },
   "env": {
     "MISTRALRS_MTP_PREFIX_REPLAY": "none",
