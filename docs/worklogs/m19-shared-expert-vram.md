@@ -1829,3 +1829,37 @@ the `lock_access` fix reduced the race markedly but did not eliminate it: the de
 that a rebuild can restore. Phase A therefore stands where it was documented - correct enough to pass the chat gate,
 neutral in performance, with a residual rare race in the no-prefix-cache configuration - and the borrow stays behind
 both env flags with `engines/naiwa.json` untouched.
+
+## Reviewing the TOCTOU fix: two real gaps closed, and the defect is still elsewhere (2026-10-23)
+
+Went over the fix as it stands after the revert. What it covers, verified in the code:
+
+- `slab::ACCESS` (a mutex) + `borrowed()`; a fill holds the lock from the gate check until its copies are queued,
+  the borrow holds it from setting the flag until `empty_range` has emptied the range and `copy.synchronize()`
+  has returned;
+- `empty_range` clears each slot twice - before waiting for the readers and again after - which is what kills the
+  "fill reserved before the clear, published after it" case;
+- `copy.after_device_work()` before the borrow, and a per-layer `synchronize()` at the end of a borrowed chunk.
+
+**Two gaps found in the review, both real, both fixed here:**
+
+1. **the publish was not gated.** `load_reserved` set `slot.buf = Some(buf)` outside any gate, so a fill that had
+   queued its copy before the flag went up could publish *afterwards* - re-marking a slot whose bytes the chunk
+   owns. The whole fill (gate check, copy, publish) is now one critical section under `lock_access`, with a second
+   gate check immediately before the publish.
+2. **lock order.** `upload_in_place` cloned the slot's `Arc<SlotBuf>` *before* taking the lock, so a fill waiting
+   for the lock held an Arc that `empty_range` (holding the lock) was waiting for: a deadlock. The lock now spans
+   `load_reserved`, giving one order everywhere (`access` then `state`).
+
+**And the rate did not move**: after both fixes, 8/12 and 8/12 at `--pcie-frac 0` (was 4-10/12) with 93-124
+non-finite chunk outputs. So the fill machinery was not the missing piece.
+
+**One more hypothesis tested and excluded**: an over-read past a borrowed projection, landing in the *next*
+projection's weights - valid mapped memory, wrong data, invisible to every host-side check. `NAIWA_BORROW_PAD_MIB`
+leaves a gap after each projection in the borrowed layout: 8 MiB gave 7/12, 64 MiB gave 8/12. Not that either.
+
+**Where that leaves the review**: every host-visible writer into the borrowed bytes is now excluded by
+construction, the padding rules out an over-read past the range, and every instrumentation hides the failure. That
+combination says the remaining defect is a **device-side ordering** the host cannot observe, and the honest way to
+settle it is `--tool racecheck` on a standalone two-thread reproducer - not another probe on the engine, which is
+what this session has been doing for too long. The probe (`NAIWA_BORROW_PAD_MIB`) and the two fixes stay.

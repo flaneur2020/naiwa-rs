@@ -702,6 +702,15 @@ impl CachedLayer {
         slot: usize,
         sync: bool,
     ) -> candle_core::Result<Option<usize>> {
+        // One critical section against the borrow: the gate check, the copy and the publish all happen under
+        // `lock_access`. Without this the *publish* was the hole - a fill that queued its copy before the borrow
+        // raised the flag could publish `slot.buf` afterwards, re-marking a slot whose bytes the chunk owns (which
+        // is why the defect came back after a rebuild). Lock order is `access -> state`, the same as the borrow's.
+        let _access = super::slab::lock_access();
+        if super::slab::borrowed() {
+            self.state.lock().unwrap().slots[slot].expert = None;
+            return Ok(None);
+        }
         let loaded = match &self.copy_stream {
             Some(cs) => self.upload_in_place(cs, expert_id, slot, sync),
             None => self.expert_weights(expert_id).map(|w| {
@@ -714,6 +723,13 @@ impl CachedLayer {
             }),
         };
         let mut st = self.state.lock().unwrap();
+        // The borrow could have raised the flag while the copy was in flight; `_access` has been held throughout,
+        // so it cannot have - but check anyway, because publishing into a slot the chunk owns is the failure this
+        // whole gate exists for.
+        if super::slab::borrowed() {
+            st.slots[slot].expert = None;
+            return Ok(None);
+        }
         match loaded {
             // Lent while this upload ran: drop it rather than publish into a lent slot.
             Ok(Some(_)) if slot >= st.usable => {
@@ -771,8 +787,8 @@ impl CachedLayer {
             (&memory[1], &u[expert_range(&up, expert_id)?]),
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
-        // Under `lock_access`, so the borrow cannot take the range between this check and the copies below.
-        let access = super::slab::lock_access();
+        // The caller (`load_reserved`) holds `lock_access` across this check and the copies below, so the borrow
+        // cannot take the range in between. No lock is taken here: it is not reentrant.
         if super::slab::borrowed() {
             // A borrowed chunk owns the slab's low end right now: this slot may *be* part of the chunk's buffer, so
             // the upload must not happen at all. The slot keeps its reservation and has no published buffer, so the
@@ -792,7 +808,6 @@ impl CachedLayer {
             // records the batch's completion on the same stream.
             unsafe { cs.queue_async(&buf.fence, &parts)? };
         }
-        drop(access);
         Ok(Some(Arc::clone(buf)))
     }
 
