@@ -887,15 +887,24 @@ mod tests {
         );
 
         // A big card: ceiling, both buffers.
-        assert_eq!(plan(gb(12), layer, 8192).unwrap(), (2, 8192));
+        assert_eq!(plan(gb(12), layer, 8192, false).unwrap(), (2, 8192));
+
+        // Borrowing: the layer buffer is a range of the cache's slab, so it is not paid from free VRAM at all -
+        // a chunk that would only afford one buffer otherwise still gets the ceiling here. And there is one range
+        // (every layer borrows the same bytes), so the stride is one by construction.
+        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 8192));
+        assert_eq!(plan(gb(12), layer, 8192, true).unwrap().0, 1);
+        // A borrowed chunk still pays its activations from free VRAM, and measured at 1.95x the estimate, so the
+        // chunk shrinks where the non-borrow formula would still grant the ceiling.
+        assert!(plan(2049 << 20, layer, 8192, true).unwrap().1 >= 1725);
 
         // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
-        assert_eq!(plan(2049 << 20, layer, 8192).unwrap(), (1, 8192));
+        assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 8192));
         // 2400 MiB is the edge where the second buffer just fits (2399 needed).
-        assert_eq!(plan(2400 << 20, layer, 8192).unwrap(), (2, 8192));
+        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (2, 8192));
 
         // The operator's ceiling is a ceiling, not a target.
-        assert_eq!(plan(gb(12), layer, 512).unwrap().1, 512);
+        assert_eq!(plan(gb(12), layer, 512, false).unwrap().1, 512);
 
         // The second buffer only when the same chunk affords it.
         let need2 = |free_guess: usize| {
@@ -908,15 +917,15 @@ mod tests {
         };
         // With the 512 MiB floor, a 12 GB card's ~2.3 GiB buys one buffer at the ceiling and
         // 8 GiB buys two; the floor is what keeps a prompt step's own scratch out of the way.
-        assert_eq!(plan(gb(8), layer, 8192).unwrap(), (2, 8192));
+        assert_eq!(plan(gb(8), layer, 8192, false).unwrap(), (2, 8192));
         let just = need2(gb(1));
-        assert_eq!(plan(just, layer, 8192).unwrap(), (2, 8192));
+        assert_eq!(plan(just, layer, 8192, false).unwrap(), (2, 8192));
         // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
-        assert_eq!(plan(just * 8 / 10, layer, 8192).unwrap().0, 1);
-        assert_eq!(plan(just * 8 / 10, layer, 8192).unwrap().1, 8192);
+        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().0, 1);
+        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().1, 8192);
 
         // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
-        assert_eq!(plan(layer, layer, 1024), None);
+        assert_eq!(plan(layer, layer, 1024, false), None);
     }
 
     /// The fork's `MoEExperts::from_qtensors` computes the routed MoE of the stacks it is
