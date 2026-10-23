@@ -1377,3 +1377,26 @@ decode finiteness), and the `prefill_load` debug notes.
 and without a numeric gate; the borrow stays behind both env flags. The next fix has a precise target now - the
 second borrowed chunk in a session, with no prefix cache - and a ready-made reproducer (`--mtp` off, FRAC 0,
 prefix-cache 0, 3 turns of `doc`).
+
+## The control that settles it (2026-10-23)
+
+Same configuration, four turns, the only difference the borrow:
+
+| arm | stream errors | server log |
+|---|---:|---|
+| borrow off (2.3 GB) | **0** | clean |
+| borrow on (2.3 GB) | **3 of 4 turns** | **clean** |
+
+Each failing turn gets `{"message": "Internal server error."}` on the SSE stream and **nothing** in the engine log -
+no `ERROR`, no `WARN`, no `step - Model failed`. So an error is being raised where the API layer swallows it, and
+it only happens with the borrow. In this configuration (`--pcie-frac 0 --prefix-cache-n 0`, no drafter) *every*
+turn after the first runs a full chunk, so the trigger is the second borrowed chunk of a session - first chunk
+byte-identical to the baseline, later ones into a stream error.
+
+That is the precise, reproducible target that is left. Everything else about the borrow is measured and clean:
+the chunk is bit-exact, the chat arm (prefix cache 1) passes 3/3 harness rounds and is faster.
+
+**Why this is where the milestone stops**: the remaining defect needs an error path in `mistralrs-core`'s
+streaming engine to be made visible (its errors are not logged by default), and then a second-chunk investigation
+in a configuration whose only purpose was byte-identity. That is a milestone of its own, and M19 has already
+shipped its mechanism - the slab - plus a measured, faster, experimental borrow on top of it.
