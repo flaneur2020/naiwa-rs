@@ -1723,3 +1723,43 @@ The integration, in the order it has to happen (this is the 3-5 days the earlier
 
 **Expected**: cache 2.0-2.3 GB -> ~2.9-3.2 GB (+45%), i.e. ~-13% TPOT by the measured curve, at zero numerics
 risk (the bytes do not change, only which pages back them).
+
+## Phase B step 1-4: the VMM slab exists and lends its tail (2026-10-23)
+
+Landed, in dependency order:
+
+1. **a patched `cudarc`** (`~/code/cudarc-vmm`, 0.19.10 plus ~30 lines): `CudaSlice::from_raw(ptr, len, stream)`
+   and an `owned` flag its `Drop` honours. Nothing else changed; `[patch.crates-io]` in this manifest is what makes
+   it apply (and `.cargo/config.toml` names the toolkit version so the vendored build script does not have to find
+   `nvcc` on PATH). This was unavoidable: kernel arguments may only be pushed by types `cudarc` knows
+   (`PushKernelArg`'s fields are private), so a virtual address has to be dressed as a `CudaSlice`.
+2. **`QCudaStorage::from_va(va, el_count, dtype, device)`** in candle: a storage over a reservation, owning nothing,
+   so kernel arguments, views, copies and `device_ptr` all behave as usual.
+3. **`Slab` as a reservation**: with `NAIWA_SLAB_VMM=1` the slab reserves its virtual range once
+   (`cuMemAddressReserve`) and maps 64 MiB segments into it (`cuMemCreate` + `cuMemMap` + `cuMemSetAccess`). Carving
+   banks is unchanged - the same bump allocator over the same addresses - so every tensor built on it keeps its
+   pointer forever.
+4. **`lend_tail(bytes)` / `reclaim()`**: unmap + release whole tail segments, and map fresh ones back at the same
+   offsets. Contents are gone by design; the slots there are the ones the borrow empties.
+
+**Two device tests, both passing:**
+
+```
+VMM: 256 MiB reserved; free after map 11256 MiB, after unmap+release 11512 MiB (+256)
+VMM: cuMemAllocAsync of 256 MiB from the pool: ok
+VMM: remapped at the same address and read back 5a
+VMM slab: lent 128 MiB, free 11256 -> 11384 MiB
+VMM slab: reclaimed and readable again at the same address
+```
+
+- the first proves the mechanism (the driver's pool takes the freed pages, the range remaps at the same address);
+- the second proves the *slab*: carve a bank at the reservation's start, write/read through the storage, lend 128 MiB
+  (**free VRAM rises by exactly 128**), `resident() < bytes()`, reclaim, and the same address is writable again.
+
+**Nothing regressed**: 49 unit tests, and the oracle gate is byte-identical **both** with the patched cudarc and with
+`NAIWA_CACHE_SLAB=1 NAIWA_SLAB_VMM=1` (the log confirms `banks carved from it`).
+
+**What is left is step 5**: make the plan spend it - `cache = free_at_load + scratch_estimate`, `lend_tail` at chunk
+start and `reclaim` after the chunk's last kernel, with the lent region's slots marked empty and the per-layer
+`usable` high-water lowered while the pages are gone (the field already exists, and the `lock_access` discipline that
+fixed the borrow's TOCTOU is what fences the lend).
