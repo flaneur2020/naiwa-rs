@@ -1459,3 +1459,32 @@ input-finiteness check beside the output one.
 back right before the compute; a difference proves a write inside the window, and its position names the writer.
 If the canary survives, the read path is wrong instead (an offset/length in the range arithmetic), which is the
 other half of the hypothesis and just as cheap to check.
+
+## Two hypotheses excluded (2026-10-23)
+
+**Not a write inside the window.** Every fill that reaches `upload_in_place` now prints when the slab is borrowed;
+the failing run (`alias` on, 31 non-finite chunk outputs) reported **0**. So no fill DMA lands in the borrowed range
+while the chunk computes. Combined with `BORROW_STILL 0` after every empty, the bytes the chunk owns are not being
+overwritten by the cache.
+
+**Not an offset error in the range arithmetic.** `QCudaStorage::device_ptr` and the kernel arguments both go through
+the `PaddedCudaSlice` helpers, which add `self.offset` - the same offset the DMA's `SlotMemory` uses, so the
+buffers are read and written at the address the borrow handed out. A wrong base would also fail with the lookahead
+off, and that configuration is clean.
+
+**Where that leaves it**: the corruption needs the alias *and* the lookahead, is not a write and not a base
+address, appears in the layer's own MoE output while its input is finite, and only from the second turn on - i.e.
+only after a decode step has run with the lookahead on. The remaining suspects are all about *state that a lookahead
+decode leaves behind and a chunk then trips over*: the preload handoff's claim/seq accounting, the `PassCell`'s
+batch, or the per-layer `tick`/LRU bookkeeping shifting which slot a fill targets between the empty and the next
+fill.
+
+**Kept instruments**: `NAIWA_BORROW_ALIAS` (alias vs own memory), `NAIWA_BORROW_CHECK` (chunk input/output and
+per-layer decode finiteness), `WRITE_DURING_BORROW` (a fill reaching the upload while borrowed), `BORROW_STILL`
+(nothing resident in the range after an empty), `NAIWA_LOG_INTERNAL` (the real cause behind a 500), `NAIWA_RANK_DBG`
+(a backtrace wherever a tensor's rank is wrong - which caught a bug in the check itself).
+
+**Milestone position**: the slab is shipped and byte-identical; the borrow is measured, faster in the chat arm and
+3/3 rounds clean there, but it is not correct in general and stays behind both env flags with
+`engines/naiwa.json` untouched. The defect is documented to the level where the next session starts from evidence
+rather than from a suspicion.

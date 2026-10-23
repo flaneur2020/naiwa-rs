@@ -771,6 +771,10 @@ impl CachedLayer {
             (&memory[1], &u[expert_range(&up, expert_id)?]),
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
+        if super::slab::borrowed() {
+            // A borrowed chunk owns the slab's low end right now; a fill landing there corrupts its layer buffer.
+            eprintln!("WRITE_DURING_BORROW layer {} expert {expert_id} sync={sync}", self.layer);
+        }
         if sync {
             cs.upload(&buf.fence, &parts)?;
         } else {
