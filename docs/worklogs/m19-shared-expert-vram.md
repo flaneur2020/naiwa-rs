@@ -1345,3 +1345,35 @@ experimental arm at 2.95 GB whose numbers are **not** gated, the borrow behind b
 problems to solve written down here: the prompt path's real VRAM requirement in the FRAC=0 configuration, the
 rank-2 consumer that receives a 3-D prompt tensor (the one concrete clue, and now reproducible on demand at
 2.95 GB + borrow), and the hang at 2.6 GB.
+
+## The numeric gate, done properly: the chunk is bit-exact (2026-10-23)
+
+Earlier attempts at a byte-identity check were worthless for a reason worth writing down: **`--mtp` makes greedy
+output non-deterministic** (M16 recorded it - the drafts change which tokens share an expert, and the same prompt
+can end differently). Any comparison must drop the drafter. With `--mtp` off, `--pcie-frac 0`,
+`--prefix-cache-n 0`, `--seed 0`, same 3-turn `doc` conversation, borrow off vs on (both at 2.3 GB):
+
+| turn | borrow off | borrow on | verdict |
+|---|---:|---:|---|
+| **1** (the 1725-row chunk) | 363 B | 363 B | **byte-identical** |
+| 2 | 337 B | **0 B** | the borrow arm answers nothing |
+| 3 | 337 B | 338 B | diverges, as it must after turn 2 |
+
+So **the borrowed chunk is numerically exact**: the same bytes computed through a different address give the same
+answer, which is what the design promised (no numeric change, only placement). That is the gate the borrow needed
+for its *chunk* half, and it passes.
+
+**What it does not cover**: a later turn that runs another full chunk (no prefix cache means every turn does) comes
+back empty on the borrow arm - turn 2 here, and the same symptom the harness sees as "no content delta". So there
+is a second defect, on the *second* borrowed chunk of a session, in this configuration. The chat arm (prefix cache
+1, so later turns reuse instead of re-chunking) passes 3/3 rounds, which is consistent: it rarely runs a second
+chunk.
+
+**Instruments that stay**: `NAIWA_RANK_DBG` (candle prints a backtrace where a tensor's rank is wrong - it did not
+fire in the four clean reproducers, so the rank-2 case is rarer than first thought), `NAIWA_BORROW_CHECK` (per-layer
+decode finiteness), and the `prefill_load` debug notes.
+
+**Status unchanged where it matters**: `engines/naiwa.json` is the measured arm; `naiwa-loan.json` is experimental
+and without a numeric gate; the borrow stays behind both env flags. The next fix has a precise target now - the
+second borrowed chunk in a session, with no prefix cache - and a ready-made reproducer (`--mtp` off, FRAC 0,
+prefix-cache 0, 3 turns of `doc`).
