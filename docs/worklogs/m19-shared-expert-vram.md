@@ -1552,3 +1552,29 @@ Two consequences:
 **Where M19 ends**: the slab is shipped and byte-identical; the borrow is measured and faster in the chat arm (3/3
 rounds clean there) and is a race in the no-prefix-cache configuration; it stays behind both env flags, with
 `engines/naiwa.json` untouched and seven instruments plus this recipe written down.
+
+## How to locate this efficiently: the measurements say "statistics first" (2026-10-23)
+
+Two results this round, one of which is a lesson about method:
+
+- **`CUDA_LAUNCH_BLOCKING=1` makes the failure vanish** (31 non-finite chunk outputs and 2 failed turns without it;
+  1 and 0 with it, all four turns clean). Every launch serialised removes it, so the cause is **cross-stream
+  ordering**, not arithmetic and not a wrong buffer.
+- **A single-run "fix" is worthless here.** Ordering the copy stream after all of candle's queued work before the
+  borrow gave a perfectly clean run - 0 non-finite, 0 errors - and the next two runs with the same binary gave 31
+  and 32. That probe is kept (it is semantically right: the borrowed bytes may still be read by something the cache
+  queued) but it is **not** the fix, and the earlier note claiming it was has been corrected.
+
+So the efficient way to finish this is not another hypothesis on the engine; it is to make the defect
+**measurable as a rate**:
+
+1. **A standalone stress reproducer** (`#[ignore]` test): allocate a slab, `borrow_from` three ranges, then loop
+   - upload a fake stack over the copy stream (the chunk side), compute on it, and simultaneously have one thread
+     do what the lookahead does (`admit`-style DMA into a slot carved from the same bytes),
+   - verify with the canary **read on a second stream**, so the observation does not serialise the race the way the
+     canary did;
+   - report a failure **rate** over thousands of iterations (milliseconds each, no model load, no engine).
+2. **Bisect with the rate as the metric**: each A/B needs enough iterations to separate, say, 1-in-50 from 1-in-500.
+   Every bisect in this milestone that used a single multi-turn chat run produced at least one contradictory result.
+3. Then, and only then, `compute-sanitizer --tool memcheck` on the reproducer with a synchronous allocator, where
+   the flashinfer KV-write false positives are absent and the report is small enough to read.

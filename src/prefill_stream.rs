@@ -367,6 +367,12 @@ impl PrefillStream {
         // write into them. Cleared at the end of `forward`, after the synchronise.
         crate::moe::slab::set_borrowed(true);
         let base = slab.base()?;
+        // The borrowed bytes are the cache's, so a kernel or a fill the cache queued can still be reading them.
+        // Ordering the copy stream after everything candle has queued is the semantically right thing to do here;
+        // it is **not** a fix, though - one run came out clean with it and the next two came out with 31 and 32
+        // non-finite chunk outputs, which is the run-to-run noise this defect lives in. `CUDA_LAUNCH_BLOCKING=1`
+        // (every launch serialised) does make it vanish, which is what says the cause is cross-stream ordering.
+        self.copy.after_device_work()?;
         if let Some(cache) = self.cache.as_ref() {
             let emptied = cache.empty_range(base, base + offset as u64);
             // Everything a fill queued on the copy stream has to land *before* the chunk writes these bytes,
