@@ -58,9 +58,3 @@ opt-level = 3
 [build-dependencies]
 # Same CUDA kernel build helper the fork's build.rs uses.
 cudaforge = "=0.1.6"
-
-# `cudarc` with one addition: `CudaSlice::from_raw`, a slice over memory it does not own, which is what a CUDA
-# virtual-memory reservation needs (`cuMemMap`'d pages the Slab lends to and reclaims from the driver's pool).
-# Every other behaviour is upstream 0.19.10.
-[patch.crates-io]
-cudarc = { path = "../cudarc-vmm" }

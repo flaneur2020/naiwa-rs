@@ -1798,3 +1798,34 @@ shapes.
 
 The one scenario where Phase B would pay is a workload with **long decodes between chunks** (the refill amortises
 over many tokens); this corpus answers in 64 tokens, so it does not.
+
+## Reverted to Phase A (2026-10-23)
+
+Phase B is out of the tree, at the user's request, and Phase A is the milestone's state.
+
+**Reverted** (`git checkout 8755370 -- src/moe/slab.rs src/prefill_stream.rs src/moe/cached_layer.rs Cargo.toml .cargo/config.toml harness/chat/engines/naiwa-loan.json`, plus the candle edit):
+
+- the VMM slab: `Vmm`, `SEGMENT`, `lend_tail`/`reclaim`/`resident`/`lent`/`lendable`, `NAIWA_SLAB_VMM`;
+- `PrefillStream::{lend_for_chunk, reclaim_after_chunk}`, the `lending` branch in `plan()` and the decode-side
+  hook;
+- `QCudaStorage::from_va` in candle;
+- the vendored `cudarc` patch: `[patch.crates-io]` and the `CUDARC_CUDA_VERSION` env are gone, and `Cargo.lock`
+  resolves `cudarc 0.19.10` from crates.io again.
+
+`~/code/cudarc-vmm` stays on disk as the record of that work; nothing references it.
+
+**Kept**: the Phase A borrow (`NAIWA_CACHE_SLAB` + `NAIWA_PREFILL_BORROW`), its gate/`lock_access` discipline,
+`QCudaStorage::borrow_from` and the `Arc`+offset `PaddedCudaSlice`, every diagnostic (`NAIWA_PREFILL_PEAK`,
+`NAIWA_PREFILL_STRICT`, `NAIWA_BORROW_{ALIAS,CHECK,CANARY,SNAP}`, `NAIWA_RANK_DBG`, `read_bytes_at`,
+`copy_range_to`, `NAIWA_LOG_INTERNAL` in the fork), and the rate meter.
+
+**Verified after the revert**: builds, 49 unit tests (4 ignored), the oracle gate byte-identical in both modes
+(default and `NAIWA_CACHE_SLAB` + `NAIWA_PREFILL_BORROW`), and the harness 2 rounds with **0 failures**, TPOT
+37/45/51/52 ms against the baseline arm's 35/43/45/51 - i.e. neutral.
+
+**One correction to the record**: the "60 stress iterations, 0 failures" that closed the borrow's TOCTOU was
+**build-specific**. The reverted tree was rebuilt and the same configuration failed **4/12** immediately after. So
+the `lock_access` fix reduced the race markedly but did not eliminate it: the defect needs a precise interleaving
+that a rebuild can restore. Phase A therefore stands where it was documented - correct enough to pass the chat gate,
+neutral in performance, with a residual rare race in the no-prefix-cache configuration - and the borrow stays behind
+both env flags with `engines/naiwa.json` untouched.

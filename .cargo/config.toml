@@ -5,9 +5,3 @@
 # with a copy of qflash-rs/target so the dependency cache is warm; only the local crate rebuilds.
 [build]
 target-dir = "/home/yazhou/naiwa-rs/target"
-
-# The patched cudarc (see `[patch.crates-io]` in Cargo.toml) runs its own build script, which shells out to `nvcc`
-# to detect the toolkit; the build-script environment does not always have it on PATH, so name the version this
-# machine has (13.1, which cudarc spells "13010") instead of relying on detection.
-[env]
-CUDARC_CUDA_VERSION = "13010"

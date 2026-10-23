@@ -12,7 +12,7 @@
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
     "--cpu-moe",
     "--expert-cache-gb",
-    "2.9",
+    "2.0",
     "--pcie-frac",
     "0.2",
     "--prefill-stream",
@@ -46,7 +46,7 @@
     "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M, both shards (native, not the requant)",
     "kv": "BF16 paged attention, 32-token blocks",
     "context": 4096,
-    "expert_cache": "2.9 GB with the M19 borrow + Phase B lending (NAIWA_CACHE_SLAB=1 NAIWA_SLAB_VMM=1 NAIWA_PREFILL_BORROW=1 NAIWA_PREFILL_LEND=1): the chunk's layer buffer is a range of the cache's slab, and its activation scratch comes from the slab's tail pages, lent to the driver at the chunk's start and reclaimed at the first decode step (256 MiB segments: ~2.7 ms to lend, ~1.5 ms to reclaim).",
+    "expert_cache": "2.0 GB with the M19 borrow: the chunk's 650 MiB layer buffer is a range of the cache's slab (NAIWA_CACHE_SLAB=1 NAIWA_PREFILL_BORROW=1), so it costs no VRAM of its own. 2.3 GB OOM'd in the MTP chat config because the borrow changes what the planner can spend; 2.0 GB leaves the decode/verify reserve intact.",
     "pcie_frac": 0.2,
     "prefill": "--prefill-stream --prefill-stream-min-tokens 64 (prefill 147-285 tok/s vs 11-13 on the CPU)",
     "speculation": "MTP --mtp-n-predict 4, one round trip per layer per step instead of per token (M16). MISTRALRS_MTP_PREFIX_REPLAY=none lifts the builtin-MTP Full replay, which otherwise kills both the snapshot and the restore; equivalence gated in M16 item 2",
@@ -61,8 +61,6 @@
     "MISTRALRS_MTP_PREFIX_REPLAY": "none",
     "MISTRALRS_ALIGN_CHECKPOINTS": "1",
     "NAIWA_CACHE_SLAB": "1",
-    "NAIWA_PREFILL_BORROW": "1",
-    "NAIWA_SLAB_VMM": "1",
-    "NAIWA_PREFILL_LEND": "1"
+    "NAIWA_PREFILL_BORROW": "1"
   }
 }
