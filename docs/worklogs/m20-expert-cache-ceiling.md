@@ -857,3 +857,43 @@ unchanged + bytes not scarce = no measurable effect, which is precisely what the
   `last_use < tick` eviction protection and with a demand threshold, promotion still cannot beat doing nothing. So the
   decode-side 40 ms is not explained by *which* experts are resident, and the remaining levers are the ones §19 named:
   turn-1 prefill (+1.3-1.5 s) and the kernel.
+
+## 26. Shipped on by default: the point is dynamic residency, not the two milliseconds (2026-10-24)
+
+Decision (user's call, and the right framing): **promotion is on by default** - `NAIWA_PROMOTE_MAX` defaults to **1**
+per layer per step, `NAIWA_PROMOTE_MIN_HITS` to **4**, and `NAIWA_PROMOTE_MAX=0` is the only way to switch it off.
+
+The reason is not the measurement in §25 (which is neutral) but **what the mechanism adds that the cache did not
+have**:
+
+| before | with promotion |
+|---|---|
+| residency changed only when a slot was *free* (`fill_candidate` picks by demand) or when the lookahead swapped a prediction in (and a wrong prediction evicts a hot expert) | residency follows **what decode is actually asking for, right now**: the expert that just came through the ring is a *witnessed* demand, and it can become resident without a second H2D |
+| the resident set is essentially frozen once the cache fills, except for lookahead churn | the resident set **tracks the conversation** - topic drift, a code block, a long document all re-shape it |
+| a miss costs the CPU path (250 us) *every* time it recurs | a recurring miss converts itself into a hit after 4 sightings, at the price of one d2d copy |
+
+So it is an **online adaptivity channel** that costs nothing measurable (§25: -1.1 ms median inside a 6 ms spread) and
+that the cache previously lacked. That is worth default-on even at parity.
+
+Guards that make default-on safe, all measured:
+
+- the copy runs on **candle's stream** (§24), so no traffic is added to the PCIe queue that carries staging;
+- **empty slots first**, and LRU victims only among slots with `last_use < tick` (§23) - never one this step reads;
+- **no `Arc` crosses a step** (§22) - the ring's refcount contract (`wait_for_readers`) is untouched;
+- the token path **never blocks** on the borrow gate (`slab::try_lock_access`, §23) - it stands down for the step;
+- `hit_counts >= 4` means only genuinely hot experts are admitted (§25), which is what removed the penalty.
+
+### Validation of the shipped default
+
+Chat harness, 2 rounds, 132 turns, both arms, promotion on by default: **0 failures**.
+
+| class | TPOT p50 (on) | TPOT p50 (g14, off) | turn-1 |
+|---|---:|---:|---:|
+| code | 35 | 34 | 988 ms |
+| doc | 44 | 46 | 3 746 ms |
+| long | 48 | 44 | 3 785 ms |
+| short | 49 | 40 | 1 039 ms |
+
+Per-class medians at this turn count move by more than the effect could (short reads 49 against 40 while `doc`
+improved 46 -> 44), which is the same noise band the probe showed; the controlled probe remains the statement of
+record (§25) and the harness's job here is the correctness gate, which it passed.

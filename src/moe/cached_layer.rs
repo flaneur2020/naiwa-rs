@@ -671,25 +671,28 @@ impl CachedLayer {
     ///
     /// Nothing here outlives the step: the `Arc`s come from the step's own hit list, so the staging ring's refcounts
     /// fall as they always did (`wait_for_readers` depends on exactly that).
-    /// Whether promotion is switched on at all (`NAIWA_PROMOTE_MAX > 0`). Read once: the decode path calls this
-    /// every layer, so it must not touch the environment.
-    pub(crate) fn promoting(&self) -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
+    /// Promote up to this many staged experts **per layer per step** (default 1; `0` switches promotion off
+    /// entirely, and is the only value that makes the decode path pay nothing for it).
+    fn promote_cap() -> usize {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
             std::env::var("NAIWA_PROMOTE_MAX")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .is_some_and(|n| n > 0)
+                .unwrap_or(1)
         })
+    }
+
+    /// Whether promotion is switched on at all. Read once: the decode path calls this every layer, so it must not
+    /// touch the environment.
+    pub(crate) fn promoting(&self) -> bool {
+        Self::promote_cap() > 0
     }
 
     pub(crate) fn promote_staged(&self, candle_stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>) -> candle_core::Result<usize> {
         // The cap is **per step across all layers**, not per layer: at a per-layer cap of 8 this queued
         // 48 x 8 = 384 d2d copies of 1.88 MB (720 MB) per token, which ran prefill at 5.8 T/s.
-        let cap = std::env::var("NAIWA_PROMOTE_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        let cap = Self::promote_cap();
         if self.layer == 0 {
             PROMOTED_THIS_STEP.store(0, Ordering::Relaxed);
         }
@@ -723,7 +726,7 @@ impl CachedLayer {
         let min_sightings = std::env::var("NAIWA_PROMOTE_MIN_HITS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2);
+            .unwrap_or(4);
         let mut promoted = 0usize;
         let mut skipped = 0usize;
         let mut cold = 0usize;
