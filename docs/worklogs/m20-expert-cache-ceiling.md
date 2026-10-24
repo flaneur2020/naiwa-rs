@@ -266,3 +266,35 @@ Two consequences, both cheap to test and both independent of the VRAM ceiling:
 
 Recorded so it is not re-derived: **the miss is worth 24 ms/token to us and ~0 to strata; at 56-100 us per miss we
 are paying full DMA latency, serially, 240-430 times per token.**
+
+## 13. Hit rate: ours is good, theirs is unmeasured - and the hit rate is not the difference (2026-10-24)
+
+| | us | strata |
+|---|---|---|
+| coverage (structural) | **9.8%** of the 12 288 experts (1 208 slots at 2.3 GB) | **6.5%** (800 blobs at 1.5 GB) |
+| measured expert hit rate | **51% at one row, 78-81% with MTP's 5 rows** (M16; cache was ~12 slots/layer = 4.7% coverage) | **never measured** - we have no counter in their build and never instrumented a run |
+| TPOT response to cache size | 43 ms at 2.3 GB, 51 ms at 1.85 GB, 19 ms all-resident | flat 39 ms across three workloads |
+
+Two things follow, and they kill the obvious hypothesis:
+
+1. **Our hit rate is not bad.** At only 4.7% coverage we already hit 51% at one row and 78-81% under MTP, because
+   consecutive draft rows share experts. We hold *more* slots than strata's paired configuration (9.8% against
+   6.5%) and we still pay 24 ms of memory term per token. **Coverage is not the binding term.**
+2. **The 24 ms cannot be explained by transfer volume alone.** At 80% hit rate a token has ~96 misses; 96 full
+   1.88 MB transfers at 13.4 GB/s is 13.8 ms. We pay 24 - i.e. **~250 us per miss**, above the 144 us a pure
+   transfer costs. The excess is the host side: we run `--pcie-frac 0.2`, so **80% of misses take the CPU path**,
+   which has per-miss host overhead on top of the same 24 GB of reads.
+
+So the difference from strata is *not* "they hit more often". It is:
+
+- they keep the miss **off the critical path** (lookahead a layer ahead, cost = bandwidth not latency);
+- for the misses that do land on the path, our **path is the CPU one** four times out of five.
+
+Whether strata's *effective* hit rate is also higher than ours (e.g. frequency-based admission instead of our
+`last_use` LRU) cannot be answered from our data - and it does not need to be, because the two levers we can pull
+are both independent of it:
+
+| lever | why it is first |
+|---|---|
+| `--pcie-frac` 0.2 -> 0.4 / 0.6 at 2.3 GB | moves misses from the CPU path to the GPU ring: no VRAM, one flag, and M16 already showed 1.0 saturates PCIe (2 668 MiB staged vs 848) so the optimum is interior |
+| admission policy (frequency / second-touch instead of pure LRU) | raises the hit rate at *equal* coverage - but only worth measuring once the miss path is cheap, otherwise it optimises the term that is not binding |
