@@ -438,3 +438,40 @@ somewhere in 0.4-0.6**. But even half of that table is worth more than the 8.7 m
 
 Recorded prediction, so it can be wrong in public: **A3 lands at TPOT 33-36 ms with slope ~4-5 ms/GB; the ceiling
 work then adds 2-3 ms on top; the kernel is what closes the rest.**
+
+## 16. T0 measured: `--pcie-frac 0.4` makes the TPOT curve flat (2026-10-24)
+
+The sweep M20 §15 asked for, run on the shipping binary: same model, same flags, cache 2.3 and 1.85 GB, five
+`--pcie-frac` values; the probe is one `doc` conversation, TPOT taken from turn 2 (64 output tokens, reuse 0.97) so
+every cell is the same shape of work. n = 2 at 0.2/0.6, 3-5 at 0.3-0.5.
+
+| `--pcie-frac` | TPOT @ 2.3 GB | TPOT @ 1.85 GB | **slope** |
+|---:|---:|---:|---:|
+| **0.2 (today)** | 41.7 ms | 46.5 ms | **+10.7 ms/GB** |
+| 0.3 | 40.4 | 40.9 | **+1.2** |
+| **0.4** | **40.8** (n=5) | **41.0** (n=5) | **+0.4** |
+| 0.5 | 43.7 | 42.6 | -2.4 |
+| 0.6 | 46.4 | 53.7 | **+16.3** |
+
+**T0 is met**, and better than the target: slope 17.8 -> **0.4 ms/GB at frac 0.4** (target was <= 4). And it is not a
+trade - the absolute number improves too: 41.7 -> 40.8 ms at 2.3 GB, and **46.5 -> 41.0 ms at 1.85 GB (-12%)**.
+
+The shape is exactly the predicted one: the lever moves misses off the 250 us CPU path onto the ring, where the
+lookahead can cover them; and past ~0.5 the ring's own traffic crosses the link's capacity (frac 0.6 is 6 ms worse
+at 2.3 GB and 13 ms worse at 1.85 GB), which is M16's `frac 1.0` saturation arriving earlier than expected. **The
+optimum is interior, at 0.3-0.4.**
+
+### What this is worth, immediately
+
+At frac 0.4 a **1.85 GB cache performs like the 2.3 GB cache did at frac 0.2** (41.0 against 41.7 ms). So 450 MiB
+of cache can now be handed to something else *for free* - and M18 already measured what that 450 MiB buys when
+given to the prefill stream: a second layer buffer, **turn-1 4 431 -> 3 654 ms (-18%)**. The trade M18 had to refuse
+(cache for buffers) is now free, which is a bigger effect than the whole ceiling project (8.7 ms of TPOT).
+
+That is the next experiment, and it is one flag: `--pcie-frac 0.4 --expert-cache-gb 1.85` plus the stream's second
+buffer, turn-1 against today.
+
+### Caveat, in writing
+
+`frac > 0` is not byte-exact (M9: near-ties flip with the resident/miss split), which is why this arm is measured on
+the chat harness and never on the `frac 0` oracle. The harness runs below are the correctness check for it.
