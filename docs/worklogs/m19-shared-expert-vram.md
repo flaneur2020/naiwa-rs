@@ -2004,3 +2004,34 @@ the decode reserve that Phase A and Phase B both kept taking.
 
 **Committed as a default**: the memset. It is cheap, it makes the borrowed bytes fully defined, and it turns a
 3-10/12 corruption into a 1-7/12 one confined to the decode side.
+
+## Why the borrow ends up with *less usable cache*, measured at an equal cache size (2026-10-24)
+
+The fair comparison - both arms at `--expert-cache-gb 2.3`, three rounds, 0 failures:
+
+| class | TPOT baseline | TPOT borrow | TTFT t1 baseline | TTFT t1 borrow | e2e baseline | e2e borrow |
+|---|---:|---:|---:|---:|---:|---:|
+| code | 35 ms | 36 ms | 1007 ms | **923 ms** | 27.3 s | 27.1 s |
+| doc | **42 ms** | **46 ms** | 3837 ms | **3778 ms** | 31.2 s | 34.1 s |
+| long | 47 ms | 49 ms | 3774 ms | 3827 ms | 37.8 s | 45.5 s |
+| short | 41 ms | 47 ms | 1048 ms | 1064 ms | 41.6 s | 40.1 s |
+
+So the borrow is neutral on turn-1 (slightly better: the chunk costs 866 MiB instead of 1 378) and **slightly worse on
+TPOT**, at the same configured cache.
+
+**The reason is the thing the question was really about**: the borrow does not shrink the *configured* cache - it
+spends **650 MiB of it, i.e. ~345 of 1 208 slots, for the duration of every chunk**, and those slots' residents are
+gone afterwards. `empty_range` marks them empty, the decode then misses on them and refills them over the following
+steps. So:
+
+- at an *equal* cache size the borrow pays a ~29% eviction + refill per prompt and gains nothing;
+- to *gain*, the cache has to grow by the 650 MiB the borrow frees - and that is exactly what the MTP chat
+  configuration cannot afford: at 2.6 GB and above the decode/verify reserve no longer fits, which is the OOM that
+  the earlier 2.95 GB arm hit.
+
+That is the milestone's answer in one sentence: **the bytes a borrow frees are worth less to the decode than the
+slots it takes away, unless the cache grows by the same amount - and the cache cannot grow without eating the
+decode reserve that MTP needs.**
+
+Numbers for the record: 1 208 slots at 2.3 GB, ~1.88 MB each, borrowed span 650 MiB ≈ 345 slots ≈ 29%; chunk cost
+1 378 MiB (baseline) vs 866 MiB (borrow); decode low-water reserve ~600 MiB.
