@@ -705,3 +705,41 @@ Next step when the machine is clean: run the same three arms (0 / 8 / 16 with th
 `NAIWA_PROMOTE_TRACE=1` printing, per layer, the number of promotions and the copy stream's backlog - if promotion
 disturbs prefill it must be through the stream it shares with the chunk's own uploads, and that is one number away
 from being visible.
+
+## 22. The hang at cap 0 was a real bug in the diff — found and fixed (2026-10-24, after a reboot)
+
+The reboot made the picture unambiguous: the pre-promotion build (`475d0a3`) came up **READY** on the first try,
+the promotion build **NOTREADY 4/4** - so it was the diff, not the machine, and not the environment.
+
+The bug was one line's worth of asymmetry in `dma_miss::stream_pcie`:
+
+```rust
+// before
+if layer.promoting() { layer.set_staged_now(Vec::new()); }   // the *clear* was gated ...
+...
+layer.set_staged_now(slot_of_pending);                       // ... but the *write* was not
+```
+
+So with promotion off, every step stored `Arc` clones of the step's ring slots in `staged_now` and **nothing ever
+drained them**. `stage_misses` waits on each ring slot's refcount with `copy_stream::wait_for_readers`, which spins
+until the refcount falls back to the ring's own `Arc` - it never did, so the warmup spun forever. That is exactly the
+mechanism §20 hypothesised, arriving through a different door: not the pending *list* design, but an ungated write
+next to a gated clear.
+
+Fix: clear unconditionally, and only *populate* when promotion is on:
+
+```rust
+layer.set_staged_now(Vec::new());                 // unconditional
+...
+if layer.promoting() { layer.set_staged_now(v); } // only what will be drained
+```
+
+Verified after the fix: `cap 0` is **READY** and measures turn-2 TPOT **37.5 / 57.2 / 35.7 ms** (the 57 ms is the
+usual outlier; the shipped arm measured 40-43 ms across the day, so the arms overlap).
+
+**Still open**: the `cap > 0` arm. With the fix it comes up READY and prefill is back to a normal 345 T/s (the 5.8 T/s
+crawl is gone - that was the same leak, seen from the promote side), but the first request then does not complete and
+`PROMOTE` never prints, i.e. promotion blocks before its first publish. Next step is a one-request trace with
+`NAIWA_PROMOTE_TRACE=1` plus `NAIWA_STEP_DBG`, looking specifically at `queue_d2d`'s wait on the **destination**
+slot's fence: that event is recorded by a previous step's reader fence, and waiting on it from the copy stream is the
+one ordering nobody has exercised before.

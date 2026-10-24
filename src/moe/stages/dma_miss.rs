@@ -21,11 +21,10 @@ fn stream_pcie(
     };
     // Promotion first: those copies then fall under the same completion event as this step's staging, and the
     // pending `Arc`s are released before the ring may re-use their slots.
-    // This step's staging replaces last step's candidate list: the `Arc`s must not outlive a step. Skipped
-    // entirely when promotion is off, so the shipped path pays nothing for it.
-    if layer.promoting() {
-        layer.set_staged_now(Vec::new());
-    }
+    // This step's staging replaces last step's candidate list, and the clearing is **unconditional**: a clone left
+    // in there keeps a ring slot's refcount above one, and `stage_misses` waits on that refcount
+    // (`wait_for_readers`). Gating this on `promoting()` was the bug that hung warmup at cap 0.
+    layer.set_staged_now(Vec::new());
     // Every path records the layer's completion event: `upload_async` after each expert's copies,
     // and one bare record when there was nothing to stage, so the consumer's wait is satisfied
     // either way (a wait on an event that was never recorded would hang the stream).
@@ -114,7 +113,10 @@ fn stage_misses(
             slot_of
         }
     };
-    layer.set_staged_now(slot_of_pending);
+    // Only worth remembering when something will drain it (same step, on this thread).
+    if layer.promoting() {
+        layer.set_staged_now(slot_of_pending);
+    }
     let bank_first = STAGING_RING_FIRST;
     if slot_of.is_empty() {
         return Ok(());
