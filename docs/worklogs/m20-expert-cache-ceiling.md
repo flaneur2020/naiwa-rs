@@ -475,3 +475,30 @@ buffer, turn-1 against today.
 
 `frac > 0` is not byte-exact (M9: near-ties flip with the resident/miss split), which is why this arm is measured on
 the chat harness and never on the `frac 0` oracle. The harness runs below are the correctness check for it.
+
+## 17. The freed 450 MiB, spent: turn-1 -21% and TPOT slightly better (2026-10-24)
+
+T0 bought 450 MiB of cache back for free (a 1.85 GB cache now performs like 2.3 GB did at frac 0.2). M18 said what
+that 450 MiB is worth if given to the prefill stream: a second layer buffer, -18% on turn-1. Measured, same binary,
+same probe, two reps per arm:
+
+| arm | cache | chunk | plan | turn-1 TTFT | turn-2 TPOT |
+|---|---:|---:|---|---:|---:|
+| A (today) | 2.3 GB | 8192 | 1 x 650 MiB + 522 act (+192 head) = 1 364 of 2 336 free | 3.83 / 3.64 s | 42.3 / 40.7 ms |
+| **C** | **1.85 GB** | **8192** | **2 x 650 MiB + 522 act = 2 014 of 2 882 free** | **3.05 / 2.87 s** | **40.5 / 40.8 ms** |
+| B | 1.85 GB | 4096 | 2 x 650 + 426 act = 1 918 of 2 882 free | 3.09 / 2.88 s | 45.6 / 40.8 ms |
+
+- **turn-1 TTFT 3.74 -> 2.96 s (-21%)** - the second buffer finally fits, because the cache released 450 MiB.
+- **TPOT 41.5 -> 40.65 ms (-0.9%)**: the trade M18 had to refuse (cache for buffers, +6 ms of TPOT) **now costs
+  nothing at all** - the flatness bought at frac 0.4 pays for it.
+- Chunk 4096 buys nothing on top (it only shrinks the activations); 8192 stays.
+
+So the configuration that ships is now **`--expert-cache-gb 1.85 --pcie-frac 0.4 --max-prefill-chunk-tokens 8192`,
+with two prefill buffers granted by the plan**, against M19's `2.3 / 0.2 / 8192, one buffer`:
+
+| | M19 gate10 | now |
+|---|---:|---:|
+| turn-1 TTFT (doc) | 3.8 s | **3.0 s** |
+| TPOT (doc, turn 2) | 41.7 ms | **40.7 ms** |
+| TPOT slope (0.45 GB) | +10.7 ms/GB | **+0.4 ms/GB** |
+| prefill buffers | 1 | **2** |
