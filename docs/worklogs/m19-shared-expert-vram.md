@@ -2112,3 +2112,25 @@ those two calls are for.
 **Harness after the change**: 2 rounds, **0 failures**; TTFT turn-1 slightly better (995 vs 1006 ms `code`), TPOT
 unchanged (40/47/46 against 36/43/44) - the hoisting removes overhead but cannot change the economics: the per-chunk
 `empty_range` still clears ~345 slots and the decode still refills ~610 MiB.
+
+## Double buffering: implemented, not granted here, and net-negative when it is (2026-10-24)
+
+Asked whether prefill double-buffers and whether enabling it would help.
+
+**It exists.** `PrefillStream` holds `bufs: [LayerBuf; 2]` and `plan()` grants `stride = 2` when two buffers fit:
+`fits(best, 2)` needs `2 x 650 + act(8192) 522 + act/8 65 + head 512 = 2 399 MiB` of free VRAM. This card has
+1 817-2 109 MiB at the first chunk, so every run reports **`1 x 650 MiB layer buffer(s)`** - the second is never
+granted, with or without the borrow (`plan` forces `stride = 1` when borrowing anyway, since all layers borrow the
+same range).
+
+**Why it would help turn-1**: M17 measured the chunk as co-limited, ~57 ms of PCIe and ~61 ms of compute per layer.
+With one buffer those two are largely serial; a second buffer lets the next layer stream while the current one
+computes, removing the smaller of the pair. M18 measured exactly that: **turn-1 4 431 -> 3 654 ms (-18%)**.
+
+**Why it does not pay**: the 650 MiB comes out of the expert cache. M18 measured the other side of it too - cache
+2.3 -> 1.85 GB, **TPOT 44.9 -> 51.0 ms**. On today's numbers the trade is: -0.7 s on turn-1 against +6 ms x 64
+tokens x 3 turns = **+1.1 s**, i.e. +0.4 s per conversation - the same net-negative verdict M18 reached.
+
+**And with the borrow it is worse**: borrowing forces one buffer by construction; borrowing *two* ranges would mean
+1.3 GB taken from the cache, i.e. ~26 layers (54% of it) emptied per chunk instead of ~13, doubling the refill cost
+that already makes the borrow break even at best.
