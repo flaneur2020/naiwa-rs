@@ -453,11 +453,21 @@ impl PrefillStream {
             crate::moe::quiesce(true);
             let _ = self.device.synchronize();
         }
+        // **Once per chunk**, keyed on the layer index (a chunk always starts at layer 0 - and a flag reset elsewhere
+        // would be missed when two requests run chunks back to back): the gate, the emptying and the zeroing. What
+        // must stay per layer is the *ordering* - `after_device_work` and the synchronise below - because with the
+        // alias layer L+1's upload writes the bytes layer L's kernels are still reading.
+        let fresh_chunk = layer == 0;
         // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
         // write into them. The lock is held from setting the flag until every copy a fill queued has landed, so a
         // fill cannot slip between the check and its DMA (the TOCTOU that survived until now).
-        let slab_access = crate::moe::slab::lock_access();
-        crate::moe::slab::set_borrowed(true);
+        let slab_access = if fresh_chunk {
+            let guard = crate::moe::slab::lock_access();
+            crate::moe::slab::set_borrowed(true);
+            Some(guard)
+        } else {
+            None
+        };
         let base = slab.base()?;
         // The borrowed bytes are the cache's, so a kernel or a fill the cache queued can still be reading them.
         // Ordering the copy stream after everything candle has queued is the semantically right thing to do here;
@@ -465,7 +475,7 @@ impl PrefillStream {
         // non-finite chunk outputs, which is the run-to-run noise this defect lives in. `CUDA_LAUNCH_BLOCKING=1`
         // (every launch serialised) does make it vanish, which is what says the cause is cross-stream ordering.
         self.copy.after_device_work()?;
-        if std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
+        if fresh_chunk && std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
             // **Default** (disable with `NAIWA_BORROW_NOZERO`): zero the whole borrowed span before the upload. The
             // chunk only DMAs each projection's
             // `size_in_bytes`; `MATRIX_ROW_PADDING` bytes at the end - which a kernel may legitimately read - are
@@ -474,11 +484,14 @@ impl PrefillStream {
             // most recently.
             let stream = self.copy.cuda_stream();
             // SAFETY: the span is inside the slab and mapped; the memset is queued before the upload.
+            // Zero the largest span any layer in this chunk can use (the biggest shape is 650 MiB), so every
+            // layer's padding - which sits inside that span - is defined for the whole chunk.
+            let span = offset.max(650usize << 20).min(slab.bytes());
             unsafe {
                 let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
                     base as u64,
                     0,
-                    offset,
+                    span,
                     stream.cu_stream(),
                 );
                 if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
@@ -489,7 +502,7 @@ impl PrefillStream {
         if let Some(cache) = self.cache.as_ref() {
             // Probe: keep everything identical but skip the emptying, to tell "the chunk writing into the cache's
             // bytes" from "the cache's slot metadata being cleared".
-            let emptied = if std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
+            let emptied = if !fresh_chunk || std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
                 0
             } else {
                 cache.empty_range(base, base + offset as u64)

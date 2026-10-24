@@ -2083,3 +2083,32 @@ answers, prompts just above the 1024 boundary). It would only pay with prompts s
 long answers - i.e. not this workload.
 
 Restored `engines/naiwa.json` and `naiwa-loan.json` to cache 2.3 GB, cap 8192.
+
+## Why the borrow "repeats" - it does not, and the repeated part is now once per chunk (2026-10-24)
+
+Question worth answering precisely: prefill already uses *constant* memory, so why does `prefill_borrow` fire again
+and again?
+
+**The span is constant.** Every layer of a chunk borrows the same `[base, base + offset)`; nothing is re-taken. What
+repeats is the **re-view**: this GGUF mixes quant types per layer (seven shapes), and a quantised tensor's shape and
+dtype must match the layer's stack, so `QCudaStorage::from_va`/`borrow_from` and `MoEExperts::from_qtensors` are
+rebuilt - measured at **88 µs** (`prefill_realloc: layer 0 shape change took 88.376µs`). That is unavoidable and
+cheap.
+
+**What was neither constant nor cheap** was the one-off work being repeated with it: `copy.synchronize()`,
+`empty_range` (48 layers × every slot) and the 531 MiB memset ran **once per relayout, ~37 times per chunk**. They
+are now hoisted to **once per chunk**, keyed on `layer == 0` (a flag reset elsewhere would be missed when two
+requests run chunks back to back):
+
+```
+borrow: one line per chunk, 310 slots emptied (was ~37 lines per chunk)
+```
+
+**What must stay per layer** is the ordering - `after_device_work()` and the synchronise at the end of `forward` -
+because with the alias, layer L+1's upload writes the very bytes layer L's kernels are still reading. Removing them
+with the rest of the repeated work reintroduced NaN immediately (measured), which is a useful confirmation of what
+those two calls are for.
+
+**Harness after the change**: 2 rounds, **0 failures**; TTFT turn-1 slightly better (995 vs 1006 ms `code`), TPOT
+unchanged (40/47/46 against 36/43/44) - the hoisting removes overhead but cannot change the economics: the per-chunk
+`empty_range` still clears ~345 slots and the decode still refills ~610 MiB.
