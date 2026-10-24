@@ -1940,3 +1940,34 @@ happens after the last check would be invisible to everything in the tree today.
 State: `NAIWA_BORROW_PRIVATE`, `NAIWA_BORROW_NOEMPTY`, `NAIWA_BORROW_ALIGN`, `NAIWA_BORROW_PAD_MIB`,
 `NAIWA_PREFILL_QUIESCE` stay as probes; the borrow stays behind its two env flags; the slab, the gate discipline and
 all diagnostics stay.
+
+## The probes now separate two bugs, and neither is a write (2026-10-24)
+
+Four probes, each changing exactly one thing, at 12 stress iterations each (`--pcie-frac 0`):
+
+| probe | what it isolates | result |
+|---|---|---|
+| `NAIWA_BORROW_PRIVATE=1` | the same `borrow_from` + offset views, but a private 768 MiB allocation; no cache, no `empty_range`, no gate | **0/12, 0 non-finite** (twice) |
+| `NAIWA_BORROW_NOEMPTY=1` | the cache's slab, but no `empty_range` (gate kept) | **12/12 failed, 0 non-finite** |
+| `NAIWA_BORROW_UNUSED=1` (+`NAIWA_SLAB_EXTRA_MIB`) | the cache's *allocation*, but from its unused tail - nothing points at it, no `empty_range`, no gate | **12/12 failed, 0 non-finite** |
+| `NAIWA_BORROW_ALIGN`, `NAIWA_BORROW_PAD_MIB` | offset alignment / over-read past a projection | no change |
+
+Two conclusions, both useful:
+
+1. **the borrow's own machinery is correct.** With a private allocation the whole path - `borrow_from`, the offset
+   layout, the kernels, the fences, the per-layer synchronise - runs clean, twice.
+2. **there are two distinct failures, and the one being chased is the rare one.** Whenever the *gate* and
+   `empty_range` are present the chunk is finite and the failure is rare (3-10/12, non-finite chunk outputs);
+   whenever they are absent (`NOEMPTY`, `UNUSED`) the failure is *certain* (12/12) but with **finite** chunk outputs -
+   the decode reading slots whose bytes the chunk overwrote. So the gate + `empty_range` pair is what keeps the
+   *common* bug away, and the *rare* one (non-finite chunk outputs) survives them.
+
+That also means the rare one cannot be a stale-slot read: with the gate up and the range emptied, the chunk's own
+bytes are the only thing that could be wrong, and the private run proves the machinery for exactly those bytes is
+sound. What differs is only *which physical memory* they are - the cache's - and every host-visible writer into it
+is excluded by construction.
+
+**Recommendation, unchanged and now better supported**: the borrow is not shippable; the slab, the gate discipline,
+`borrow_from` and the probes are the deliverables. The next step needs a controlled interleaving, i.e. a standalone
+two-thread reproducer under `compute-sanitizer --tool racecheck`, with the `UNUSED` probe as the control that makes
+the second bug appear on demand (12/12) - which is a much better foothold than the rare one this session chased.

@@ -346,12 +346,32 @@ impl PrefillStream {
                     .device
                     .as_cuda_device()
                     .map_err(|e| candle_core::Error::Msg(format!("private borrow needs CUDA: {e}")))?;
-                // The largest layer's three projections fit comfortably in 768 MiB.
-                let st = candle_core::quantized::cuda::QCudaStorage::zeros(
-                    dev,
-                    (768usize << 20) / 4,
-                    candle_core::quantized::GgmlDType::F32,
-                )?;
+                // The largest layer's three projections fit comfortably in 768 MiB. With `NAIWA_BORROW_UNUSED`
+                // the same block is carved from the cache slab's unused tail instead of a private allocation: the
+                // bytes are the cache's, but no bank points at them.
+                let st = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
+                    let slab = self.slab.as_ref().ok_or_else(|| {
+                        candle_core::Error::Msg("unused-borrow needs the cache slab".into())
+                    })?;
+                    // The last 768 MiB of the reservation: the banks only ever carved a prefix, so this block is
+                    // inside the cache's allocation with nothing pointing at it.
+                    // 900 MiB for a 768 MiB request: `borrow_from` pads by `MATRIX_ROW_PADDING`, which is 32 MiB
+                    // for F32, and the padded size must fit inside the block.
+                    let block = 900usize << 20;
+                    let tail = slab.bytes().saturating_sub(block);
+                    slab.borrow_at(
+                        tail,
+                        (block - (40 << 20)) / 4,
+                        candle_core::quantized::GgmlDType::F32,
+                        &self.device,
+                    )?
+                } else {
+                    candle_core::quantized::cuda::QCudaStorage::zeros(
+                        dev,
+                        (768usize << 20) / 4,
+                        candle_core::quantized::GgmlDType::F32,
+                    )?
+                };
                 slot.replace(Arc::new(st));
             }
             Arc::clone(slot.as_ref().unwrap())
@@ -391,7 +411,9 @@ impl PrefillStream {
         layer: usize,
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
-        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some() {
+        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some()
+            || std::env::var_os("NAIWA_BORROW_UNUSED").is_some()
+        {
             return self.borrow_private(stacks);
         }
         let slab = self.slab.as_ref().expect("checked by borrows()");
@@ -403,7 +425,17 @@ impl PrefillStream {
             let _ = dims;
             let _ = el_count;
             if std::env::var_os("NAIWA_BORROW_ALIAS").is_some() {
-                let storage = slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?;
+                // `NAIWA_BORROW_UNUSED=1`: carve from the slab's *unused* tail (the banks only took `cursor` bytes),
+                // so the buffer is inside the cache's allocation but overlaps no bank and nothing points at it.
+                // That separates "the alias with live slots" from "merely being inside the slab".
+                let storage = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
+                    match slab.alloc(stack.shape().elem_count(), stack.dtype(), &self.device)? {
+                        Some(st) => st,
+                        None => candle_core::bail!("slab is full"),
+                    }
+                } else {
+                    slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?
+                };
                 offset += storage.allocated_bytes();
                 out.push(self.copy.like_from_storage(stack, storage)?);
             } else {

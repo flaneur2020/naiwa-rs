@@ -85,7 +85,14 @@ impl GpuCacheMoeProvider {
                 if !super::slab::Slab::enabled() {
                     return None;
                 }
-                let bytes = (self.cache_gb * 1e9) as usize;
+                // `NAIWA_SLAB_EXTRA_MIB` (probe): reserve more than the cache can use, so a test can borrow from
+                // the slab's *unused* tail - inside the cache's allocation but overlapping no bank.
+                let extra = std::env::var("NAIWA_SLAB_EXTRA_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    << 20;
+                let bytes = (self.cache_gb * 1e9) as usize + extra;
                 match super::slab::Slab::new(device, bytes) {
                     Ok(slab) => {
                         let slab = Arc::new(slab);
