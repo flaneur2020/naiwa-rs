@@ -67,6 +67,7 @@ the stack resident), not from buffer arithmetic.
 
 | # | target | how it is judged |
 |---|---|---|
+| **T0** | **TPOT is insensitive to cache size**: `slope = (TPOT(1.85 GB) - TPOT(2.3 GB)) / 0.45 GB` drops from today's **17.8 ms/GB** to **<= 4**, and TPOT at 2.3 GB with it | two serves per arm (cache 2.3 and 1.85), harness 3 rounds |
 | T1 | **the ledger explains every MiB**: `MISTRALRS_VRAM_DUMP` + the plan + the measured low-water add up to 12 282 within 2% | itemisation sums |
 | T2 | **the binding constraint is named by experiment**, not by argument: for each of C1/C2/C3, a run where removing *only* that consumer raises the cache ceiling | ceiling moves by the predicted amount |
 | T3 | cache ceiling **>= 3.0 GB** with the chat harness still passing (0 failures, 3 rounds) | harness |
@@ -374,3 +375,66 @@ speculative traffic of its own.
 
 Acceptance: harness 3 rounds, 0 failures, medians; oracle untouched (`frac` stays 0 for the byte-exact arm).
 Predicted: B neutral-to-worse, C **-2..-6 ms TPOT**, D best and cheapest to reason about.
+
+## 15. Restated plan: the goal is a flat TPOT curve, not a bigger number (2026-10-24)
+
+The user's framing is the right one, and it reorders everything: strata's property is not "39 ms", it is **39 ms
+whatever the cache does** (doc/long/short, and by construction whatever its `auto` picks). Our curve is steep:
+
+```
+TPOT(c) = 19.0 + 104.4 * exp(-c / 1.564)      slope at 2.3 GB: 17.8 ms/GB
+strata:                                       slope: ~0
+```
+
+So the milestone's primary target becomes **T0 (flatness)**, and the ceiling work (T3) is demoted to a supporting
+action. Two consequences worth stating plainly:
+
+- **A bigger cache becomes less valuable, not more.** If the slope is 4 ms/GB, the difference between 2.3 and 1.85 GB
+  is 1.8 ms; between 2.3 and 3.0 GB it is 2.8 ms. At today's slope the same 0.7 GB is worth 12 ms.
+- **The M19 borrow is disqualified by this KPI**, independently of its other costs: it injects ~345 evictions =
+  a -0.65 GB shock *per chunk*, i.e. it is a deliberate spike on the very curve we are trying to flatten. It stays
+  off by default for a reason that is now sharper than "net zero".
+
+### The levers, ordered by expected value per unit of work
+
+| arm | change | why it flattens | expected |
+|---|---|---|---|
+| **A0** | today: `--pcie-frac 0.2`, lookahead on, promote off | baseline | TPOT 43, slope 17.8 |
+| **A1** | `--pcie-frac 0.4` | moves misses from the CPU path (250 us, unhideable) to the ring (hideable); link is at 31-39% so there is room | ~37-39, slope ~10 |
+| **A2** | `--pcie-frac 0.6` | as above, more of the miss becomes lookahead-coverable | ~33-36, slope ~5 |
+| **A3** | A2 + **promote-on-stage, cap 16/token** | staged bytes already crossed the link; admitting them turns the *next* miss into a hit, which both lowers TPOT and lowers the slope | ~32-35, slope ~4 |
+| **A4** | A3 + whatever the ceiling ledger funds | fewer misses to hide in the first place | ~30-33 |
+
+No new mechanism per arm beyond the flags and the promotion path, and the oracle arm (`frac 0`) is untouched
+throughout - `frac > 0` is harness-only by the M9 rule.
+
+### Why A1-A3 can plausibly beat the whole ceiling project
+
+`dTPOT/dCache` is dominated by the *exposed* fraction of misses. Today only a fifth of misses even reach the ring,
+so four fifths are unhideable by construction:
+
+| `--pcie-frac` | misses through the ring | expected memory term | expected TPOT |
+|---:|---:|---:|---:|
+| 0.2 (today) | 19/token | 24 ms | 43 |
+| 0.4 | 38/token | ~14 ms | ~33 |
+| 0.6 | 58/token | ~9 ms | ~28 |
+| 0.8 | 77/token | ~4 ms | ~23 |
+
+The table is an upper bound - it assumes hiding is free and that the link does not queue - and M16 already showed
+`frac 1.0` with MTP saturates the link (2 668 MiB staged per window against 848), so the optimum is **interior,
+somewhere in 0.4-0.6**. But even half of that table is worth more than the 8.7 ms the ceiling buys, and it costs
+**no VRAM at all**.
+
+### Order of work
+
+1. **A1/A2 sweep** (`--pcie-frac` 0.4 / 0.6, cache 2.3 and 1.85 per arm) - one flag, two serves per arm, and it
+   measures T0 directly.
+2. **A3**: promote-on-stage with a cap (the only code change in the sequence: admit a staged expert into an empty
+   slot, else over the LRU victim, at most N per token, counted as `promotions`).
+3. **Ledger + `auto`** (S1-S4): keep it, but as the thing that stops "OOM in round 2" and lets chunk/cache be
+   derived - not as the primary performance lever.
+4. **Kernel (M20.2)**: the only route to the prefill side of the gap and to removing the 650 MiB; unchanged by any
+   of the above.
+
+Recorded prediction, so it can be wrong in public: **A3 lands at TPOT 33-36 ms with slope ~4-5 ms/GB; the ceiling
+work then adds 2-3 ms on top; the kernel is what closes the rest.**
