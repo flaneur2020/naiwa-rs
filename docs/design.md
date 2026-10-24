@@ -200,6 +200,34 @@ MiB more cache on this card; it is tracked as "Next" item 6 in
 
 ---
 
+### 4.4 The memory philosophy, as measured (M16-M20)
+
+Six rules, each earned by a measurement rather than argued:
+
+1. **Plan first, then tune.** The cache is the *residual* of a computed budget, not a parameter. Strata carves one
+   arena from measured free VRAM at startup and recomputes after the first chunk; we hand-set `--expert-cache-gb`
+   and guess a 512 MiB headroom. Until M20 prints the ledger, "2.6 GB OOMs" has no explanation.
+2. **The granularity of sharing sets its cost.** Sharing *bytes with live content* (the M19 alias) requires
+   emptying the slots, zeroing the padding and ordering every layer against the DMA - and the emptying alone
+   (~345 slots, +610 MiB of refill per chunk) cancelled the 650 MiB it saved. Sharing only what is *idle and
+   never written* (decode headroom, the ring) has no such tax. Never share live bytes again.
+3. **The workspace's size is a property of the kernel, not of the buffer strategy.** 650 MiB is what a kernel that
+   reads a whole expert stack per layer needs; strata's MMQ reads a byte-sized ring. M19 tried to pay with buffers
+   (rings, borrow, VMM, chunk shrink) and every route cost more than it saved - so the ~1.5 GB gap to strata is a
+   kernel question (M20), not a policy question.
+4. **Every trade is priced per token and per turn, never per chunk.** Chunk 1024 buys 2.6 GB of cache for
+   +1.9 s of turn-1: 15x against. Two buffers buy -18% turn-1 for +6 ms/token: net negative. Phase B's VMM pages
+   buy nothing and cost TPOT. The unit of account is what decides.
+5. **Failure posture: shrink, then refuse, never silently disable.** One 3 MiB miss once turned the prefill stream
+   off for a whole run (4 s -> 132 s) and nobody saw it. `NAIWA_PREFILL_STRICT` exists so that a plan that cannot
+   be funded fails loudly, the way strata re-plans instead of switching a feature off.
+6. **A ceiling you cannot name is not a ceiling.** Any claim of "N GB is the limit" ships with the arm that fails
+   at N + 0.1 GB, for the same reason every wait in this codebase carries a must-fail control.
+
+The corollary that cost the most to learn: **residency beats staging** (the drafter's 675 MiB Q2_0 pool, the
+two-layer PLE deletion), and *compression* is the only way to buy residency without buying VRAM - which is why
+"dense BF16 -> 8-bit requant, 650 MiB saved" stays off the table: it breaks the oracle.
+
 ## 5. Performance envelope
 
 | configuration | round p50 | tok/s | tokens/round |
