@@ -63,9 +63,11 @@ fn prompt_step_ceiling() -> usize {
     }
 }
 
-/// Free VRAM kept on top of what the plan below prices: the KV blocks and the copy-stream staging a
-/// prompt step grows into, plus the driver's own bookkeeping.
-const HEADROOM: usize = 192 << 20;
+/// Free VRAM kept on top of what the plan prices: the KV blocks and the copy-stream staging a prompt
+/// step grows into, plus the driver's own bookkeeping. This is what the plan *requires* (and it was
+/// 512 MiB since M10); `log_plan` used to print 192 for it, which read as if the plan left more room
+/// than it did.
+const MAX_HEADROOM: usize = 512 << 20;
 
 /// The prefill path's memory decision: how many layer buffers, and the prompt step they were
 /// priced with.
@@ -122,7 +124,7 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: b
         .map(|mib| mib << 20);
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
-        let head = slack_override.unwrap_or_else(|| (512 << 20).max(free / 8));
+        let head = slack_override.unwrap_or_else(|| MAX_HEADROOM.max(free / 8));
         if borrowing {
             // The layer buffer is a range of the cache's slab, so it costs nothing here - but the chunk still pays
             // its activations and the step's scratch out of free VRAM, and that is *more* than the estimate:
@@ -152,7 +154,21 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: b
     }
     // Two buffers double-buffer the upload against the compute. The borrow has only one range (every layer takes
     // the same bytes), so it is one buffer by construction.
-    let stride = if !borrowing && fits(best, 2) { 2 } else { 1 };
+    //
+    // The second buffer is *optional*, so it is also the one place where a decode reserve can be required without
+    // risking the stream itself: the buffers stay allocated for the session, so whatever they take is gone from the
+    // free VRAM decode will need afterwards (measured low-water ~600 MiB). `fits(best, 2)` alone prices the chunk
+    // and a fixed head and then granted two buffers with 606 MiB spare - which OOM'd a 1725-row prompt
+    // (`moe experts forward: CUDA_ERROR_OUT_OF_MEMORY`). One buffer still fits in that case, so refusing the second
+    // degrades rather than disables, which is the failure posture the design asks for.
+    let reserve = std::env::var("NAIWA_DECODE_RESERVE_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mib| mib << 20)
+        .unwrap_or(700 << 20);
+    let two = fits(best, 2)
+        && free.saturating_sub(2 * layer_bytes + activation_bytes(best) + MAX_HEADROOM) >= reserve;
+    let stride = if !borrowing && two { 2 } else { 1 };
     Some((stride, best))
 }
 
@@ -561,7 +577,7 @@ impl PrefillStream {
             mib(peak.free_at_start),
             mib(peak.min_free),
             mib(self.layer_bytes() * plan.stride as u64 as usize),
-            mib(activation_bytes(plan.chunk) + HEADROOM),
+            mib(activation_bytes(plan.chunk) + MAX_HEADROOM),
             mib(activation_bytes(plan.chunk)),
         );
         peak.free_at_start = 0;
@@ -614,7 +630,7 @@ impl PrefillStream {
                      leave room for the stream, or drop --prefill-stream",
                     mib(self.layer_bytes()),
                     mib(activation_bytes(previous.chunk.max(256))),
-                    mib(HEADROOM),
+                    mib(MAX_HEADROOM),
                     mib(free),
                 );
                 if Self::strict() {
@@ -625,7 +641,7 @@ impl PrefillStream {
                          NAIWA_PREFILL_STRICT to let the CPU take the chunk (33x slower)",
                         mib(self.layer_bytes()),
                         mib(activation_bytes(previous.chunk.max(256))),
-                        mib(HEADROOM),
+                        mib(MAX_HEADROOM),
                         mib(free),
                     );
                 }
@@ -1127,8 +1143,16 @@ mod tests {
 
         // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
         assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 8192));
-        // 2400 MiB is the edge where the second buffer just fits (2399 needed).
-        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (2, 8192));
+        // 2400 MiB is the edge where the second buffer's *chunk* just fits (2399 needed) - but not the decode
+        // reserve, so the plan keeps one buffer. This is the arm that OOM'd: a 1.85 GB cache left 2620 MiB free,
+        // two buffers were granted with 606 MiB to spare, and a 1725-row prompt died in
+        // `moe experts forward: CUDA_ERROR_OUT_OF_MEMORY`.
+        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (1, 8192));
+        assert_eq!(plan(2620 << 20, layer, 8192, false).unwrap(), (1, 8192));
+        // The second buffer's churn is 2334 MiB (2 buffers + act 522 + head 512); the decode reserve makes the
+        // edge 2334 + 700 = 3034 MiB.
+        assert_eq!(plan((3034 << 20) - 1, layer, 8192, false).unwrap().0, 1);
+        assert_eq!(plan(3034 << 20, layer, 8192, false).unwrap(), (2, 8192));
 
         // The operator's ceiling is a ceiling, not a target.
         assert_eq!(plan(gb(12), layer, 512, false).unwrap().1, 512);
@@ -1145,7 +1169,7 @@ mod tests {
         // With the 512 MiB floor, a 12 GB card's ~2.3 GiB buys one buffer at the ceiling and
         // 8 GiB buys two; the floor is what keeps a prompt step's own scratch out of the way.
         assert_eq!(plan(gb(8), layer, 8192, false).unwrap(), (2, 8192));
-        let just = need2(gb(1));
+        let just = need2(gb(1)) + (700 << 20);
         assert_eq!(plan(just, layer, 8192, false).unwrap(), (2, 8192));
         // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
         assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().0, 1);
@@ -1284,8 +1308,8 @@ fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
         plan.stride,
         mib(layer),
         mib(act),
-        mib(HEADROOM),
-        mib(plan.stride * layer + act + HEADROOM),
+        mib(MAX_HEADROOM),
+        mib(plan.stride * layer + act + MAX_HEADROOM),
         mib(free),
     );
 }

@@ -502,3 +502,45 @@ with two prefill buffers granted by the plan**, against M19's `2.3 / 0.2 / 8192,
 | TPOT (doc, turn 2) | 41.7 ms | **40.7 ms** |
 | TPOT slope (0.45 GB) | +10.7 ms/GB | **+0.4 ms/GB** |
 | prefill buffers | 1 | **2** |
+
+## 18. The second buffer needs a decode reserve - and the plan did not have one (2026-10-24)
+
+Spending the freed 450 MiB on the second buffer (§17) **OOM'd on the harness** - not a NaN, not a slow run:
+
+```
+step - Model failed with error: moe experts forward DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+naiwa round 1 doc turn 1 failed: no content delta
+```
+
+Cause: `plan` priced the chunk (`buffers + act + act/8 + max(512 MiB, free/8)`) and then granted two buffers with
+**606 MiB to spare** - but the buffers stay allocated for the session, so decode only gets what is left, and the
+measured decode low-water is ~600 MiB. The chunk and the decode reserve are needed at *different times*, which is
+M19's whole premise, but the buffers are permanent, so the reserve has to survive them.
+
+Two fixes, both small:
+
+1. **A decode reserve on the second buffer only** (`NAIWA_DECODE_RESERVE_MIB`, default 700 MiB). The second buffer
+   is the optional one, so refusing it degrades (one buffer, same chunk) instead of disabling the stream - the
+   failure posture S4 asks for. It does not touch the one-buffer path, which is validated.
+2. **`log_plan` printed 192 MiB of "headroom" while `fits` required 512** - a reporting bug that made the plan look
+   roomier than it was. Both now use the same constant (`MAX_HEADROOM`), so the line is the ledger.
+
+Re-measured with the reserve in place (2 buffers now only where free VRAM funds them *and* the reserve):
+
+| cache | free at load | buffers | turn-1 | turn-2 TPOT |
+|---:|---:|---|---:|---:|
+| 2.3 GB | 2 336 MiB | 1 | 3.83 / 3.64 s | 40.7 / 40.8 ms |
+| 1.85 GB | 2 882 | 1 (refused: spare 606 < 700) | - | 41.0 |
+| 1.6 GB | 3 169 | **2** | **4.01 / 3.95 s** | 43.5 / 41.7 |
+| 1.4 GB | 3 393 | **2** | **3.07 / 2.81 s** | 45.6 / 41.0 |
+
+So the second buffer is worth its -21% turn-1 at 1.4 GB but costs 0.5-5 ms of TPOT there, and the turn-1 numbers
+are not monotone in cache size (1.6 GB reads worse than 1.4). **The flat-curve configuration is the one that ships**:
+2.3 GB, frac 0.4, one buffer, TPOT 40.7 and turn-1 3.7 - and the second buffer stays a knob for later, now guarded
+by the reserve instead of by luck.
+
+### What this episode adds to the plan
+
+It is the first measured instance of the milestone's T2: **the constraint was named by an experiment** (an OOM
+inside `moe experts forward`, at 606 MiB of spare) rather than by argument. It also prices one of S1's terms: the
+decode reserve is ~700 MiB on this card, which is exactly the number `--expert-cache-gb auto` will have to subtract.
