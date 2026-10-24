@@ -349,8 +349,6 @@ pub(crate) struct CachedLayer {
     pub(crate) layer: usize,
     pub(crate) layers: Arc<Layers>,
     pub(crate) staging: Arc<StagingRings>,
-    /// Completion of this layer's promotion copies (see [`CachedLayer::promote_staged`]).
-    pub(crate) promote: Option<Arc<CopyDone>>,
     /// This step's staged experts, with the ring buffer each was staged into. Written and consumed **within one
     /// step on the token thread** - deliberately not across a step boundary: a surviving `Arc` of a ring slot keeps
     /// its refcount above one, and `stage_misses` waits on that refcount (`wait_for_readers`).
@@ -574,14 +572,6 @@ impl CachedLayer {
         *self.staged_now.lock().unwrap() = v;
     }
 
-    /// Wait on candle's stream for this layer's promotion copies (if it promoted anything last step).
-    pub(crate) fn wait_promote(&self) -> candle_core::Result<()> {
-        let (Some(done), Device::Cuda(_)) = (self.promote.as_ref(), self.slot_device()) else {
-            return Ok(());
-        };
-        done.wait_on(self.slot_device())
-    }
-
     pub(crate) fn staging_done(&self) -> Option<&Arc<CopyDone>> {
         self.staging_done.as_ref()
     }
@@ -693,7 +683,7 @@ impl CachedLayer {
         })
     }
 
-    pub(crate) fn promote_staged(&self, cs: &Arc<CopyStream>) -> candle_core::Result<usize> {
+    pub(crate) fn promote_staged(&self, candle_stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>) -> candle_core::Result<usize> {
         // The cap is **per step across all layers**, not per layer: at a per-layer cap of 8 this queued
         // 48 x 8 = 384 d2d copies of 1.88 MB (720 MB) per token, which ran prefill at 5.8 T/s.
         let cap = std::env::var("NAIWA_PROMOTE_MAX")
@@ -780,15 +770,25 @@ impl CachedLayer {
                 };
                 match (&dst.data, &src_buf.data) {
                     (SlotData::Banked { memory: dmem, .. }, SlotData::Banked { memory: smem, .. }) => {
-                        cs.queue_d2d(
-                            &src_buf.fence,
-                            &dst.fence,
-                            &[
-                                (&dmem[0], &smem[0]),
-                                (&dmem[1], &smem[1]),
-                                (&dmem[2], &smem[2]),
-                            ],
-                        )?;
+                        // **d2d on candle's own stream**, not on the PCIe copy stream: the kernels reading the
+                        // staging slot are queued there, so the copy is ordered after them by the stream itself -
+                        // no event to wait on, and nothing added to the queue that carries this step's 180 MB of
+                        // staging. The slot's fence is then recorded *after* the copy, so a later upload from the
+                        // lookahead (which waits on that fence) cannot overwrite it mid-flight.
+                        for (d, s2) in [(&dmem[0], &smem[0]), (&dmem[1], &smem[1]), (&dmem[2], &smem[2])] {
+                            if s2.len() < d.len() {
+                                candle_core::bail!("promotion of {} bytes into a {}-byte slot", s2.len(), d.len());
+                            }
+                            // SAFETY: both are live device allocations, `d.len` is a prefix of the source, and the
+                            // copy is queued on the stream that reads the source and will read the destination.
+                            unsafe {
+                                candle_core::cuda_backend::cudarc::driver::result::memcpy_dtod_async(
+                                    d.ptr(), s2.ptr(), d.len(), candle_stream.cu_stream(),
+                                )
+                            }
+                            .map_err(candle_core::Error::wrap)?;
+                        }
+                        dst.fence.record_reads(&self.slot_device)?;
                         Ok(Arc::clone(dst))
                     }
                     _ => Ok(Arc::clone(src_buf)),
@@ -811,9 +811,6 @@ impl CachedLayer {
             }
         }
         if promoted > 0 {
-            if let Some(done) = self.promote.as_ref() {
-                done.record(cs)?;
-            }
             stats::record_promotions(promoted);
         }
         if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {

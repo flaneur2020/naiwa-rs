@@ -462,11 +462,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             Some(cs) => Some(crate::doorbell::PassCell::new(Arc::new(CopyDone::new(cs)?))),
             None => None,
         };
-        // The promotion copies' completion, so the next step waits for them before it reads a promoted slot.
-        let promote_clone: Option<Arc<CopyDone>> = match &copy_stream {
-            Some(cs) => Some(Arc::new(CopyDone::new(cs)?)),
-            None => None,
-        };
 
         let cached = Arc::new(CachedLayer {
             _pinned: pinned,
@@ -475,7 +470,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             layer: layer_idx,
             layers: Arc::clone(&self.layers),
             staging: Arc::clone(&self.staging),
-            promote: promote_clone,
             staged_now: Mutex::new(Vec::new()),
             hidden,
             num_experts,

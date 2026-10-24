@@ -209,7 +209,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         filling: AtomicBool::new(false),
         preload: None,
         staging_done: None,
-        promote: None,
         staged_now: Mutex::new(Vec::new()),
     })
 }

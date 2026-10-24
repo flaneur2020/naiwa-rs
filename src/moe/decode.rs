@@ -74,9 +74,6 @@ pub(crate) fn forward(
     #[cfg(feature = "cuda")]
     {
         layer.wait_preload()?;
-        if layer.promoting() {
-            layer.wait_promote()?;
-        }
     }
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
     // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
@@ -155,8 +152,11 @@ pub(crate) fn forward(
     // sit behind every kernel that reads the staging slots.
     #[cfg(feature = "cuda")]
     if layer.staging_enabled() && layer.promoting() {
-        if let Some(cs) = layer.copy_stream() {
-            if let Err(e) = layer.promote_staged(cs) {
+        // On candle's stream: the d2d copy needs ordering against the kernels that read the staging slot, and that
+        // is the stream they run on. The PCIe copy stream is for the host-side staging and is already saturated.
+        if let candle_core::Device::Cuda(dev) = layer.slot_device() {
+            let stream = dev.cuda_stream();
+            if let Err(e) = layer.promote_staged(&stream) {
                 tracing::warn!("promote_on_stage: {e}");
             }
         }

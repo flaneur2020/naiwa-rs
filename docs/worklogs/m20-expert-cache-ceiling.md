@@ -779,3 +779,41 @@ Off by default, and it stays off: the estimate in §14.3 (2-6 ms) was the *upper
 sign is the opposite. What the episode established is worth more than the 2 ms would have been: the copy stream is
 saturated enough that *any* extra traffic on it is a net loss, which is the same conclusion as the `--pcie-frac`
 sweep's cliff at 0.6 (§16) - and it is now measured rather than inferred.
+
+## 24. Right question: the d2d does not need the PCIe stream — and that was not the cost either (2026-10-24)
+
+"为什么重用 copy stream？它只是 d2d" - correct, and it was a design mistake worth fixing. The copy stream exists for
+H2D from page-locked host memory; a device-to-device copy belongs on **candle's own stream**, where the kernels that
+read the staging slot are *already queued*, so the ordering comes from the stream itself:
+
+| | on the copy stream (as shipped in §23) | on candle's stream |
+|---|---|---|
+| ordering vs. the kernels reading the ring | wait on the ring slot's `ReadFence` event | **free**: same stream, in order |
+| ordering vs. the slot's next reader | per-layer `promote` `CopyDone` + `wait_promote` next step | **free**: same stream |
+| traffic added to the PCIe queue | 90-180 MB/step on top of 180 MB of staging | **none** |
+| protection against a lookahead upload into the slot | the destination's fence | the destination's fence, **recorded after the copy** (which is what closes that window) |
+
+So the mechanism is now ~30 lines shorter: `queue_d2d` and the `promote` `CopyDone` are gone, no extra event per
+layer per step, no `wait_promote` on the token path.
+
+**Measured, and the answer is the same**: turn-2 TPOT of the `doc` probe, 3 runs each, promotions confirmed running
+(8 940 published over one conversation at cap 1):
+
+| arm | runs | median | vs baseline 40.7 |
+|---|---|---:|---:|
+| baseline (off) | 40.7 / 40.8 / 38.8 | 40.7 ms | - |
+| copy stream, cap 1 | 41.9 / 42.7 / 49.3 | 42.7 | +2.0 |
+| copy stream, cap 2 | 45.0 / 42.4 / 45.3 | 45.0 | +4.3 |
+| **candle stream, cap 1** | 48.2 / 41.1 / 49.6 | **48.2** | +7.5 (noisy) |
+| **candle stream, cap 2** | 41.6 / 46.2 / 39.2 | **41.6** | +0.9 (in noise) |
+
+Moving the copies off the PCIe stream did **not** turn it positive, so the dominant cost was never the stream: it is
+the **admission economics**. A promoted expert is by definition one that just missed - a rare one - while the slot it
+takes comes from the LRU tail, i.e. a hot resident. The copy buys a hit the conversation was unlikely to need and
+pays for it with the cache's most useful occupant. That is the same law as M19's Phase A and Phase B, now measured a
+third time from a third direction.
+
+The cleaner design stays in the tree, off by default (`NAIWA_PROMOTE_MAX`, `NAIWA_PROMOTE_TRACE`), because it is
+correct now and because the *next* attempt should start from it: an admission rule that only promotes a staged expert
+it has seen **twice** would fix the economics rather than the plumbing, and that is a one-line condition on
+`self.state.hit_counts` - if anyone wants the 2 ms back.
