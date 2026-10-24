@@ -298,3 +298,79 @@ are both independent of it:
 |---|---|
 | `--pcie-frac` 0.2 -> 0.4 / 0.6 at 2.3 GB | moves misses from the CPU path to the GPU ring: no VRAM, one flag, and M16 already showed 1.0 saturates PCIe (2 668 MiB staged vs 848) so the optimum is interior |
 | admission policy (frequency / second-touch instead of pure LRU) | raises the hit rate at *equal* coverage - but only worth measuring once the miss path is cheap, otherwise it optimises the term that is not binding |
+
+## 14. Three proposals evaluated: drop readahead, profile-preload, promote-on-stage (2026-10-24)
+
+### 14.1 Dropping readahead because it "uses PCIe bandwidth"
+
+The arithmetic does not support the premise. At 80% hit rate a token has 96 misses = 180 MB = **13.5 ms of link
+time, i.e. 31% of a 43 ms TPOT** (~39% once MTP's ~1.25 forward passes per output token are counted). The link is
+**not saturated during decode**; what costs us is latency per miss (250 us against a 144 us transfer), not queueing.
+Readahead's bandwidth therefore displaces nothing that is scarce - and it is the only thing standing between a miss
+and the critical path.
+
+There is however a second, plausible cost that has nothing to do with bandwidth: `swaps` (lookahead loading a
+prediction *over* a resident). A wrong prediction both wastes a transfer and evicts a hot expert, which then misses
+again - two misses for one wrong guess. Under MTP the drafts change the topk, so predictions are weaker than in
+plain decode. That is measurable today from counters we already keep (`lookahead_loads`, `swaps`,
+`lookahead_dropped`).
+
+**Verdict**: not a bandwidth question, so it must be decided as an A/B on prediction accuracy, not argued. Cheap
+either way: one flag (`--no-lookahead`), and the counters say whether the swaps were earning their keep.
+
+### 14.2 Profile-preload the expert set (strata's "profile" idea)
+
+Record the expert set a conversation (or a warm-up) touches, then install that set at startup instead of letting
+LRU discover it. The ceiling on the benefit is the **cold start only**: our LRU reaches 78-81% within a handful of
+tokens, so preloading can only save the misses of the first few tokens - order 10 tokens x 96 misses x 250 us =
+**0.24 s per conversation**, i.e. <1% of a 34.5 s e2e, and it cannot help at all once the cache is warm.
+
+It also has a structural limit: the working set is `480 lookups per token`, and a conversation touches far more
+distinct experts than the 1 208 slots hold, so "the set" is not storable except as a *ranking*, which is exactly
+what an admission policy is. **Verdict: low value, and the parts that are worth anything are admission policy,
+not a saved profile.** (A profile does have one cheap use: seeding a *fresh* process after a restart, which is not
+a latency problem we have.)
+
+### 14.3 Promote staged experts into the cache, with a cap
+
+This is the one of the three with a real mechanism behind it: a staged expert has **already crossed the link**, so
+admitting it costs a device-to-device copy (or a slot hand-over) instead of a 1.88 MB transfer, and it converts our
+most expensive miss kind (the CPU path, 250 us) into a hit. Pollution is the risk, hence the cap the proposal asks
+for.
+
+Upper bound, using the measured 250 us per miss saved and `--pcie-frac 0.2` (19 of 96 misses per token are staged):
+
+| reuse of the staged misses | extra hits/token | TPOT saved |
+|---|---:|---:|
+| 10% | 10 | **2.4 ms** |
+| 25% | 24 | **6.0 ms** |
+| 50% | 48 | 12.0 ms |
+
+But the bound is optimistic in one direction and pessimistic in another: at 80% hit rate the *remaining 20%* are by
+definition the rarely-used experts, so their reuse is likely near the bottom of that table - **yet** the same experts
+tend to be reused *within a conversation* (the prompt's topic persists), which is exactly the time scale a decode
+cache sees. So 2-6 ms is the honest range, at zero VRAM, against 8.7 ms for the whole 3 GB ceiling project.
+
+### 14.4 The combination is the interesting design, and it is one experiment
+
+The three proposals add up to a coherent restructure: **stop speculating, start exploiting what is certain.**
+
+```
+today:  lookahead predicts -> transfers over the link -> swaps over residents (sometimes wrong)
+        staged experts are used once and thrown away
+after:  no speculative prefetch -> every transfer is one we needed
+        every staged expert is a candidate for residency (capped)
+```
+
+That is also closer to strata's shape: its ring feeds the kernel and its admission is demand-driven, with no
+speculative traffic of its own.
+
+| arm | flags | what it tests |
+|---|---|---|
+| A | today (`--pcie-frac 0.2`, lookahead on) | baseline |
+| B | `--no-lookahead` | does the speculation pay? (`swaps` accuracy) |
+| C | `--pcie-frac 0.4` + promote-on-stage, cap 16/token | does demand-driven admission beat speculation at equal bandwidth? |
+| D | B + C | the restructure |
+
+Acceptance: harness 3 rounds, 0 failures, medians; oracle untouched (`frac` stays 0 for the byte-exact arm).
+Predicted: B neutral-to-worse, C **-2..-6 ms TPOT**, D best and cheapest to reason about.
