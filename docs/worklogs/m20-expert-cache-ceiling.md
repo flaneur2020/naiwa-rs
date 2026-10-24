@@ -122,3 +122,31 @@ T4 exists so that "we raised the ceiling" cannot be bought by making the working
 3. Does the prefill `headroom` (512 MiB, or free/8) ever bind in a real chunk? It was chosen for the paged-attention
    scratch, and M19's slack experiment suggests the formula under-counts by >89 MiB - so the headroom is doing real
    work and cannot simply be donated.
+
+## 9. Strata's ideas, adopted one at a time
+
+Strata solved this problem structurally, not by tuning. Five of its ideas bear directly on the ceiling, and each
+one maps to a step here - which is why M20 is described as "diagnose first": strata's first move *is* to compute a
+plan, and we currently do not have one.
+
+| # | strata's idea | where it lives there | our current shape | what M20 does with it |
+|---|---|---|---|---|
+| S1 | **one arena, carved once from measured free VRAM; the cache is the residual** | `Prefill::init(borrow, borrow_bytes)` carves resident / cache / borrow / ring at startup | cache is hand-set (`--expert-cache-gb`), then the stream takes "whatever is left", and a static 512 MiB headroom is guessed | step 1's ledger, then `--expert-cache-gb auto` = `free - decode_headroom - rings - borrowable_region`; **the ceiling becomes a printed number, not a parameter** |
+| S2 | **the chunk is derived from memory, not configured** (`--prefill auto` = the largest chunk that fills the ring) | `bytes_needed(chunk)` priced up front | `--max-prefill-chunk-tokens 8192` hand-set; `plan()` can only refuse afterwards | after S1, invert `fits()`: report the largest chunk the plan funds, and use that |
+| S3 | **the plan is recomputed after the first chunk** | `relayout(chunk, borrow, borrow_bytes, err)` | our plan is once, at load; the slack experiment showed its formula under-counts the peak by >89 MiB | recompute from the measured peak (`NAIWA_PREFILL_PEAK` already samples it per layer) and re-carve |
+| S4 | **failure posture: shrink, never disable** | a chunk that does not fit re-plans; the feature stays on | a miss once turned the stream off silently (4 s -> 132 s, M18) | any arm that cannot fund its reservation must fail loudly or shrink, and be reported |
+| S5 | **borrow the bytes the cache already owns, sized in bytes** | a ring carved from `PreBorrow` space, returned after | we borrow a 650 MiB whole-stack region and empty ~345 slots | **not copied**: M19 measured the alias cost and the ring-batching cost. This is the one idea that needs the kernel (M20.2), and the reason the ceiling gap is ~1.5 GB rather than ~0 |
+
+The honest reading of S5 is the one M19 earned: strata can borrow *cheaply* because what it borrows is small
+(~33 MiB ring) and because a byte ring never needs the alias discipline our whole-stack buffers do. Copying
+strata's *arithmetic* without copying its *kernel* is exactly what M19 Phase A/B did, and it lost. So M20 takes
+S1-S4 (all of which are planning, and all of which are measurable) and leaves S5 where it belongs.
+
+### What "aligning with strata" then means, concretely
+
+1. `--expert-cache-gb auto`: the cache is whatever the plan has left, after a **measured** (not guessed) decode
+   headroom - strata's residual idea, and the fix for "2.6 GB OOMs but nobody can say why".
+2. One startup line: `total | resident | kv | recurrent | drafter | staging rings | borrowable region |
+   decode headroom | cache N slots`. Every MiB named; T1 is then a diff, not an investigation.
+3. The chunk printed as "what the plan funds" instead of a hand-set cap (S2), with the recompute-after-first-chunk
+   posture (S3) so a formula that under-counts corrects itself instead of silently degrading (S4).
