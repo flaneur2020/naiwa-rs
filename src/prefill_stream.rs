@@ -465,6 +465,27 @@ impl PrefillStream {
         // non-finite chunk outputs, which is the run-to-run noise this defect lives in. `CUDA_LAUNCH_BLOCKING=1`
         // (every launch serialised) does make it vanish, which is what says the cause is cross-stream ordering.
         self.copy.after_device_work()?;
+        if std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
+            // **Default** (disable with `NAIWA_BORROW_NOZERO`): zero the whole borrowed span before the upload. The
+            // chunk only DMAs each projection's
+            // `size_in_bytes`; `MATRIX_ROW_PADDING` bytes at the end - which a kernel may legitimately read - are
+            // left as whatever the cache last wrote there. In a private allocation those bytes are zero, in the
+            // cache's slab they are stale quantised weights, whose contents depend on what the lookahead filled
+            // most recently.
+            let stream = self.copy.cuda_stream();
+            // SAFETY: the span is inside the slab and mapped; the memset is queued before the upload.
+            unsafe {
+                let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
+                    base as u64,
+                    0,
+                    offset,
+                    stream.cu_stream(),
+                );
+                if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    candle_core::bail!("memset of the borrowed span failed: {rc:?}");
+                }
+            }
+        }
         if let Some(cache) = self.cache.as_ref() {
             // Probe: keep everything identical but skip the emptying, to tell "the chunk writing into the cache's
             // bytes" from "the cache's slot metadata being cleared".

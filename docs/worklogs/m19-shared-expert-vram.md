@@ -1971,3 +1971,36 @@ is excluded by construction.
 `borrow_from` and the probes are the deliverables. The next step needs a controlled interleaving, i.e. a standalone
 two-thread reproducer under `compute-sanitizer --tool racecheck`, with the `UNUSED` probe as the control that makes
 the second bug appear on demand (12/12) - which is a much better foothold than the rare one this session chased.
+
+## Found it: the chunk's *padding* was reading the cache's stale bytes (2026-10-24)
+
+The mechanism the whole session was missing, and it fits every observation:
+
+**the chunk only DMAs each projection's payload (`size_in_bytes`), while the layout reserves `MATRIX_ROW_PADDING`
+bytes after it - and a quantised kernel may legitimately read into that padding.** In a private allocation
+(`QCudaStorage::zeros`) those bytes are **zero**; in the cache's slab they are **whatever the cache last wrote** -
+a different quantiser's blocks, whose scales can be NaN, and whose contents depend on what the lookahead filled most
+recently. That is why the defect needed the alias, needed `empty_range` (which is what puts the cache's bytes under
+the borrow), and needed the lookahead.
+
+**Zeroing the borrowed span before the upload** (`cuMemsetD8Async`, ~0.2 ms for 531 MiB) removes it:
+
+| configuration | non-finite chunk outputs | failed iterations |
+|---|---:|---:|
+| before (no zeroing) | 31-155 per run | 3-10/12 |
+| **after (zeroing, default)** | **0 in four runs** | 1-7/12, all of them `argmax received invalid logits` |
+
+So the chunk is now correct: **zero non-finite chunk outputs across four stress runs** and the harness gate passes
+with **0 failures** in 3 rounds.
+
+**What is left is a different, decode-side failure**: `argmax received invalid logits` (NaN logits in the step
+*after* a chunk) in 1-7 of 12 stress iterations. It is not the CPU-miss path (a 0.3 GB cache, i.e. almost all
+misses, is clean without the borrow: 0/12 twice), and it is not the chunk.
+
+**And the economics are unchanged**, which is the milestone's answer: the harness gate with the borrow at 2.0 GB is
+neutral to slower (TPOT 36/48/49/54 against the baseline's 36/44/46/50; e2e worse in every class), because freeing
+the 650 MiB layer buffer costs the cache 300 MiB relative to the 2.3 GB baseline - the MTP chat configuration needs
+the decode reserve that Phase A and Phase B both kept taking.
+
+**Committed as a default**: the memset. It is cheap, it makes the borrowed bytes fully defined, and it turns a
+3-10/12 corruption into a 1-7/12 one confined to the decode side.
