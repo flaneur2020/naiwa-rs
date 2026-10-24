@@ -1,0 +1,267 @@
+diff --git a/src/copy_stream.rs b/src/copy_stream.rs
+index 02eef9a..18ff35c 100644
+--- a/src/copy_stream.rs
++++ b/src/copy_stream.rs
+@@ -273,6 +273,45 @@ mod cuda {
+             self.queue_copies(fence, parts)
+         }
+ 
++        /// Queue device-to-device copies: `dst` gets `src`'s first `dst.len` bytes, once the *source's* readers are
++        /// done and the *destination's* are too.
++        ///
++        /// This is how a staged expert is promoted into the cache: its bytes already crossed the link, so
++        /// admitting it costs a d2d copy instead of a second H2D. Both fences matter - the source ring slot is
++        /// being read by the step's kernels, and the destination slot by whatever still holds it.
++        pub fn queue_d2d(
++            &self,
++            src_fence: &ReadFence,
++            dst_fence: &ReadFence,
++            parts: &[(&SlotMemory, &SlotMemory)],
++        ) -> Result<()> {
++            self.stream
++                .context()
++                .bind_to_thread()
++                .map_err(Error::wrap)?;
++            for fence in [src_fence, dst_fence] {
++                if let Some(event) = fence.event.lock().unwrap().as_ref() {
++                    self.stream.wait(event).map_err(Error::wrap)?;
++                }
++            }
++            for (dst, src) in parts {
++                if src.len < dst.len {
++                    candle_core::bail!(
++                        "promotion of {} bytes into a {}-byte slot",
++                        src.len,
++                        dst.len
++                    );
++                }
++                // SAFETY: both are live allocations, `dst.len` bytes are being written and they are a prefix of
++                // the source; the caller keeps the source alive and orders the readers after this stream.
++                unsafe {
++                    result::memcpy_dtod_async(dst.ptr, src.ptr, dst.len, self.stream.cu_stream())
++                }
++                .map_err(Error::wrap)?;
++            }
++            Ok(())
++        }
++
+         /// Copy each `src` into its `dst` once the slot's readers are done (`fence`), and return
+         /// after the copies have landed.
+         pub fn upload(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
+diff --git a/src/moe/cached_layer.rs b/src/moe/cached_layer.rs
+index ca274f5..f5d8151 100644
+--- a/src/moe/cached_layer.rs
++++ b/src/moe/cached_layer.rs
+@@ -349,6 +349,9 @@ pub(crate) struct CachedLayer {
+     pub(crate) layer: usize,
+     pub(crate) layers: Arc<Layers>,
+     pub(crate) staging: Arc<StagingRings>,
++    /// Experts staged last step, with the ring buffer they were staged into — see
++    /// [`CachedLayer::set_promote_pending`].
++    pub(crate) promote_pending: Mutex<Vec<(u32, Arc<SlotBuf>)>>,
+     pub(crate) hidden: usize,
+     pub(crate) num_experts: usize,
+     pub(crate) top_k: usize,
+@@ -564,6 +567,12 @@ impl CachedLayer {
+         self.staging_done.as_ref()
+     }
+ 
++    /// Experts staged last step, with the ring buffer they were staged into: candidates for promotion into the
++    /// cache. The bytes already crossed the link, so admitting one is a d2d copy.
++    pub(crate) fn set_promote_pending(&self, v: Vec<(u32, Arc<SlotBuf>)>) {
++        *self.promote_pending.lock().unwrap() = v;
++    }
++
+     pub(crate) fn layers(&self) -> &Arc<Layers> {
+         &self.layers
+     }
+@@ -646,6 +655,94 @@ impl CachedLayer {
+         }))
+     }
+ 
++    /// Promote the experts staged last step into the cache, up to `NAIWA_PROMOTE_MAX` per layer per step.
++    ///
++    /// A staged expert has **already crossed the link**, so admitting it is a device-to-device copy rather than a
++    /// second H2D - it converts the next step's most expensive miss (the CPU path) into a hit for the price of a
++    /// copy. Polluting the cache is the risk, hence the cap and the order (empty slots first, LRU victims after).
++    ///
++    /// Called at the *start* of a step, before `stage_misses` queues this step's copies: the caller records the
++    /// layer's completion event after both, so the existing `wait_staging` orders the readers - and it also means
++    /// the pending `Arc`s are dropped before the ring re-uses those slots (`wait_for_readers` waits on the
++    /// refcount, which a pending clone would hold).
++    pub(crate) fn promote_pending(&self, cs: &Arc<CopyStream>) -> candle_core::Result<usize> {
++        let cap = std::env::var("NAIWA_PROMOTE_MAX")
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or(0);
++        // Always drain: a pending clone holds a ring slot's refcount, and the ring cannot re-use it until it falls.
++        let pending = std::mem::take(&mut *self.promote_pending.lock().unwrap());
++        if cap == 0 || pending.is_empty() {
++            return Ok(0);
++        }
++        let _access = super::slab::lock_access();
++        if super::slab::borrowed() {
++            return Ok(0);
++        }
++        let mut promoted = 0usize;
++        for (expert, src_buf) in pending.into_iter().take(cap) {
++            let expert = expert as usize;
++            // Reserve: an empty slot, else the least-recently-used one.
++            let slot = {
++                let mut st = self.state.lock().unwrap();
++                if st.slots.iter().any(|s| s.expert == Some(expert)) {
++                    continue;
++                }
++                let usable = st.usable;
++                let pick = st.slots[..usable]
++                    .iter()
++                    .position(|s| s.expert.is_none())
++                    .or_else(|| lru_victim(&st.slots, &[]).map(|(_, slot)| slot));
++                let Some(slot) = pick else { continue };
++                st.slots[slot].expert = Some(expert);
++                slot
++            };
++            let storage = {
++                let st = self.state.lock().unwrap();
++                Arc::clone(&st.slots[slot].storage)
++            };
++            let copied: candle_core::Result<bool> = 'copy: {
++                let entry = storage.lock();
++                let Some(dst) = entry.as_ref() else {
++                    break 'copy Ok(false); // lent
++                };
++                match (&dst.data, &src_buf.data) {
++                    (SlotData::Banked { memory: dmem, .. }, SlotData::Banked { memory: smem, .. }) => {
++                        copy_stream::wait_for_readers(dst);
++                        // The *source* is ordered by its own fence (its readers recorded it this step), not by a
++                        // refcount wait: `pending` holds a clone of it until this point.
++                        cs.queue_d2d(
++                            &src_buf.fence,
++                            &dst.fence,
++                            &[
++                                (&dmem[0], &smem[0]),
++                                (&dmem[1], &smem[1]),
++                                (&dmem[2], &smem[2]),
++                            ],
++                        )?;
++                        Ok(true)
++                    }
++                    _ => Ok(false),
++                }
++            };
++            let mut st = self.state.lock().unwrap();
++            match copied {
++                Ok(true) => {
++                    let tick = st.tick;
++                    let s = &mut st.slots[slot];
++                    s.buf = Some(Arc::clone(
++                        storage.lock().as_ref().expect("published buffer"),
++                    ));
++                    s.last_use = tick;
++                    promoted += 1;
++                }
++                _ => st.slots[slot].expert = None,
++            }
++        }
++        stats::record_promotions(promoted);
++        Ok(promoted)
++    }
++
+     /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the
+     /// (slow) copy and published only after it, so concurrent admitters never share a slot
+     /// and readers never see a half-written one. `None`: already resident or no empty slot.
+diff --git a/src/moe/provider.rs b/src/moe/provider.rs
+index f92ead1..4795efb 100644
+--- a/src/moe/provider.rs
++++ b/src/moe/provider.rs
+@@ -470,6 +470,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
+             layer: layer_idx,
+             layers: Arc::clone(&self.layers),
+             staging: Arc::clone(&self.staging),
++            promote_pending: Mutex::new(Vec::new()),
+             hidden,
+             num_experts,
+             top_k: ctx.config.num_experts_per_tok,
+diff --git a/src/moe/stages/dma_miss.rs b/src/moe/stages/dma_miss.rs
+index f8dcfb3..5d54238 100644
+--- a/src/moe/stages/dma_miss.rs
++++ b/src/moe/stages/dma_miss.rs
+@@ -19,6 +19,9 @@ fn stream_pcie(
+     let (Some(cs), Some(done)) = (layer.copy_stream(), layer.staging_done()) else {
+         return Ok(());
+     };
++    // Promotion first: those copies then fall under the same completion event as this step's staging, and the
++    // pending `Arc`s are released before the ring may re-use their slots.
++    let _ = layer.set_promote_pending(Vec::new()); // BISECT: promotion disabled
+     // Every path records the layer's completion event: `upload_async` after each expert's copies,
+     // and one bare record when there was nothing to stage, so the consumer's wait is satisfied
+     // either way (a wait on an event that was never recorded would hang the stream).
+@@ -56,6 +59,7 @@ fn stage_misses(
+     // Working on `&Arc<SlotBuf>` directly matters: `wait_for_readers` waits for the refcount
+     // to fall back to the ring's own `Arc` — cloning into a borrow list first would count
+     // that clone and spin forever (W105: three 900s-timeout hangs, exactly here).
++    let mut slot_of_pending: Vec<(u32, Arc<SlotBuf>)> = Vec::new();
+     let slot_of = {
+         let mut ring = ring.lock().unwrap();
+         let chosen = streamed_misses(misses, layer.pcie_frac(), ring.len());
+@@ -98,9 +102,15 @@ fn stage_misses(
+                 stats::record_cache_pcie(bytes as u64);
+                 slot_of.insert(expert, (Arc::clone(buf), pos));
+             }
++            let pending: Vec<(u32, Arc<SlotBuf>)> = slot_of
++                .iter()
++                .map(|(id, (buf, _))| (*id, Arc::clone(buf)))
++                .collect();
++            slot_of_pending = pending;
+             slot_of
+         }
+     };
++    layer.set_promote_pending(slot_of_pending);
+     let bank_first = STAGING_RING_FIRST;
+     if slot_of.is_empty() {
+         return Ok(());
+diff --git a/src/stats/cache.rs b/src/stats/cache.rs
+index 802b152..a8de3c3 100644
+--- a/src/stats/cache.rs
++++ b/src/stats/cache.rs
+@@ -9,6 +9,8 @@ pub(crate) struct CacheStats {
+     pub installed: bool,
+     /// Routed experts of decode steps served from a slot.
+     pub hits: u64,
++    /// Experts staged through the PCIe ring and then promoted into the cache (d2d), capped per layer per step.
++    pub promotions: u64,
+     /// Routed experts of decode steps run on the CPU.
+     pub misses: u64,
+     /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
+@@ -33,6 +35,7 @@ pub(crate) struct CacheStats {
+ static CACHE_STATS: Mutex<CacheStats> = Mutex::new(CacheStats {
+     installed: false,
+     hits: 0,
++    promotions: 0,
+     misses: 0,
+     staged: 0,
+     lookahead_loads: 0,
+@@ -50,6 +53,10 @@ pub(crate) fn record_cache_installed() {
+ }
+ 
+ /// Routed experts of decode steps served from a slot.
++pub(crate) fn record_promotions(n: usize) {
++    CACHE_STATS.lock().unwrap().promotions += n as u64;
++}
++
+ pub(crate) fn record_cache_hits(n: usize) {
+     CACHE_STATS.lock().unwrap().hits += n as u64;
+ }
+diff --git a/src/stats/mod.rs b/src/stats/mod.rs
+index cf9eac9..94410f8 100644
+--- a/src/stats/mod.rs
++++ b/src/stats/mod.rs
+@@ -19,7 +19,7 @@ mod round;
+ mod step;
+ 
+ pub(crate) use cache::{
+-    dump_cache_stats, record_cache_hits, record_cache_installed, record_cache_lookahead_dropped,
++    dump_cache_stats, record_cache_hits, record_promotions, record_cache_installed, record_cache_lookahead_dropped,
+     record_cache_lookahead_load, record_cache_misses, record_cache_pcie, record_cache_result_stall,
+     record_cache_staged, record_cache_swap, record_cache_sync_wait,
+ };

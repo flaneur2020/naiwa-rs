@@ -621,3 +621,33 @@ The earlier note that strata runs 1.5 GB is the *pinned* M10 configuration (`--e
 itself it takes **1 028 slots / 1.98 GiB**, i.e. 8.4% coverage against our 9.8%. So the cache sizes are now
 comparable and **the old "+1.09 GB" framing of the gap is obsolete** - with frac 0.4 the TPOT gap is +5% (probe) and
 their hit rate is the *lower* of the two. The gap that remains is prefill, not decode.
+
+## 20. Promote-on-stage (A3): implemented, and it deadlocks in warmup — not resolved (2026-10-24)
+
+The one lever left that costs no VRAM: a staged expert has already crossed the link, so admitting it into the cache
+is a **device-to-device copy** instead of a second H2D. Implemented as:
+
+- `CopyStream::queue_d2d(src_fence, dst_fence, parts)` - waits on both fences (the ring slot's readers and the cache
+  slot's) and issues one `memcpy_dtod_async` per projection part.
+- `CachedLayer::promote_pending(cs)` - drains the previous step's staged `(expert, Arc<SlotBuf>)` list, reserves a
+  slot (empty first, then LRU), queues the d2d copy and publishes, under `lock_access` so the borrow's gate holds.
+  Capped by `NAIWA_PROMOTE_MAX` per layer per step (default 0 = off).
+- `dma_miss`: set the pending list at the end of `stage_misses`, and run `promote_pending` **at the start of the next
+  step's `stream_pcie`** - before this step's copies - so the existing per-layer completion event (`done`) orders the
+  readers, and so the pending `Arc`s are dropped before the ring may hand those slots out again.
+
+**It hangs in warmup**: the process reaches the staging-ring creation and then every thread sits on a futex. The
+hang survives with promotion disabled (`set_promote_pending(vec![])` per step), and disappears when the whole diff is
+stashed - so it is caused by the diff, not by the environment (which was backed up by a `READY` run of the stashed
+build on the same command line).
+
+Most likely cause, not yet proven: the pending list holds an `Arc` clone of a **ring** slot across a step boundary,
+and `stage_misses` waits on that slot's readers with `copy_stream::wait_for_readers`, which spins until the refcount
+falls back to the ring's own `Arc`. Draining at the start of the next step should be early enough - but the warmup
+also runs the lookahead/doorbell pass, and that path can hold a staged slot at the same time, which would turn the
+wait into a deadlock. The next design should therefore **not** keep a clone across a step boundary: promote the
+expert *inside* `stage_misses`, handing the ring `Arc` straight to the cache slot and giving the ring a replacement
+buffer, or promote at the end of the step with a per-slot "promote once" flag so no `Arc` outlives the step.
+
+Kept, for the next attempt: the patch is in [`m20-promote-attempt.patch.txt`](m20-promote-attempt.patch.txt), and the
+estimate that motivates it is unchanged (2-6 ms of TPOT at zero VRAM, from §14.3).
