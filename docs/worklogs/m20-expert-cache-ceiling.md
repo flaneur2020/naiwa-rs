@@ -686,3 +686,22 @@ staging and the prefill chunk's own uploads.
 
 Estimate unchanged and still unproven: **2-6 ms of TPOT at zero VRAM** (§14.3). It stays off until it can be measured
 without the penalty.
+
+### Where this was left, and what blocks the next step
+
+- The code is committed and **off** (`NAIWA_PROMOTE_MAX` unset): `CachedLayer::promoting()` is false, so
+  `set_staged_now`, `promote_staged` and `wait_promote` are never called and the shipped path is the one gate14
+  validated. `cargo test`: 49 passed.
+- The cap-0 arm **was** measured on this build before the machine degraded: turn-2 TPOT 41.6 / 40.0 / 43.3 ms, i.e.
+  identical to the shipped configuration, as expected.
+- The enabled arm still needs an explanation: with a per-step cap of 8, prefill runs at **5.8 T/s** (a 1700-token
+  prompt does not finish), which is not explained by copy volume (the per-layer version's 720 MB/step was one
+  cause, and fixing it changed nothing measurable).
+- **The machine is now unusable for this**: repeated load/kill cycles leave every server stalling in warmup *before*
+  `prefill (warmup): plan` is logged, on the shipped code path as well (58 GB RSS against 32-61 GB available,
+  page-fault traffic, zero progress). The next attempt needs a fresh boot before it can be measured at all.
+
+Next step when the machine is clean: run the same three arms (0 / 8 / 16 with the per-step cap) and add
+`NAIWA_PROMOTE_TRACE=1` printing, per layer, the number of promotions and the copy stream's backlog - if promotion
+disturbs prefill it must be through the stream it shares with the chunk's own uploads, and that is one number away
+from being visible.
