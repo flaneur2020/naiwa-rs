@@ -2035,3 +2035,24 @@ decode reserve that MTP needs.**
 
 Numbers for the record: 1 208 slots at 2.3 GB, ~1.88 MB each, borrowed span 650 MiB ≈ 345 slots ≈ 29%; chunk cost
 1 378 MiB (baseline) vs 866 MiB (borrow); decode low-water reserve ~600 MiB.
+
+## 2.6 and 2.9 GB: both arms OOM, so 2.3 is the configuration's ceiling (2026-10-24)
+
+Asked to measure the borrow at 2.6 and 2.9 GB. There is nothing to measure, because **neither arm can run there**:
+
+| `--expert-cache-gb` | baseline (no borrow) | borrow |
+|---|---|---|
+| **2.3** | runs - TPOT 35/42/47/41 ms | runs - TPOT 36/46/49/47 ms |
+| **2.6** | **`CUDA_ERROR_OUT_OF_MEMORY`** (round 1, `long` turn 1) | **`CUDA_ERROR_OUT_OF_MEMORY`** (round 1, `long` turn 1) |
+| 2.9 / 2.95 | OOM | OOM |
+
+The baseline arm was run at 2.6 GB specifically as the control, and it fails the same way. So the ceiling is a
+property of the **configuration** - MTP with `--mtp-n-predict 4`, the recurrent pool, the prefix checkpoint and an
+8192-token chunk's activations - and not of the borrow. The borrow does not move that ceiling at all, because the
+binding constraint is the *decode* reserve, which neither Phase A (the layer buffer) nor Phase B (the scratch pages)
+touches.
+
+**That closes the question of whether the borrow can pay in this workload**, and it is arithmetic rather than
+tuning: the cache cannot grow (2.3 is the ceiling with or without the borrow), so the borrow's only effect is the
+one measured at equal size - it spends ~345 of 1 208 slots for the duration of every chunk and the decode refills
+them afterwards, i.e. a ~29% eviction per prompt for no gain.
