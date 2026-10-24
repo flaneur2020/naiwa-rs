@@ -561,3 +561,63 @@ decode reserve is ~700 MiB on this card, which is exactly the number `--expert-c
 The per-class medians are noisy at this turn count (doc reads 46 against the probe's 40.7 - the harness mixes turn
 shapes), but no class regressed and `short` - the class with the most turns and therefore the most misses - moved
 54 -> 40 ms. The controlled probe (§16) remains the clean statement of the flatness effect.
+
+## 19. Where we stand against strata, 2026-10-24 (after T0)
+
+Both engines, same card, concurrency 1, same corpus and protocol. Strata's columns are its paired M10.2 run
+(`--spec 4`, `--expert-cache 800` blobs -> **1 028 slots / 1.98 GiB** when it sizes itself, `--kv int8`); ours are
+g14 (2.3 GB, `--pcie-frac 0.4`, chunk 8192, one prefill buffer, MTP 4).
+
+| class | metric | strata | us now | delta |
+|---|---|---:|---:|---:|
+| `doc` | TTFT turn 1 | 2 430 ms | 3 819 ms | **+57%** |
+| | TTFT >=2 (p50) | 631 ms | 1 096 ms | **+74%** |
+| | TPOT p50 | 39 ms | 46 ms (probe: **40.8**) | +18% (+5%) |
+| | reuse | 0.99 | 0.98 | -1 pt |
+| | e2e / conversation | 20.1 s | 34.5 s | **+72%** |
+| `long` | TTFT turn 1 | 2 273 ms | 3 730 ms | **+64%** |
+| | TTFT >=2 | 1 018 ms | 988 ms | **-3%** |
+| | TPOT | 39 ms | 44 ms | +13% |
+| | reuse | 0.99 | 0.98 | -1 pt |
+| | e2e | 39.9 s | 43.8 s | +10% |
+| `short` | TTFT turn 1 | 1 035 ms | 1 031 ms | -0.4% |
+| | TTFT >=2 | 625 ms | 992 ms | **+59%** |
+| | TPOT | 39 ms | 40 ms | +3% |
+| | reuse | 0.95 | 0.91 | -4 pt |
+| | e2e | 29.1 s | 40.3 s | **+38%** |
+| `code` | TTFT turn 1 | 984 ms | 929 ms | -6% |
+| | TTFT >=2 | 1 165 ms | 1 196 ms | +3% |
+| | TPOT | 29 ms | 34 ms | +17% |
+| | reuse | 0.67 | 0.87 | **+20 pt** |
+| | e2e | 21.9 s | 26.1 s | +19% |
+
+### Where we are ahead, and by how much
+
+| property | us | strata | reading |
+|---|---|---|---|
+| TPOT with every expert resident (compute floor) | **19 ms** | 39 ms | our decode is ~2x faster when memory is not the limit |
+| decode hit rate, single row | **51%** | 47.3% (its own logged figure) | we hit *more* often at a comparable cache |
+| decode hit rate under MTP | **78-81%** | n/a (no equivalent) | speculation raises it for us |
+| redo on `code` (mixed code/doc conversation) | 0.87 | 0.67 | we reuse context better on that class |
+| TPOT slope across a 0.45 GB cache change | **+0.4 ms/GB** | ~0 (flat) | we are now flat too, since frac 0.4 |
+
+### What is actually left
+
+1. **Turn-1 prefill, +1.3-1.5 s on every class with a long prompt.** This is the single largest item and it is
+   structural: 24 GB of expert reads per 1725-row chunk, and strata streams them through its byte ring while we
+   DMA whole layers into 650 MiB buffers. M17/M18 closed 1.5 s of it; the rest needs the kernel (M20.2).
+2. **TTFT >=2 on `doc`/`short` (+0.4-0.5 s)** - the tail of a turn's new tokens taking the chunk path at 24 GB per
+   chunk; the same term one size down.
+3. **TPOT +5-13%**, which is now the *smallest* of the three: 40.8 ms against 39 in the clean probe. Their 39 is flat
+   because the miss is hidden; ours is flat because frac 0.4 hides most of it. Both are near their compute floors
+   (39 and 19 respectively) - ours is the lower floor, theirs the better hiding.
+4. **Unexplained residual in `doc` e2e**: the components above account for ~3.2 s of a 14.4 s difference, and the
+   rest is in the tail (p90 TTFT 2 161 ms against strata's 733) and in turns the medians hide. Worth one
+   per-turn diff before it is explained away as bookkeeping.
+
+### Cache, corrected
+
+The earlier note that strata runs 1.5 GB is the *pinned* M10 configuration (`--expert-cache 800`); when it sizes
+itself it takes **1 028 slots / 1.98 GiB**, i.e. 8.4% coverage against our 9.8%. So the cache sizes are now
+comparable and **the old "+1.09 GB" framing of the gap is obsolete** - with frac 0.4 the TPOT gap is +5% (probe) and
+their hit rate is the *lower* of the two. The gap that remains is prefill, not decode.
