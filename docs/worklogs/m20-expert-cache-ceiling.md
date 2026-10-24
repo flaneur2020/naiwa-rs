@@ -743,3 +743,39 @@ crawl is gone - that was the same leak, seen from the promote side), but the fir
 `NAIWA_PROMOTE_TRACE=1` plus `NAIWA_STEP_DBG`, looking specifically at `queue_d2d`'s wait on the **destination**
 slot's fence: that event is recorded by a previous step's reader fence, and waiting on it from the copy stream is the
 one ordering nobody has exercised before.
+
+## 23. Promote-on-stage measured: +2.0 ms at cap 1, +4.3 at cap 2 — a clean negative (2026-10-24)
+
+With the two deadlocks fixed (and a third correct-by-construction restriction added), the mechanism finally runs and
+its value can be read off directly. Turn-2 TPOT of the `doc` probe, three runs per arm, same server flags, one server
+at a time:
+
+| `NAIWA_PROMOTE_MAX` (per layer) | runs | median | vs baseline |
+|---|---|---:|---:|
+| **0 (off)** | 40.7 / 40.8 / 38.8 | **40.7 ms** | - |
+| 1 (48 copies/step, 90 MB) | 41.9 / 42.7 / 49.3 | **42.7 ms** | **+2.0** |
+| 2 (96 copies/step, 180 MB) | 45.0 / 42.4 / 45.3 | **45.0 ms** | **+4.3** |
+
+Monotone in the cap, so it is the mechanism and not noise. The reason is the same law M19 hit twice: a promoted
+expert is by definition one that just **missed**, i.e. a rare one, while the slot it takes comes from the LRU tail -
+so the copy buys a hit that the conversation was unlikely to use and costs a hot resident. On top of that the copy
+shares the one copy stream with the step's staging (180 MB), which is where the marginal cost lands.
+
+### The three bugs this cost, all worth keeping fixed
+
+1. **The ungated write / gated clear** (§22): ring-slot `Arc`s leaked, `wait_for_readers` spun, warmup hung. Fixed.
+2. **The token thread blocked on the borrow gate**: `promote_staged` took `slab::lock_access()`, which the lookahead
+   holds across `upload_in_place` - and that *waits for the token thread's own read clones to drop*. Straight
+   deadlock, and the reason "the first request never completes". Fixed with
+   `slab::try_lock_access()`: the token path never blocks on it, it stands down for that step instead (the mechanism
+   only needs the atomic `borrowed()` flag, not the lock).
+3. **Evicting a slot the current step is reading**: the plan is built before promotion, so the slot's read fence does
+   not cover the incoming copy. Fixed by restricting victims to `last_use < tick`, which is exactly "no kernel of this
+   step touches it" (`Route::submit` stamps `tick` on every hit).
+
+### Verdict
+
+Off by default, and it stays off: the estimate in §14.3 (2-6 ms) was the *upper bound from reuse*, and the measured
+sign is the opposite. What the episode established is worth more than the 2 ms would have been: the copy stream is
+saturated enough that *any* extra traffic on it is a net loss, which is the same conclusion as the `--pcie-frac`
+sweep's cliff at 0.6 (§16) - and it is now measured rather than inferred.

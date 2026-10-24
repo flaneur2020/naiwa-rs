@@ -40,6 +40,17 @@ pub(crate) fn lock_access() -> MutexGuard<'static, ()> {
     ACCESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`lock_access`] for a caller on the token thread that must **never** block on it.
+///
+/// The lookahead holds this lock across `upload_in_place`, which waits for the readers of the slot it is
+/// overwriting (`copy_stream::wait_for_readers`, spinning on refcounts that only the token thread can drop). A
+/// token-thread waiter would therefore deadlock against it - measured as "a request never finishes" with promotion
+/// on. Nothing on the token path needs the lock: it needs to *know* whether a chunk owns the slab, and that is an
+/// atomic read (`borrowed()`). So: try, and stand down if it is busy.
+pub(crate) fn try_lock_access() -> Option<MutexGuard<'static, ()>> {
+    ACCESS.try_lock().ok()
+}
+
 /// Mark the slab as borrowed (or not) for the duration of one layer's compute.
 pub(crate) fn set_borrowed(on: bool) {
     BORROWED.store(on, Ordering::Release);

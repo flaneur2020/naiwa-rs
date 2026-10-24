@@ -703,22 +703,42 @@ impl CachedLayer {
         if self.layer == 0 {
             PROMOTED_THIS_STEP.store(0, Ordering::Relaxed);
         }
+        let _ = &PROMOTED_THIS_STEP;
         // Always drain, even with the cap at zero: these `Arc`s must not survive the step.
         let staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
+        if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
+            eprintln!(
+                "PROMOTE_ENTER layer {} cap {} staged {} promoting {}",
+                self.layer,
+                cap,
+                staged.len(),
+                self.promoting()
+            );
+        }
         if cap == 0 || staged.is_empty() {
             return Ok(0);
         }
-        let _access = super::slab::lock_access();
+        // Never block the token thread here: the lookahead holds this lock while it waits for *our* readers to
+        // drop (see `slab::try_lock_access`), so blocking would deadlock. Standing down costs one step of
+        // promotions, which is the right failure for an optimisation.
+        let Some(_access) = super::slab::try_lock_access() else {
+            return Ok(0);
+        };
         if super::slab::borrowed() {
             return Ok(0);
         }
         let mut promoted = 0usize;
+        let mut skipped = 0usize;
         let mut seen: Vec<u32> = Vec::with_capacity(cap);
         for (expert, src_buf) in staged.iter() {
-            if PROMOTED_THIS_STEP.load(Ordering::Relaxed) >= cap {
+            // The cap is **per layer per step**: a per-step budget spent itself in the first few layers, which
+            // made the choice of what to promote arbitrary (measured: layers 0-3 consumed all 8, layers 45-47
+            // promoted nothing). At `cap = 1` that is 48 copies = 90 MB per step, half of what staging moves.
+            if promoted >= cap {
                 break;
             }
             if seen.contains(expert) {
+                skipped += 1;
                 continue;
             }
             seen.push(*expert);
@@ -728,13 +748,25 @@ impl CachedLayer {
                 if st.slots.iter().any(|s| s.expert == Some(expert)) {
                     continue;
                 }
+                // An empty slot first, then the least-recently-used one - but never a slot this step touched:
+                // `Route::submit` stamps `last_use = tick` on every hit, so `last_use < tick` is exactly "no kernel
+                // of this step reads it", which is what makes overwriting it safe (the plan was built before
+                // promotion, so its read fence does not cover this copy).
                 let usable = st.usable;
-                let pick = st.slots[..usable]
+                let tick = st.tick;
+                let empty = st.slots[..usable].iter().position(|s| s.expert.is_none());
+                let victim = st.slots[..usable]
                     .iter()
-                    .position(|s| s.expert.is_none())
-                    .or_else(|| lru_victim(&st.slots, &[]).map(|(_, slot)| slot));
-                let Some(slot) = pick else { continue };
+                    .enumerate()
+                    .filter(|(_, s)| s.expert.is_some() && s.buf.is_some() && s.last_use < tick)
+                    .min_by_key(|(slot, s)| (s.last_use, *slot))
+                    .map(|(slot, _)| slot);
+                let Some(slot) = empty.or(victim) else {
+                    skipped += 1;
+                    continue;
+                };
                 st.slots[slot].expert = Some(expert);
+                st.slots[slot].buf = None;
                 slot
             };
             let storage = {
@@ -783,6 +815,17 @@ impl CachedLayer {
                 done.record(cs)?;
             }
             stats::record_promotions(promoted);
+        }
+        if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
+            // Off by default; `NAIWA_PROMOTE_TRACE=1` prints one line per layer per step.
+            eprintln!(
+                "PROMOTE layer {} staged {} promoted {} skipped {} filled {}",
+                self.layer,
+                staged.len(),
+                promoted,
+                skipped,
+                self.state.lock().unwrap().slots.iter().filter(|s| s.expert.is_some()).count()
+            );
         }
         Ok(promoted)
     }
