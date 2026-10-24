@@ -197,3 +197,39 @@ likely; the expected gain is therefore **~2-4% of e2e**, and the milestone's gua
 is the only route that touches the 650 MiB *and* the TTFT; M19 measured the cheap version of it at 3.4x slower,
 so it is a project, not a step. The cache ceiling is a step, worth ~5% e2e, and it should be taken first because
 it is also the cheapest thing to *know*.
+
+## 11. Correction to §10: the gap is *miss visibility*, not only bytes (2026-10-24)
+
+§10 said "strata reaches 39 ms with 1.5 GB, our curve needs 2.59 GB to match" (+1.09 GB). The arithmetic holds,
+but the *interpretation* does not survive a second look at the numbers we already have:
+
+| | strata | us |
+|---|---|---|
+| TPOT by class (same corpus, same card, concurrency 1) | **39 / 39 / 39 ms** (doc/long/short) | 43 / 46 / 54 ms |
+| TPOT when the cache moves by 0.45 GB | flat | **43 -> 51 ms** |
+| TPOT with every expert resident | - | **19 ms** |
+| reuse | 0.95-0.99 | 0.90-0.98 |
+
+Strata's TPOT is **flat across three workloads with very different working sets**, which is the signature of a
+decode that is *not* cache-limited: its misses are off the critical path (lookahead prefetch into the ring, then the
+ring feeds the kernel). Ours moves with the cache in every measurement we have, i.e. **our decode is
+memory-latency-bound and the miss is visible**.
+
+That changes what "aligning with strata" means:
+
+- The "+1.09 GB" is not "they do more with less cache". It is "**they hide the miss and we do not**", expressed in
+  cache-equivalent units. Their 39 ms is their *compute* floor with speculation; our 19 ms all-resident floor is
+  below it - so when memory is not the limit we are faster than they are, which is the opposite of the conclusion
+  the raw TPOT comparison suggests.
+- Therefore the cheap test is **not** VRAM at all: it is `--pcie-frac` (how much of the miss the lookahead ring
+  absorbs) and the admission policy, both of which multiply the *effective* cache without a byte of extra memory.
+  We run `--pcie-frac 0.2`; M9's oracle notes record that `frac > 0` changes near-ties, so any such sweep must be
+  measured on the harness (which tolerates it) and never on the byte-exact oracle arm.
+- This reorders M20's own plan: **step 2 becomes "how visible is a miss?"** (sweep `--pcie-frac` 0.2 / 0.4 / 0.6 at
+  2.3 GB, record TPOT), before the ledger work, because if miss visibility is the binding term then the 650 MiB
+  of buffer is a second-order problem and the ceiling target T3 should be restated in *effective* cache.
+
+Numbers to beat, for the record: strata 39 ms flat; our curve predicts 34.3 ms at 3.0 GB, i.e. **a cache of 3.0 GB
+would put us ahead of strata's measured TPOT** - which is only plausible *because* their number is compute-bound and
+ours is memory-bound. If a `--pcie-frac` sweep alone moves us from 43 to ~39 ms, then the ceiling is worth less than
+§10 estimated and the hiding is worth more.
