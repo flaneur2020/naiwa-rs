@@ -72,7 +72,12 @@ pub(crate) fn forward(
     // event, so this also drains a copy the lookahead queued late; a layer that never gets
     // predicted has no claim and costs no CUDA call at all.
     #[cfg(feature = "cuda")]
-    layer.wait_preload()?;
+    {
+        layer.wait_preload()?;
+        if layer.promoting() {
+            layer.wait_promote()?;
+        }
+    }
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
     // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
     // from 858 us to 11 us). The staged experts still need the ring, so they keep the wait. This is
@@ -144,6 +149,17 @@ pub(crate) fn forward(
     }
     if fenced.is_err() {
         let _ = layer.slot_device().synchronize();
+    }
+    // Promote this step's staged experts into the cache (d2d, capped): the bytes already crossed the link, so
+    // admitting one is a copy rather than the next step's CPU-path miss. Queued after the fence loop, so the copies
+    // sit behind every kernel that reads the staging slots.
+    #[cfg(feature = "cuda")]
+    if layer.staging_enabled() && layer.promoting() {
+        if let Some(cs) = layer.copy_stream() {
+            if let Err(e) = layer.promote_staged(cs) {
+                tracing::warn!("promote_on_stage: {e}");
+            }
+        }
     }
     drop(plan.hits);
     #[allow(unused_variables)]

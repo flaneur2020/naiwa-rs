@@ -19,7 +19,7 @@ mod round;
 mod step;
 
 pub(crate) use cache::{
-    dump_cache_stats, record_cache_hits, record_cache_installed, record_cache_lookahead_dropped,
+    dump_cache_stats, record_cache_hits, record_promotions, record_cache_installed, record_cache_lookahead_dropped,
     record_cache_lookahead_load, record_cache_misses, record_cache_pcie, record_cache_result_stall,
     record_cache_staged, record_cache_swap, record_cache_sync_wait,
 };

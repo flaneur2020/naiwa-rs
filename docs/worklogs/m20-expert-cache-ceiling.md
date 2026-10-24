@@ -651,3 +651,38 @@ buffer, or promote at the end of the step with a per-slot "promote once" flag so
 
 Kept, for the next attempt: the patch is in [`m20-promote-attempt.patch.txt`](m20-promote-attempt.patch.txt), and the
 estimate that motivates it is unchanged (2-6 ms of TPOT at zero VRAM, from §14.3).
+
+## 21. Promote-on-stage, second attempt: the deadlock is gone, the enabled path crawls (2026-10-24)
+
+The §20 deadlock is **not** the promotion logic. Two facts settle it:
+
+- the whole diff stashed and the identical command line is `READY`, but the same diff with promotion **disabled**
+  (`NAIWA_PROMOTE_MAX=0`) also reached `READY` once the machine had no other server running - the earlier hangs were
+  a 58 GB RSS process thrashing against 32 GB of available memory, not a lock;
+- every thread in the "deadlock" was on a futex with **zero** CPU in the copy path, which is what a page-fault
+  storm looks like, not what `wait_for_readers`' spin looks like.
+
+Redesigned anyway, because the §20 hazard was real even if it was not the cause: **nothing keeps an `Arc` of a
+staging slot across a step**. The staged list is now written by `stage_misses` and consumed by
+`promote_staged` **in the same step, on the same thread**, called from `decode.rs` right after the fence loop (so the
+d2d copies queue behind every kernel that reads the ring). The reader ordering comes from the usual mechanism: the
+copies are recorded into a per-layer `promote` `CopyDone`, and the next step's resident submit waits on it next to
+`wait_preload`. The cap is **per step across layers** - at a per-layer cap of 8 the first version queued
+48 x 8 = 384 d2d copies of 1.88 MB = **720 MB per token**, which ran prefill at 5.8 T/s.
+
+**What is measured, and what is not.**
+
+| `NAIWA_PROMOTE_MAX` | prefill | turn-2 TPOT | verdict |
+|---|---:|---|---|
+| 0 (off) | normal | 41.6 / 40.0 / 43.3 ms | identical to the shipped build (`promoting()` is false, so no call is made at all) |
+| 8, per layer | **5.8 T/s** | - | 720 MB/step: withdrawn, replaced by a per-step cap |
+| 8, per step | **5.8 T/s** | - | **still crawls**, so volume was not the (only) cause - unexplained |
+
+So the mechanism is in the tree, correct in shape, and **off**: with the cap at zero, `promoting()` short-circuits
+before any of it runs, which is why the shipped configuration is bit-for-bit the one g14 validated. What is missing is
+a diagnosis of why enabling it costs ~60x on prefill; the next step is a single-layer trace
+(`NAIWA_RANK_DBG`-style) of `queue_d2d` against the copy stream's own backlog, since promotion shares the stream with
+staging and the prefill chunk's own uploads.
+
+Estimate unchanged and still unproven: **2-6 ms of TPOT at zero VRAM** (§14.3). It stays off until it can be measured
+without the penalty.

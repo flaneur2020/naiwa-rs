@@ -9,6 +9,8 @@ pub(crate) struct CacheStats {
     pub installed: bool,
     /// Routed experts of decode steps served from a slot.
     pub hits: u64,
+    /// Experts staged through the PCIe ring and then promoted into the cache (d2d), capped per layer per step.
+    pub promotions: u64,
     /// Routed experts of decode steps run on the CPU.
     pub misses: u64,
     /// Experts served from the staging ring over PCIe: neither a cache hit nor a CPU miss.
@@ -33,6 +35,7 @@ pub(crate) struct CacheStats {
 static CACHE_STATS: Mutex<CacheStats> = Mutex::new(CacheStats {
     installed: false,
     hits: 0,
+    promotions: 0,
     misses: 0,
     staged: 0,
     lookahead_loads: 0,
@@ -50,6 +53,10 @@ pub(crate) fn record_cache_installed() {
 }
 
 /// Routed experts of decode steps served from a slot.
+pub(crate) fn record_promotions(n: usize) {
+    CACHE_STATS.lock().unwrap().promotions += n as u64;
+}
+
 pub(crate) fn record_cache_hits(n: usize) {
     CACHE_STATS.lock().unwrap().hits += n as u64;
 }

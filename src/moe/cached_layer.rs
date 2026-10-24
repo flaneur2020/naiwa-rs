@@ -1,7 +1,7 @@
 //! Cached layers and the model-wide `Layers` index.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::{DType, Device, Tensor};
@@ -349,6 +349,12 @@ pub(crate) struct CachedLayer {
     pub(crate) layer: usize,
     pub(crate) layers: Arc<Layers>,
     pub(crate) staging: Arc<StagingRings>,
+    /// Completion of this layer's promotion copies (see [`CachedLayer::promote_staged`]).
+    pub(crate) promote: Option<Arc<CopyDone>>,
+    /// This step's staged experts, with the ring buffer each was staged into. Written and consumed **within one
+    /// step on the token thread** - deliberately not across a step boundary: a surviving `Arc` of a ring slot keeps
+    /// its refcount above one, and `stage_misses` waits on that refcount (`wait_for_readers`).
+    pub(crate) staged_now: Mutex<Vec<(u32, Arc<SlotBuf>)>>,
     pub(crate) hidden: usize,
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
@@ -511,6 +517,9 @@ impl RoutedExperts for CachedExperts {
     }
 }
 
+/// Promotions spent in the current step, across layers (see `CachedLayer::promote_staged`).
+static PROMOTED_THIS_STEP: AtomicUsize = AtomicUsize::new(0);
+
 impl CachedLayer {
     pub(crate) fn state(&self) -> &Mutex<LayerState> {
         &self.state
@@ -558,6 +567,19 @@ impl CachedLayer {
 
     pub(crate) fn pcie_frac(&self) -> f32 {
         self.pcie_frac
+    }
+
+    /// Remember this step's staged experts, replacing anything left over (which drops those `Arc`s).
+    pub(crate) fn set_staged_now(&self, v: Vec<(u32, Arc<SlotBuf>)>) {
+        *self.staged_now.lock().unwrap() = v;
+    }
+
+    /// Wait on candle's stream for this layer's promotion copies (if it promoted anything last step).
+    pub(crate) fn wait_promote(&self) -> candle_core::Result<()> {
+        let (Some(done), Device::Cuda(_)) = (self.promote.as_ref(), self.slot_device()) else {
+            return Ok(());
+        };
+        done.wait_on(self.slot_device())
     }
 
     pub(crate) fn staging_done(&self) -> Option<&Arc<CopyDone>> {
@@ -644,6 +666,125 @@ impl CachedLayer {
             up: expert_qtensor_on_device(&up, expert_id, &self.slot_device)?,
             down: expert_qtensor_on_device(&down, expert_id, &self.slot_device)?,
         }))
+    }
+
+    /// Promote this step's staged experts into the cache, up to `NAIWA_PROMOTE_MAX` per layer per step.
+    ///
+    /// A staged expert has **already crossed the link**, so admitting it is a device-to-device copy rather than a
+    /// second H2D: it turns the next step's most expensive miss (the CPU path, ~250 us) into a hit. Polluting the
+    /// cache is the risk, hence the cap and the order (empty slots first, LRU victims after).
+    ///
+    /// Called at the **end** of a layer's step, after the fence loop has recorded the staged slots' readers - so the
+    /// copies queue behind the kernels that read them, on the copy stream. The *next* step waits on
+    /// [`Self::promote_done`] before it submits the resident experts, which is what orders the readers of the
+    /// published slots.
+    ///
+    /// Nothing here outlives the step: the `Arc`s come from the step's own hit list, so the staging ring's refcounts
+    /// fall as they always did (`wait_for_readers` depends on exactly that).
+    /// Whether promotion is switched on at all (`NAIWA_PROMOTE_MAX > 0`). Read once: the decode path calls this
+    /// every layer, so it must not touch the environment.
+    pub(crate) fn promoting(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("NAIWA_PROMOTE_MAX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .is_some_and(|n| n > 0)
+        })
+    }
+
+    pub(crate) fn promote_staged(&self, cs: &Arc<CopyStream>) -> candle_core::Result<usize> {
+        // The cap is **per step across all layers**, not per layer: at a per-layer cap of 8 this queued
+        // 48 x 8 = 384 d2d copies of 1.88 MB (720 MB) per token, which ran prefill at 5.8 T/s.
+        let cap = std::env::var("NAIWA_PROMOTE_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if self.layer == 0 {
+            PROMOTED_THIS_STEP.store(0, Ordering::Relaxed);
+        }
+        // Always drain, even with the cap at zero: these `Arc`s must not survive the step.
+        let staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
+        if cap == 0 || staged.is_empty() {
+            return Ok(0);
+        }
+        let _access = super::slab::lock_access();
+        if super::slab::borrowed() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        let mut seen: Vec<u32> = Vec::with_capacity(cap);
+        for (expert, src_buf) in staged.iter() {
+            if PROMOTED_THIS_STEP.load(Ordering::Relaxed) >= cap {
+                break;
+            }
+            if seen.contains(expert) {
+                continue;
+            }
+            seen.push(*expert);
+            let expert = *expert as usize;
+            let slot = {
+                let mut st = self.state.lock().unwrap();
+                if st.slots.iter().any(|s| s.expert == Some(expert)) {
+                    continue;
+                }
+                let usable = st.usable;
+                let pick = st.slots[..usable]
+                    .iter()
+                    .position(|s| s.expert.is_none())
+                    .or_else(|| lru_victim(&st.slots, &[]).map(|(_, slot)| slot));
+                let Some(slot) = pick else { continue };
+                st.slots[slot].expert = Some(expert);
+                slot
+            };
+            let storage = {
+                let st = self.state.lock().unwrap();
+                Arc::clone(&st.slots[slot].storage)
+            };
+            let copied: candle_core::Result<Arc<SlotBuf>> = 'copy: {
+                let entry = storage.lock();
+                let Some(dst) = entry.as_ref() else {
+                    break 'copy Ok(Arc::clone(src_buf));
+                };
+                match (&dst.data, &src_buf.data) {
+                    (SlotData::Banked { memory: dmem, .. }, SlotData::Banked { memory: smem, .. }) => {
+                        cs.queue_d2d(
+                            &src_buf.fence,
+                            &dst.fence,
+                            &[
+                                (&dmem[0], &smem[0]),
+                                (&dmem[1], &smem[1]),
+                                (&dmem[2], &smem[2]),
+                            ],
+                        )?;
+                        Ok(Arc::clone(dst))
+                    }
+                    _ => Ok(Arc::clone(src_buf)),
+                }
+            };
+            let mut st = self.state.lock().unwrap();
+            match copied {
+                Ok(buf) => {
+                    let tick = st.tick;
+                    let s = &mut st.slots[slot];
+                    s.buf = Some(buf);
+                    s.last_use = tick;
+                    PROMOTED_THIS_STEP.fetch_add(1, Ordering::Relaxed);
+                    promoted += 1;
+                }
+                Err(e) => {
+                    st.slots[slot].expert = None;
+                    return Err(e);
+                }
+            }
+        }
+        if promoted > 0 {
+            if let Some(done) = self.promote.as_ref() {
+                done.record(cs)?;
+            }
+            stats::record_promotions(promoted);
+        }
+        Ok(promoted)
     }
 
     /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the

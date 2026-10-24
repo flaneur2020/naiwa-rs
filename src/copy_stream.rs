@@ -273,6 +273,45 @@ mod cuda {
             self.queue_copies(fence, parts)
         }
 
+        /// Queue device-to-device copies: `dst` gets `src`'s first `dst.len` bytes, once the *source's* readers are
+        /// done and the *destination's* are too.
+        ///
+        /// This is how a staged expert is promoted into the cache: its bytes already crossed the link, so
+        /// admitting it costs a d2d copy instead of a second H2D. Both fences matter - the source ring slot is
+        /// being read by the step's kernels, and the destination slot by whatever still holds it.
+        pub fn queue_d2d(
+            &self,
+            src_fence: &ReadFence,
+            dst_fence: &ReadFence,
+            parts: &[(&SlotMemory, &SlotMemory)],
+        ) -> Result<()> {
+            self.stream
+                .context()
+                .bind_to_thread()
+                .map_err(Error::wrap)?;
+            for fence in [src_fence, dst_fence] {
+                if let Some(event) = fence.event.lock().unwrap().as_ref() {
+                    self.stream.wait(event).map_err(Error::wrap)?;
+                }
+            }
+            for (dst, src) in parts {
+                if src.len < dst.len {
+                    candle_core::bail!(
+                        "promotion of {} bytes into a {}-byte slot",
+                        src.len,
+                        dst.len
+                    );
+                }
+                // SAFETY: both are live allocations, `dst.len` bytes are being written and they are a prefix of
+                // the source; the caller keeps the source alive and orders the readers after this stream.
+                unsafe {
+                    result::memcpy_dtod_async(dst.ptr, src.ptr, dst.len, self.stream.cu_stream())
+                }
+                .map_err(Error::wrap)?;
+            }
+            Ok(())
+        }
+
         /// Copy each `src` into its `dst` once the slot's readers are done (`fence`), and return
         /// after the copies have landed.
         pub fn upload(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
