@@ -717,8 +717,16 @@ impl CachedLayer {
         if super::slab::borrowed() {
             return Ok(0);
         }
+        // **Second sighting, at least**: an expert that just missed is by definition a rare one, and evicting a hot
+        // resident to hold it is how this mechanism lost 2-4 ms (§23/§24). `hit_counts` counts *demand* (every routed
+        // expert, resident or not), so this admits only what has actually been asked for repeatedly.
+        let min_sightings = std::env::var("NAIWA_PROMOTE_MIN_HITS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2);
         let mut promoted = 0usize;
         let mut skipped = 0usize;
+        let mut cold = 0usize;
         let mut seen: Vec<u32> = Vec::with_capacity(cap);
         for (expert, src_buf) in staged.iter() {
             // The cap is **per layer per step**: a per-step budget spent itself in the first few layers, which
@@ -736,6 +744,11 @@ impl CachedLayer {
             let slot = {
                 let mut st = self.state.lock().unwrap();
                 if st.slots.iter().any(|s| s.expert == Some(expert)) {
+                    skipped += 1;
+                    continue;
+                }
+                if st.hit_counts[expert] < min_sightings {
+                    cold += 1;
                     continue;
                 }
                 // An empty slot first, then the least-recently-used one - but never a slot this step touched:
@@ -816,11 +829,12 @@ impl CachedLayer {
         if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
             // Off by default; `NAIWA_PROMOTE_TRACE=1` prints one line per layer per step.
             eprintln!(
-                "PROMOTE layer {} staged {} promoted {} skipped {} filled {}",
+                "PROMOTE layer {} staged {} promoted {} skipped {} cold {} filled {}",
                 self.layer,
                 staged.len(),
                 promoted,
                 skipped,
+                cold,
                 self.state.lock().unwrap().slots.iter().filter(|s| s.expert.is_some()).count()
             );
         }

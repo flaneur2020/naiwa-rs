@@ -817,3 +817,43 @@ The cleaner design stays in the tree, off by default (`NAIWA_PROMOTE_MAX`, `NAIW
 correct now and because the *next* attempt should start from it: an admission rule that only promotes a staged expert
 it has seen **twice** would fix the economics rather than the plumbing, and that is a one-line condition on
 `self.state.hit_counts` - if anyone wants the 2 ms back.
+
+## 25. Second sighting: the penalty is gone, the gain is inside the noise — and the reason is the good one (2026-10-24)
+
+The rule asked for: only promote what has actually been **asked for repeatedly** (`hit_counts` counts *demand*, every
+routed expert, resident or not - it is the same counter `fill_candidate` uses to pick what to admit):
+
+```rust
+if st.hit_counts[expert] < min_sightings { cold += 1; continue; }   // NAIWA_PROMOTE_MIN_HITS, default 2
+```
+
+Five runs of the baseline and of `cap 1 / min 4`, three of the other arms, one server at a time, turn-2 TPOT of the
+`doc` probe:
+
+| arm | runs | median | vs baseline |
+|---|---|---:|---:|
+| baseline (off) | 38.8 / 44.8 / 40.8 / 42.1 / 42.5 | **42.1** | - |
+| cap 1, min 2 | 46.7 / 40.6 / 36.1 | 40.6 | -1.5 |
+| cap 2, min 2 | 40.3 / 41.4 / 38.8 | 40.3 | -1.8 |
+| **cap 1, min 4** | 37.6 / 40.7 / 46.5 / 42.1 / 41.0 | **41.0** | **-1.1** |
+| cap 1, min 8 | 43.1 / 37.2 / 47.0 | 43.1 | +1.0 |
+
+**The rule works as intended**: the +2.0/+4.3 ms penalty of §23 disappears (the arm is now 1 ms *better* than the
+baseline instead of 2-4 ms worse). But the residual is well inside the baseline's own spread (38.8-44.8, i.e. 6 ms),
+so with n = 5 a sub-2 ms effect cannot be resolved: **this is neutral, not a win.**
+
+And there is a structural reason to expect exactly that, which is more useful than the number: **the cache's
+admission was already demand-driven.** `fill_candidate` admits the highest-`hit_counts` non-resident expert whenever a
+slot is free, i.e. LRU plus demand. Promotion only changes **where the bytes come from** - the ring instead of the
+host - and the host link is the one resource with headroom (~31-39% busy during decode, §14.1). Occupancy policy
+unchanged + bytes not scarce = no measurable effect, which is precisely what the table says.
+
+### Where this leaves A3
+
+- Correct, clean, and off by default (`NAIWA_PROMOTE_MAX`); the three real bugs it found are fixed and stay (§22-24).
+- As an optimisation it is **neutral**: not worth carrying as a shipped default, worth keeping as a probe because it
+  answers "is the admission policy or the byte source the lever?" — **the policy**, and the policy already works.
+- What it rules out, for the record: with the copy on candle's stream, with an empty-slot preference, with
+  `last_use < tick` eviction protection and with a demand threshold, promotion still cannot beat doing nothing. So the
+  decode-side 40 ms is not explained by *which* experts are resident, and the remaining levers are the ones §19 named:
+  turn-1 prefill (+1.3-1.5 s) and the kernel.
