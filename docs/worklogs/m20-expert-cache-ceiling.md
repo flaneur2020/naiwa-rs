@@ -150,3 +150,50 @@ S1-S4 (all of which are planning, and all of which are measurable) and leaves S5
    decode headroom | cache N slots`. Every MiB named; T1 is then a diff, not an investigation.
 3. The chunk printed as "what the plan funds" instead of a hand-set cap (S2), with the recompute-after-first-chunk
    posture (S3) so a formula that under-counts corrects itself instead of silently degrading (S4).
+
+## 10. Estimated payoff, before spending anything (2026-10-24)
+
+Two measured anchors and one measured floor give a curve for TPOT against cache size
+
+```
+T(c) = 19.0 + 104.4 * exp(-c / 1.564)      c in GB      (doc class, 64-token answers, MTP 4)
+```
+
+| anchor | value | source |
+|---|---|---|
+| T(2.30) = 43.0 ms | gate10 median | M19 gate10 |
+| T(1.85) = 51.0 ms | same workload, cache cut for a second buffer | M18 |
+| floor 19.0 ms | every expert resident (`NAIWA_GPU_ONLY_EXPERTS=1`) | M10 (18.8/19.0/24.2) |
+
+**The fit is cross-checked against a point it was not fitted on**: T(1.5) = 59.0 ms, against M10's recorded
+"0.5 GB less cache costs decode: TPOT 57-60 ms". Three points, one curve, no free parameter left.
+
+| cache | TPOT (model) | vs today | doc e2e | share of e2e |
+|---|---:|---:|---:|---:|
+| 1.85 GB | 51.0 ms | +8.0 | +1.5 s | - |
+| **2.30 GB (today)** | **43.0 ms** | - | 34.5 s | - |
+| 2.60 GB | 38.8 ms | -4.2 | -0.8 s | -2.3% |
+| **3.00 GB (T3)** | **34.3 ms** | **-8.7 (-20%)** | **-1.7 s** | **-4.8%** |
+| 3.30 GB | 31.7 ms | -11.3 (-26%) | -2.2 s | -6.3% |
+| 3.60 GB | 29.5 ms | -13.5 (-32%) | -2.6 s | -7.5% |
+
+**What that buys against strata.** Strata reaches 39 ms on this card with 1.5 GB. Our curve needs **2.59 GB** to
+match that number - so the same TPOT costs us **+1.09 GB**, which decomposes almost exactly into the two things
+M19 named: **650 MiB** (the whole-stack prefill buffer strata does not need) plus **~0.45 GB** (per-miss
+efficiency: their DMA path and kernel against ours).
+
+**What it does not buy.** e2e per conversation is *not* dominated by TPOT: at 64-token answers and three turns,
+decode is ~8.3 s of the 34.5 s doc conversation, so a 20-32% TPOT cut is 5-8% of e2e. Strata's doc conversation
+is 20.1 s, so even at 3.6 GB we would land at ~31.9 s - **still 1.6x behind**, because the rest of the gap lives
+in turn-1 prefill (3.7 s against their 2.4 s) and in per-miss cost.
+
+**Risk-adjusted.** The 3.0-3.6 GB outcome requires the ledger to find 650-1 250 MiB that is genuinely idle during
+decode. The 2.6/2.9 GB OOMs - which hit the baseline too - argue that it may not be there. Call that 40-50%
+likely; the expected gain is therefore **~2-4% of e2e**, and the milestone's guaranteed product is the diagnosis
+(and, if C2 is the binding constraint, a cache size that is *computed* instead of guessed - worth more than the
+5% because it removes a whole class of "OOM in round 2").
+
+**The honest comparison with the other open direction**: the kernel (M20.2 / grouped GEMM reading a byte ring)
+is the only route that touches the 650 MiB *and* the TTFT; M19 measured the cheap version of it at 3.4x slower,
+so it is a project, not a step. The cache ceiling is a step, worth ~5% e2e, and it should be taken first because
+it is also the cheapest thing to *know*.
