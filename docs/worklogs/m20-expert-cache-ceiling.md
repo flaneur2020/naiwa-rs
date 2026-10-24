@@ -233,3 +233,36 @@ Numbers to beat, for the record: strata 39 ms flat; our curve predicts 34.3 ms a
 would put us ahead of strata's measured TPOT** - which is only plausible *because* their number is compute-bound and
 ours is memory-bound. If a `--pcie-frac` sweep alone moves us from 43 to ~39 ms, then the ceiling is worth less than
 §10 estimated and the hiding is worth more.
+
+## 12. How expensive is a miss, for us and for strata (2026-10-24)
+
+The §11 reframing can be priced. At 2.3 GB our doc TPOT is 43 ms and the all-resident floor is 19 ms, so the
+**memory term is 24 ms per token**. A token does `48 layers x topk 10 = 480` expert lookups; at 9.9% uniform
+coverage (30-50% effective, with popularity skew) that is 240-430 misses:
+
+| effective hit rate | misses/token | implied cost per miss |
+|---:|---:|---:|
+| 10% | 432 | **56 us** |
+| 30% | 336 | **71 us** |
+| 50% | 240 | **100 us** |
+
+One 1.88 MB slot at 13.4 GB/s is **144 us**. The implied per-miss cost is the same order as a full transfer, which
+says the miss is **serialised on the critical path** - not overlapped, not hidden. This is the whole 24 ms.
+
+Strata's TPOT is flat at 39 ms across working sets (doc/long/short), so its memory term is ~0: either the miss is
+fully hidden (lookahead issues the copy a layer ahead, and the cost becomes PCIe *bandwidth* rather than *latency*)
+or its per-miss path is cheaper. The flatness argues for hiding; the fact that its 39 ms exceeds our 19 ms
+all-resident floor argues that hiding is not free (their compute floor is simply higher than ours).
+
+Two consequences, both cheap to test and both independent of the VRAM ceiling:
+
+1. **`--pcie-frac` is the hiding knob we already have.** We run 0.2, i.e. only a fifth of the misses go through the
+   GPU ring; the rest take the CPU path. A sweep at 2.3 GB (0.2 / 0.4 / 0.6) prices the hiding directly: if TPOT
+   drops toward 39 ms, the effective cache has grown by ~1 GB *without a byte of VRAM*.
+2. **Our prediction problem is harder than theirs.** Hiding requires predicting 480 lookups per token across 48
+   layers, and under MTP the drafts change topk, so a wrong guess costs a wasted transfer. Their byte-sized ring
+   makes a wrong guess cost 1.88 MB; our whole-stack buffer makes the *workspace* 650 MiB but a wrong *prediction*
+   costs the same 1.88 MB - so this is the one place where our architecture is not the handicap.
+
+Recorded so it is not re-derived: **the miss is worth 24 ms/token to us and ~0 to strata; at 56-100 us per miss we
+are paying full DMA latency, serially, 240-430 times per token.**
