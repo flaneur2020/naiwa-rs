@@ -544,3 +544,20 @@ by the reserve instead of by luck.
 It is the first measured instance of the milestone's T2: **the constraint was named by an experiment** (an OOM
 inside `moe experts forward`, at 606 MiB of spare) rather than by argument. It also prices one of S1's terms: the
 decode reserve is ~700 MiB on this card, which is exactly the number `--expert-cache-gb auto` will have to subtract.
+
+### Final validation of the shipped configuration (2026-10-24)
+
+`--expert-cache-gb 2.3 --pcie-frac 0.4 --max-prefill-chunk-tokens 8192`, one layer buffer, decode reserve in place:
+**2 rounds, 132 turns, 0 failures**, and the plan line now reads the truth
+(`1 x 650 + 522 act + 512 headroom = 1684 MiB of 2335 free`).
+
+| class | TPOT p50 | turn-1 TTFT | e2e/conv | gate10 (frac 0.2) TPOT |
+|---|---:|---:|---:|---:|
+| code | 34 ms | 0.93 s | 26.1 s | 36 |
+| doc | 46 | 3.82 s | 34.5 s | 43 |
+| long | 44 | 3.73 s | 43.8 s | 44 |
+| short | **40** | 1.03 s | 40.3 s | **54** |
+
+The per-class medians are noisy at this turn count (doc reads 46 against the probe's 40.7 - the harness mixes turn
+shapes), but no class regressed and `short` - the class with the most turns and therefore the most misses - moved
+54 -> 40 ms. The controlled probe (§16) remains the clean statement of the flatness effect.
