@@ -403,7 +403,10 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m19-shared-expert-vram.md`](worklogs/m19-shared-expert-vram.md) — M19 (one expert-VRAM
+Worklog: [`worklogs/m20-expert-cache-ceiling.md`](worklogs/m20-expert-cache-ceiling.md) — M20 (open: what sets
+the expert cache's ceiling on a 12 GiB card — we hold 2 355 MiB, 19%; a VRAM ledger plus a per-consumer constraint
+probe, then one mechanism against whichever consumer the probe names. Alignment target with strata: >= 3.0 GiB).
+Worklog: [`worklogs/m19-shared-expert-vram.md`](worklogs/m19-shared-expert-vram.md) — M19 closed, all four designs rejected on measurement (one expert-VRAM
 arena: the prefill stream borrows the expert cache's top slots, strata's `Prefill::init(borrow)`/`relayout`
 shape, so decode gets ~2 200 slots and prefill keeps two buffers instead of trading one for the other).
 Worklog: [`worklogs/m18-prefill-transport.md`](worklogs/m18-prefill-transport.md) — M18 (the prefill stream's
