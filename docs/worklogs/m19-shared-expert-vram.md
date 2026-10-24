@@ -2056,3 +2056,30 @@ touches.
 tuning: the cache cannot grow (2.3 is the ceiling with or without the borrow), so the borrow's only effect is the
 one measured at equal size - it spends ~345 of 1 208 slots for the duration of every chunk and the decode refills
 them afterwards, i.e. a ~29% eviction per prompt for no gain.
+
+## Smaller chunk, bigger cache: it works, and it loses by an order of magnitude (2026-10-24)
+
+The user's suggestion - shrink the chunk so the cache can grow - is exactly the right lever, and it does work:
+
+| cap | cache | chunks per 1725-row prompt | turn-1 TTFT | OOM |
+|---|---|---:|---:|---|
+| 8192 | 2.3 GB | 1 | **3.8 s** | no |
+| 2048 | 2.6 GB | 1 | - | **baseline OOM'd in round 2** |
+| **1024** | **2.6 GB** | **2** | **5.7-5.9 s** | **no (both arms, 2 rounds, 0 failures)** |
+
+So at a 1024-token cap the cache grows from 2.3 to 2.6 GB and *neither* arm OOMs. The bill:
+
+- turn-1 TTFT **+1.9 s** (3.8 -> 5.7-5.9 s) because the 1725-row prompt is now read in **two** chunks, and M17
+  measured the second chunk at 2.2x the cost of one;
+- TPOT unchanged within noise (baseline 34/49/46/50, borrow 35/47/46/49) - the +13% slots are worth ~-4% TPOT by
+  the curve, i.e. ~0.13 s over a 64-token answer, and at 2.6 GB the borrow's ~345-slot eviction per prompt eats even
+  that.
+
+**The trade by the numbers**: +1 900 ms of turn-1 against ~130 ms of decode once. A factor of fifteen against.
+
+So the ceiling at 2.3 GB with an 8192 cap is not an artefact of the borrow or of the chunk formula: it is the
+configuration's best operating point, and buying cache with chunk size is a losing exchange on this corpus (short
+answers, prompts just above the 1024 boundary). It would only pay with prompts several times the chunk size and
+long answers - i.e. not this workload.
+
+Restored `engines/naiwa.json` and `naiwa-loan.json` to cache 2.3 GB, cap 8192.
