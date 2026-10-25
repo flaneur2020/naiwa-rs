@@ -403,10 +403,13 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m21-continued-turn.md`](worklogs/m21-continued-turn.md) — M21 (open: the continued turn. A
-non-first turn's suffix stays on the CPU expert path because `--prefill-stream-min-tokens` sits above every suffix we
-serve, at 21 ms/row against strata's 3; 54/54 continued turns in the three-round compare took the CPU path. Target:
-doc TTFT >= 2 p50 <= 700 ms, p90 <= 800 ms, against strata's 672/762).
+Worklog: [`worklogs/m21-continued-turn.md`](worklogs/m21-continued-turn.md) — M21 (closed as **negative**: three
+mechanisms refuted by measurement - `--prefill-stream-min-tokens` 64/32/16/8/1 identical, merging the suffix 2-4x
+worse, `NAIWA_PREFILL_THRESHOLD` 32/64/128/256 identical - and one law established: a continued turn costs ~1.2 s
+because a prefill chunk reads ~23 GiB (32 rows already route ~all 256 experts x 48 layers) and no chunking, path or
+threshold changes the size of that pass. Hands off two things: a **cache-sizing defect** (3.0 GB cache makes turn-1
+prefill 41x slower, 154 s, where 1.4 GB is 24% *faster*), and M22: the grouped-GEMM kernel that reads only the
+resident subset on the GPU and the rest on the CPU, which is what makes strata's 3 ms/row possible).
 Worklog: [`worklogs/m20-expert-cache-ceiling.md`](worklogs/m20-expert-cache-ceiling.md) — M20 (open: what sets
 the expert cache's ceiling on a 12 GiB card — we hold 2 355 MiB, 19%; a VRAM ledger plus a per-consumer constraint
 probe, then one mechanism against whichever consumer the probe names. Alignment target with strata: >= 3.0 GiB).
