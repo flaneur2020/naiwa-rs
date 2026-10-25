@@ -105,8 +105,26 @@ pub(crate) fn activation_bytes(chunk: usize) -> usize {
 /// 915 / 1815 / 3615 tokens at 201 / 356 / 416 tok/s; two buffers at 512 at 147 / 285. So the search
 /// walks the 256-token grid from `ceiling` down and takes the second buffer only when the *same*
 /// chunk affords it.
+const PLAN_GRID: usize = 256;
+
 pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool) -> Option<(usize, usize)> {
-    const GRID: usize = 256;
+    plan_with_reserve(free, layer_bytes, ceiling, borrowing, 0)
+}
+
+/// `kv_reserve`: bytes the KV cache will still take **after** this plan is made. The plan runs at warmup, when the
+/// paged-attention pool has not grown to the conversation's first prompt yet; measured on this card at
+/// `--pa-context-len 4096`, the first chunk found 384 MiB less free than warmup did. Without the term the plan says
+/// "1666 MiB of 1730 MiB free, fits" and the first chunk then re-measures 1346 and turns the stream off for the
+/// session - a 41x slower prefill, silently (m21-continued-turn.md §10/§11).
+pub(crate) fn plan_with_reserve(
+    free: usize,
+    layer_bytes: usize,
+    ceiling: usize,
+    borrowing: bool,
+    kv_reserve: usize,
+) -> Option<(usize, usize)> {
+    const GRID: usize = PLAN_GRID;
+    let free = free.saturating_sub(kv_reserve);
     // The activation term is an estimate, so it carries slack: on this card the formula alone would
     // take a 1280-token chunk with 3 MiB to spare (the exact shape of the miss that cost a whole
     // run's prefill). An eighth is enough to land on the 1024 the measurements proved.
@@ -172,6 +190,22 @@ pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: b
     Some((stride, best))
 }
 
+/// The KV bytes the plan must leave alone: the paged-attention pool grows to the first prompt's length *after*
+/// warmup's measurement. 384 MiB is what this card lost between warmup and the first chunk at
+/// `--pa-context-len 4096` (m21 §11); the term scales with the context because the pool does.
+///
+/// `NAIWA_KV_RESERVE_MIB` (probe): override it, e.g. `0` to reproduce the pre-M21 behaviour.
+fn kv_reserve() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("NAIWA_KV_RESERVE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mib| mib << 20)
+            .unwrap_or(384 << 20)
+    })
+}
+
 /// One layer's host stacks (gate, up, down). Holding them keeps the memory that in-flight
 /// uploads read alive.
 struct HostStacks([Arc<QTensor>; 3]);
@@ -204,6 +238,9 @@ pub struct PrefillStream {
     /// The memory plan in force (buffers and prompt step), from warmup and re-checked at the first
     /// long chunk. `None` until someone decides; `stride == 0` means the stream is off.
     plan: Mutex<Option<Plan>>,
+    /// Set once the stream has been refused because it cannot fit: every later chunk fails the same way rather
+    /// than quietly running on the CPU, which is what "the stream is off" used to mean (41x slower, m21 §10).
+    refused: std::sync::atomic::AtomicBool,
     /// The first long chunk has re-checked the plan against the free VRAM it actually sees.
     checked: std::sync::atomic::AtomicBool,
     /// Chunks shorter than this stay on the CPU.
@@ -277,6 +314,7 @@ impl PrefillStream {
             comm,
             layers: RwLock::default(),
             plan: Mutex::new(None),
+            refused: std::sync::atomic::AtomicBool::new(false),
             checked: std::sync::atomic::AtomicBool::new(false),
             min_tokens,
             peak: Mutex::new(Peak::default()),
@@ -322,7 +360,13 @@ impl PrefillStream {
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let (stride, chunk) = plan(free, self.layer_bytes(), prompt_step_ceiling(), self.borrows())?;
+        let (stride, chunk) = plan_with_reserve(
+            free,
+            self.layer_bytes(),
+            prompt_step_ceiling(),
+            self.borrows(),
+            kv_reserve(),
+        )?;
         Some((Plan { stride, chunk }, free))
     }
 
@@ -338,6 +382,19 @@ impl PrefillStream {
     /// The plan in force, or `(stride 0, chunk 0)` if it did not fit.
     fn current(&self) -> Plan {
         (*self.plan.lock().unwrap()).unwrap_or(Plan { stride: 0, chunk: 0 })
+    }
+
+    /// Whether the stream has been refused (see the field).
+    fn is_refused(&self) -> bool {
+        self.refused.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `NAIWA_PREFILL_ALLOW_CPU=1`: accept a prompt that runs on the CPU when the stream does not fit. Off by
+    /// default so a cache that starves the stream fails at startup with the number to fix, instead of serving at
+    /// 41x slower (m21 §10).
+    fn allow_cpu() -> bool {
+        static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *A.get_or_init(|| std::env::var_os("NAIWA_PREFILL_ALLOW_CPU").is_some())
     }
 
     /// How many buffers to use, decided once from free VRAM: `2` (overlap the next layer's upload
@@ -624,15 +681,56 @@ impl PrefillStream {
             None => {
                 let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
                 let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
+                // What the floor costs, and therefore what `--expert-cache-gb` would have to give up for the stream
+                // to run: the smallest chunk the grid can pick, one buffer, the activations and the slack.
+                let floor = self.layer_bytes()
+                    + activation_bytes(PLAN_GRID) * 9 / 8
+                    + MAX_HEADROOM
+                    + kv_reserve();
+                // The exact amount the cache must give up: the smallest reduction (in MiB) at which `plan` starts
+                // returning a chunk. A closed form would be the floor minus what is free, but the floor moves with
+                // the grid and the slack, so measure it instead of arguing about it.
+                let give_up = {
+                    let mut r = 0usize;
+                    while r < (4096 << 20) {
+                        if plan_with_reserve(
+                            free + r,
+                            self.layer_bytes(),
+                            prompt_step_ceiling(),
+                            self.borrows(),
+                            kv_reserve(),
+                        )
+                        .is_some()
+                        {
+                            break;
+                        }
+                        r += 64 << 20;
+                    }
+                    r
+                };
                 warn!(
                     "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB activations + \
-                     {:.0} MiB headroom does not fit in {:.0} MiB free). Lower --expert-cache-gb to \
-                     leave room for the stream, or drop --prefill-stream",
+                     {:.0} MiB headroom + {:.0} MiB KV reserve does not fit in {:.0} MiB free, of which \
+                     the KV will take its own {:.0}). The whole prompt then runs on the CPU, 41x slower: \
+                     drop --expert-cache-gb by at least {:.2} GB (or drop --prefill-stream, or set \
+                     NAIWA_PREFILL_ALLOW_CPU=1 to accept the slow path)",
                     mib(self.layer_bytes()),
                     mib(activation_bytes(previous.chunk.max(256))),
                     mib(MAX_HEADROOM),
+                    mib(kv_reserve()),
                     mib(free),
+                    mib(kv_reserve()),
+                    (give_up as f64) / (1024.0 * 1024.0 * 1024.0),
                 );
+                // A 41x slower prefill is a defect, not a way to run: refuse unless the caller says otherwise.
+                if !Self::allow_cpu() {
+                    self.refused.store(true, std::sync::atomic::Ordering::Release);
+                    candle_core::bail!(
+                        "prefill stream does not fit - see the warning above for the --expert-cache-gb to \
+                         drop to. Set NAIWA_PREFILL_ALLOW_CPU=1 to run the prompt on the CPU anyway (41x \
+                         slower), or drop --prefill-stream"
+                    );
+                }
                 if Self::strict() {
                     candle_core::bail!(
                         "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB activations + \
@@ -795,6 +893,12 @@ impl PrefillStream {
         let (batch, seq, _) = xs.dims3()?;
         if seq == 1 {
             return Ok(None);
+        }
+        if self.is_refused() {
+            candle_core::bail!(
+                "prefill stream refused: it did not fit at startup and NAIWA_PREFILL_ALLOW_CPU was not set, so \
+                 this prompt cannot run (drop --expert-cache-gb, see the startup warning)"
+            );
         }
         if batch * seq < self.min_tokens || self.stacks(layer).is_none() {
             // Which path a chunk took must be readable from the log, not inferred from the timing: a suffix under
@@ -1359,4 +1463,28 @@ fn forward_batched(
         start += len;
     }
     Tensor::cat(&parts, 1)
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    /// m21 §11: the plan must not spend the KV's growth. 1 730 MiB free with a 384 MiB reserve is 1 346 - the number
+    /// the first chunk actually found - and the 650 MiB buffer no longer fits there, so the plan refuses instead of
+    /// choosing a chunk that the first request would have to abandon.
+    #[test]
+    fn the_kv_reserve_is_not_spendable() {
+        let layer = 650 << 20;
+        let free = 1730 << 20;
+        let refused = plan_with_reserve(free, layer, 8192, false, 384 << 20);
+        assert!(
+            refused.is_none(),
+            "with the KV reserve the stream cannot fit: {refused:?}"
+        );
+        // Without the reserve the same free VRAM looks fine - which is exactly the bug the reserve removes.
+        assert!(plan_with_reserve(free, layer, 8192, false, 0).is_some());
+        // The card's shipping configuration stays comfortable: 2 498 MiB free at a 2.3 GB cache.
+        let shipping = plan_with_reserve(2498 << 20, layer, 8192, false, 384 << 20);
+        assert!(shipping.is_some_and(|(_, chunk)| chunk >= 8192), "{shipping:?}");
+    }
 }

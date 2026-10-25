@@ -163,6 +163,10 @@ impl GpuCacheMoeProvider {
         #[cfg(feature = "cuda")]
         if let Some(first) = layers.first() {
             let before = crate::copy_stream::free_bytes(first.slot_device()).unwrap_or(0);
+        info!(
+            "expert cache: warmup sees {:.0} MiB free before the pool trim",
+            before as f64 / (1u64 << 20) as f64
+        );
             crate::copy_stream::trim_device_pool(first.slot_device())?;
             let after = crate::copy_stream::free_bytes(first.slot_device()).unwrap_or(0);
             info!(
@@ -239,6 +243,15 @@ impl GpuCacheMoeProvider {
         // buffer count together and publishes the step to the scheduler.
         if let Some(prefill) = &self.prefill {
             prefill.plan();
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(first) = layers.first() {
+            if let Some(free) = crate::copy_stream::free_bytes(first.slot_device()) {
+                info!(
+                    "expert cache: {:.0} MiB free with the rings and mapped buffers built",
+                    free as f64 / (1u64 << 20) as f64
+                );
+            }
         }
         #[allow(unused_mut)]
         let mut captures = 0usize;
@@ -343,6 +356,13 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             // refined as layers arrive.  The quota can only stay the same or shrink, never grow,
             // because earlier layers have already claimed their slots.
             let estimated_layers = 48u64;
+            if let Some(free) = crate::copy_stream::free_bytes(&ctx.layer_device) {
+                info!(
+                    "expert cache: layer 0 budget decision, {:.0} MiB device free now, {:.0} MiB requested",
+                    free as f64 / (1u64 << 20) as f64,
+                    (self.cache_gb * 1024.0 * 1024.0 * 1024.0) / (1u64 << 20) as f64
+                );
+            }
             let per_layer = inner.remaining_bytes / estimated_layers;
             inner.bytes_per_layer = Some(per_layer);
             info!(

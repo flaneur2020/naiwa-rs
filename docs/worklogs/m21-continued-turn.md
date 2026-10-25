@@ -312,3 +312,35 @@ The plan is not wrong to refuse: at 1 346 MiB free, one 650 MiB layer buffer plu
 
 (a1) is the one to do first: it is small, it removes a 41x silent regression from the shipping configuration space,
 and it is the precondition for measuring (a2) fairly.
+
+## 12. (a1) shipped: the plan now reserves the KV's growth, and the cache ceiling moved to 2.6 GB (2026-10-24)
+
+Three changes, all small:
+
+1. **The plan reserves the KV's growth.** `plan_with_reserve(free, layer, ceiling, borrowing, kv_reserve)`: the KV
+   pool grows to the first prompt's length *after* warmup measured it. 384 MiB is what this card lost between warmup
+   and the first chunk at `--pa-context-len 4096` (measured, §11), and the term is the `NAIWA_KV_RESERVE_MIB` knob.
+   A unit test pins it: at 1 730 MiB free the plan refuses with the reserve and accepts without it, and the shipping
+   2.3 GB configuration (2 498 MiB free) still takes the full 8 192 chunk.
+2. **The refusal is loud and gives the number.** It bisects the free VRAM for the smallest cache reduction at which
+   a chunk fits and says: *"drop --expert-cache-gb by at least 0.62 GB"*.
+3. **It stays refused.** `PrefillStream::refused` is sticky: a stream that cannot fit no longer publishes
+   `stride 0` and quietly serves at 41x. `NAIWA_PREFILL_ALLOW_CPU=1` is the opt-in for the slow path (measured: 152
+   s, exactly the old behaviour), and without it the request fails with the remedy in the message.
+
+### The cache ceiling moves: 2.3 -> 2.6 GB
+
+| `--expert-cache-gb` | plan | behavior |
+|---|---|---|
+| 2.3 (was shipping) | chunk 8 192, `1684 MiB of 2498 MiB free` | unchanged: 0 failures, turn-1 3 637-3 805 ms |
+| **2.6** | chunk 8 192, `1684 MiB of 2178 MiB free` | **works**: turn-1 3 679-3 779 ms, TPOT turn-2 41.8 ms - +300 MiB of cache for free |
+| 2.8 | - | CUDA OOM **at startup** (the cache itself does not fit; an earlier 2.8 boot got through and served 154 s, so this size was always luck) |
+| 3.0 | warns, then every request fails | *"prefill stream refused ... drop --expert-cache-gb by at least 0.62 GB"* |
+
+So M20's premise - "2 355 MiB is our ceiling and 2.6-3.0 GB OOMs" - was wrong in an instructive way: 2.6 GB never
+OOM'd, it lost the *plan* and then served at 41x, which the earlier milestones read as a failed arm. The ceiling the
+ledger should have reported is **2.6 GB with a working prefill**, and the 384 MiB that decided it was the KV's own
+growth, invisible to a plan that measured once at warmup.
+
+Gate status: the prefill plan defect of §10 is fixed; the *continued turn* has not moved (that is M22's kernel), and
+the 2.6 GB arm is being run through the chat harness for the correctness gate before it is considered shippable.
