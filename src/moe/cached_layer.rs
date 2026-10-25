@@ -323,9 +323,32 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
 // take the decode split instead, whose expert cache the preceding chunk has just warmed.
 const PREFILL_THRESHOLD: usize = 32;
 
-/// The largest decode window the cache serves, i.e. the row count every warmup-sized mapped buffer
-/// and the CPU-result ring must cover. `PREFILL_THRESHOLD` is the same number by construction.
-pub(crate) const MAX_DECODE_ROWS: usize = PREFILL_THRESHOLD;
+/// The largest row count the *decode split* may be asked to take, i.e. what every warmup-sized mapped buffer and
+/// the CPU-result ring must cover. It is the ceiling for `NAIWA_PREFILL_THRESHOLD`, not that value itself: the
+/// buffers are sized once (a bigger threshold allocates more, a smaller one wastes it) and the routing decision is
+/// read at runtime.
+pub(crate) const MAX_DECODE_ROWS: usize = 256;
+
+/// M21: the row count above which a prompt chunk takes the whole-chunk path (CPU experts, or `--prefill-stream`)
+/// instead of the decode split.
+///
+/// 32 exists because a prompt is prefilled as `[0, align_down(len, 32))` then a remainder of at most 31 rows (the
+/// recurrent checkpoint boundary), and a remainder of a few rows on the whole-chunk path costs ~600 ms - a few rows
+/// still touch a third of every layer's experts. That same argument applies to a **continued turn**, whose whole
+/// suffix is the remainder: 51 rows arrive as 32 + 19, so the 32-row piece pays 600 ms for what the decode split
+/// would take in a few cheap steps against the cache the previous turn just warmed.
+///
+/// `NAIWA_PREFILL_THRESHOLD` (probe) raises the cut so a whole small suffix takes the decode split.
+fn prefill_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("NAIWA_PREFILL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(PREFILL_THRESHOLD)
+            .clamp(1, MAX_DECODE_ROWS)
+    })
+}
 
 /// Mutable per-layer decode state: doorbell, slots and LRU/hit counters.
 pub(crate) struct LayerState {
@@ -413,10 +436,10 @@ impl RoutedExperts for CachedExperts {
         // (no predecessor triggers it); a layer already full or filling is a no-op.
         // The decode side of the VRAM low-water instrument (`NAIWA_PREFILL_PEAK=1`), once per step: sampling
         // every layer would be 48 driver calls per token.
-        if layer.layer == 0 && num_tokens <= PREFILL_THRESHOLD && crate::vram_peak::enabled() {
+        if layer.layer == 0 && num_tokens <= prefill_threshold() && crate::vram_peak::enabled() {
             crate::vram_peak::note_step(&layer.slot_device);
         }
-        if num_tokens > PREFILL_THRESHOLD {
+        if num_tokens > prefill_threshold() {
             let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
             {
                 let mut st = layer.state.lock().unwrap();

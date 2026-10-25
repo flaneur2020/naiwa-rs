@@ -1,6 +1,7 @@
 # M21 — the continued turn: why every non-first turn runs its suffix on the CPU, and what it costs
 
-Status: **open** (planned 2026-10-24).
+Status: **closed as negative** (2026-10-24): three mechanisms refuted (§8, §9, §10), one law established, and a
+cache-sizing defect handed off (§10). The kernel direction is M22.
 Parent: [m20-expert-cache-ceiling.md](m20-expert-cache-ceiling.md) — §27, §30, §31.
 One mechanism this milestone: **the small-suffix prefill path** — a continued turn's new rows go to the GPU instead
 of the CPU expert path, by choosing the threshold from the upload arithmetic rather than leaving it above every
@@ -226,3 +227,59 @@ continued-turn TTFT ≈ (number of 32-row aligned chunks) x 600 ms
 which predicts strata's shape as well: their 623 ms fixed + 3 ms/row means they pay it **once per turn, not per
 32 rows** - they chunk the suffix by something other than a 32-row block, and their per-row cost is 100x smaller.
 That is the thing M22 has to reproduce, and it is a kernel fact, not a scheduling one.
+
+## 10. Third mechanism refuted, and a defect the cache sweep walked into (2026-10-24)
+
+### `NAIWA_PREFILL_THRESHOLD` (the decode-split cut, default 32)
+
+If the constant is 32 because a chunk of a few rows that goes the whole-chunk way costs ~600 ms, raising it so a
+whole small suffix takes the decode split should be the same win for a continued turn. Swept `{32, 64, 128, 256}`,
+doc probe, 3 runs each:
+
+| threshold | turn-2 TTFT (51 new rows) | turn-3 |
+|---|---|---|
+| 32 (shipped) | 1 233 / 1 239 / 1 254 ms | 1 074 / 1 110 / 2 351 |
+| 64 | 1 160 / 1 167 / 1 185 | 1 065 / 1 078 / 2 335 |
+| 128 | 1 207 / 1 225 / 1 232 | 1 126 / 2 069 / 2 937 |
+| 256 | 1 259 / 1 273 / 1 273 | 1 125 / 2 123 / 1 150 |
+
+**Identical.** So the continued turn does not care whether its suffix is cut at 32 rows, merged, computed on the CPU,
+or streamed: **all four knobs land on ~1.2 s.** Three mechanisms, one answer, so the cost is not in any of them.
+
+The number that explains it is M17's: *a prefill chunk reads ~23 GiB of expert data*, because even 32 rows route
+nearly all 256 experts of all 48 layers. Nothing about the chunk's shape changes the size of that pass; chunking,
+merging and path selection only change how many times it is paid - and the merge arm paid it in a slow way, the
+others pay it the same way.
+
+### The cache sweep found a defect instead
+
+While testing whether residency matters (it would not, per the above), two cache sizes were run:
+
+| cache | turn-1 TTFT | turn-2 | turn-3 |
+|---|---:|---:|---:|
+| 1.4 GB | **2 858 / 2 953 / 2 989** | 1 397 / 2 408 / 2 417 | 1 241 / 1 242 / 2 135 |
+| 2.3 GB (shipped) | 3 597 / 3 769 / 3 773 | 1 233 / 1 239 / 1 254 | 1 074 / 1 110 / 2 351 |
+| **3.0 GB** | **154 008 / 154 859** | 991 / 1 147 | 6 077 / 8 977 |
+
+Two things fall out:
+
+1. **A smaller cache makes turn-1 prefill faster** (2 858 ms at 1.4 GB against 3 773 at 2.3 GB, -24%): the prefill
+   stream's buffers and the cache compete, and at 1.4 GB the plan gives the stream more room.
+2. **At 3.0 GB turn-1 prefill degrades by 41x** (154 s for 1 725 rows, i.e. 89 ms/row - the whole chunk falling
+   back to the CPU path with nothing resident). This is a **defect, not a trade**: M19/M20 read the 2.6-3.0 GB arms
+   as OOM; here is a 3.0 GB boot that runs, and its prefill is unusable. Whatever the plan decides when the cache is
+   large, it must refuse to launch the stream rather than silently lose 150 s - that is §4.4's "failure shrinks,
+   never silently" applied to the prefill plan.
+
+M21 therefore closes with one model and two negative results, and hands off one defect:
+
+```
+continued-turn TTFT ≈ 1.2 s  (independent of chunking, path, and decode-split threshold)
+                    = one pass over the chunk's distinct-expert set
+                      (M17: ~23 GiB per chunk, because 32 rows already route ~all 256 experts x 48 layers)
+```
+
+Making that pass cheap is a **kernel** question (a grouped GEMM that reads only the resident subset on the GPU and the
+remainder on the CPU, without materialising the full set) - M22 - and strata's 3 ms/row is that kernel, not a
+scheduling trick: their fixed 623 ms + 3 ms/row means one set pass per *turn*, not per chunk, and 100x cheaper per
+row.
