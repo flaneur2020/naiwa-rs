@@ -1034,3 +1034,53 @@ Two gaps therefore survive KV alignment, in order of measured size:
 1. **Turn-1 prefill: 2 208 us/row against 1 361** (+58-65% of TTFT t1) - kernel/workspace, M20.2.
 2. **Turn >= 2 TTFT: +0.4 s median, +1.4 s p90**, and the p90 is 3x theirs - the fixed per-request path.
 3. Decode: mean at or near parity, but **variance 3-4x theirs**.
+
+## 29. strata's expert profile: parsed, wired, and it fixes the cold start (2026-10-24)
+
+The cold start was the last un-reused piece of strata's design. Their log, on every boot:
+
+```
+strata generate: expert cache 1028 slots, 1.98 GiB of VRAM
+strata generate: pre-filled 1028 of 1028 slots from the profile in 0.2 s (12542 MB/s)
+```
+
+### The format (read straight from their writer)
+
+`tools/make_profile.py` writes `STRP` v1, and our reader (`src/moe/profile.rs`) parses exactly that:
+
+```text
+"STRP"                                     magic
+<5I: version=1, layers, experts, slots, n> little-endian
+n * <HH: layer, expert>                    the ranking, best first
+layers*experts * <i: table[l][e] = rank>   redundant (the ranking inverted), not read
+```
+
+`data/expert-profile-coder.bin`: **48 x 256 = 12 288 ranked pairs**, uniformly 256 per layer, layers interleaved in
+rank order. The trailing table is what strata's own `read_profile` also ignores.
+
+Our slots are **per layer**, theirs are one pool, so the mapping is: each layer takes *its own* pairs in rank order
+until its slots run out. `--expert-profile PATH` does that at warmup through the ordinary `admit(.., sync)` path -
+which is the point: no new copy machinery, no new memory, and it respects the borrow gate.
+
+### Measured cold start
+
+Cold = the **first** conversation after a boot (`doc` probe), warm = the second. Two conversations per arm, one
+server at a time, `NAIWA_PROFILE_FILL` = the share of each layer's slots to seed:
+
+| arm | cold turn-1 TPOT | cold turn-2 TPOT | warm turn-2 |
+|---|---:|---:|---:|
+| off | 48.1 | 39.6 | 40.6 |
+| **seed 100%** | **45.6** | **34.0** | 38.8 |
+| seed 50% | 45.1 | 45.5 | 45.5 |
+| seed 25% | 47.3 | 43.9 | 37.4 |
+
+**Full seed: -2.5 ms on the first turn and -5.6 ms (-14%) by the second.** Partial seeds are worse than both - so
+the "leave empty slots for the demand path" idea is refuted by its own A/B (a full cache of good guesses beats an
+empty slot that has to be filled at 250 us a miss).
+
+Cost: `seeded 888 of 1358 slots in 0.14 s`, no extra VRAM (the banks already exist; seeding writes into them, so the
+prefill plan's free-VRAM measurement is unchanged), and 470 slots were **already warm** before seeding came along -
+which is worth knowing: the loader itself leaves the cache 35% full.
+
+Made default: the harness engine configs pass `--expert-profile data/expert-profile-coder.bin`. A missing or
+unreadable profile is a startup error, not a silent no-op, and without the flag nothing changes.

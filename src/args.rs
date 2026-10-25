@@ -248,6 +248,12 @@ pub struct ModelOptions {
     #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
     pub expert_cache_gb: Option<f64>,
 
+    /// With `--expert-cache-gb`, fill the cache before the first token from a strata expert profile
+    /// (`data/expert-profile-coder.bin`): every layer takes its own highest-ranked experts, in rank order, until
+    /// its slots are full. The first conversation then starts warm instead of teaching the cache what it is about.
+    #[arg(long = "expert-profile", requires = "expert_cache_gb")]
+    pub expert_profile: Option<std::path::PathBuf>,
+
     /// With `--expert-cache-gb`, DMA this share (0.0-1.0) of each decode step's expert-cache
     /// misses from the pinned host stacks into the staging ring (16 slots shared by all layers)
     /// and run them on the GPU alongside the residents. Costs a fixed ~tens of MB of VRAM on

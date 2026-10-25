@@ -22,6 +22,11 @@ use crate::prefill_stream::PrefillStreams;
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
 
+/// The profile reader takes sizes rather than reading them again: it filters to what the model has. Both are
+/// generous upper bounds, so a profile written for a bigger model still reads (its extra pairs are dropped).
+const PROFILE_LAYERS: usize = 128;
+const PROFILE_EXPERTS: usize = 1024;
+
 /// Device-layer map that keeps every decoder layer on the main device; mistral.rs clamps the
 /// count to the model's layer count. Taken-over experts are not counted, so auto mapping would
 /// spill whole layers to the CPU.
@@ -36,6 +41,7 @@ pub fn install_cpu_moe(
     pcie_frac: f32,
     lookahead_swaps: usize,
     lookahead: bool,
+    profile: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let prefill = prefill_stream.map(PrefillStreams::new);
     if let Some(min_tokens) = prefill_stream {
@@ -43,12 +49,21 @@ pub fn install_cpu_moe(
             "--prefill-stream: prefill chunks of {min_tokens} tokens or more run their experts on the GPU"
         );
     }
+    // Read here, where a bad path is still a startup error rather than a surprise at warmup.
+    let profile = match &profile {
+        Some(path) => Some(Arc::new(
+            crate::moe::Profile::read(path, PROFILE_LAYERS, PROFILE_EXPERTS)
+                .map_err(|e| anyhow::anyhow!("--expert-profile {}: {e}", path.display()))?,
+        )),
+        None => None,
+    };
     let provider = Arc::new(GpuCacheMoeProvider::new(
         expert_cache_gb,
         prefill,
         pcie_frac,
         lookahead_swaps,
         lookahead,
+        profile,
     ));
     let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
     install_routed_experts_provider(provider)?;
@@ -303,6 +318,7 @@ pub fn base_builder(
             model.pcie_frac,
             model.lookahead_swaps,
             !model.no_lookahead,
+            model.expert_profile.clone(),
         )?;
     }
     let paged = &model.paged_attn;

@@ -37,6 +37,7 @@ mod arena;
 mod cached_layer;
 mod decode;
 mod expert;
+mod profile;
 mod provider;
 mod rings;
 pub(crate) mod slab;
@@ -49,6 +50,7 @@ mod staging;
 #[cfg(test)]
 mod tests;
 
+pub use profile::Profile;
 pub use provider::GpuCacheMoeProvider;
 pub(crate) use arena::SlotArena;
 pub(crate) use rings::{plan as plan_rings, RingPlan, Round, RoundSlots};

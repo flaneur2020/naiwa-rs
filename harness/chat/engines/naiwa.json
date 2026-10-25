@@ -13,6 +13,8 @@
     "--cpu-moe",
     "--expert-cache-gb",
     "2.3",
+    "--expert-profile",
+    "/home/yazhou/code/strata/data/expert-profile-coder.bin",
     "--pcie-frac",
     "0.4",
     "--prefill-stream",
@@ -55,7 +57,8 @@
     "max_seqs": "4: the hybrid model reserves a ~112 MiB recurrent state per sequence slot, so the default 32 cost 3.5 GiB of VRAM for slots a one-request-at-a-time server never uses. At 4 the same card affords a 3 GB expert cache instead of 1 GB",
     "drafter": "MTP head's experts resident on the GPU in Q2_0 (moe::resident): 675 MiB, 2.25 bit/weight, same format/size strata uses; prefill 1696 rows 2.73 s -> 10.4 ms, draft forward 1.0-2.4 ms -> 0.55 ms",
     "checkpoint_alignment": "MISTRALRS_ALIGN_CHECKPOINTS=1 stops a verify step on the next paged block boundary, so the recurrent prefix checkpoint is taken at the end of every turn instead of only when a step happens to land on a boundary (measured 3/4 turns before). Costs nothing measurable: the dropped drafts are re-proposed next step and the continuation token is still sampled",
-    "promotion": "on by default since M20 \u00a725: promote up to 1 staged expert per layer per step, only if it has been demanded >= 4 times (dynamic residency that follows decode). Measured neutral (-1.1 ms median, inside the baseline's 6 ms spread)."
+    "promotion": "on by default since M20 \u00a725: promote up to 1 staged expert per layer per step, only if it has been demanded >= 4 times (dynamic residency that follows decode). Measured neutral (-1.1 ms median, inside the baseline's 6 ms spread).",
+    "cold_start": "--expert-profile strata/data/expert-profile-coder.bin: the cache starts with the profile's hot experts (strata's ranking), 0.14 s, no extra VRAM. Cold turn-1 TPOT 45.6 vs 48.1 and cold turn-2 34.0 vs 39.6 (M20 \u00a729)."
   },
   "env": {
     "MISTRALRS_MTP_PREFIX_REPLAY": "none",

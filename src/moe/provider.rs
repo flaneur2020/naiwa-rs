@@ -69,6 +69,8 @@ pub struct GpuCacheMoeProvider {
     lookahead_swaps: usize,
     /// `--no-lookahead`: the provider's prediction is off (tests only).
     lookahead: bool,
+    /// `--expert-profile`: the experts to put in the cache before the first token (strata's ranking).
+    profile: Option<Arc<super::profile::Profile>>,
     /// `NAIWA_CACHE_SLAB=1`: every layer's bank is carved from this one allocation instead of its own, so the
     /// cache's bytes are a contiguous pool the prefill stream can borrow from.
     slab: std::sync::OnceLock<Option<Arc<super::slab::Slab>>>,
@@ -117,6 +119,7 @@ impl GpuCacheMoeProvider {
         pcie_frac: f32,
         lookahead_swaps: usize,
         lookahead: bool,
+        profile: Option<Arc<super::profile::Profile>>,
     ) -> Self {
         stats::record_cache_installed();
         let total_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -135,6 +138,7 @@ impl GpuCacheMoeProvider {
             pcie_frac,
             lookahead_swaps,
             lookahead,
+            profile,
             slab: std::sync::OnceLock::new(),
         }
     }
@@ -166,6 +170,49 @@ impl GpuCacheMoeProvider {
                 (before as f64) / (1u64 << 20) as f64,
                 (after as f64) / (1u64 << 20) as f64,
                 ((after.saturating_sub(before)) as f64) / (1u64 << 20) as f64,
+            );
+        }
+        // The cache starts *hot*: `--expert-profile` names the experts routing picks most, best first, and each
+        // layer takes its own share until its slots run out (strata's own cold start: "pre-filled 1028 of 1028
+        // slots from the profile in 0.2 s"). Before the first token, so the first conversation does not pay for a
+        // cache that is still learning what it is about.
+        #[cfg(feature = "cuda")]
+        if let Some(profile) = &self.profile {
+            let t0 = std::time::Instant::now();
+            // `NAIWA_PROFILE_FILL` (probe, 0..1): seed only this share of each layer's slots, leaving the rest empty
+            // for the demand path, which fills an empty slot without evicting anything. A full seed has no fast path
+            // left: every expert the conversation actually wants must then displace a guess.
+            let share: f64 = std::env::var("NAIWA_PROFILE_FILL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0);
+            let mut filled = 0usize;
+            for layer in &layers {
+                let budget = ((layer.state().lock().unwrap().usable as f64) * share).round() as usize;
+                for &expert in profile.layer(layer.layer()).iter().take(budget) {
+                    match layer.admit(expert, true) {
+                        Ok(Some(_)) => filled += 1,
+                        // Full, already resident, or the borrow owns the bytes: this layer is done either way.
+                        Ok(None) => {}
+                        Err(e) => warn!("expert profile: layer {} expert {expert}: {e}", layer.layer()),
+                    }
+                }
+            }
+            if let Some(first) = layers.first() {
+                first.slot_device().as_cuda_device()?.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+            }
+            let (mut slots, mut usable) = (0usize, 0usize);
+            for l in &layers {
+                let st = l.state().lock().unwrap();
+                slots += st.slots.iter().filter(|s| s.expert.is_some()).count();
+                usable += st.usable;
+            }
+            info!(
+                "expert profile: {} -> seeded {filled} of {usable} slots in {:.2} s; {slots} resident \
+                 ({} were warm already, NAIWA_PROFILE_FILL={share})",
+                profile.source,
+                t0.elapsed().as_secs_f64(),
+                slots.saturating_sub(filled)
             );
         }
         // Every mapped buffer is sized and allocated here, once: the top-k doorbell per layer (for
