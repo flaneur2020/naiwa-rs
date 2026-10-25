@@ -107,10 +107,11 @@ pub(crate) fn step_boundary(layers: usize) {
     let ms = |i: usize| ns[i] as f64 / 1e6;
     #[cfg(feature = "cuda")]
     let (expert_ms, expert_n) = dev::take_ms();
+
     #[cfg(not(feature = "cuda"))]
     let (expert_ms, expert_n) = (0.0, 0usize);
     eprintln!(
-        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers) | plan {:.1} spawn {:.1} preload_wait {:.1} gpu {:.1} \
+        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers)  | plan {:.1} spawn {:.1} preload_wait {:.1} gpu {:.1} \
          staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | waits>200us preload {}/{} staging {}/{} \
          cpu {}/{}",
         total as f64 / 1e6,
