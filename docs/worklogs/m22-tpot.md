@@ -440,3 +440,27 @@ tuning at this point.
 
 The remaining TPOT gap is `code` (+14.6%) and it is the per-layer device pass - the same 48 x ~1.9 ms that strata pays,
 minus about 0.3 ms that their kernel does not. That is a kernel question (M22.2), and it is the only one left.
+
+## 15. The expert kernels are 52% of a step at 16% of peak bandwidth - M22.2 opens (2026-10-24)
+
+The budget now also brackets each layer's expert submissions with CUDA events and reads them a step later
+(`stats::budget::dev`), which separates the device time of the expert kernels from the rest of the layer's device work:
+
+```
+STEP_BUDGET layers 48 total 63.3 ms expert_dev 33.0 ms (48 layers) | plan 55.2 staging_wait 3.4 cpu_join 0.3
+```
+
+| | per step | per layer |
+|---|---:|---:|
+| expert kernels | **33.0 ms (52%)** | **0.69 ms** |
+| everything else (attention, norms, routing, launches) | 30.3 ms (48%) | 0.63 ms |
+
+Those kernels move `batch x topk x 1.88 MB = 20-50` expert reads per layer (~56 MB, 2.7 GB per step), so they run at
+**82 GB/s - 16% of what the card sustains**. The path is `indexed_moe_fused_decode` -> `launch_moe_gemv_fused_gate_up_*`:
+**GEMV** kernels, one row per (row, expert) pair, which is the classic reason a batch-1 decode sits at a tenth of peak
+bandwidth while a batched GEMM reaches 80%+.
+
+That is the remaining TPOT gap in one sentence, and it is why `code` (+14.6%) and `short` (+3.1%) are the classes that
+are left: they spend most of their step in this path. M22.2 is opened with the measurement, the traffic model, the
+prize (2x -> TPOT -27%, 3.6x -> -38%) and the plan (group the pairs by expert, then one launch per layer that
+dequantises each expert's blocks once).

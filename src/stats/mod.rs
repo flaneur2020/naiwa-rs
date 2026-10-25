@@ -20,6 +20,8 @@ mod round;
 mod step;
 
 pub(crate) use budget::{add as record_budget, enabled as budget_enabled, step_boundary as record_step_boundary, Phase as BudgetPhase};
+#[cfg(feature = "cuda")]
+pub(crate) use budget::dev as budget_dev;
 pub(crate) use cache::{
     dump_cache_stats, record_cache_hits, record_promotions, record_cache_installed, record_cache_lookahead_dropped,
     record_cache_lookahead_load, record_cache_misses, record_cache_pcie, record_cache_result_stall,

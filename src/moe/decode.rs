@@ -102,6 +102,13 @@ pub(crate) fn forward(
     let split = false;
 
     #[cfg(feature = "cuda")]
+    let cuda_stream = if stats::budget_enabled() {
+        Some(layer.slot_device().as_cuda_device()?.cuda_stream())
+    } else {
+        None
+    };
+    let expert_ev = cuda_stream.as_ref().and_then(|s| stats::budget_dev::start(s));
+    #[cfg(feature = "cuda")]
     let resident_acc = if split {
         let residents: Vec<Vec<Hit>> = plan
             .hits
@@ -153,6 +160,10 @@ pub(crate) fn forward(
     };
     #[cfg(not(feature = "cuda"))]
     let acc = Gpu::submit(layer, &plan.hits, &x2d, act);
+    #[cfg(feature = "cuda")]
+    if let Some(stream) = &cuda_stream {
+        stats::budget_dev::end(stream, expert_ev);
+    }
     // Kernels reading these slots may be queued even if a later step failed: fence every
     // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
     // cannot be recorded, wait for the device instead.

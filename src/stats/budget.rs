@@ -105,11 +105,16 @@ pub(crate) fn step_boundary(layers: usize) {
     // The previous step's counters are read before this step's begin: `swap` above cleared them, so the print is
     // one step behind, which is fine - the phases were accumulated over exactly those layers.
     let ms = |i: usize| ns[i] as f64 / 1e6;
+    #[cfg(feature = "cuda")]
+    let (expert_ms, expert_n) = dev::take_ms();
+    #[cfg(not(feature = "cuda"))]
+    let (expert_ms, expert_n) = (0.0, 0usize);
     eprintln!(
-        "STEP_BUDGET layers {layers} total {:.1} ms | plan {:.1} spawn {:.1} preload_wait {:.1} gpu {:.1} \
+        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers) | plan {:.1} spawn {:.1} preload_wait {:.1} gpu {:.1} \
          staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | waits>200us preload {}/{} staging {}/{} \
          cpu {}/{}",
         total as f64 / 1e6,
+        expert_ms,
         ms(Phase::Plan as usize),
         ms(Phase::Spawn as usize),
         ms(Phase::PreloadWait as usize),
@@ -125,4 +130,61 @@ pub(crate) fn step_boundary(layers: usize) {
         slow.2,
         layers,
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Device-side expert timing (M22.2).
+//
+// The host phases above say where the *thread* waits, but not whether the wait is the expert kernels or the rest of
+// the layer (attention, norms, routing): the doorbell is queued behind all of it. So this brackets the layer's expert
+// submissions with CUDA events and reads them at the next step boundary, when they have completed. `expert` is the
+// device time of the expert kernels; the step's device total minus it is everything else. Only live under
+// `NAIWA_STEP_BUDGET=1`.
+#[cfg(feature = "cuda")]
+pub(crate) mod dev {
+    use std::sync::Arc;
+
+    use candle_core::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
+
+    thread_local! {
+        static PAIRS: std::cell::RefCell<Vec<(CudaEvent, CudaEvent)>> = std::cell::RefCell::new(Vec::new());
+    }
+
+    /// Record the start of a layer's expert kernels. `None` when the probe is off, so callers pass it straight on.
+    pub(crate) fn start(stream: &Arc<CudaStream>) -> Option<CudaEvent> {
+        if !super::on() {
+            return None;
+        }
+        let ev = stream.context().new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).ok()?;
+        ev.record(stream).ok()?;
+        Some(ev)
+    }
+
+    /// Record the end and keep the pair for the step boundary.
+    pub(crate) fn end(stream: &Arc<CudaStream>, start: Option<CudaEvent>) {
+        let Some(start) = start else { return };
+        let Ok(ev) = stream.context().new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)) else {
+            return;
+        };
+        if ev.record(stream).is_err() {
+            return;
+        }
+        PAIRS.with(|p| p.borrow_mut().push((start, ev)));
+    }
+
+    /// Sum the finished pairs (ms) and clear. Called once per step, at the boundary.
+    pub(crate) fn take_ms() -> (f64, usize) {
+        PAIRS.with(|p| {
+            let mut pairs = p.borrow_mut();
+            let mut total = 0.0f64;
+            for (a, b) in pairs.iter() {
+                if let Ok(ms) = a.elapsed_ms(b) {
+                    total += ms as f64;
+                }
+            }
+            let n = pairs.len();
+            pairs.clear();
+            (total, n)
+        })
+    }
 }

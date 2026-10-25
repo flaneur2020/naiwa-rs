@@ -403,6 +403,12 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m22.2-expert-kernel.md`](worklogs/m22.2-expert-kernel.md) — M22.2 (**open**: the expert kernel.
+M22's step budget, extended with CUDA events around the expert submissions, shows the expert kernels are **52% of a
+decode step (33 ms of 63) running at 82 GB/s - 16% of the card's bandwidth** - because `indexed_moe_fused_decode`
+dispatches one **GEMV per (row, expert) pair**. 2x on that kernel is -27% TPOT, 3.6x is -38%, and it is the only thing
+left between us and strata on `code` (+14.6%) and `short` (+3.1%). Plan: group the pairs by expert in `decode.rs`,
+then one launch per layer over (expert, its rows) that dequantises each weight block once).
 Worklog: [`worklogs/m22-tpot.md`](worklogs/m22-tpot.md) — M22 (**targets met except the per-layer constant**: the
 per-step budget showed the step is device-bound (plan 91%, staging 4%, CPU 0.3%, GPU util 97%), acceptance joined the
 harness, and the fixed `--mtp-n-predict 4` turned out to cost 6.5-7 ms: automatic depth took TPOT to stratа parity and
