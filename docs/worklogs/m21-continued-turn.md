@@ -177,3 +177,52 @@ Open: whether the checkpoint at the end of a merged chunk still satisfies the re
 step of the mechanism is to check whether one block-aligned checkpoint at the *end* of a merged chunk is enough, or
 whether the intermediate ones are load-bearing for the *next* turn. If they are, the mechanism becomes "checkpoint at
 the end, and if the next turn's reuse then starts earlier, re-verify": a different trade, measured the same way.
+
+## 9. Second measurement: merging the suffix is worse, and it says why (2026-10-24)
+
+`MISTRALRS_MERGE_SUFFIX_BELOW=N` (fork, `pipeline/prompt_chunks.rs`): when a prompt's suffix is `N` rows or fewer,
+`build_prompt_chunk_plan` drops `block_align`, so the suffix is prefilled as one chunk instead of being cut at every
+paged-attention block boundary. Doc probe, three runs per arm, one server at a time.
+
+| arm | turn-2 TTFT (51 new rows, 2 aligned chunks) | turn-3 | turn-4 |
+|---|---|---|---|
+| off (block-aligned) | 1 194 / 1 227 / 2 525 ms | 1 090 / 1 169 / 2 277 | 628 / 688 / 1 135 |
+| merge <= 64 (1 chunk) | **2 504 / 2 505 / 4 828** | 2 276 / 2 675 / 3 791 | 439 / 3 639 / 4 330 |
+| merge <= 128 | **2 087 / 2 102 / 4 753** | 2 090 / 3 750 / 5 744 | 350 / 753 / 3 536 |
+
+**Merging costs 2-4x.** A 51-row suffix as one chunk takes 2.5-4.8 s where two 32-row chunks take 1.2 s, so the block
+boundary is not merely convenient for checkpoints - **the prefill path is fast only when a chunk ends on a block
+boundary**. The 32-row cut is load-bearing, and the "one bigger chunk amortises the fixed cost" argument (which the
+§8 chunk model invites) is wrong: the fixed cost is not per-chunk overhead that a bigger chunk amortises, it is
+proportional to the *distinct experts the chunk routes*, and an unaligned chunk takes a slower path on top.
+
+(One `off` arm OOM'd at startup in the first sweep - leftover rows of a previous server still resident, since
+`memory.used` was 0 only after waiting - and was re-run clean; the numbers above are the clean arm.)
+
+### What this leaves
+
+Both mechanisms M21 set out to try are now refuted by measurement:
+
+| mechanism | prediction | result |
+|---|---|---|
+| lower `--prefill-stream-min-tokens` (CPU -> GPU for small chunks) | 10x | **identical** at 64/32/16/8/1 (§8) |
+| merge a small suffix into one chunk | chunks x 620 ms -> 1 x 620 | **2-4x worse** (§9) |
+
+And the two numbers that bound it: a 32-row aligned chunk costs ~600 ms whichever path computes it (CPU at
+`min_tokens=64`, streamed at `min_tokens=16`), while a 1 725-row chunk costs 2.35 ms/row. The difference is
+**amortisation of the distinct-expert set**: 32 rows route ~35% of a layer's 256 experts and can pay for that set
+once; 1 725 rows route all of them and pay for the same set once as well, so cost per row collapses.
+
+So the remaining lever for a continued turn is not the chunking and not the path choice; it is **the cost of one
+pass over the distinct-expert set of a small chunk** - the CPU expert kernel for a 32-row batch, or the streamed
+union of ~90 experts per layer. That is a kernel milestone (M22), and M21 closes with two negative results and one
+model:
+
+```
+continued-turn TTFT ≈ (number of 32-row aligned chunks) x 600 ms
+                     = (new_rows / 32 + 1) x 600 ms
+```
+
+which predicts strata's shape as well: their 623 ms fixed + 3 ms/row means they pay it **once per turn, not per
+32 rows** - they chunk the suffix by something other than a 32-row block, and their per-row cost is 100x smaller.
+That is the thing M22 has to reproduce, and it is a kernel fact, not a scheduling one.
