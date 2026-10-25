@@ -95,10 +95,16 @@ def main() -> int:
                 continue
             # One number per drafted position: the median over turns, not every turn's value (the first version
             # concatenated them and printed 24 columns for 6 turns).
-            per_pos = " / ".join(
-                f(med([(t.get("accept_pos") or [None] * 4 + [None] * 4)[i] for t in late]), 2)
-                for i in range(4)
-            )
+            # An arm recorded before the field existed (or an engine that cannot report it) has no per-position list
+            # at all, and a short list (a step that never reached position 3) has fewer entries than 4.
+            def pos(i):
+                vals = []
+                for t in late:
+                    row = t.get("accept_pos") or []
+                    vals.append(row[i] if i < len(row) else None)
+                return med(vals)
+
+            per_pos = " / ".join(f(pos(i), 2) for i in range(4))
             print(
                 f"| {cls} | {engine} | {f(med([t.get('acceptance') for t in late]), 2)} | "
                 f"{f(med([t.get('tokens_per_step') for t in late]), 2)} | {per_pos} |"
