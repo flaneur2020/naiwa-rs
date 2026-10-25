@@ -20,7 +20,7 @@
     "--max-context",
     "4096",
     "--kv",
-    "int8"
+    "fp16"
   ],
   "cwd": "/home/yazhou/code/strata",
   "tokenizer": "/home/yazhou/code/Strata-data/packs/coder-iq1_m/tokenizer",

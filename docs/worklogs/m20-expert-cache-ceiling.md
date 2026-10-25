@@ -966,3 +966,71 @@ constant offset.
 | hide the miss off the critical path (cross-layer prefetch) | **-5 ms/token**, i.e. -1.8 s per `long` turn, -0.9 s per `code` turn | decode |
 | prefill kernel at strata's us/row | -1.46 s per long conversation, once | turn 1 |
 | turn >= 2 tail (p90 2 307 -> 768) | -1.5 s at p90 | every turn >= 2 |
+
+## 28. KV aligned with strata: fp16 vs int8 changes nothing, so that was never the gap (2026-10-24)
+
+Fairness check first: the earlier strata config passed `--kv int8` at `--max-context 4096`, which is **not** what
+strata's own launcher does - `setup.py:5084` reads `kv = "fp16" if ctx <= 8192 else (a.kv or "int8")`, i.e. below 8K
+it is plain fp16 and the flag is not even passed (`setup.py:5357`). The engine honours the flag at any context
+(`generate.cpp:2175`, `qsa_set_kv_int8(o.kv == "int8")`), so our harness had been running strata **better than its
+default**. Fixed: `strata-engine.json` now says `--kv fp16`, and the expert cache still comes up at 1028 slots / 1.98
+GiB, so nothing but KV precision moved.
+
+**Strata TPOT, int8 vs fp16, same harness, same class, median of turn >= 2:**
+
+| class | int8 | fp16 | delta |
+|---|---:|---:|---:|
+| code | 29.8 | 30.4 | +0.6 ms |
+| doc | 40.6 | 39.2 | -1.4 |
+| long | 39.6 | 39.4 | -0.2 |
+| short | 40.7 | 40.2 | -0.5 |
+
+**Nothing.** Which makes sense once the bytes are compared: at a ~2K prompt the KV is a few MiB per token-step while
+the expert stream is 256 experts x topk 10 x 640 x 2560 weights - the KV is not where decode time goes, it is where
+*long-context* time goes, which is exactly why strata's own launcher only quantises above 8K. The "they have `--kv
+int8`" footnote from §19 is dead, as is any thought that the compare was unfair in their favour on KV.
+
+### The aligned table (g17, 2 rounds, 0 failures, both f16 KV)
+
+| class | metric | strata | naiwa | delta |
+|---|---|---:|---:|---:|
+| code | TTFT t1 | 1 025 | 965 | -6% (**we win**) |
+| code | TTFT >=2 p50 / p90 | 1 159 / 1 203 | 1 269 / 2 644 | +10% / **+120%** |
+| code | TPOT | 30.4 | 34 | +13% |
+| code | e2e/conv | 22.7 s | 27.8 s | +22% |
+| doc | TTFT t1 | 2 420 | 3 822 | **+58%** |
+| doc | TTFT >=2 p50 / p90 | 668 / 754 | 1 176 / 2 175 | **+76% / +188%** |
+| doc | TPOT | 39.2 | 43 | +10% |
+| doc | e2e/conv | 25.1 s | 29.2 s | +16% |
+| long | TTFT t1 | 2 257 | 3 724 | **+65%** |
+| long | TTFT >=2 p50 / p90 | 821 / 1 223 | 958 / 1 165 | +17% / -5% |
+| long | TPOT | 39.4 | 47 | +19% |
+| long | e2e/conv | 37.3 s | 38.0 s | **+2%** |
+| short | TTFT t1 | 1 087 | 1 062 | -2% (**we win**) |
+| short | TTFT >=2 p50 / p90 | 655 / 804 | 987 / 1 364 | **+51% / +70%** |
+| short | TPOT | 40.2 | 49 | +22% |
+| short | e2e/conv | 31.8 s | 36.1 s | +14% |
+
+### The new thing this run shows: it is not the mean, it is the variance
+
+Turn >= 2 TPOT medians across the three runs of the same binary and the same classes:
+
+| class | g15 | g16 | g17 | strata (g16, g17) |
+|---|---:|---:|---:|---:|
+| code | 35 | 36 | 34 | 30, 30 |
+| doc | 44 | 45 | 43 | 41, 39 |
+| long | 48 | 45 | 47 | 40, 39 |
+| short | 52 | **38** | 49 | 41, 40 |
+
+strata sits at 39-41 in every class of every run. **We move between 38 and 52 for the same class.** So the honest
+statement of the decode gap is not "we are 20% slower" but "**we are 39-49 ms depending on the run, they are 39-41
+always**": our mean is sometimes at parity (g16 `short` 38, §25 probe 40.7-42.1) and our spread is what a user
+experiences as jitter. That is §11's "our misses are on the critical path, theirs are not" showing up as variance
+rather than as a mean, and it means the first decode lever is **stability** (removing the 8-13 ms excursions), not
+shaving 2 ms off the median.
+
+Two gaps therefore survive KV alignment, in order of measured size:
+
+1. **Turn-1 prefill: 2 208 us/row against 1 361** (+58-65% of TTFT t1) - kernel/workspace, M20.2.
+2. **Turn >= 2 TTFT: +0.4 s median, +1.4 s p90**, and the p90 is 3x theirs - the fixed per-request path.
+3. Decode: mean at or near parity, but **variance 3-4x theirs**.

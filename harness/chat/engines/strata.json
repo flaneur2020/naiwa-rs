@@ -27,7 +27,7 @@
   },
   "record": {
     "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M via ~/code/Strata-data/packs/coder-iq1_m (same GGUF shards)",
-    "kv": "int8",
+    "kv": "fp16 - aligned with naiwa (f16). strata's own launcher forces fp16 below 8K context anyway (setup.py: kv = 'fp16' if ctx <= 8192); the earlier config overrode it to int8, which flattered strata.",
     "context": 4096,
     "expert_cache": "800 blobs (~1.5 GB at 1.88 MB/blob). `auto` fills the card and is not comparable.",
     "speculation": "--spec 4 --spec-min-p 0.5 (required for a native IQ pack: T >= 2)",
