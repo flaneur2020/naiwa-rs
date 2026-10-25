@@ -441,3 +441,68 @@ If the fit predicate prices the per-token expert traffic (§12's second follow-u
 `1 024 x 8`), the 2.6 GB arm should keep turn-1 near 3 700 ms *and* take doc TPOT to 38 - i.e. **doc TPOT would go
 from +10% to -7%**, our first decode win on a long-context class. That is a two-line change to the predicate plus one
 measurement, and it is what the next round should do before any kernel work.
+
+## 14. TTFT and TPOT separated: two different gaps with two different causes (from g19, 3 rounds)
+
+### TTFT — ours grows with the conversation, theirs shrinks
+
+Turn-index medians across classes (ms):
+
+| | t1 | t2 | t3 | t4 | t5 |
+|---|---:|---:|---:|---:|---:|
+| strata | 1 685 | 808 | 718 | 678 | 632 |
+| naiwa | 2 328 | 1 077 | 1 212 | 1 391 | 865 |
+| delta | +38% | +33% | +69% | **+105%** | +37% |
+
+**Their continued-turn TTFT falls** (808 -> 632 as the prefix grows and the suffix gets shorter, 623 ms + 3 ms/row
+with the row term shrinking). **Ours rises** (1 077 -> 1 391) because the cost is `ceil(new_rows / 32) x 600 ms`: the
+turn that happens to need 73 new rows pays three chunks (2 290 ms) where the one needing 41 pays two (1 100 ms). The
+per-class spread is the same fact from another side:
+
+| class | strata t1 | naiwa t1 | strata >=2 p50 / p90 / max | naiwa >=2 p50 / p90 / max |
+|---|---:|---:|---|---|
+| code | 1 019 | **1 000** | 1 201 / 1 216 / 1 221 | 1 276 / 2 560 / 2 670 |
+| doc | 2 442 | 3 760 | 672 / 761 / 781 | 1 193 / **1 511** / 2 232 |
+| long | 2 266 | 3 796 | 822 / 904 / 913 | 1 077 / 1 218 / 2 110 |
+| short | 1 104 | **1 025** | 658 / 855 / 867 | 1 117 / **2 201** / 2 537 |
+
+Two different wins and two different losses: **turn-1 on the small classes is ours** (code -2%, short -7%, thanks to
+profile seeding), while **their continued turn is 2-3x tighter** (max 781 ms on doc against our 2 232).
+
+### TPOT — our floor is at parity, our ceiling is 2-3x
+
+| class | strata p10 / p50 / p90 / max | naiwa p10 / p50 / p90 / max | delta p50 | delta p90 |
+|---|---|---|---:|---:|
+| code | 26.9 / 29.9 / 32.7 / 32.9 | 32.6 / 35.7 / 37.3 / 39.2 | +5.8 ms | +4.6 ms |
+| doc | 36.9 / 40.5 / 43.1 / 43.3 | 39.4 / 44.4 / 49.3 / 60.7 | +3.9 | +6.2 |
+| long | 38.5 / 39.8 / 40.7 / 41.0 | **38.5** / 44.1 / 49.4 / 51.2 | +4.3 | +8.7 |
+| short | 39.3 / 40.9 / 42.9 / 43.9 | 44.4 / 50.5 / 56.1 / **79.0** | +9.6 | +13.2 |
+
+Read it as three columns, not one:
+
+1. **p10 is at parity or near it** (`long` 38.5 against 38.5, `doc` +2.5 ms). When nothing goes wrong, decode is the
+   same speed on this card.
+2. **p50 is +4-10 ms**, worst on `short`, and the class pattern says where it comes from: their TPOT rises +11 ms from
+   `code` (300-row context) to `doc` (2 000-row), ours +8 ms - **the attention side is not the problem**; the
+   *constant* term is (`code` 29.9 against our 35.7 = +5.8 ms, i.e. 48 layers x ~120 us of per-layer fixed cost).
+3. **p90 and max are 1.4-3x**: `short` p90 56.1 against 42.9 and a max of 79 against 44. That tail is a miss landing
+   inside a step, not a slower kernel - it is the same effect M20 §28 measured as "our TPOT medians move 38-52
+   across boots, theirs sit at 39-41".
+
+Per turn index, TPOT: strata 39.9 / 40.8 / 39.3 / 39.4 / 40.4 (flat), ours 43.2 / 46.9 / 41.2 / 40.7 / 46.8.
+
+### What each gap is worth, in seconds of a conversation
+
+| class | TTFT >= 2 cost of the gap | TPOT cost of the gap | which dominates |
+|---|---:|---:|---|
+| doc | 13 turns x 0.52 s = **6.8 s** | 84 deltas x 3.9 ms = 0.3 s | **TTFT by 20x** |
+| short | 15 turns x 0.46 s = **6.9 s** | 95 deltas x 9.6 ms = 0.9 s | **TTFT by 7x** |
+| long | 2 turns x 0.26 s = 0.5 s | 400 deltas x 4.3 ms = **1.7 s** | **TPOT by 3x** |
+| code | 9 turns x 0.08 s = 0.7 s | 142 deltas x 5.8 ms = 0.8 s | even |
+
+So there is no single "the gap": **continued-turn TTFT decides the chat classes (doc, short) and decode decides the
+long class.** M21 measured everything that could be done about the first from the scheduling side and refuted all of
+it (§8-§10); the second is the per-layer constant, which is a kernel question (M22).
+
+The cheapest real win remains the one from §12: price the per-token expert traffic in the fit predicate so the 2.6 GB
+arm keeps its 8 192 chunk - doc TPOT 44 -> 38 (**-7% against strata's 41**, a win) without the 1.8 s turn-1 penalty.
