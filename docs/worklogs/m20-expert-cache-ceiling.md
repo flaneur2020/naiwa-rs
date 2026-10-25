@@ -1140,3 +1140,39 @@ outliers (`doc` 49.9, `short` 51.5) are the same excursions the warm medians sho
 | +6 ms constant | `code`: 35.7 against 29.9 at ~300 rows | 48 layers x per-layer fixed cost (host round-trip, staging latency) - kernel/architecture, not cache size |
 | +10 ms, only on varied content | `short`: 50.5 against 40.9 with a short context and *lower* reuse than ours | misses on the critical path (§11) |
 | 3-4x variance | 32-60 against 32-41 across boots | the same misses, arriving at different times |
+
+## 31. What the per-turn TTFT really is: every continued turn runs its suffix on the CPU (2026-10-24)
+
+Fitting turn >= 2 TTFT against the number of *new* rows (`prompt_tokens * (1 - reuse)`), 54 points per engine,
+g19:
+
+| | fixed | marginal |
+|---|---:|---:|
+| strata | **623 ms** | 3.09 ms/row |
+| naiwa | ~0 ms | **21-28 ms/row** |
+
+The scatter says the same thing without a fit: strata is 607-696 ms for 22-34 new rows (flat, and 1 200 ms at 193),
+we are 498 ms at 24 rows, 1 001 at 30-50, 1 364 at 50-80, 2 537 at 80-101. **Our slope is 7-8x theirs and our
+intercept is better than theirs.**
+
+The cause is a threshold, not a kernel. `--prefill-stream-min-tokens` is 64 in the harness config (`DEFAULT_MIN_TOKENS`
+is 1024, so the default is even worse), and a chunk below it stays on the **CPU** path. New-row counts of continued
+turns in g19:
+
+| new rows | requests |
+|---|---:|
+| < 32 | 5 / 54 |
+| **< 64** | **45 / 54** |
+| < 128 | 54 / 54 |
+| < 1024 | 54 / 54 |
+
+So **all 54 continued turns** - i.e. every non-first turn of every conversation - ran their suffix through the CPU
+expert path at ~21 ms/row. Strata runs the same rows on the GPU at ~3 ms/row.
+
+What the streamed path would cost for a 41-row suffix: the chunk routes 41 x 10 = 410 experts, one 1.88 MB upload
+each = 770 MB, i.e. **~57 ms at 13.4 GB/s** - against 860 ms on the CPU path. Even at 3-4x the ideal that is a
+0.6-0.8 s saving per continued turn, on every conversation, for a flag value.
+
+That makes this the next milestone (M21) rather than the kernel work: it is the largest remaining gap in the chat
+workload (doc TTFT >= 2 is +76% p50 and +188% p90, short +51%/+70%), it costs ~10 s of a doc conversation, and the
+first experiment is a sweep of one flag, with the gate **doc TTFT >= 2 p50 <= 700 ms** (strata: 672).
