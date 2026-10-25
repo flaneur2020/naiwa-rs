@@ -403,7 +403,11 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m22-tpot.md`](worklogs/m22-tpot.md) — M22 (**open, this iteration's focus**: TPOT only. M21 §14
+Worklog: [`worklogs/m22-tpot.md`](worklogs/m22-tpot.md) — M22 (**targets met except the per-layer constant**: the
+per-step budget showed the step is device-bound (plan 91%, staging 4%, CPU 0.3%, GPU util 97%), acceptance joined the
+harness, and the fixed `--mtp-n-predict 4` turned out to cost 6.5-7 ms: automatic depth took TPOT to stratа parity and
+a win on doc (38.9 vs 40.0; short 40.7 vs 40.4, long 40.5 vs 40.0, code 34.5 vs 30.2) with the worst step falling from
+79 to 57.7 ms. Remaining: `code` +14%, the 48-layer constant, which is a kernel question. Original plan: TPOT only. M21 §14
 split the metrics and the gap is not one thing: our TPOT *floor* is at parity with strata (`long` p10 38.5 ms both),
 the *median* loses a constant +5.8-9.6 ms (48 layers x ~120 us of per-layer fixed cost, not context - their TPOT rises
 +11 ms from a 300-row to a 2 000-row context, ours only +8), and the *tail* is 1.4-3x (short p90 56.1 vs 42.9, max 79
