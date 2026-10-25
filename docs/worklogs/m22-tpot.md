@@ -394,3 +394,49 @@ long +10.9% -> +1.0%, short +23.5% -> +3.1%.
 **What is left, and it is one thing twice:** `code` at +14.6% and `short` at +3.1% both sit at the same place - the
 per-layer fixed cost, which shows up as a constant on the short-context class and as the p90 on the class with the
 most varied content. Everything else in the milestone's target table is met.
+
+## 14. The remaining flags are at their optimum - three "no change" results (2026-10-24)
+
+With greedy drafting shipped, the two knobs that were tuned under the *old* decode shape were re-swept. Both say
+"leave them alone", which is worth recording so nobody re-runs them:
+
+**`--pcie-frac`** (doc probe, 4 turns x 3 runs, turn >= 2):
+
+| frac | TPOT p50 | p90 |
+|---|---:|---:|
+| **0.4 (shipped)** | **37.0** | **38.9** |
+| 0.35 | 39.6 | 48.1 |
+| 0.30 | 37.4 | 39.9 |
+| 0.25 | 41.8 | 48.8 |
+
+0.4 and 0.3 are the same to within the spread; 0.35 and 0.25 are clearly worse. **Keep 0.4** - the optimum did not move
+when the depth and the sampling did.
+
+**Fixed depth, measured on the `code` class** (which is the class still +14.6%, short prompts, so the per-layer constant
+is what shows):
+
+| depth | TPOT p50 | p90 | acceptance | tok/step |
+|---|---:|---:|---:|---:|
+| **auto** | 40.8 | 46.3 | 0.62 | 2.35 |
+| 2 | 42.6 | **44.9** | 0.55 | 2.11 |
+| 3 | **36.5** | 45.7 | 0.72 | 3.15 |
+
+On this probe depth 3 wins the median and loses the p90 against automatic, while on the doc probe automatic was the
+best of all of them - which is the autotuner's purpose (it picks per batch from measured cost), so **auto stays**. The
+one thing this table says clearly is that a *fixed* depth cannot be right for both classes, and that the acceptance
+differences (0.55 / 0.62 / 0.72 at depths 2 / auto / 3) are large enough that the choice matters more than any kernel
+tuning at this point.
+
+### Where M22 ends
+
+| lever | result |
+|---|---|
+| depth: fixed 4 -> automatic | **-15% TPOT**, worst step 79 -> 57.7 ms |
+| draft sampling: auto -> greedy | **-9.5% p50, -22% p90** |
+| `--pcie-frac` | at its optimum (0.4); no change |
+| `--lookahead-swaps` | at its optimum (2); 4 is 24% worse |
+| cache size / promotion / KV / second buffer | closed earlier (§2) |
+| per-step budget | built; the step is 95% device time, the ring 4%, the CPU path 0.3% |
+
+The remaining TPOT gap is `code` (+14.6%) and it is the per-layer device pass - the same 48 x ~1.9 ms that strata pays,
+minus about 0.3 ms that their kernel does not. That is a kernel question (M22.2), and it is the only one left.
