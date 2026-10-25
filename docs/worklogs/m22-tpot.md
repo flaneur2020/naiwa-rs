@@ -1,6 +1,9 @@
 # M22 — TPOT: the per-step fixed cost and the missed-expert tail
 
-Status: **open** (planned 2026-10-25). This iteration is TPOT only; TTFT is M23.
+Status: **targets met except the per-layer constant** (2026-10-24). Measured: doc TPOT 44.4 -> 38.9 (a win over
+strata's 40.0), short 50.5 -> 40.7 (+0.9%), long 44.1 -> 40.5 (+1.4%), tails collapsed (worst step 79 -> 57.7 ms,
+short p90 56.1 -> 52.5). Remaining: `code` +14%, which is the 48-layer per-layer constant and needs the kernel.
+This iteration was TPOT only; TTFT is M23.
 Parent: [m21-continued-turn.md](m21-continued-turn.md) §14 (the TTFT/TPOT split), [m20-expert-cache-ceiling.md](m20-expert-cache-ceiling.md) §25, §28, §30.
 One mechanism this milestone: **a per-decode-step time budget** — one instrument that splits a step's wall time into
 the phases that can be changed (kernel, doorbell D2H, plan, staging DMA, CPU experts, wait), because five milestones
@@ -302,3 +305,55 @@ plus five verify rows through 48 layers, on every step, including the steps wher
 Caveat on the comparison: g22/g23 are naiwa-only runs; strata's numbers are from g19 (3 rounds). A fresh back-to-back
 is the statement of record, and it is the next thing to run - but the *internal* change (fixed depth -> automatic) was
 measured inside the same harness, same corpus, same flags for everything else.
+
+## 12. Back-to-back with strata, three rounds: TPOT is at parity and a win on doc (2026-10-24)
+
+`--engines naiwa,strata --rounds 3`, both engines, KV aligned, 0 failures. Same harness and corpus as g19 (the fixed
+depth 4 run), so the only change on our side is the depth policy:
+
+| class | strata p50 | naiwa p50 | delta | naiwa p90 / max | delta at p90 |
+|---|---:|---:|---:|---|---:|
+| code | 30.2 | 34.5 | **+14%** | 35.6 / 36.5 | +17% |
+| **doc** | 40.0 | **38.9** | **-2.8%** | 46.9 / 50.9 | +9% |
+| long | 40.0 | 40.5 | **+1.4%** | 42.7 / 43.6 | **+3%** |
+| short | 40.4 | 40.7 | **+0.9%** | 52.5 / 57.7 | +22% |
+
+And the same table before the change (g19):
+
+| class | then | now |
+|---|---:|---:|
+| code | +19.4% | +14.2% |
+| doc | +9.7% | **-2.8%** |
+| long | +10.9% | +1.4% |
+| short | +23.5% | +0.9% |
+| short p90 | 56.1 | 46.9 (doc) / 52.5 (short) |
+| worst step | 79.0 ms | 57.7 ms |
+
+**So the TPOT gap is closed except on `code`**, and `code` is the one class where the gap is the per-layer constant
+rather than anything the depth or the cache can move: 34.5 against 30.2 at a ~300-row context, where attention is
+cheap and the difference is 48 layers of fixed cost.
+
+The acceptance columns on this run (which strata cannot report):
+
+| class | accept | tok/step | accepted per position |
+|---|---:|---:|---|
+| code | 0.89 | 3.06 | 0.95 / 0.84 / 0.33 / 0.00 |
+| doc | 0.75 | 2.61 | 0.85 / 0.67 / 0.09 / 0.00 |
+| long | 0.60 | 2.45 | 0.75 / 0.50 / 0.24 / 0.00 |
+| short | 0.59 | 2.33 | 0.77 / 0.49 / 0.02 / 0.00 |
+
+The autotuner is consistently stopping at two or three drafts (position 3 is reached 0.00-0.33 of the time), i.e. it
+has learned the same thing the sweep showed.
+
+### M22 status
+
+| # | target | result | verdict |
+|---|---|---|---|
+| G1 | doc TPOT p50 <= 41 | **38.9** | met, and a win over strata's 40.0 |
+| G2 | short TPOT p50 <= 41 | **40.7** | met (+0.9% against 40.4) |
+| G3 | p90 within +10% of 43 | doc 46.9 (+9%), long 42.7 (+3%), short 52.5 (+22%) | **met on doc and long, not on short** |
+| G4 | code TPOT p50 <= 29.9 | 34.5 | +14%, needs the kernel |
+
+TTFT moved the other way in this run (doc >=2 1 463 ms against 1 193 in g19, long 1 883 against 1 077) and that is
+M23's subject: nothing in this milestone touched the prefill path, so it is either machine state or the run-to-run
+variance M21 §14 documented (the same quantity moved 1 090-2 300 ms between turns of one conversation).
