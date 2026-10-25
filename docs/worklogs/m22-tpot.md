@@ -186,3 +186,37 @@ Two things fall out immediately, and neither was visible from TPOT alone:
 So the milestone's T1 has its instrument. Next: `--mtp-n-predict` 2/3/4 and `--spec-min-p` against
 `tokens_per_step`, `acceptance` and TPOT p50/p90, then decide whether the lever is the window, the drafter's depth, or
 the per-layer pass (step time).
+
+## 10. `--mtp-n-predict 4` was costing 6-7 ms: the depth sweep (2026-10-24)
+
+The acceptance numbers said positions 3-4 are kept 0.43/0.25 of the time, so a fixed four-draft window pays for
+drafts and verify rows that mostly lose. Swept the depth with the probe (doc, 4 turns, 3 runs per arm), all turn >= 2
+TPOT values pooled:
+
+| `--mtp-n-predict` | turn-2 TPOT (3 runs) | turn-3 | turn-4 | pooled median | acceptance | tok/step |
+|---|---|---:|---:|---:|---:|---:|
+| **4** (was shipped) | 45.4 / 43.0 / 41.3 | 43.8 / 48.4 / 61.0 | 33.9 / 35.2 / 45.1 | **43.8 ms** | 0.53 / 0.43 / 0.75 | 3.15 / 2.74 / 4.08 |
+| 3 | 40.3 / 46.2 / 41.7 | 46.3 / 47.8 / 56.3 | 34.7 / 35.6 / 45.8 | 45.8 | - | - |
+| **2** | **36.9 / 39.7 / 35.7** | **38.8 / 37.8 / 41.4** | **35.8 / 33.7 / 37.3** | **37.3** | 0.81 / 0.71 | 2.62 / 2.42 |
+| auto (2/3/4/6) | 36.1 / 36.6 / 35.6 | 36.8 / 48.2 / 45.1 | 37.8 / 47.5 / 34.2 | **36.8** | 0.80 / 0.75 | 2.62 / 2.58 |
+
+**Depth 2 or automatic beats the fixed 4 by 6.5-7.0 ms (-15%)**, and the turn-2 column does not overlap: 36-40 ms
+against 41-45. TTFT is unchanged (3 655-3 780 ms at every depth), so this is purely the decode path.
+
+Why it works, in the milestone's own terms: TPOT is `step_time / tokens_per_step`. Depth 2 commits 2.4-2.6 tokens per
+step (against 2.7-3.2 at depth 4) but the step is *much* cheaper, because the verify pass runs `drafts + 1` rows through
+all 48 layers and the drafter runs `drafts` chain steps. Losing 0.5 tokens per step costs 20% of the numerator; halving
+the wasted draft/verify work saves more.
+
+So the shipped configuration drops the explicit flag and takes the autotuner's choice (`AUTO_DEPTHS = [2, 3, 4, 6]`,
+picked from measured cost per batch), which measured as good as the best fixed depth and adapts when a batch's easy
+text does reward a deeper window.
+
+### What this does to the comparison
+
+| class | strata (g19) | naiwa, depth 4 (g19) | naiwa, depth 2 (probe) | delta vs strata |
+|---|---:|---:|---:|---:|
+| doc TPOT p50 | 40.5 | 44.4 | **37.3** | **-8%** |
+
+If the harness reproduces it, **doc TPOT flips from +10% to -8%** - our first decode win on a long-context class, and
+it came from a flag, not a kernel. G1 of this milestone (doc <= 41) would be met.
