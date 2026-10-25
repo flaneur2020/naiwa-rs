@@ -283,3 +283,32 @@ Making that pass cheap is a **kernel** question (a grouped GEMM that reads only 
 remainder on the CPU, without materialising the full set) - M22 - and strata's 3 ms/row is that kernel, not a
 scheduling trick: their fixed 623 ms + 3 ms/row means one set pass per *turn*, not per chunk, and 100x cheaper per
 row.
+
+## 11. The 3.0 GB defect, named: the plan measures free VRAM before the rings exist
+
+The 3.0 GB arm's log says it in two lines:
+
+```
+prefill (warmup): chunk 7424, 1 x 650 MiB layer buffer(s) + 504 MiB activations + 512 MiB headroom
+                  = 1666 MiB of 1730 MiB free                      <- the plan, at warmup: fits
+WARN prefill stream: off (one 650 MiB layer buffer + 504 MiB activations + 512 MiB headroom
+                  does not fit in 1346 MiB free)                   <- the first chunk, 384 MiB later
+```
+
+`PrefillStreams::plan()` runs at warmup and decides `stride 1, chunk 7424` from 1 730 MiB free. Between that
+measurement and the first chunk, the staging rings are built (~215 MiB across the seven quant shapes) and the KV
+grows; `reserve()` re-measures, finds 1 346 MiB, and `plan()` returns `None` - so `Plan { stride: 0, chunk: 0 }` is
+published and **the stream is off for the whole session**. Every prefill chunk then takes the CPU path: **154 s for a
+1 725-row prompt, 89 ms/row, 41x slower** - the code's own warning says 33x.
+
+The plan is not wrong to refuse: at 1 346 MiB free, one 650 MiB layer buffer plus the 512 MiB headroom and the
+160 MiB activation floor cannot coexist. Three ways out, smallest first:
+
+| | what | cost | what it buys |
+|---|---|---|---|
+| **(a1)** | take the measurement **once**, after everything that allocates has allocated (rings, doorbells, KV), so the number is not stale; and when the stream does not fit, **clamp `--expert-cache-gb` down until it does**, logging the clamp, instead of launching a cache that starves the stream | hours | 3.0 GB becomes "cache clamped to ~2.4 GB, stream intact, turn-1 3.7 s" instead of "3.0 GB, 154 s". Also makes the 1.4 GB arm's -24% turn-1 explicable in one line rather than a coincidence |
+| **(a2)** | make the stream's unit **sub-layer**: ~90 experts (170 MiB) instead of a full 650 MiB layer stack, so it fits beside almost any cache | days, and it is the grouped-GEMM kernel | a 3.0 GB cache *with* a fast prefill - M20's original objective, which the old ledger called impossible |
+| (a3) | default `NAIWA_PREFILL_STRICT` on | minutes | a loud refusal instead of a 41x silent regression - correct by §4.4, but it refuses to serve rather than serving well |
+
+(a1) is the one to do first: it is small, it removes a 41x silent regression from the shipping configuration space,
+and it is the precondition for measuring (a2) fairly.
