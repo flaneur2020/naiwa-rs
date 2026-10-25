@@ -41,6 +41,20 @@ pub(crate) fn forward(
     let rows = batch * seq;
     let x2d = xs.reshape((rows, hidden))?;
     stats::record_step_layer(layer.slot_device(), layer.layer());
+    // A step's first layer marks the boundary: print the previous step's budget (see `stats::budget`).
+    if layer.layer() == 0 {
+        stats::record_step_boundary(layer.layers().len());
+    }
+    let budget = stats::budget_enabled();
+    let mut t = if budget { std::time::Instant::now() } else { std::time::Instant::now() };
+    macro_rules! mark {
+        ($phase:expr) => {
+            if budget {
+                stats::record_budget($phase, t.elapsed().as_nanos() as u64);
+                t = std::time::Instant::now();
+            }
+        };
+    }
     Preload::submit(layer, &x2d, rows, hidden)?;
 
     let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
@@ -56,6 +70,7 @@ pub(crate) fn forward(
         DmaMiss::submit(layer, &mut plan)?;
     }
 
+    mark!(stats::BudgetPhase::Plan);
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
     stats::record_cache_misses(n_cpu);
     // Experts that went to the staging ring: counted apart from both hits and CPU misses.
@@ -67,6 +82,7 @@ pub(crate) fn forward(
     }
 
     let cpu = CpuMiss::submit(layer, &plan.misses, &x2d, rows)?;
+    mark!(stats::BudgetPhase::Spawn);
 
     // Wait for the latest preload claim on candle's stream. The claim carries its own completion
     // event, so this also drains a copy the lookahead queued late; a layer that never gets
@@ -75,6 +91,7 @@ pub(crate) fn forward(
     {
         layer.wait_preload()?;
     }
+    mark!(stats::BudgetPhase::PreloadWait);
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
     // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
     // from 858 us to 11 us). The staged experts still need the ring, so they keep the wait. This is
@@ -111,6 +128,7 @@ pub(crate) fn forward(
     // ... and the staging DMA's completion event, on candle's stream.
     #[cfg(feature = "cuda")]
     layer.wait_staging()?;
+    mark!(stats::BudgetPhase::Gpu);
 
     #[cfg(feature = "cuda")]
     let hits_to_run: Vec<Vec<Hit>> = if split {
@@ -161,16 +179,21 @@ pub(crate) fn forward(
             }
         }
     }
+    mark!(stats::BudgetPhase::StagingWait);
     drop(plan.hits);
     #[allow(unused_variables)]
     let (gpu_out, capture_bank) = acc?;
     fenced?;
+    mark!(stats::BudgetPhase::Fence);
 
     // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
     let cpu_out = cpu.map(|p| p.upload()).transpose();
+    mark!(stats::BudgetPhase::CpuJoin);
     let sum = match cpu_out? {
         None => gpu_out,
         Some(c) => (gpu_out + c)?,
     };
-    sum.to_dtype(xs.dtype())?.reshape((batch, seq, hidden))
+    let out = sum.to_dtype(xs.dtype())?.reshape((batch, seq, hidden))?;
+    mark!(stats::BudgetPhase::Other);
+    Ok(out)
 }

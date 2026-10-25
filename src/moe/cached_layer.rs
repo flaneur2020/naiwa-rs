@@ -132,6 +132,11 @@ impl Layers {
         emptied
     }
 
+    /// How many layers the cache holds: what a step's budget divides by.
+    pub(crate) fn len(&self) -> usize {
+        self.layers.read().len()
+    }
+
     pub(crate) fn all(&self) -> Vec<Arc<CachedLayer>> {
         self.layers
             .read()

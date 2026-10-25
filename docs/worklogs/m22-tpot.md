@@ -116,3 +116,44 @@ median of >= 3 runs.
   moves. T0 answers it.
 - **Does the tail correlate with the plan's chosen ring slots?** 16 slots shared by all layers, `--pcie-frac 0.4`:
   a step that needs more misses than the ring holds waits for the ring, which is a tail with a fixed width.
+
+## 8. First budget reading: the step is device-bound, and the host is not the problem (2026-10-24)
+
+`NAIWA_STEP_BUDGET=1`, doc probe, one server:
+
+```
+STEP_BUDGET layers 48 total 92.9 ms | plan 84.7 spawn 1.1 preload_wait 0.0 gpu 2.7 staging_wait 3.3 cpu_join 0.4
+                                    | fence 0.0 other 0.7 | waits>200us preload 0/48 staging 0/48 cpu 0/48
+STEP_BUDGET layers 48 total 110.9 ms | plan 102.1 spawn 1.1 preload_wait 0.0 gpu 3.1 staging_wait 3.5 cpu_join 0.4
+```
+
+**`plan` is 91% of a decode step**, and `plan` is where the host waits for the device: `Route::submit` calls
+`Doorbell::publish_and_read`, which queues the top-k ring on candle's stream and then **spins on the host** until the
+device bumps the sequence counter (`wait_and_read`, `d2h/topk.rs`). So the 85-100 ms in that column is not host work -
+it is the GPU doing the layer's work while the host is blocked at the doorbell. Everything the host actually does is
+`spawn 1.1 + cpu_join 0.4 + staging_wait 3.3 = 4.8 ms` of a 97 ms step.
+
+Confirmed independently: **GPU utilisation during a 99-token generation is 97% at the median, 100% at p90** (49
+samples at 300 ms), memory-controller utilisation 22%. The host is idle and the device is saturated.
+
+### What that means for the milestone
+
+TPOT is `step_time / tokens_per_step`. Both terms are now named:
+
+| term | measured | lever |
+|---|---|---|
+| step time | ~91-111 ms per pass, 48 layers x ~1.9 ms, host-blocked at each layer's doorbell | **GPU work per layer** (attention + expert kernels), and pipelining the host wait buys *nothing* while the device is at 97% |
+| tokens per step | not yet measured directly; the pass count (185 passes over one session) against the tokens generated says it is small | **MTP acceptance** - the cheapest lever left, and §3's T1 |
+
+So the prediction this milestone started with - "the constant is 48 layers x ~120 us of host round trip" - is **wrong
+in the interesting direction**: the round trip is real but it is *waiting for the GPU*, so it costs what the GPU costs.
+The gap to strata is therefore not host overhead either; at a similar step time it is **tokens per step**, and the rest
+is per-layer kernel efficiency.
+
+### Next, in order
+
+1. **Measure acceptance directly** (T1): tokens committed per step, with `--mtp-n-predict` 2/4/6 and `--spec-min-p`.
+   If we commit 2.2 where strata commits 3, TPOT 44 becomes 32 at the *same* step time - no kernel work at all.
+2. If acceptance is already at its ceiling, the lever is the per-layer GPU pass: the budget says 1.9 ms/layer for a
+   layer whose expert work is 10 experts x 3 GEMMs on a handful of rows, which is a kernel question (M22.2).
+3. Do not spend anything on host-side pipelining: at 97% device utilisation there is nothing to overlap.

@@ -11,6 +11,7 @@
 //! output format in their own file; only the repeated plumbing is shared below: the one-shot
 //! environment gate, the reporting window, the once-per-process header, and the unit conversions.
 
+mod budget;
 mod cache;
 mod fused;
 mod lookahead;
@@ -18,6 +19,7 @@ mod retired;
 mod round;
 mod step;
 
+pub(crate) use budget::{add as record_budget, enabled as budget_enabled, step_boundary as record_step_boundary, Phase as BudgetPhase};
 pub(crate) use cache::{
     dump_cache_stats, record_cache_hits, record_promotions, record_cache_installed, record_cache_lookahead_dropped,
     record_cache_lookahead_load, record_cache_misses, record_cache_pcie, record_cache_result_stall,
