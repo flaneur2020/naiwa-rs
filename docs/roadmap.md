@@ -403,6 +403,10 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m21-continued-turn.md`](worklogs/m21-continued-turn.md) — M21 (open: the continued turn. A
+non-first turn's suffix stays on the CPU expert path because `--prefill-stream-min-tokens` sits above every suffix we
+serve, at 21 ms/row against strata's 3; 54/54 continued turns in the three-round compare took the CPU path. Target:
+doc TTFT >= 2 p50 <= 700 ms, p90 <= 800 ms, against strata's 672/762).
 Worklog: [`worklogs/m20-expert-cache-ceiling.md`](worklogs/m20-expert-cache-ceiling.md) — M20 (open: what sets
 the expert cache's ceiling on a 12 GiB card — we hold 2 355 MiB, 19%; a VRAM ledger plus a per-consumer constraint
 probe, then one mechanism against whichever consumer the probe names. Alignment target with strata: >= 3.0 GiB).

@@ -401,6 +401,9 @@ impl RoutedExperts for CachedExperts {
     ) -> candle_core::Result<Tensor> {
         let layer = &self.0;
         let (batch, seq, hidden_dim) = xs.dims3()?;
+        // Which shape the MoE forward is handed is the difference between one batched expert pass and one pass per
+        // row, so it belongs in the log rather than in an inference from the timing (`NAIWA_STREAM_DBG=1`).
+        crate::dbg_note("moe_forward", &format!("layer {}: batch {batch} seq {seq}", layer.layer));
         debug_assert_eq!(hidden_dim, layer.hidden);
         let num_tokens = batch * seq;
 

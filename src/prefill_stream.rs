@@ -797,6 +797,17 @@ impl PrefillStream {
             return Ok(None);
         }
         if batch * seq < self.min_tokens || self.stacks(layer).is_none() {
+            // Which path a chunk took must be readable from the log, not inferred from the timing: a suffix under
+            // the threshold is the common case for continued turns, and a silently declined stream looks exactly
+            // like "the flag did nothing".
+            crate::dbg_note(
+                "prefill_stream",
+                &format!(
+                    "layer {layer}: {} rows below the {}-row stream threshold - CPU path",
+                    batch * seq,
+                    self.min_tokens
+                ),
+            );
             if batch * seq >= self.min_tokens {
                 crate::dbg_note(
                     "prefill_stream",
