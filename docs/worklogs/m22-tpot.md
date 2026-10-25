@@ -251,3 +251,54 @@ Two things this changes for the rest of M22:
    the median, not the stubs. That remains the miss-in-a-step problem.
 2. The **`code` constant** (+3 ms now) is what is left of the per-layer term, and it is the only remaining place a
    kernel change would show up.
+
+## 11. The tail is the device, not the ring: where the p90 comes from (2026-10-24)
+
+A 400-token generation under `NAIWA_STEP_BUDGET=1` (203 steps, fresh server, automatic depth), slowest decile against
+the fastest half, phases in ms per step:
+
+| phase | fastest 50% | slowest 10% | ratio | share of a slow step |
+|---|---:|---:|---:|---:|
+| **total** | **57.8** | **96.5** | **1.67** | 100% |
+| **plan** (the doorbell wait) | 50.8 | **88.3** | **1.74** | **95%** |
+| gpu (kernel queueing) | 2.3 | 2.8 | 1.21 | 3% |
+| staging_wait | 2.9 | 3.3 | **1.12** | 4% |
+| spawn | 0.9 | 1.1 | 1.23 | 1% |
+| cpu_join | 0.3 | 0.3 | 1.22 | 0% |
+
+And the layer counts that would show a ring or CPU problem:
+
+| | fastest 50% | slowest 10% |
+|---|---:|---:|
+| layers waiting >200 us on staging | 0.11 / 48 | **0.10 / 48** |
+| layers waiting >200 us on the CPU ring | 0.00 / 48 | **0.00 / 48** |
+
+**A slow step is not a step that waits more often** - it is a step whose *device work* took longer, and the host sees
+that as a longer doorbell wait (the ring is queued behind the previous layer's kernels, so its wait measures the whole
+per-layer device time). The staging ring is 4% of a step either way and the CPU ring is nothing.
+
+So the tail has one cause: **per-step device time varies**, and the biggest lever on it is how many rows a step verifies
+- which is the depth, chosen per step by the autotuner. That makes the depth change of §10 also the tail fix:
+
+| class | TPOT p50 / p90 / max, fixed depth 4 (g22) | automatic (g23) |
+|---|---|---|
+| code | 35.1 / 36.0 / 36.1 | **33.1 / 34.4 / 35.1** |
+| doc | 44.4 / 52.0 / 58.3 | **40.3 / 45.3 / 46.9** |
+| long | 46.8 / 50.9 / 50.9 | **41.3 / 43.2 / 43.2** |
+| short | 41.1 / 67.7 / **73.5** | 41.5 / **46.8 / 48.4** |
+
+`short`'s worst step went from 73.5 ms to 48.4, `doc`'s from 58.3 to 46.9. The fixed window was the tail: four drafts
+plus five verify rows through 48 layers, on every step, including the steps where positions 3-4 were certain to lose.
+
+### M22 targets, status
+
+| # | target | today | strata | status |
+|---|---|---|---|---|
+| G1 | doc TPOT p50 <= 41 | **40.3** | 40.5 | **met** |
+| G2 | short TPOT p50 <= 41 | **41.5** | 40.9 | +1.5% (target was parity) |
+| G3 | p90 within +10% of 43 (<= 47.3) | doc 45.3, short 46.8 | 43 | **met** |
+| G4 | code TPOT p50 <= 29.9 | 33.1 | 29.9 | +10%, kernel only |
+
+Caveat on the comparison: g22/g23 are naiwa-only runs; strata's numbers are from g19 (3 rounds). A fresh back-to-back
+is the statement of record, and it is the next thing to run - but the *internal* change (fixed depth -> automatic) was
+measured inside the same harness, same corpus, same flags for everything else.
