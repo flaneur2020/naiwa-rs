@@ -1084,3 +1084,59 @@ which is worth knowing: the loader itself leaves the cache 35% full.
 
 Made default: the harness engine configs pass `--expert-profile data/expert-profile-coder.bin`. A missing or
 unreadable profile is a startup error, not a silent no-op, and without the flag nothing changes.
+
+## 30. TPOT against strata, three rounds, KV aligned, profile seeding on (2026-10-24)
+
+`--engines naiwa,strata --rounds 3`, both f16 KV, strata at its own point (1028 slots, spec 4), naiwa shipped
+(2.3 GB, `--pcie-frac 0.4`, chunk 8192, promotion + profile seeding). 0 failures.
+
+| class | strata TPOT (turn >= 2) | naiwa | delta | strata reuse | naiwa reuse |
+|---|---:|---:|---:|---:|---:|
+| code | **29.9** (n=9) | 35.7 | **+19%** | 0.67 | 0.87 |
+| doc | 40.5 (n=18) | 44.4 | +10% | 0.99 | 0.98 |
+| long | 39.8 (n=6) | 44.1 | +11% | 0.98 | 0.98 |
+| short | **40.9** (n=21) | 50.5 | **+23%** | 0.95 | 0.89 |
+| turn-1 (all) | 39.9 (n=12) | 43.2 | +8% | - | - |
+
+And the shape of the two distributions is the finding:
+
+| | r1 | r2 | r3 | spread of turn-1 |
+|---|---:|---:|---:|---:|
+| strata | 40.2 | 39.7 | 40.7 | 32-41 ms |
+| naiwa | 45.8 | 44.7 | 47.6 | **32-60 ms** |
+
+**strata is a flat 39.7-40.7 across three independent boots**; we are 44.7-47.6 with per-conversation excursions to
+60. Their TPOT is also nearly flat *across classes* (29.9 code, ~40 everywhere else), which is a useful decomposition
+because the classes differ in context length, not in expert count:
+
+- their **context-proportional** part is +10.5 ms (29.9 at ~300 rows -> 40.4 at ~2 000 rows), ours is +8.7 (35.7 ->
+  44.4): the attention side is comparable, we are if anything slightly better;
+- their **constant** part (the ~300-row/`code` case) is **29.9 against our 35.7**: **+6 ms per token that has nothing
+  to do with context** - 48 layers x ~125 us of host round-trip and staging latency, i.e. the per-layer fixed cost,
+  not the cache.
+
+`short` is the worst class for us (50.5 against 40.9) with a *short* context, so it cannot be the context term: it is
+the same 48 x fixed cost plus **misses from varied content** (our reuse 0.89 against their 0.95). That is exactly
+§11/§28's statement with three more rounds behind it.
+
+### Cold start, in situ
+
+Round 1's first conversation is the truly cold one - the only place `--expert-profile` shows up inside the harness:
+
+| class | strata | naiwa |
+|---|---:|---:|
+| code | 40.5 | **35.1** (we win) |
+| doc | 38.7 | 49.9 |
+| long | 32.2 | 31.8 (parity) |
+| short | 41.3 | 51.5 |
+
+Two of four at or better than strata, where a cold boot used to be a 48 ms worst case (§29). The remaining cold
+outliers (`doc` 49.9, `short` 51.5) are the same excursions the warm medians show, not a seeding failure.
+
+### Where the 6 ms and the variance come from, in one line each
+
+| gap | evidence | owner |
+|---|---|---|
+| +6 ms constant | `code`: 35.7 against 29.9 at ~300 rows | 48 layers x per-layer fixed cost (host round-trip, staging latency) - kernel/architecture, not cache size |
+| +10 ms, only on varied content | `short`: 50.5 against 40.9 with a short context and *lower* reuse than ours | misses on the critical path (§11) |
+| 3-4x variance | 32-60 against 32-41 across boots | the same misses, arriving at different times |
