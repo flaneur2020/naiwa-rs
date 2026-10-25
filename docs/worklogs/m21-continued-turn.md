@@ -344,3 +344,40 @@ growth, invisible to a plan that measured once at warmup.
 
 Gate status: the prefill plan defect of §10 is fixed; the *continued turn* has not moved (that is M22's kernel), and
 the 2.6 GB arm is being run through the chat harness for the correctness gate before it is considered shippable.
+
+### The harness says 2.6 GB is not shippable, and why
+
+Chat harness, 2 rounds, both arms side by side (g20):
+
+| class | naiwa (2.3 GB) | naiwa-c26 (2.6 GB) |
+|---|---:|---:|
+| code TPOT | 36 | **34** |
+| doc TPOT | 45 | **38** |
+| code TTFT >= 2 p50 | 1 297 | **1 200** |
+| doc TTFT t1 | **3 723** | 5 562 |
+| long TTFT t1 | - | 5 804 |
+
+The decode side improves exactly as M20 predicted (+300 MiB of cache, doc TPOT -7 ms). The turn-1 cost comes from the
+first long chunk re-checking the plan and publishing a smaller step:
+
+```
+prefill: chunk 8192, 1 x 650 MiB layer buffer(s) + 522 MiB activations + 512 MiB headroom = 1684 MiB of 2178 MiB free
+prefill: the prompt step drops from 8192 to 1024 tokens for the rest of the session
+```
+
+**8x smaller chunks, 8x the expert traffic per token** - that is the +1.8 s. The reserve of 384 MiB is what one
+conversation's KV costs; the harness runs four sequences across conversations (`--max-seqs 4`, prompts up to 2 072
+rows), so the KV takes several times that and the plan falls back to 1 024.
+
+Decision: **2.3 GB stays the shipping default.** 2.6 GB is a real trade (doc TPOT -7 ms for turn-1 +1.8 s) and it is
+now *visible* instead of silent, which is what this milestone was about. Two follow-ups for whoever wants the
+300 MiB:
+
+- scale `NAIWA_KV_RESERVE_MIB` with `--max-seqs` (one sequence measured 384 MiB; four is several times that), so the
+  plan's warmup decision already prices the KV instead of discovering it at the first chunk;
+- or let the plan spend the reserve on the *chunk* explicitly: at 2.6 GB, `1 024 x 8` costs 8x the traffic, while
+  `4 096 x 2` costs 2x and fits - the bisect already prefers the biggest chunk that fits, so this needs the plan to
+  price the *per-token* traffic, not just the memory. That is a two-line change to the fit predicate and a
+  measurement.
+
+The defect of §10 is closed: a stream that cannot fit now says so, with the number, at startup.
