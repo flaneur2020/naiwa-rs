@@ -897,3 +897,72 @@ Chat harness, 2 rounds, 132 turns, both arms, promotion on by default: **0 failu
 Per-class medians at this turn count move by more than the effect could (short reads 49 against 40 while `doc`
 improved 46 -> 44), which is the same noise band the probe showed; the controlled probe remains the statement of
 record (§25) and the harness's job here is the correctness gate, which it passed.
+
+## 27. Side-by-side with strata, same machine same day (2 rounds, 0 failures)
+
+Not the old logs of §19: `--engines naiwa,strata --rounds 2`, both arms, back to back. strata is configured at its own
+chosen point (`--expert-cache 800`, ~1.5 GB, `--kv int8`, `--spec 4 --spec-min-p 0.5`), naiwa at the shipped point
+(2.3 GB, `--pcie-frac 0.4`, chunk 8192, promotion on).
+
+| class | metric | strata | naiwa | delta |
+|---|---|---:|---:|---:|
+| code | TTFT t1 | 1 029 | 1 018 | -1% |
+| code | TTFT >=2 p50 | 1 191 | 1 299 | +9% |
+| code | TTFT >=2 p90 | 1 207 | 2 039 | **+69%** |
+| code | TPOT | 29.8 | 35.7 | **+20%** |
+| code | e2e/conv | 22.6 s | 27.6 s | +22% |
+| doc | TTFT t1 | 2 430 | 3 813 | **+57%** |
+| doc | TTFT >=2 p50 | 673 | 1 257 | **+87%** |
+| doc | TTFT >=2 p90 | 764 | 2 307 | **+202%** |
+| doc | TPOT | 40.6 | 45.0 | +11% |
+| doc | e2e/conv | 25.7 s | 29.9 s | +16% |
+| long | TTFT t1 | 2 260 | 3 797 | **+68%** |
+| long | TTFT >=2 p50 | 828 | 1 119 | +35% |
+| long | TTFT >=2 p90 | 1 199 | 1 213 | +1% |
+| long | TPOT | 39.6 | 44.6 | +13% |
+| long | e2e/conv | 38.4 s | 51.6 s | **+34%** |
+| short | TTFT t1 | 1 110 | 1 071 | -3% |
+| short | TTFT >=2 p50 | 655 | 1 023 | **+56%** |
+| short | TTFT >=2 p90 | 823 | 1 429 | +74% |
+| short | **TPOT** | 40.7 | **37.8** | **-7% (we win)** |
+| short | e2e/conv | 30.8 s | 35.3 s | +15% |
+
+We win, on this run: **short TPOT (37.8 vs 40.7)**, short and code turn-1 TTFT, and reuse on code (**0.83 vs 0.67**)
+- i.e. where the working set is small and reuse is high, the cache does its job better than theirs.
+
+### Where the gap actually is, in the units that pay for it
+
+**1. Decode TPOT, +5 ms/token, and it is the whole long-conversation gap.** A `long` turn generates ~370-400 tokens:
+
+```
+strata  370 x 39.6 ms = 14.7 s        naiwa  400 x 44.6 ms = 17.8 s
+```
+
+so on `long` the +2.2 s/turn e2e gap is **~82% decode** (the rest is one turn-1 prefill). `code` is the worst per
+token (+6 ms) even though our reuse there is *higher* than theirs - which is exactly §11's finding restated in a real
+corpus: **their TPOT is flat because their misses are off the critical path; ours are on it.** `--pcie-frac 0.4` fixed
+the *slope* (0.4 ms/GB), not the level.
+
+**2. Turn-1 prefill, +62% per prompt row.** Turn-1 prompts average 1 724 rows:
+
+| | TTFT | per row |
+|---|---:|---:|
+| strata | 2 345 ms | **1 361 us** |
+| naiwa | 3 805 ms | **2 208 us** |
+
++1.46 s per long conversation, paid once. This is the 650 MiB workspace + kernel problem (M20.2), and it is the
+biggest *single* number in the table that one mechanism could remove.
+
+**3. Turn >= 2 TTFT: median +0.4 s, but p90 +1.5 s, and the p90 is the anomaly.** With reuse at 0.97-0.98 the new
+suffix is a few dozen rows, so this is the fixed per-request path (checkpoint restore, drafter prefix replay, tail
+block split, the first decode step's staging burst). Theirs is tight (doc p90 764 ms against our 2 307); ours has a
+tail. By turn it is t2 1 274 / t3 1 171 / t4 698 - not monotone, so it is a distribution with a fat tail rather than a
+constant offset.
+
+### Ranking, by measured seconds
+
+| lever | worth | where |
+|---|---|---|
+| hide the miss off the critical path (cross-layer prefetch) | **-5 ms/token**, i.e. -1.8 s per `long` turn, -0.9 s per `code` turn | decode |
+| prefill kernel at strata's us/row | -1.46 s per long conversation, once | turn 1 |
+| turn >= 2 tail (p90 2 307 -> 768) | -1.5 s at p90 | every turn >= 2 |
