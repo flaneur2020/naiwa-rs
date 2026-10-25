@@ -403,6 +403,13 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m22-tpot.md`](worklogs/m22-tpot.md) — M22 (**open, this iteration's focus**: TPOT only. M21 §14
+split the metrics and the gap is not one thing: our TPOT *floor* is at parity with strata (`long` p10 38.5 ms both),
+the *median* loses a constant +5.8-9.6 ms (48 layers x ~120 us of per-layer fixed cost, not context - their TPOT rises
++11 ms from a 300-row to a 2 000-row context, ours only +8), and the *tail* is 1.4-3x (short p90 56.1 vs 42.9, max 79
+vs 44) because a miss lands inside a step. One mechanism: a per-decode-step time budget, so the phase is named before
+one is built. Then, cheapest first: MTP acceptance, lookahead depth, ring shape. Targets: doc TPOT p50 <= 41, short
+<= 41, p90 within +10% of strata's 43).
 Worklog: [`worklogs/m21-continued-turn.md`](worklogs/m21-continued-turn.md) — M21 (closed as **negative**: three
 mechanisms refuted by measurement - `--prefill-stream-min-tokens` 64/32/16/8/1 identical, merging the suffix 2-4x
 worse, `NAIWA_PREFILL_THRESHOLD` 32/64/128/256 identical - and one law established: a continued turn costs ~1.2 s
