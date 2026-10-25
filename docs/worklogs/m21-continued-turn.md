@@ -381,3 +381,63 @@ now *visible* instead of silent, which is what this milestone was about. Two fol
   measurement.
 
 The defect of §10 is closed: a stream that cannot fit now says so, with the number, at startup.
+
+## 13. The comparison after (a1), from the three-round run (no new run needed)
+
+g19 is the last full back-to-back - `--engines naiwa,strata --rounds 3`, KV aligned (fp16 both), strata at its own
+point (1 028 slots / 1.98 GiB, spec 4, fp16 KV), naiwa at the shipping point (2.3 GB, `--pcie-frac 0.4`, chunk 8192,
+profile seeding, promotion on). Nothing shipped since changes that configuration: the M21 work between then and now
+is a negative result three times over (§8-§10) plus (a1), whose only effect at 2.3 GB is that the plan keeps 384 MiB
+back for the KV - verified in g20's 2.3 GB arm (plan still `chunk 8192, 1684 MiB of 2498 MiB free`, 0 failures).
+So the table is current.
+
+| class | metric | strata | naiwa | delta |
+|---|---|---:|---:|---:|
+| code | TTFT t1 | 1 019 | 1 000 | **-2%** |
+| code | TTFT >= 2 p50 / p90 | 1 201 / 1 216 | 1 276 / 2 560 | +6% / **+111%** |
+| code | TPOT | 30.0 | 36 | +19% |
+| code | e2e/conv | 5.4 s | 6.7 s | +23% |
+| code | reuse | 0.67 | 0.87 | **+30%** |
+| doc | TTFT t1 | 2 442 | 3 760 | **+54%** |
+| doc | TTFT >= 2 p50 / p90 | 672 / 761 | 1 193 / 1 511 | **+78% / +99%** |
+| doc | TPOT | 41 | 44 | +10% |
+| doc | e2e/conv | 4.1 s | 4.9 s | +19% |
+| doc | reuse | 0.99 | 0.98 | -1% |
+| long | TTFT t1 | 2 266 | 3 796 | **+68%** |
+| long | TTFT >= 2 p50 / p90 | 822 / 904 | 1 077 / 1 218 | +31% / +35% |
+| long | TPOT | 40 | 44 | +11% |
+| long | e2e/conv | 13.9 s | 16.5 s | +18% |
+| short | TTFT t1 | 1 104 | 1 025 | **-7%** |
+| short | TTFT >= 2 p50 / p90 | 658 / 718 | 1 117 / 2 137 | **+70% / +198%** |
+| short | TPOT | 41 | 51 | **+23%** |
+| short | e2e/conv | 4.1 s | 5.7 s | +42% |
+| short | reuse | 0.95 | 0.89 | -7% |
+
+### What the last two milestones actually moved
+
+| change | effect on this table |
+|---|---|
+| **profile seeding** (M20 §29) | turn-1 on the small classes flipped to a win: code -2%, short -7%. Before it, a cold boot was a 48 ms worst case |
+| **promotion on by default** (M20 §26) | neutral within noise; it is in both this and the earlier table |
+| **KV aligned to fp16** (M20 §28) | nothing - strata's int8 gave it 0.6 ms at most, and at a 2 K prompt the KV is not where decode time goes |
+| **M21 (a1) KV reserve + refusal** | nothing at 2.3 GB, by construction; it removes a 41x silent failure at 3.0 GB |
+| **2.6 GB** (measured, not shipped) | doc TPOT 44 -> **38**, code 36 -> 34, code TTFT >= 2 1 276 -> 1 200, but turn-1 3 723 -> 5 562 ms |
+
+### The gap, in the units that pay for it
+
+1. **A continued turn: +0.46 s on `short`, +0.52 on `doc`** (p50), and the p90 is 2-3x worse because it is *one more
+   chunk*. This is §8's law exactly: `chunks x ~600 ms` for us against strata's `623 ms + 3 ms/row` **once per
+   turn**. For the 51-row suffix that is 1 200 ms against 776 ms. It is the single largest per-turn gap and the
+   milestone's whole subject.
+2. **Turn-1 on long prompts: +1.5 s** (2 208 us/row against 1 361). Paid once per conversation; the kernel (M22).
+3. **Decode: +6-10 ms per token**, worst on `short` (+10), which is the *constant* per-layer term (M20 §30: 48 layers
+   x per-layer fixed cost), not the cache - our reuse on `short` is lower than theirs (0.89 vs 0.95), and both are
+   on the critical path for us.
+4. **p90 everywhere**: 1.5-3x, and it is the same two causes (one extra chunk, and a miss landing in a step).
+
+### The one change that would flip a column
+
+If the fit predicate prices the per-token expert traffic (§12's second follow-up: prefer `4 096 x 2` over
+`1 024 x 8`), the 2.6 GB arm should keep turn-1 near 3 700 ms *and* take doc TPOT to 38 - i.e. **doc TPOT would go
+from +10% to -7%**, our first decode win on a long-context class. That is a two-line change to the predicate plus one
+measurement, and it is what the next round should do before any kernel work.
