@@ -220,3 +220,34 @@ text does reward a deeper window.
 
 If the harness reproduces it, **doc TPOT flips from +10% to -8%** - our first decode win on a long-context class, and
 it came from a flag, not a kernel. G1 of this milestone (doc <= 41) would be met.
+
+### Harness validation (g23, 2 rounds, automatic depth)
+
+| class | TPOT p50 (depth 4, g19) | TPOT p50 (auto, g23) | strata (g19) | delta vs strata |
+|---|---:|---:|---:|---:|
+| code | 35.7 | **33** | 29.9 | +10% (was +19%) |
+| doc | 44.4 | **40** | 40.5 | **-1% (was +10%)** |
+| long | 44.1 | **41** | 39.8 | +3% (was +11%) |
+| short | 50.5 | **42** | 40.9 | +3% (was +23%) |
+
+0 failures. The per-position table shows the autotuner doing exactly what the sweep said it should - positions 3-4
+are now reached 0.02-0.08 of the time (they were 0.43/0.25 when the depth was fixed at 4), so `accept` rises to
+0.58-0.86 and `tok/step` settles at 2.35-3.61:
+
+| class | accept | tok/step | accepted per position |
+|---|---:|---:|---|
+| code | 0.86 | 3.61 | 0.98 / 0.86 / 0.69 / 0.05 |
+| doc | 0.65 | 2.51 | 0.79 / 0.57 / 0.08 / 0.00 |
+| long | 0.58 | 2.59 | 0.75 / 0.52 / 0.30 / 0.00 |
+| short | 0.58 | 2.35 | 0.76 / 0.47 / 0.02 / 0.00 |
+
+**So TPOT is now at parity on `doc` and within 3% on `long`/`short`, and the remaining `code` gap (+10%) is the
+per-layer constant.** G1 met, G2/G3 essentially met (short 42 against a 41 target, p90 still the tail). TTFT is
+untouched, as expected - that is M23's subject.
+
+Two things this changes for the rest of M22:
+
+1. **The tail (G3) did not move**: `short` p90 2 272 ms is TTFT, and TPOT p90 was 56.1 in g19; the depth change lowers
+   the median, not the stubs. That remains the miss-in-a-step problem.
+2. The **`code` constant** (+3 ms now) is what is left of the per-layer term, and it is the only remaining place a
+   kernel change would show up.
