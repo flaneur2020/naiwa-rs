@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import os
 import signal
 import socket
@@ -271,6 +272,74 @@ class Engine:
 # ---------------------------------------------------------------------------
 
 
+# The engine's Prometheus counters, read before and after each turn so a turn gets its own deltas. The server is
+# single-flight for the harness's requests, so the difference is attributable. Names match mistralrs-core's
+# `engine/logger.rs` (`add_speculative_stats`); a turn without speculation reports zeros, an engine without the
+# endpoint (strata) reports None and the columns stay empty rather than invented.
+SPEC_COUNTERS = (
+    "mistralrs_speculative_drafts_total",  # verification steps: one per decode step
+    "mistralrs_speculative_draft_tokens_proposed_total",
+    "mistralrs_speculative_draft_tokens_accepted_total",
+)
+# Per drafted position, how often it survived: the shape of acceptance (position 0 is the first draft).
+SPEC_POS = "mistralrs_speculative_draft_tokens_accepted_per_pos_total"
+SPEC_POS_RE = re.compile(r'^' + SPEC_POS + r'\{position="(\d+)"\} ')
+
+
+def read_metrics(base: str) -> dict:
+    try:
+        with urllib.request.urlopen(base + "/metrics", timeout=5) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - no endpoint is a fact about the engine, not an error
+        return {}
+    got = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        if name in SPEC_COUNTERS:
+            try:
+                got[name] = float(value)
+            except ValueError:
+                pass
+            continue
+        m = SPEC_POS_RE.match(line)
+        if m:
+            try:
+                got[f"{SPEC_POS}:{int(m.group(1))}"] = float(value)
+            except ValueError:
+                pass
+    return got
+
+
+def spec_delta(before: dict, after: dict, completion_tokens) -> dict:
+    """Steps, drafts, acceptance and tokens per step for one turn."""
+    if not before or not after:
+        return {"spec_steps": None, "spec_proposed": None, "spec_accepted": None,
+                "acceptance": None, "tokens_per_step": None}
+    steps = after.get(SPEC_COUNTERS[0], 0.0) - before.get(SPEC_COUNTERS[0], 0.0)
+    proposed = after.get(SPEC_COUNTERS[1], 0.0) - before.get(SPEC_COUNTERS[1], 0.0)
+    accepted = after.get(SPEC_COUNTERS[2], 0.0) - before.get(SPEC_COUNTERS[2], 0.0)
+    tokens = completion_tokens - 1 if isinstance(completion_tokens, int) else None
+    # Where the drafts die: position 0 is the first draft, so this says whether the drafter is weak everywhere or
+    # only deep. A step commits `accepted + 1` tokens, which is why acceptance divides TPOT at a fixed step time.
+    positions = []
+    for i in range(8):
+        key = f"{SPEC_POS}:{i}"
+        if key not in after:
+            break
+        delta = after.get(key, 0.0) - before.get(key, 0.0)
+        positions.append(delta / steps if steps > 0 else None)
+    return {
+        "spec_steps": int(steps),
+        "spec_proposed": int(proposed),
+        "spec_accepted": int(accepted),
+        "acceptance": (accepted / proposed) if proposed > 0 else None,
+        "tokens_per_step": (tokens / steps) if steps > 0 and tokens else None,
+        "accept_pos": positions or None,
+    }
+
+
 def stream_turn(base: str, body: dict, timeout: float) -> dict:
     req = urllib.request.Request(
         base + "/v1/chat/completions",
@@ -417,7 +486,11 @@ def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, 
                 "stream": True,
             }
             body.update(cfg.get("body") or {})
-            return stream_turn(engine.base, body, args.timeout)
+            before = read_metrics(engine.base)
+            out = stream_turn(engine.base, body, args.timeout)
+            after = read_metrics(engine.base)
+            out.update(spec_delta(before, after, out.get("completion_tokens")))
+            return out
 
         for turn in WARMUP:
             request([{"role": "user", "content": turn["user"]}], turn["max_tokens"])
@@ -458,7 +531,8 @@ def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, 
                     print(
                         f"  {conv['class']:5s} {conv['id']:8s} t{i + 1} "
                         f"ttft {fmt(rec['ttft_ms'])} tpot {fmt(rec['tpot_ms'])} "
-                        f"tok/s {fmt(rec.get('decode_tps'))} reuse {fmt_ratio(rec['reuse'])}",
+                        f"tok/s {fmt(rec.get('decode_tps'))} reuse {fmt_ratio(rec['reuse'])} "
+                        f"accept {fmt_ratio(rec.get('acceptance'))} tok/step {fmt(rec.get('tokens_per_step'))}",
                         flush=True,
                     )
     finally:

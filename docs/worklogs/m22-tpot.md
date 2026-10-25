@@ -157,3 +157,32 @@ is per-layer kernel efficiency.
 2. If acceptance is already at its ceiling, the lever is the per-layer GPU pass: the budget says 1.9 ms/layer for a
    layer whose expert work is 10 experts x 3 GEMMs on a handful of rows, which is a kernel question (M22.2).
 3. Do not spend anything on host-side pipelining: at 97% device utilisation there is nothing to overlap.
+
+## 9. Acceptance is now part of every comparison (2026-10-24)
+
+The harness reads the engine's Prometheus counters before and after each request and records the speculation numbers
+with the turn (`harness/chat/run.py`, `read_metrics` / `spec_delta`; `summarize.py` prints a **Speculation** section
+first). Fields: `spec_steps`, `spec_proposed`, `spec_accepted`, `acceptance`, `tokens_per_step`, and `accept_pos` -
+the share of steps that kept each drafted position, i.e. *where* the drafts die.
+
+This is the term that divides TPOT. First reading (g22, naiwa alone, 2 rounds, doc probe corpus):
+
+| class | accept p50 | tok/step | accepted per drafted position | TPOT p50 | implied step time |
+|---|---:|---:|---|---:|---:|
+| code | **0.72** | 3.88 | 0.89 / 0.78 / 0.67 / 0.51 | 35 ms | 136 ms |
+| short | 0.62 | 3.58 | 0.88 / 0.67 / 0.50 / 0.39 | 41 | 147 |
+| doc | 0.56 | 3.33 | 0.81 / 0.68 / 0.43 / 0.25 | 44 | 146 |
+| long | **0.44** | 2.77 | 0.77 / 0.50 / 0.29 / 0.21 | 47 | 130 |
+
+Two things fall out immediately, and neither was visible from TPOT alone:
+
+1. **Step time is nearly constant (130-147 ms) and tokens per step is what varies** (2.77-3.88). So TPOT's class
+   spread is *acceptance*, not kernel speed - `long` is 47 ms because it commits 2.77 tokens where `code` commits 3.88,
+   at almost the same step cost.
+2. **The drafter dies by position 4** (0.25-0.51) but position 1 is 0.68-0.89. With `--mtp-n-predict 4` we pay for
+   four drafts and use ~2. A shorter window would commit fewer tokens per step at a lower step cost; a *better*
+   drafter is worth more than a longer one. Both are cheap experiments now that the metric is in the harness.
+
+So the milestone's T1 has its instrument. Next: `--mtp-n-predict` 2/3/4 and `--spec-min-p` against
+`tokens_per_step`, `acceptance` and TPOT p50/p90, then decide whether the lever is the window, the drafter's depth, or
+the per-layer pass (step time).

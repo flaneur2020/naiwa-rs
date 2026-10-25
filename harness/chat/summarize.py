@@ -84,9 +84,30 @@ def main() -> int:
     print()
 
     # 1. per class -------------------------------------------------------------------------------
+    print("## Speculation (acceptance divides TPOT at a fixed step time: a step commits accepted + 1 tokens)")
+    print()
+    print("| class | engine | accept p50 | tok/step p50 | accepted per drafted position |")
+    print("|---|---|---:|---:|---|")
+    for cls in classes:
+        for engine in engines:
+            late = group(later, engine, cls)
+            if not late or all(t.get("acceptance") is None for t in late):
+                continue
+            # One number per drafted position: the median over turns, not every turn's value (the first version
+            # concatenated them and printed 24 columns for 6 turns).
+            per_pos = " / ".join(
+                f(med([(t.get("accept_pos") or [None] * 4 + [None] * 4)[i] for t in late]), 2)
+                for i in range(4)
+            )
+            print(
+                f"| {cls} | {engine} | {f(med([t.get('acceptance') for t in late]), 2)} | "
+                f"{f(med([t.get('tokens_per_step') for t in late]), 2)} | {per_pos} |"
+            )
+    print()
     print("## Per class\n")
-    print("| class | engine | turns | TTFT t1 | TTFT ≥2 p50 | p90 | TPOT p50 | decode tok/s | reuse p50 | e2e/conv |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("| class | engine | turns | TTFT t1 | TTFT ≥2 p50 | p90 | TPOT p50 | decode tok/s | reuse p50 "
+          "| accept | tok/step | e2e/conv |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for cls in classes:
         for engine in engines:
             late = group(later, engine, cls)
@@ -104,6 +125,8 @@ def main() -> int:
                 f"{f(med([t['tpot_ms'] for t in late]))} ms | "
                 f"{f(med([t['decode_tps'] for t in late]), 1)} | "
                 f"{f(med([t['reuse'] for t in late]), 2)} | "
+                f"{f(med([t['acceptance'] for t in late]), 2)} | "
+                f"{f(med([t['tokens_per_step'] for t in late]), 2)} | "
                 f"{f(med(list(e2e.values())) / 1000.0, 1)} s |"
             )
     print("\nTTFT = request write → first content delta. TPOT = decode window / gaps (speculative")
