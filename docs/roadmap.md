@@ -403,6 +403,11 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m22.3-shared-activation.md`](worklogs/m22.3-shared-activation.md) — M22.3 (**open, this
+iteration's focus**: the expert GEMV reads its activation 8x per block and that is **72% of its traffic** - 1 728 KB of
+activation re-reads against 690 KB of irreducible weights per (row, expert) pair. One mechanism: stage the activation
+in shared memory once per block, a 3.5x traffic cut, which should take `expert_dev` from 33 to 10-13 ms of a 63 ms step
+(TPOT 35.8 -> ~20 ms). Gate: `expert_dev` <= 16.5 ms, oracle arm byte-identical, `code` TPOT <= 30.1).
 Worklog: [`worklogs/m22.2-expert-kernel.md`](worklogs/m22.2-expert-kernel.md) — M22.2 (**open**: the expert kernel.
 M22's step budget, extended with CUDA events around the expert submissions, shows the expert kernels are **52% of a
 decode step (33 ms of 63) running at 82 GB/s - 16% of the card's bandwidth** - because `indexed_moe_fused_decode`
