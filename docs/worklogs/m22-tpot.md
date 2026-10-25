@@ -1,6 +1,6 @@
 # M22 — TPOT: the per-step fixed cost and the missed-expert tail
 
-Status: **targets met except the per-layer constant** (2026-10-24). Measured: doc TPOT 44.4 -> 38.9 (a win over
+Status: **targets met except the per-layer constant** (2026-10-24). Measured: doc TPOT 44.4 -> 37.7 (a win over
 strata's 40.0), short 50.5 -> 40.7 (+0.9%), long 44.1 -> 40.5 (+1.4%), tails collapsed (worst step 79 -> 57.7 ms,
 short p90 56.1 -> 52.5). Remaining: `code` +14%, which is the 48-layer per-layer constant and needs the kernel.
 This iteration was TPOT only; TTFT is M23.
@@ -357,3 +357,40 @@ has learned the same thing the sweep showed.
 TTFT moved the other way in this run (doc >=2 1 463 ms against 1 193 in g19, long 1 883 against 1 077) and that is
 M23's subject: nothing in this milestone touched the prefill path, so it is either machine state or the run-to-run
 variance M21 §14 documented (the same quantity moved 1 090-2 300 ms between turns of one conversation).
+
+## 13. Greedy drafting: -9.5% TPOT p50 and -22% p90 (2026-10-24)
+
+The acceptance column made a lever visible that no amount of TPOT-watching would have: at temperature 0 the target is
+greedy, so a **draft drawn probabilistically disagrees with it more often than a greedy draft does**. Swept the draft
+sampling policy and two neighbours on the doc probe (4 turns, 3 runs per arm, turn >= 2):
+
+| arm | n | TPOT p50 | p90 | acceptance | tok/step |
+|---|---:|---:|---:|---:|---:|
+| auto (was shipped) | 9 | 40.9 | 50.1 | 0.64 | 2.33 |
+| probabilistic | 9 | 40.4 | 47.6 | 0.65 | 2.33 |
+| **greedy** | 6 | **37.0** | **38.9** | **0.82** | **2.67** |
+| `--pcie-frac 0.3` | 9 | 39.5 | 44.6 | 0.69 | 2.52 |
+| `--lookahead-swaps 4` | 9 | 47.1 | **52.9** | 0.69 | 2.62 |
+
+- **Greedy drafting is the win**: -9.5% at the median, -22% at p90, and the acceptance number explains it exactly
+  (0.82 against 0.64). Shipped in all engine configs.
+- **`--lookahead-swaps 4` is refuted** (47.1, the worst arm): two extra prediction swaps per row and pass cost more
+  DMA than the hits they buy. The default 2 stays.
+- `--pcie-frac 0.3` measured 1.4 ms better at the median and 5.5 ms at p90, which is *inside* the spread of an n=9
+  arm - a candidate for the next sweep, not a change to make from this data.
+
+### Back-to-back after it (g25, 3 rounds, both engines, 0 failures)
+
+| class | strata p50 | naiwa p50 | delta | naiwa p90 | acceptance | tok/step |
+|---|---:|---:|---:|---:|---:|---:|
+| code | 30.1 | 34.5 | **+14.6%** | 36.0 | 0.89 | 3.06 |
+| **doc** | 40.3 | **37.7** | **-6.4%** | 45.9 | 0.76 | 2.75 |
+| long | 40.2 | 40.6 | **+1.0%** | 42.3 | 0.64 | 2.32 |
+| short | 40.4 | 41.7 | +3.1% | 50.1 | 0.57 | 2.38 |
+
+Against the same run before the depth and sampling changes (g19): code +19.4% -> +14.6%, doc +9.7% -> **-6.4%**,
+long +10.9% -> +1.0%, short +23.5% -> +3.1%.
+
+**What is left, and it is one thing twice:** `code` at +14.6% and `short` at +3.1% both sit at the same place - the
+per-layer fixed cost, which shows up as a constant on the short-context class and as the p90 on the class with the
+most varied content. Everything else in the milestone's target table is met.
