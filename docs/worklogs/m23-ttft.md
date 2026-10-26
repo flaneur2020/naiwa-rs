@@ -172,3 +172,20 @@ keeping the experts resident - which needs 23.4 GiB of a 12 GiB card, i.e. a dif
 routed upload trims 25% of the former's bytes for a 4% TTFT win.** Closing the remaining gap needs residency, not
 tuning - which reframes the *conversation* as the unit: fewer chunks per conversation is worth 1.2 s each, and that is
 where the next milestone should look (`--prefix-cache-n`, continued-turn chunking, M21's `chunks x 600 ms` law).
+
+## 7. Instrument attempt: the prefill stage profile has to move into `cuda/gdn.rs`
+
+Tried to attribute the 1.67 ms/token slope with a per-stage timer (`NAIWA_LAYER_PROFILE=1`): a guard in
+`models/qwen3_next.rs::Attention::forward`, a conv/recurrence split in `gdn/layer.rs::forward_recurrent_core`, and
+router/experts/shared timers in `SparseMoeBlock::forward`. **None of the three ever fired**, and that is itself the
+answer to where the code is:
+
+- the sparse MoE is not the fork's `SparseMoeBlock` - naiwa-rs's `moe::cached_layer` owns that forward, so nothing in
+  `qwen3_next.rs` runs for our layers' experts;
+- the dense `Attention::forward` in the same file is not reached either: this model's layers are GDN (gated DeltaNet),
+  and its prefill goes through `try_forward_grouped_packed_gdn` -> `cuda/gdn.rs`, the grouped/packed kernel path, with
+  `gdn/layer.rs` only as the wrapper.
+
+So a stage profile for prefill has to instrument `mistralrs-core/src/cuda/gdn.rs` (and the paged-attention prefill for
+the few full-attention layers), not the model file. The fork is back to pristine for those two files: an instrument
+that never fires is worse than none, and the numbers it was meant to refine are already in §6.
