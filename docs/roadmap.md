@@ -403,12 +403,14 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m23-ttft.md`](worklogs/m23-ttft.md) — M23 (**open, this iteration's focus**: TTFT. A 1 725-token
-`doc` turn 1 is **3.87 s (345 T/s)** of which only **0.51 s** is instrumented MoE step time - 87% is outside the
-budget instrument. The arithmetic closes on PCIe: `--prefill-stream` uploads one whole layer of experts per step
-(**650 MiB x 48 = 30.5 GB per chunk**, 2.3 s at M20's calibrated 13.4 GB/s), and step 2's own counters say the chunk
-routes to only **4 391 of 12 288 experts (35.7%)**. Routing the upload: 10.9 GB, TTFT **~1.6-2.0 s**. Gates: turn-1
-TTFT <= 2.2 s, prefill >= 600 T/s, no `long`/`code` regression, oracle arm byte-identical.
+Worklog: [`worklogs/m23-ttft.md`](worklogs/m23-ttft.md) — M23 (**open; first lever withdrawn, the law stands**: TTFT.
+Four cold requests give **`TTFT = 1.15 s per chunk + 1.67 ms per token`**. The constant has an exact explanation - a
+chunk streams the model's whole **23.4 GiB** expert set once, which at the ~20 GB/s pinned memory sustains here is
+1.17 s (measured 1.15) - and it cannot be routed away: with `topk = 10` over 256 experts a chunk of a few dozen rows
+already touches ~78% of each layer's experts, 1 392 rows all of them. The routed-upload attempt was built, measured
+(650 -> 487 MiB/layer, **-4%** TTFT) and **removed**. What is left is the *number of chunks per conversation* (each one
+costs 1.2 s) and residence, which needs 23.4 GiB in 12 GiB. `doc`'s four turns spend ~4.6 s of their 6.8 s TTFT on
+the constant.
 Worklog: [`worklogs/m22.4-vec-dot.md`](worklogs/m22.4-vec-dot.md) — M22.4 (**closed, negative**: rewriting `vec_dot`.
 Six mechanisms measured out - shared-memory staging **+19%** (L1 already absorbs the stride-8 gaps, so per-block DRAM
 traffic was exact), 4-way fused reduction **0**, per-expert row grouping **1% left** (17.6 us/pair against an

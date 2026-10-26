@@ -1,6 +1,8 @@
 # M23 - TTFT (prefill)
 
-**Status:** open, **first measurement done** - prefill is transfer-bound, and it uploads 2.8x more than it reads.
+**Status:** open, **first measurement done, first lever withdrawn**. The measured curve stands
+(`TTFT = 1.15 s per chunk + 1.67 ms per token`, §6); the routed upload built in §5 was **rolled back** after it
+measured -4%: a prefill chunk touches essentially every expert (§6), which is what prefill does by construction.
 **Parent:** M22 (TPOT line closed at doc -6.4%), M21 (the continued-turn chunk cost model).
 **Why now:** TPOT is at its floor. TTFT is the largest remaining term: doc/short spend **6.8-6.9 s per conversation**
 in prefill, 7-20x the remaining TPOT headroom.
@@ -25,7 +27,7 @@ The MoE steps inside it - and there are only **three** `STEP_BUDGET` lines for t
 So **87% of TTFT is outside the instrumented MoE step**: 3.87 s of TTFT against 0.51 s of step time. The expert kernels
 are 0.18 s of it (4.7%).
 
-## 2. The missing time is PCIe, and the arithmetic is exact
+## 2. (withdrawn - see §5/§6) The missing time is PCIe, and the arithmetic is exact
 
 `--prefill-stream` keeps **two device buffers of one whole layer of experts each** and uploads a layer per chunk step,
 verbatim, from the pinned host stacks (`prefill_stream.rs` module docs). The startup line reports the size:
@@ -39,7 +41,7 @@ which is the bulk of the unexplained 3.36 s, with the rest being the unhidden fi
 
 **Prefill is a transfer, not a computation.**
 
-## 3. And it moves 2.8x more bytes than the chunk reads
+## 3. (withdrawn - the 4 391 counts cache slots, not experts) it moves 2.8x more bytes than the chunk reads
 
 Step 2's own counters answer this: **13 920 pairs, 4 391 distinct experts** across 48 layers, i.e. **91 distinct
 experts per layer out of 256 = 35.7%**. The upload is not routed at all - it streams every expert of every layer.
@@ -54,7 +56,7 @@ Note the same counter also shows prefill's `(row, expert)` redundancy is much wo
 headroom at 1 392 rows vs 27-34% at 4** - which is why routing the upload pays here even though it does not for decode
 (M22.4 §2 measured grouping at 1% for the GEMV).
 
-## 4. The mechanism to build
+## 4. (withdrawn with §5) The mechanism to build
 
 Per layer, the router runs before that layer's experts, so the exact needed set *is* known before the upload - just
 not early enough to hide it behind the previous layer. That trade is worth taking, because the upload is 2.8x smaller
@@ -82,7 +84,7 @@ the stream buffer, then run), with the buffer sized for the worst case the route
 `NAIWA_PREFILL_THRESHOLD` 32/64/128/256 all equivalent; chunk 1024 costs +1.9 s. So the chunk *boundaries* are not the
 lever - the bytes are.
 
-## 5. Built the routed upload - and it falsifies §2-§4
+## 5. Built the routed upload - falsified, and **removed** from the tree
 
 Implemented `NAIWA_PREFILL_ROUTED=1`: per layer, the distinct experts this chunk routes to are gathered out of the
 host stack and copied into their own places in the full-size layer buffer (`upload_experts_async`), so the *layout*
@@ -124,8 +126,10 @@ That is now the M23 target, and it is a *different* kind of work: a per-stage ti
 stage that owns the 2.1 ms/row. The chunk-boundary levers were already refuted in M21, and the transfer levers are
 refuted here.
 
-`NAIWA_PREFILL_ROUTED=1` stays in the tree, gated and off by default: it is a real -25% on upload bytes and -4% on
-TTFT, but it does not move the number that matters.
+**Removed.** `NAIWA_PREFILL_ROUTED`, `copy_stream::upload_experts_async` and the per-layer gather are back out of the
+tree: prefill routes to (nearly) all experts by construction - `topk = 10` over 256 experts means a few dozen rows
+already cover ~78% of a layer's experts (§6) - so "only upload what is routed" is not a mechanism, it is a rounding
+error. Reverted in full, no traces, no gated leftovers.
 
 ## 6. The TTFT curve: a 1.15 s per-chunk constant, and its exact explanation
 
@@ -162,14 +166,15 @@ keeping the experts resident - which needs 23.4 GiB of a 12 GiB card, i.e. a dif
 
 | lever | effect | status |
 |---|---|---|
-| routed upload (§5) | 650 -> 487 MiB/layer, TTFT -4% | shipped, `NAIWA_PREFILL_ROUTED=1`, off by default |
+| routed upload (§5) | 650 -> 487 MiB/layer, TTFT -4% | **built, measured, removed**: prefill touches every expert |
 | bigger chunks (amortise the constant) | the constant is per chunk, so this is the only lever with real leverage | chunk is already at the VRAM ceiling (2 048 rows, M20/M21) |
 | keep experts resident | would remove the constant entirely | 23.4 GiB in 12 GiB: impossible here |
 | cache-only prefill (rings / `--prefill-stream-min-tokens`) | shorter chunks avoid the stream | refuted in M21, all settings equivalent |
 | attention / dense path | 87% of *compute*, but compute is the 1.67 ms/token slope, not the constant | measured: MoE steps are 508 ms of a 3.87 s chunk |
 
-**M23's honest result: TTFT is 1.15 s of unavoidable weight streaming per chunk plus 1.67 ms/token of compute; the
-routed upload trims 25% of the former's bytes for a 4% TTFT win.** Closing the remaining gap needs residency, not
+**M23's honest result: TTFT is 1.15 s of unavoidable weight streaming per chunk plus 1.67 ms/token of compute - a
+prefill chunk needs essentially every expert, so no amount of routing, gathering or chunk-shaping moves the constant;
+only residence would, and 23.4 GiB does not fit in 12 GiB.** Closing the remaining gap needs residency, not
 tuning - which reframes the *conversation* as the unit: fewer chunks per conversation is worth 1.2 s each, and that is
 where the next milestone should look (`--prefix-cache-n`, continued-turn chunking, M21's `chunks x 600 ms` law).
 
