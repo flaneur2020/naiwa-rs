@@ -403,11 +403,24 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m22.3-shared-activation.md`](worklogs/m22.3-shared-activation.md) — M22.3 (**open, this
-iteration's focus**: the expert GEMV reads its activation 8x per block and that is **72% of its traffic** - 1 728 KB of
-activation re-reads against 690 KB of irreducible weights per (row, expert) pair. One mechanism: stage the activation
-in shared memory once per block, a 3.5x traffic cut, which should take `expert_dev` from 33 to 10-13 ms of a 63 ms step
-(TPOT 35.8 -> ~20 ms). Gate: `expert_dev` <= 16.5 ms, oracle arm byte-identical, `code` TPOT <= 30.1).
+Worklog: [`worklogs/m23-ttft.md`](worklogs/m23-ttft.md) — M23 (**open, this iteration's focus**: TTFT. A 1 725-token
+`doc` turn 1 is **3.87 s (345 T/s)** of which only **0.51 s** is instrumented MoE step time - 87% is outside the
+budget instrument. The arithmetic closes on PCIe: `--prefill-stream` uploads one whole layer of experts per step
+(**650 MiB x 48 = 30.5 GB per chunk**, 2.3 s at M20's calibrated 13.4 GB/s), and step 2's own counters say the chunk
+routes to only **4 391 of 12 288 experts (35.7%)**. Routing the upload: 10.9 GB, TTFT **~1.6-2.0 s**. Gates: turn-1
+TTFT <= 2.2 s, prefill >= 600 T/s, no `long`/`code` regression, oracle arm byte-identical.
+Worklog: [`worklogs/m22.4-vec-dot.md`](worklogs/m22.4-vec-dot.md) — M22.4 (**closed, negative**: rewriting `vec_dot`.
+Six mechanisms measured out - shared-memory staging **+19%** (L1 already absorbs the stride-8 gaps, so per-block DRAM
+traffic was exact), 4-way fused reduction **0**, per-expert row grouping **1% left** (17.6 us/pair against an
+ideal-grouping 17.4), wide loads **illegal** (every IQ block starts with a 2-byte `half d`), plus M22.3's refutations.
+The one remainder is an aligned block repack (98 -> 100 B: 4 load instructions become 2, `expert_dev` 38.3 -> ~33.2 ms)
+which is five coupled subsystems - slot sizing against M20's 2.3 GB ceiling, QTensor strides, staging, the mmap borrow
+path, and four vec_dot variants - for one 14% kernel win.
+Worklog: [`worklogs/m22.3-shared-activation.md`](worklogs/m22.3-shared-activation.md) — M22.3 (**closed**: the expert
+kernel, fully decomposed. Load **<=42%**, dequant+MAC **33%**, reduction **18%** (latency, already hidden - two
+attempts to exploit it moved nothing), store **2%**; 82 GB/s effective, 16% of peak, at **2 bytes per load
+instruction**, which is a layout property. Activation staging, block shape, merged reads and MMVQ-per-expert all
+measured out; `MISTRALRS_MOE_SKIP_DOWN=1` shows `gate_up` is ~100% of the kernel.
 Worklog: [`worklogs/m22.2-expert-kernel.md`](worklogs/m22.2-expert-kernel.md) — M22.2 (**open**: the expert kernel.
 M22's step budget, extended with CUDA events around the expert submissions, shows the expert kernels are **52% of a
 decode step (33 ms of 63) running at 82 GB/s - 16% of the card's bandwidth** - because `indexed_moe_fused_decode`
