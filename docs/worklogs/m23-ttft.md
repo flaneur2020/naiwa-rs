@@ -126,3 +126,49 @@ refuted here.
 
 `NAIWA_PREFILL_ROUTED=1` stays in the tree, gated and off by default: it is a real -25% on upload bytes and -4% on
 TTFT, but it does not move the number that matters.
+
+## 6. The TTFT curve: a 1.15 s per-chunk constant, and its exact explanation
+
+Four cold requests, same server, same configuration (`--expert-cache-gb 2.2`, stream on, routed off):
+
+| prompt tokens | TTFT | ms/token |
+|---:|---:|---:|
+| 52 | 1.24 s | 23.9 |
+| 130 | 2.20 s | 16.9 |
+| 325 | 2.31 s | 7.09 |
+| 871 | 2.61 s | 3.00 |
+
+Fit: **`TTFT(N) = 1.15 s + 1.67 ms x N`**. The constant, not the slope, is what a chat conversation pays: `doc`'s four
+turns spend **~4.6 s of their 6.8 s** on it.
+
+### Where the constant comes from - and the arithmetic is exact
+
+A chunk streams every layer's expert stacks once: **23.4 GiB of expert weights** (the model's whole expert set) at the
+~20 GB/s that pinned host memory sustains here = **1.17 s**. Measured: 1.15 s. The constant *is* the weight stream.
+
+And it cannot be routed away, which is why §5 moved only 4%: with `topk = 10` over 256 experts, one row touches 3.9% of
+a layer's experts, so a chunk of `R` rows touches `1 - (1 - 10/256)^R`: **40 rows -> 78%**, 1 392 rows -> 100%. The
+`235/256` the instrument reported is not an accident of a big chunk; it is what a few dozen rows already imply.
+
+| chunk rows | experts touched per layer | cheapest possible stream |
+|---:|---:|---:|
+| 40 (a continued turn) | ~200 / 256 (78%) | 18 GiB |
+| 1 392 (a fresh document) | 256 / 256 (100%) | 23.4 GiB |
+
+So the floor for one chunk on this card is **~1.2 s**, and `doc`'s four turns cannot go below ~4.8 s of TTFT without
+keeping the experts resident - which needs 23.4 GiB of a 12 GiB card, i.e. a different machine, not a different kernel.
+
+### What M23 therefore delivers, and what it cannot
+
+| lever | effect | status |
+|---|---|---|
+| routed upload (§5) | 650 -> 487 MiB/layer, TTFT -4% | shipped, `NAIWA_PREFILL_ROUTED=1`, off by default |
+| bigger chunks (amortise the constant) | the constant is per chunk, so this is the only lever with real leverage | chunk is already at the VRAM ceiling (2 048 rows, M20/M21) |
+| keep experts resident | would remove the constant entirely | 23.4 GiB in 12 GiB: impossible here |
+| cache-only prefill (rings / `--prefill-stream-min-tokens`) | shorter chunks avoid the stream | refuted in M21, all settings equivalent |
+| attention / dense path | 87% of *compute*, but compute is the 1.67 ms/token slope, not the constant | measured: MoE steps are 508 ms of a 3.87 s chunk |
+
+**M23's honest result: TTFT is 1.15 s of unavoidable weight streaming per chunk plus 1.67 ms/token of compute; the
+routed upload trims 25% of the former's bytes for a 4% TTFT win.** Closing the remaining gap needs residency, not
+tuning - which reframes the *conversation* as the unit: fewer chunks per conversation is worth 1.2 s each, and that is
+where the next milestone should look (`--prefix-cache-n`, continued-turn chunking, M21's `chunks x 600 ms` law).
