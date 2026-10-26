@@ -1,0 +1,83 @@
+# M23 - TTFT (prefill)
+
+**Status:** open, **first measurement done** - prefill is transfer-bound, and it uploads 2.8x more than it reads.
+**Parent:** M22 (TPOT line closed at doc -6.4%), M21 (the continued-turn chunk cost model).
+**Why now:** TPOT is at its floor. TTFT is the largest remaining term: doc/short spend **6.8-6.9 s per conversation**
+in prefill, 7-20x the remaining TPOT headroom.
+
+## 1. Where a 1 725-token turn-1 actually goes
+
+One request, `doc` turn 1, `--mtp-n-predict 3`, `NAIWA_STEP_BUDGET=1`:
+
+```
+prefill tokens=1725  ttft=3.87s  => 2.24 ms/token      (engine reports 345 T/s prefill)
+```
+
+The MoE steps inside it - and there are only **three** `STEP_BUDGET` lines for the whole chunk:
+
+| step | rows implied | total | expert_dev | `plan` (doorbell wait = device) | pairs | distinct |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 63.5 ms | 20.9 | 53.9 | 480 | 480 |
+| 2 | **1 392** | **416.2 ms** | 142.4 | 399.7 | **13 920** | **4 391** |
+| 3 | 1 | 28.7 ms | 18.0 | 21.3 | 480 | 479 |
+| | | **508 ms** | 181 | | | |
+
+So **87% of TTFT is outside the instrumented MoE step**: 3.87 s of TTFT against 0.51 s of step time. The expert kernels
+are 0.18 s of it (4.7%).
+
+## 2. The missing time is PCIe, and the arithmetic is exact
+
+`--prefill-stream` keeps **two device buffers of one whole layer of experts each** and uploads a layer per chunk step,
+verbatim, from the pinned host stacks (`prefill_stream.rs` module docs). The startup line reports the size:
+
+```
+prefill (first chunk): chunk 2048, 1 x 650 MiB layer buffer(s) + 378 MiB activations + 512 MiB headroom = 1540 MiB
+```
+
+48 layers x 650 MiB = **30.5 GB per chunk**. At the H2D rate calibrated in M20 (**13.4 GB/s**) that is **2.3 s** -
+which is the bulk of the unexplained 3.36 s, with the rest being the unhidden first layer plus allocation.
+
+**Prefill is a transfer, not a computation.**
+
+## 3. And it moves 2.8x more bytes than the chunk reads
+
+Step 2's own counters answer this: **13 920 pairs, 4 391 distinct experts** across 48 layers, i.e. **91 distinct
+experts per layer out of 256 = 35.7%**. The upload is not routed at all - it streams every expert of every layer.
+
+| | today | if only the routed experts were uploaded |
+|---|---:|---:|
+| bytes per chunk | 30.5 GB | **10.9 GB** |
+| at 13.4 GB/s | 2.3 s | **0.81 s** |
+| projected TTFT | 3.87 s | **~1.6-2.0 s** |
+
+Note the same counter also shows prefill's `(row, expert)` redundancy is much worse than decode's: **68% grouping
+headroom at 1 392 rows vs 27-34% at 4** - which is why routing the upload pays here even though it does not for decode
+(M22.4 §2 measured grouping at 1% for the GEMV).
+
+## 4. The mechanism to build
+
+Per layer, the router runs before that layer's experts, so the exact needed set *is* known before the upload - just
+not early enough to hide it behind the previous layer. That trade is worth taking, because the upload is 2.8x smaller
+than the pipeline it would give up:
+
+| schedule | per layer | per chunk (48) |
+|---|---:|---:|
+| today: upload 650 MiB, pipelined | 48 ms upload (hidden behind 3 ms compute: **not** hidden) | 2.3 s |
+| **gather 232 MiB, run unpipelined** | 17 ms upload + 3 ms compute | **0.96 s** |
+| ideal: gather 232 MiB, pipelined | 17 ms (hidden) | 0.81 s |
+
+The pipelining today is already worthless for that reason: 48 ms of upload against 3 ms of compute cannot overlap into
+anything. So the first build is the simple one - **route the upload** (gather the distinct experts of the layer into
+the stream buffer, then run), with the buffer sized for the worst case the router can produce.
+
+### Gates for M23
+
+1. `doc`/`short` turn-1 TTFT: **3.87 s -> <=2.2 s** (median of 3, no failure retries), oracle arm byte-identical.
+2. Prefill T/s in the engine line: **345 -> >=600**.
+3. Never worse on `long`/`code` (their chunk sizes differ).
+
+### Refutations carried in from M21
+
+`--prefill-stream-min-tokens` 64/32/16/8/1 all equivalent; `MISTRALRS_MERGE_SUFFIX_BELOW` 2-4x slower;
+`NAIWA_PREFILL_THRESHOLD` 32/64/128/256 all equivalent; chunk 1024 costs +1.9 s. So the chunk *boundaries* are not the
+lever - the bytes are.
