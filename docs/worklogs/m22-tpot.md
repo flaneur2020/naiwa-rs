@@ -748,3 +748,47 @@ All of the above was measured through env-gated instrumentation and has been **r
 `prompt_chunks` (M21) + the `MISTRALRS_MOE_SKIP_DOWN` ablation switch, and naiwa-rs is untouched apart from the docs.
 `NAIWA_LAYER_PROFILE` and the four ablation switches lived in `qwen4_exp/text.rs` and are quoted above for
 re-application.
+
+## 20. The buffer-reuse arm looked like -52% and was **wrong** - caught by the oracle, and that is the whole point of the gate
+
+Followed §19's plan: keep the shared expert's output tensor in a long-lived buffer and write into it instead of
+producing a fresh one. Written as
+
+```rust
+let gated = mlp.broadcast_mul(&shared_gate)?;
+buf.slice_assign(&[0..b, 0..seq, 0..hidden], &gated)?;   // result *discarded*
+buf.clone()
+```
+
+| arm | step (1 row, no spec) | tokens |
+|---|---:|---|
+| baseline | 47.0-47.5 ms | 40/40 |
+| "buffer reuse" | **22.8 / 22.8 / 24.3 ms** | 40/40 |
+
+A 52% step win, reproducible over three turns, with the token and delta counts correct - and **the output was
+garbage**:
+
+```
+$ NAIWA_MOE_BUF_REUSE=1 harness/m1/capture_oracle.sh (frac 0, --no-lookahead)
+'flen-fieldsfieldsfields-fieldsfieldsantangiotaiotaiotaantangantangiotaFldiotaiota'
+$ reference.oracle.txt
+' Paris. The capital of Japan is Tokyo. The capital of Italy is Rome.'
+```
+
+**`Tensor::slice_assign` returns a new tensor; it does not write in place.** Discarding its result and returning
+`buf.clone()` returned the *stale* buffer, so every layer's shared expert contributed old data. The 52% was the cost of
+a model whose shared-expert output never changed.
+
+Two things to keep from this:
+
+1. **The oracle gate is doing its job.** A 52% speedup with a coherent-looking token stream, a clean server log and
+   matching token counts is exactly the shape of a wrong optimisation, and the `frac 0 + --no-lookahead` diff caught it
+   in one run.
+2. The honest ablation from §19 is unchanged: removing the *production* of that tensor (returning the MLP output, values
+   therefore garbage but shape and downstream work identical) is **29-33 ms against 48** - so 15-17 ms per step is tied
+   to producing one more [1, 1, 2560] tensor per layer, by a mechanism that is not the multiply kernel, not the
+   sigmoid, and not the pool's release threshold.
+
+The correct way to test it is a **true in-place write**, and candle has one: `candle_core::Variable::set(&src)` uses
+`BackendStorage::copy_strided_src` (see `candle-core/src/variable.rs`). That is the next arm: hold the buffer as a
+`Variable`, `set` it from the gated tensor, add `var.as_tensor()`, and re-run the oracle **first**.
