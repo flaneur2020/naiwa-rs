@@ -78,3 +78,38 @@ negative before a line of drafting code is written.**
   this milestone because it touches the 2.2 GB ceiling from M20.
 - Sampled decoding acceptance corrections.
 - Anything about the kernels (M22.4 closed the repack at 1.08x).
+
+## 7. §5's question, answered with measurements: an extra row costs ~200 distinct experts, and only pays if the row is a suffix row
+
+The arithmetic was supposed to come before the code, so here it is. Same probe (`code`, three 40-token turns,
+`NAIWA_STEP_BUDGET=1`, cache 2.2 GB), two row budgets:
+
+| rows | how | `pairs` | `distinct` per step | step | TPOT | **tokens/step** | tokens per 1 000 distinct |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **2** | `--mtp-n-predict 1` | 960 | 722-770 | 43.6-53.7 ms | 38.1-38.8 ms | **1.13** | **1.52** |
+| **4** | `--mtp-n-predict 3` | 1920 | 1 120-1 198 | 73.5-86.5 ms | 36.6-38.9 ms | **1.90** | **1.65** |
+
+Three things fall out:
+
+1. **Doubling the rows does not move TPOT** (38.5 -> 38.0 ms), which is exactly why M22's auto depth landed where it
+   did. `distinct` grows **1.54x** (745 -> 1 159) while tokens/step grows **1.68x**, so the efficiency gain is **8%** -
+   real, but far too small to see through the +-8% run-to-run noise.
+2. **The marginal row costs ~200 distinct experts** ((1 159-745)/2), i.e. about **106 MB of upload** at 394 MB per 745
+   distinct. A marginal *MTP* row returns ~0.38 accepted tokens (1.90-1.13 over two rows), so its price is
+   ~280 MB/step per token.
+3. **A suffix row is a different animal.** Its draft is copied from history, and strata's own documentation claims a
+   **0.94-0.99 hit rate** on continuations; at even 0.6 accepted tokens per row it would return ~1.6x the tokens of an
+   MTP row for the same ~106 MB. That, and only that, is the case for building it.
+
+### Pre-registered estimate, and the number that kills it
+
+Five rows (1 base + 1 MTP + 3 suffix) extrapolate to `distinct` ~1 350 and a step of ~79 ms; at 4.4 tokens/step that
+is **TPOT ~18 ms (-53%)**, and the same arithmetic at 2.5 tokens/step gives 31 ms (-20%).
+
+| what the first measurement must show | else |
+|---|---|
+| suffix drafts accepted at **>= 0.5 per row** on `code` | the added rows buy less than an MTP row: **M25 closes negative**, the mechanism is dead as designed, and the numerator (fewer bytes per miss) becomes the only remaining lever |
+| `doc`/`long`/`short` tokens/step not falling | the chain is firing on prose and burning rows for nothing, so it must be gated by a prefix check (length and match run) |
+
+The estimate is pre-registered here so that the eventual result cannot be read backwards, and the falsifier is a single
+number: **accepted suffix tokens per drafted row on the `code` class.**
