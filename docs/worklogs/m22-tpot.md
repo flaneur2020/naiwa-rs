@@ -653,3 +653,54 @@ LAYER_PROFILE  48 layers, total 59.7 ms:  pre-attn norm+mix+inject 3.1  mixer (G
 Their cache is *worse* than ours (49% VRAM hits, 14% over PCIe against our 26 slots/layer and 2.2 GB), and their
 speculative drafting is not what carries them (on the hard conversations they accept 43-71% and run 1.04 tokens/step).
 **The 3-7% on `doc`/`long`/`short` and the 18% on `code` are items 1-3 above, and they are measurable, not noise.**
+
+## 18. Correcting §17: we *do* overlap host and device - the 3% is the **shared expert** (2026-10-26)
+
+§17's second item was wrong and is withdrawn. The step budget settles it: the host is busy **8.2-10.9 ms of a 50-84 ms
+step** (`plan` 2.9-4.4, `gpu` 1.7-2.1, `staging_wait` 2.4-2.9, `cpu_join` 0.2-0.3), and M22 §21 already measured GPU
+utilisation at 97% median / 100% p90 with a host critical path of 8.1 ms (12%). The MoE call *appears* to block the host
+because it is waiting on the very device work that is the step - that is overlap working, not missing.
+
+With that corrected, the per-component numbers on a **one-row step with speculation off** (`--mtp-n-predict` omitted,
+so TPOT *is* the step; code class, 50.7 ms):
+
+| component | ms/step | share | strata, same model (1 tok/window) | ratio |
+|---|---:|---:|---:|---:|
+| **shared expert** (gate+up+down + gate mul) | **17.5** | **35%** | **0.9 ms** (`shared+quant`) | **20x** |
+| routed experts (device events) | 13.5 | 27% | 4.2 ms for 49% of them (rest on CPU) | 1.6x per equal work |
+| mixer: GDN/QSA + out-proj | 8.1 | 16% | 6.9 ms | 1.2x |
+| pre-attention norm + mix + inject | 3.0 | 6% | ~1.0 ms | 3x |
+| post-attention combine | 0.9 | 2% | - | - |
+| final mixer + lm_head + sampling (residual) | ~8 | 15% | head 1.2 | - |
+| host (overlapped, not additive) | 8.5 | - | 19.8 host (CPU experts) | - |
+
+`LAYER_PROFILE` line it comes from, with the shared expert on its own bucket:
+
+```
+LAYER_PROFILE  48 layers: pre-attn norm+mix+inject 3.1  mixer 8.1  post-attn 0.9  moe (router+experts+shared) 28.6
+                          shared expert (inside moe) 17.7
+```
+
+and the router falls out as `28.6 - 17.7 - 13.5 = -2.6`, i.e. **~0** - consistent to within the sync overhead the
+instrument adds.
+
+### Why the shared expert costs 20x strata's
+
+It is `Mlp::new(hidden 2560, shared_expert_intermediate 640)` - **1.64 M weights, twice per layer**, i.e. 157 M weights
+per step. At 17.5 ms that is **18 GB/s** if the weights are f16, or 4.5 GB/s if they are 4-bit: neither is a bandwidth
+limit, so the time is going somewhere else - the same shape disease as the expert GEMV (`M = 1`, 640 output rows), and
+the numbers fit a **dequantise-to-f32 then f32 GEMV** fallback (2 x 6.5 MB of f32 per layer, ~1 GB per step at 60 GB/s).
+
+Strata does the same matvec, on the same weights, in 0.9 ms - and calls it `shared+quant`, i.e. one fused, quantised
+path.
+
+### So the ranked list is now
+
+| # | item | size | how |
+|---|---|---:|---|
+| 1 | **shared expert path** | **17.5 ms/step (35%)** vs strata 0.9 | same quantised GEMV as the experts (or MMVQ) instead of the f32 fallback; no cache, no layout, no kernel-layout change |
+| 2 | expert kernels | 13.5 vs 4.2 per equal work | M22.4 §5 aligned repack (5 coupled subsystems) |
+| 3 | mixer | 8.1 vs 6.9 | 1.2x, low priority |
+| 4 | norm + mix/inject/combine | 3.9 vs ~1.0 | fuse, low priority |
+
+Item 1 is by far the cheapest: a dense, resident, 157 M-weight MLP per step that we run at 18 GB/s.
