@@ -260,6 +260,10 @@ pub struct PrefillStream {
     cache: Option<Arc<crate::moe::Layers>>,
 }
 
+/// M23: bytes and expert-copies actually moved by routed uploads since the last report.
+static ROUTED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROUTED_EXPERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One chunk's VRAM footprint, sampled at every layer (`NAIWA_PREFILL_PEAK=1`).
 ///
 /// The planner sizes the chunk from `activation_bytes(chunk)`, a formula M19 measured to under-count the peak by
@@ -382,6 +386,42 @@ impl PrefillStream {
     /// The plan in force, or `(stride 0, chunk 0)` if it did not fit.
     fn current(&self) -> Plan {
         (*self.plan.lock().unwrap()).unwrap_or(Plan { stride: 0, chunk: 0 })
+    }
+
+    /// `NAIWA_PREFILL_ROUTED=1`: upload only the experts this layer routes to, instead of the whole layer.
+    ///
+    /// A chunk routes to ~36% of a layer's 256 experts (M23 §3: 13 920 pairs over 4 391 distinct experts at 1 392
+    /// rows), so 650 MiB of upload per layer carries 2.8x the bytes the layer reads. The buffer stays the *full*
+    /// layer's size and layout - unneeded experts keep whatever the previous layer left there and are never read,
+    /// because the router cannot select them - so this changes what is copied, not what anything computes.
+    ///
+    /// It also drops the layer-`l+1` prefetch: the routing of layer `l+1` is not known while layer `l` computes, and
+    /// the pipeline it would buy is worthless anyway (48 ms of upload behind 3 ms of compute), so gathering beats
+    /// overlapping.
+    fn routed() -> bool {
+        static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *R.get_or_init(|| std::env::var_os("NAIWA_PREFILL_ROUTED").is_some())
+    }
+
+    /// Every expert this layer routes to, sorted and deduplicated.
+    fn expert_set(&self, topk_ids: &Tensor) -> candle_core::Result<Vec<u32>> {
+        let ids = topk_ids
+            .flatten_all()?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<u32>()?;
+        let mut seen = vec![false; self.num_experts];
+        for &id in &ids {
+            let e = id as usize;
+            if e < self.num_experts {
+                seen[e] = true;
+            }
+        }
+        Ok(seen
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s)
+            .map(|(e, _)| e as u32)
+            .collect())
     }
 
     /// Whether the stream has been refused (see the field).
@@ -783,7 +823,12 @@ impl PrefillStream {
     ///
     /// A mixed-quant layer whose shape differs from the buffer's frees the old buffer and
     /// allocates the new one; that is where the prefill stream's memory peak comes from.
-    fn load(&self, layer: usize, stride: usize) -> candle_core::Result<bool> {
+    fn load(
+        &self,
+        layer: usize,
+        stride: usize,
+        routed: Option<&[u32]>,
+    ) -> candle_core::Result<bool> {
         let Some(stacks) = self.stacks(layer) else {
             return Ok(false);
         };
@@ -869,6 +914,66 @@ impl PrefillStream {
         // unmodified for as long as this stream exists (`Drop` waits for the copies).
         let queued = std::time::Instant::now();
         crate::dbg_note("prefill_load", &format!("layer {layer}: queueing {} bytes", buf.bytes));
+        // M23: one expert's bytes in projection `i`. Each projection has its own size (gate/up share one, down
+        // another), so this is computed per projection, and a projection that does not divide evenly by the expert
+        // count cannot be gathered - it falls back to the whole-tensor upload.
+        let split = |i: usize| -> Option<usize> {
+            let len = data[i].len();
+            (len % self.num_experts == 0).then(|| len / self.num_experts)
+        };
+        if let (Some(experts), Some([a, b, c])) = (routed, Some([split(0), split(1), split(2)])) {
+            let (Some(a), Some(b), Some(c)) = (a, b, c) else {
+                warn!(
+                    "prefill stream: layer {layer} projections do not divide evenly by {} experts, uploading whole \
+                     tensors ({} / {} / {} B)",
+                    self.num_experts,
+                    data[0].len(),
+                    data[1].len(),
+                    data[2].len()
+                );
+                return {
+                    self.upload_full(layer, &buf, &memory, &data, &parts)?;
+                    Ok(true)
+                };
+            };
+            let eb = [a, b, c];
+            let mut moved = 0usize;
+            for (i, mem) in memory.iter().enumerate() {
+                // SAFETY: registered stacks are page-locked and kept alive by `self.layers`; `experts` are all below
+                // `num_experts`, so every offset is inside `data[i]`, which matches the buffer's length.
+                unsafe {
+                    self.copy.upload_experts_async(
+                        &buf.released,
+                        mem,
+                        &data[i],
+                        experts,
+                        eb[i],
+                        &buf.ready,
+                    )?
+                };
+                moved += experts.len() * eb[i];
+            }
+            buf.bytes = moved;
+            buf.copies = experts.len() * 3;
+            ROUTED_BYTES.fetch_add(moved as u64, std::sync::atomic::Ordering::Relaxed);
+            ROUTED_EXPERTS.fetch_add(experts.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.upload_full(layer, &buf, &memory, &data, &parts)?;
+        }
+        buf.queued = Some(queued);
+        buf.loaded = Some(layer);
+        return Ok(true);
+    }
+
+    /// Upload every expert of the layer (the pre-M23 behaviour).
+    fn upload_full(
+        &self,
+        layer: usize,
+        buf: &LayerBuf,
+        _memory: &[SlotMemory; 3],
+        _data: &[std::borrow::Cow<'_, [u8]>; 3],
+        parts: &[(&SlotMemory, &[u8])],
+    ) -> candle_core::Result<()> {
         if std::env::var_os("NAIWA_STREAM_SYNC").is_some() {
             // Serial probe: the blocking upload waits for the copies, so the line above reports the copy's own
             // wall time and rate instead of the queue-side latency (`wait_on` only *enqueues* a stream wait).
@@ -877,9 +982,8 @@ impl PrefillStream {
         } else {
             unsafe { self.copy.upload_async(&buf.released, &parts, &buf.ready)? };
         }
-        buf.queued = Some(queued);
-        buf.loaded = Some(layer);
-        Ok(true)
+        let _ = layer;
+        Ok(())
     }
 
     /// Run `layer`'s routed experts on the GPU. `None`: this chunk or layer stays on the CPU.
@@ -929,7 +1033,14 @@ impl PrefillStream {
         if stride == 0 {
             return Ok(None);
         }
-        let loaded = match self.load(layer, stride) {
+        // M23: the layer's routing, when the routed upload is on. `expert_bytes` comes from the host stack, the same
+        // divisor the copy uses, so the offsets line up exactly.
+        let routed = if Self::routed() {
+            Some(self.expert_set(topk_ids)?)
+        } else {
+            None
+        };
+        let loaded = match self.load(layer, stride, routed.as_deref()) {
             Ok(loaded) => loaded,
             Err(e) if is_out_of_memory(&e) => {
                 self.downgrade(stride)?;
@@ -937,21 +1048,33 @@ impl PrefillStream {
                 if stride == 0 {
                     return Ok(None);
                 }
-                self.load(layer, stride)?
+                self.load(layer, stride, routed.as_deref())?
             }
             Err(e) => return Err(e),
         };
         if !loaded {
             return Ok(None);
         }
-        // Stream the next layer in while this one computes — only with a second buffer.
-        if stride == 2 {
-            if let Err(e) = self.load(layer + 1, stride) {
+        // Stream the next layer in while this one computes — only with a second buffer, and never when the upload is
+        // routed: layer `l + 1`'s routing is not known yet, and gathering beats overlapping anyway (M23 §4).
+        if stride == 2 && routed.is_none() {
+            if let Err(e) = self.load(layer + 1, stride, None) {
                 warn!(
                     "prefill stream: could not prefetch layer {}: {e}",
                     layer + 1
                 );
             }
+        }
+        if let Some(offsets) = &routed {
+            crate::dbg_note(
+                "prefill_routed",
+                &format!(
+                    "layer {layer}: {} of {} experts, {} MiB",
+                    offsets.len(),
+                    self.num_experts,
+                    (offsets.len() * 3 * (self.stacks(layer).map(|s| s[0].storage_size_in_bytes()).unwrap_or(0) / self.num_experts)) >> 20
+                ),
+            );
         }
         let buf = self.bufs[layer % stride].lock().unwrap();
         let experts = buf.experts.as_ref().expect("loaded");

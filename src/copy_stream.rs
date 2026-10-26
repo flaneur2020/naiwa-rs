@@ -303,6 +303,48 @@ mod cuda {
             }
             Ok(())
         }
+
+        /// M23: gather-copy only the experts named by `offsets`.
+        ///
+        /// `src` is one whole stacked projection on the host (`[E, N, K]`, page-locked) and `dst` is the device copy of
+        /// the same shape, so expert `e` lives at byte `e * expert_bytes` on both sides. Only `experts` are copied,
+        /// which is the point: a prefill chunk routes to ~36% of a layer\'s experts, and the rest of the buffer keeps
+        /// whatever the previous layer left there - it is never read, because the router cannot select it.
+        ///
+        /// # Safety
+        /// As [`Self::upload_async`]: `dst` must be a live allocation of `src.len()` bytes, `src` page-locked and alive
+        /// until the copies complete, and every `offset + expert_bytes <= src.len()`.
+        pub unsafe fn upload_experts_async(
+            &self,
+            fence: &ReadFence,
+            dst: &SlotMemory,
+            src: &[u8],
+            experts: &[u32],
+            expert_bytes: usize,
+            done: &CopyDone,
+        ) -> Result<()> {
+            self.stream
+                .context()
+                .bind_to_thread()
+                .map_err(Error::wrap)?;
+            if let Some(event) = fence.event.lock().unwrap().as_ref() {
+                self.stream.wait(event).map_err(Error::wrap)?;
+            }
+            for &e in experts {
+                let off = e as usize * expert_bytes;
+                if off + expert_bytes > src.len() || off + expert_bytes > dst.len {
+                    candle_core::bail!(
+                        "routed upload: expert at {off} + {expert_bytes} B does not fit a {}-byte source into a {}-byte buffer",
+                        src.len(),
+                        dst.len
+                    );
+                }
+                let part = &src[off..off + expert_bytes];
+                result::memcpy_htod_async(dst.ptr + off as u64, part, self.stream.cu_stream())
+                    .map_err(Error::wrap)?;
+            }
+            done.event.record(&self.stream).map_err(Error::wrap)
+        }
     }
 
     /// Free and total device bytes (the driver's view, after any pool trim).
@@ -478,6 +520,18 @@ mod stub {
             &self,
             _fence: &ReadFence,
             _parts: &[(&SlotMemory, &[u8])],
+            _done: &CopyDone,
+        ) -> Result<()> {
+            match *self {}
+        }
+
+        pub unsafe fn upload_experts_async(
+            &self,
+            _fence: &ReadFence,
+            _dst: &SlotMemory,
+            _src: &[u8],
+            _experts: &[u32],
+            _expert_bytes: usize,
             _done: &CopyDone,
         ) -> Result<()> {
             match *self {}

@@ -81,3 +81,48 @@ the stream buffer, then run), with the buffer sized for the worst case the route
 `--prefill-stream-min-tokens` 64/32/16/8/1 all equivalent; `MISTRALRS_MERGE_SUFFIX_BELOW` 2-4x slower;
 `NAIWA_PREFILL_THRESHOLD` 32/64/128/256 all equivalent; chunk 1024 costs +1.9 s. So the chunk *boundaries* are not the
 lever - the bytes are.
+
+## 5. Built the routed upload - and it falsifies §2-§4
+
+Implemented `NAIWA_PREFILL_ROUTED=1`: per layer, the distinct experts this chunk routes to are gathered out of the
+host stack and copied into their own places in the full-size layer buffer (`upload_experts_async`), so the *layout*
+and every kernel stay identical - only fewer bytes move. The layer-`l+1` prefetch is dropped with it (§4).
+
+| arm | bytes/layer | TTFT (1 725-token doc turn 1) |
+|---|---:|---:|
+| whole layer (baseline) | 650 MiB | 3.87 s |
+| **routed** | **487 MiB (-25%)** | **3.72 s (-4%)** |
+| | | |
+
+The saving is 25% and not the 64% §3 predicted, and the direct instrumentation says why:
+
+```
+STREAM_DBG prefill_stream: layer 0 stride 1 dma_wait=901ns compute=51.8ms copy=53.0ms 9.6 GB/s 487 MiB x 705
+STREAM_DBG prefill_stream: layer 47 stride 1 dma_wait=691ns compute=61.4µs copy=1.5ms 412.6 GB/s 594 MiB x 702
+```
+
+`x 705` copies = **235 of 256 experts** per layer. A 1 392-row chunk makes 13 920 draws over 256 experts - **54 draws
+per expert** - so it uses essentially all of them, and routing can only trim the tail. **§3's "35.7% of the layer" was
+wrong**: that 4 391 came from the `pairs/distinct` counter, which counts *cache slots* for hits, not expert ids.
+
+### And the upload is not where the time is
+
+Three measurements, same chunk:
+
+| term | value | share of 3.87 s |
+|---|---:|---:|
+| MoE steps (budget instrument, all 3 steps) | 508 ms | 13% |
+| expert compute inside the stream (48 layers, summed) | 155 ms | 4% |
+| layer-buffer reallocations (37 shape changes, trim off) | 3 ms | **0.1%** |
+| **everything else - the dense path** | **~3.3 s** | **~87%** |
+
+So prefill is **not** transfer-bound. The 650 MiB upload costs at most a few hundred ms, and cutting it by a quarter
+moved TTFT by 4%. The 87% is in the non-MoE half of the layer: attention (this model's linear/DeltaNet layers),
+the router, the shared expert and the norms - **2.1 ms per row**, against ~0.11 ms per row for the experts.
+
+That is now the M23 target, and it is a *different* kind of work: a per-stage timer inside a prefill layer, then the
+stage that owns the 2.1 ms/row. The chunk-boundary levers were already refuted in M21, and the transfer levers are
+refuted here.
+
+`NAIWA_PREFILL_ROUTED=1` stays in the tree, gated and off by default: it is a real -25% on upload bytes and -4% on
+TTFT, but it does not move the number that matters.
