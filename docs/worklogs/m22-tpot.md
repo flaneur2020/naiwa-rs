@@ -792,3 +792,46 @@ Two things to keep from this:
 The correct way to test it is a **true in-place write**, and candle has one: `candle_core::Variable::set(&src)` uses
 `BackendStorage::copy_strided_src` (see `candle-core/src/variable.rs`). That is the next arm: hold the buffer as a
 `Variable`, `set` it from the gated tensor, add `var.as_tensor()`, and re-run the oracle **first**.
+
+## 21. The true in-place write: oracle-clean and **neutral** - so the 17 ms is not tensor production either
+
+§20 closed with "use `Variable::set`, it really writes in place, and run the oracle first". Done:
+
+```rust
+let gated = self.shared_expert.forward(xs)?.broadcast_mul(&shared_gate)?;
+static VAR: Mutex<Option<candle_core::Var>> = Mutex::new(None);
+// allocate once per (shape, dtype), then:
+var.set(&gated)?;          // BackendStorage::copy_strided_src - a real in-place write
+y + var.as_tensor().clone()
+```
+
+| check | result |
+|---|---|
+| **oracle** (`frac 0 + --no-lookahead`, run *before* anything else) | **byte-identical** to `harness/m1/reference.oracle.txt` |
+| step, one row, no speculation | **47.0 / 47.5 / 46.9 ms** (baseline 47.0-47.5) |
+| TPOT, `--mtp-n-predict 1` | 37.5 / 39.2 / 43.3 ms (baseline 41.4 / 42.8 / 42.0) |
+
+**No change.** So the 17 ms from §19 is not the allocation (pool threshold, measured neutral), not the sigmoid
+(measured neutral when replaced everywhere), not the matvecs (7-8 us each in isolation) and not tensor production
+(in-place, oracle-clean, neutral).
+
+That leaves the §19 `gate_only` observation - **48 ms with the multiply, 29-33 ms without** - as an isolated,
+reproducible, and *unexplained* fact. The honest statement is that it is probably **confounded**: the two arms differ
+not only in the multiply but in *which tensor the residual add consumes* (the MLP output directly versus a tensor
+derived from it by the sigmoid chain), and every attempt to attribute it through the graph has come back neutral.
+
+### Where the TPOT line actually stands
+
+| | measurement |
+|---|---|
+| shipped | auto MTP depth + greedy draft sampling: **-23% TPOT**; doc -6.4% (ahead of strata), long +1.0%, short +3.1%, code +14.6% (g25) |
+| step decomposition (ours, 1 row, no spec) | mixer 8.1, pre-attn 3.0, post 0.9, MoE 28.6 (experts 13.5 of it), final/head ~8, host 8.5 **overlapped** |
+| same step, strata's own profiler | mixer 6.9, norms ~1.0, router 3.0, shared+quant 0.9, expert GPU 4.2 (49% of experts) + CPU experts 22-33 overlapped |
+| verified remaining gaps | expert kernels **2.5x per unit work** (M22.4: 2 bytes per load instruction, a layout property) and their **CPU expert pool overlapping the GPU** |
+| measured and rejected on the way | staging (+19%), 4-way reduction (0), row grouping (1%), wide loads (illegal), block shape, shared activation, merged reads, MMVQ-per-expert, format change, CUDA graph (1%), device planner (3-4%), native sigmoid (0), pool threshold (0), in-place output buffer (0) |
+
+Nothing further on this line is measurable without a profiler that can see inside a step (`ncu` exits 137 in this
+environment and CUPTI is not wired); every remaining candidate is below the +-8% that `--pcie-frac 0.4`'s
+non-determinism imposes on TPOT. **Recommendation: stop TPOT here** - the shipped configuration beats or matches
+strata on three of four classes, and the fourth (`code`, +14.6%) is the aligned-repack project in M22.4 §5, which is a
+layout change across five subsystems, not a tuning knob.
