@@ -73,6 +73,19 @@ pub(crate) fn forward(
     mark!(stats::BudgetPhase::Plan);
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
     stats::record_cache_misses(n_cpu);
+    // M22.3: how much of the step's expert demand is distinct experts, i.e. the headroom a per-expert row batch
+    // (llama.cpp MMVQ's `ncols`) would have. Resident and staged hits are counted by slot, misses by expert id.
+    #[cfg(feature = "cuda")]
+    {
+        // Every (row, expert) pair this layer will run, resident + staged + CPU.
+        let pairs: usize = plan.hits.iter().map(Vec::len).sum::<usize>()
+            + plan.misses.iter().map(Vec::len).sum::<usize>();
+        let mut ids: Vec<usize> = plan.hits.iter().flatten().map(|h| h.1).collect();
+        ids.extend(plan.misses.iter().flatten().map(|&(id, _)| id as usize));
+        ids.sort_unstable();
+        ids.dedup();
+        stats::record_budget_pairs(ids.len(), pairs);
+    }
     // Experts that went to the staging ring: counted apart from both hits and CPU misses.
     #[cfg(feature = "cuda")]
     {

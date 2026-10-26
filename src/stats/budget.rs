@@ -48,6 +48,11 @@ static NS: [AtomicU64; PHASES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+/// M22.3: (distinct experts, (row, expert) pairs) summed over the step's layers. The ratio decides whether batching a
+/// step's rows per expert (llama.cpp MMVQ's `ncols`) has headroom: the uniform-birthday model predicts only ~7% at
+/// four rows, but speculative verify rows are highly correlated, so the real number is an empirical question.
+static PAIRS: AtomicU64 = AtomicU64::new(0);
+static DISTINCT: AtomicU64 = AtomicU64::new(0);
 static SLOW_PRELOAD: AtomicU64 = AtomicU64::new(0);
 static SLOW_STAGING: AtomicU64 = AtomicU64::new(0);
 static SLOW_CPU: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +67,15 @@ fn on() -> bool {
 
 pub(crate) fn enabled() -> bool {
     on()
+}
+
+/// Records one layer's expert demand: how many (row, expert) pairs and how many distinct experts they hit.
+pub(crate) fn record_pairs(distinct: usize, pairs: usize) {
+    if !on() {
+        return;
+    }
+    DISTINCT.fetch_add(distinct as u64, Ordering::Relaxed);
+    PAIRS.fetch_add(pairs as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn add(phase: Phase, ns: u64) {
@@ -94,6 +108,8 @@ pub(crate) fn step_boundary(layers: usize) {
     for v in NS.iter() {
         v.store(0, Ordering::Relaxed);
     }
+    let distinct = DISTINCT.swap(0, Ordering::Relaxed);
+    let pairs = PAIRS.swap(0, Ordering::Relaxed);
     let slow = (
         SLOW_PRELOAD.swap(0, Ordering::Relaxed),
         SLOW_STAGING.swap(0, Ordering::Relaxed),
@@ -111,9 +127,9 @@ pub(crate) fn step_boundary(layers: usize) {
     #[cfg(not(feature = "cuda"))]
     let (expert_ms, expert_n) = (0.0, 0usize);
     eprintln!(
-        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers)  | plan {:.1} spawn {:.1} preload_wait {:.1} gpu {:.1} \
-         staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | waits>200us preload {}/{} staging {}/{} \
-         cpu {}/{}",
+        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers) | plan {:.1} spawn {:.1} \
+         preload_wait {:.1} gpu {:.1} staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | \
+         pairs {} distinct {} ({:.0}% grouping headroom) | waits>200us preload {}/{} staging {}/{} cpu {}/{}",
         total as f64 / 1e6,
         expert_ms,
         ms(Phase::Plan as usize),
@@ -124,6 +140,9 @@ pub(crate) fn step_boundary(layers: usize) {
         ms(Phase::CpuJoin as usize),
         ms(Phase::Fence as usize),
         ms(Phase::Other as usize),
+        pairs,
+        distinct,
+        if pairs > 0 { 100.0 * (1.0 - distinct as f64 / pairs as f64) } else { 0.0 },
         slow.0,
         layers,
         slow.1,
