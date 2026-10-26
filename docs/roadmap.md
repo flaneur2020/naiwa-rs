@@ -51,7 +51,8 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M24** | whole-step CUDA graph (decode occupancy) | 🆕 open | nsys: our GPU is busy 52% of a decode step against strata's 88%; launch gap 15.1 ms/token against 7.5. Compute is 5x cheaper than theirs, so the gap is occupancy, not math |
+| **M25** | prompt-lookup suffix drafting (tokens per step) | 🆕 open | `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)`; ours is 394 MB per step and **1.13 tokens** per step. More tokens per step is the free side |
+| **M24** | whole-step CUDA graph (decode occupancy) | ❌ closed negative 2026-10-26 | nsys copy-engine attribution: **394 MB of expert upload per step = 31 ms of a 43.6 ms step (71% of the PCIe link)**; launch API is 2.4 ms (6%), so a graph's ceiling is 6% and the step cannot be shorter than the transfer |
 | **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–3 done | reuse + prefill fixed (e2e 1.9–2.8×); TPOT broken down: 19 ms GPU chain + 48 × 0.73 ms 1-row CPU gemv. That gemv is the last term |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
@@ -404,13 +405,22 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m24-occupancy.md`](worklogs/m24-occupancy.md) — M24 (**open, nothing built**: decode-step
+Worklog: [`worklogs/m25-tokens-per-step.md`](worklogs/m25-tokens-per-step.md) — M25 (**open, nothing built**:
+tokens per step. M24's law `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)` with the measured numerator
+**394 MB** and denominator **1.13 tokens** per 2-row verify; the bytes are already paid for both rows, so extra accepted
+tokens are nearly free. The one mechanism is a **prompt-lookup suffix drafter** (no new memory, no kernel) - strata has
+one (`--suffix-draft 3`, hit 0.94-0.99), we have only the MTP head. The gate is tokens/step on `code` rising 1.13 ->
+1.6 with MB/token falling 348.7 -> 250, and `doc`/`long`/`short` not regressing. §5 is answered before any code: 5 rows
+(1 base + 1 MTP + 3 suffix) multiplies the routed-expert traffic, so the row budget is chosen from the expert profile's
+expected `distinct` counts, or the milestone closes negative for the price of that arithmetic).
+Worklog: [`worklogs/m24-occupancy.md`](worklogs/m24-occupancy.md) — M24 (**closed negative**: a whole-step CUDA graph: decode-step
 occupancy. nsys (§22 of M22) shows our GPU idle **48%** of a decode step against strata's **12%**, with a
 **15.1 ms/token** launch gap against their 7.5 - while our *compute* is 5x cheaper per token (≈9 ms against ≈23). The
 one mechanism is capturing **the whole decode step** as a single CUDA graph (M2/M4/M9.1's *per-layer* graphs were
-measured neutral and deleted; §5 of the worklog pre-registers that history as the main falsification). Everything is
-gated on first attributing the 15.1 ms to launch API, host work, or not-yet-uploaded experts - if it is the last, M24
-closes negative and the follow-up is delivery pipelining).
+measured neutral and deleted; §5 of the worklog pre-registered that history as the main falsification). The attribution came out as the third
+candidate: 394 MB of expert upload per step at 12.8 GB/s is 31 ms of a 43.6 ms step, against 2.4 ms of launch API, so a
+graph's ceiling was 6% and M24 closed negative by its own rule. It also corrected M22's mislabel: the "15.1 ms launch
+gap" was mostly the copy engine, invisible in a kernel-only view).
 Worklog: [`worklogs/m23-ttft.md`](worklogs/m23-ttft.md) — M23 (**open; first lever withdrawn, the law stands**: TTFT.
 Four cold requests give **`TTFT = 1.15 s per chunk + 1.67 ms per token`**. The constant has an exact explanation - a
 chunk streams the model's whole **23.4 GiB** expert set once, which at the ~20 GB/s pinned memory sustains here is
