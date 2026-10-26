@@ -704,3 +704,47 @@ path.
 | 4 | norm + mix/inject/combine | 3.9 vs ~1.0 | fuse, low priority |
 
 Item 1 is by far the cheapest: a dense, resident, 157 M-weight MLP per step that we run at 18 GB/s.
+
+## 19. The shared expert's 17 ms, bisected: not the matvecs, not the sigmoid, not the pool - it is *producing one more
+##     tensor per layer* (2026-10-26)
+
+§18 attributed 17.5 ms/step to the shared expert. This is the bisection, all on a one-row step with speculation off
+(so TPOT *is* the step) over the `code` class, three turns each, `completion_tokens` and delta counts checked equal
+(40/40) in every arm:
+
+| arm | what it keeps | step |
+|---|---|---:|
+| full | the block as shipped | **48.4 / 49.1 ms** |
+| gate skipped (`NAIWA_MOE_SKIP_SHARED_GATE=1`) | MLP only, no gate linear / sigmoid / multiply | **28.3 / 31.0 ms** |
+| gate linear kept, multiply dropped (`NAIWA_MOE_GATE_ONLY=1`) | + gate linear + sigmoid, no multiply | **29.2 / 32.8 ms** |
+| same allocation, no multiply (`NAIWA_MOE_ALLOC_ONLY=1`, `Tensor::zeros_like`) | a fresh [1,1,2560] per layer | **48.5 / 49.8 ms** |
+| whole block skipped (`NAIWA_MOE_SKIP_SHARED=1`) | nothing | 48.3 ms - **unreliable**, the garbage answer changed the delta count |
+
+So **one extra tensor-producing kernel per layer costs ~0.3 ms, i.e. 15-17 ms of a 48-layer step**, and the ablation
+says the cost is *not* what the kernel computes.
+
+Three candidate mechanisms, all measured and **falsified**:
+
+1. **The matvecs.** Isolated benchmark (`fast_mmvq::plain`, [640, 2560] weights, one row): **Q4_K 0.008 ms (118 GB/s)**,
+   Q5_K 0.007 (159), Q6_K 0.007 (188). The shared expert's three matvecs are 24 us per layer in total, not 350.
+2. **`candle_nn::ops::sigmoid`**, which is a `CustomOp1` with only `cpu_fwd`, so on CUDA it copies host-wards and
+   **synchronises**. A queue-depth harness reproduces the stall exactly - 48 layers of a dense matmul cost 1.2 ms
+   alone, 16.7 ms with that sigmoid + a multiply per layer, and **2.0 ms with the native `(exp(-v)+1)^-1` form**
+   (also 2.4 ms via f32). Replacing it at every site in the model (`fast_sigmoid`, six call sites: the hyper-connection
+   mix/combine of both halves, the QSA output gate, the shared-expert gate, the PLE gate) changed the step from 48.4 to
+   **48.0 ms - nothing.** So the host round trip is real but not what the model is paying for.
+3. **The allocator.** The cudaMallocAsync `RELEASE_THRESHOLD` default is 0 (release on idle). Setting it to `u64::MAX`
+   once at load (`cuda_graph::cache_cuda_memory_pool`, verified by its own log line) changed the step to **48.4 ms -
+   nothing.**
+
+What survives: producing an extra [1,1,2560] tensor per layer costs 0.3 ms *whatever produces it*, and dropping the
+produce costs 17 ms/step. The next experiment is the one that distinguishes "kernel" from "buffer" directly:
+**write the shared expert's output into a buffer allocated once at load** (`copy_strided_src` into a persistent
+tensor) and measure; if the 17 ms goes, the fix is a small per-model buffer pool and it is worth **-30% TPOT**.
+
+### Tree state
+
+All of the above was measured through env-gated instrumentation and has been **reverted**: the fork is back to
+`prompt_chunks` (M21) + the `MISTRALRS_MOE_SKIP_DOWN` ablation switch, and naiwa-rs is untouched apart from the docs.
+`NAIWA_LAYER_PROFILE` and the four ablation switches lived in `qwen4_exp/text.rs` and are quoted above for
+re-application.
