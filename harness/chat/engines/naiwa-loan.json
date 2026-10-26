@@ -12,7 +12,7 @@
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
     "--cpu-moe",
     "--expert-cache-gb",
-    "2.3",
+    "2.2",
     "--expert-profile",
     "/home/yazhou/code/strata/data/expert-profile-coder.bin",
     "--pcie-frac",

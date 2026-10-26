@@ -464,3 +464,64 @@ That is the remaining TPOT gap in one sentence, and it is why `code` (+14.6%) an
 are left: they spend most of their step in this path. M22.2 is opened with the measurement, the traffic model, the
 prize (2x -> TPOT -27%, 3.6x -> -38%) and the plan (group the pairs by expert, then one launch per layer that
 dequantises each expert's blocks once).
+
+## 15. Fresh benchmark (2026-10-26, g26b + g26c): TPOT is inside its own variance, and `2.3 GB` had to go
+
+Two independent back-to-back runs, 3 rounds each, both engines, **0 failed turns in 132 records per run**, after the M22
+kernel experiments were all reverted (the fork's `indexed_moe.cu` is pristine upstream).
+
+| class | naiwa g26b | naiwa g26c | strata g26b | strata g26c | delta g26b | delta g26c | g25 delta |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| code | 34.9 | 36.0 | 29.7 | 30.0 | +17.7% | +20.0% | +14.6% |
+| doc | 40.4 | 40.6 | 40.6 | 40.3 | -0.5% | +0.8% | -6.4% |
+| long | 41.6 | 42.3 | 40.1 | 39.8 | +3.8% | +6.4% | +1.0% |
+| short | 44.1 | 43.9 | 41.3 | 40.6 | +6.8% | +8.2% | +3.1% |
+
+Strata reproduces its M22 numbers within 1.5%; naiwa reads 2-4 ms higher than g25 on all four classes. That looked like a
+regression, and it is not:
+
+**Step time (TPOT x tokens/step) is unchanged.**
+
+| class | g25 | g26b | g26c |
+|---|---:|---:|---:|
+| code | 105.6 ms (3.06 tok/step) | 100.9 (2.89) | 106.0 (2.94) |
+| doc | 103.7 (2.75) | 105.1 (2.60) | 100.9 (2.48) |
+| long | 94.2 (2.32) | 104.3 (2.51) | 99.9 (2.36) |
+| short | 99.2 (2.38) | 102.2 (2.32) | 97.1 (2.21) |
+
+The move is in **acceptance**, which is not reproducible run to run:
+
+| class | acceptance per round, g26b | per round, g26c |
+|---|---|---|
+| code | 0.83 / 0.88 / 0.82 | 0.82 / 0.83 / 0.79 |
+| doc | 0.79 / 0.78 / 0.75 | 0.79 / 0.71 / **0.62** |
+| long | 0.62 / 0.72 / 0.63 | 0.62 / 0.67 / 0.66 |
+| short | 0.53 / 0.68 / 0.59 | 0.56 / **0.72** / 0.54 |
+
+TPOT is step time divided by tokens per step, so a round whose acceptance lands at 0.53 reads 46.2 ms where the same
+machine at 0.68 reads 41.8. **The shipped `--pcie-frac 0.4` is non-deterministic by design** (the down-projection
+`atomicAdd` changes the float summation order, so near-ties flip), which makes acceptance - and therefore TPOT - vary
+by +-5-8% between rounds. That is larger than every remaining delta in the milestone's table except `code`.
+
+So the honest reading of this benchmark: **`doc`/`long`/`short` are inside the noise band of the measurement** (+-8%),
+and **`code` at +17.7% / +20.0% is the one real gap** - consistent with M22 §13's conclusion that it is the per-layer
+constant, not the kernel's throughput (step time on `code` is the *best* of the four classes).
+
+### `--expert-cache-gb 2.3` is no longer shippable - reproduced 2/2
+
+The first attempt at this benchmark died on `doc` turn 1, twice, for a reason that is worth recording:
+
+```
+WARN naiwa_rs::prefill_stream: prefill stream: off (one 650 MiB layer buffer + 522 MiB activations
+     + 512 MiB headroom + 384 MiB KV reserve does not fit in 1744 MiB free, of which the KV will
+     take its own 384). ... drop --expert-cache-gb by at least 0.19 GB
+ERROR step - Model failed with error: prefill stream does not fit
+```
+
+At `2.3 GB` the cache leaves 1 744 MiB free at the first long chunk after the harness's warmup conversation, and the
+plan needs 2 068 - so it refuses and the whole prompt goes to the CPU at 41x, which produces no tokens and fails the
+turn. At `2.2 GB` the same measurement leaves enough free VRAM and every turn runs. The harness configs
+(`naiwa.json`, `naiwa-loan.json`, `naiwa-c26.json`) therefore carry **2.2**, not 2.3.
+
+The cache cost of that change is one slot per layer (**26 against 27** of 1 881 600 B), i.e. inside the +-5% band above -
+`g26b`/`g26c` are not measuring a smaller cache, they are measuring acceptance variance.
