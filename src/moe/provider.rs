@@ -538,6 +538,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             layers: Arc::clone(&self.layers),
             staging: Arc::clone(&self.staging),
             staged_now: Mutex::new(Vec::new()),
+            staging_waves: Mutex::new(Vec::new()),
+            staged_wave_of: Mutex::new(Vec::new()),
             hidden,
             num_experts,
             top_k: ctx.config.num_experts_per_tok,

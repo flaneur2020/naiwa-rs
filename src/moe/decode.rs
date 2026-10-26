@@ -165,7 +165,44 @@ pub(crate) fn forward(
         if hits_to_run.iter().all(|row| row.is_empty()) {
             Ok((resident_out, resident_bank))
         } else {
-            let (staged_out, staged_bank) = Gpu::submit(layer, &hits_to_run, &x2d, act)?;
+            // M26: submit the staged experts wave by wave, waiting only for the wave about to run, so
+            // the later waves' DMA lands under the earlier waves' kernels.
+            let waves = layer.wave_count();
+            let mut acc: Option<(Tensor, Option<Arc<crate::moe::Bank>>)> = None;
+            if waves > 1 {
+                let rows = hits_to_run.len();
+                let mut groups: Vec<Vec<Vec<Hit>>> =
+                    (0..waves).map(|_| vec![Vec::new(); rows]).collect();
+                for (t, row) in hits_to_run.iter().enumerate() {
+                    for hit in row {
+                        let pos = hit
+                            .1
+                            .saturating_sub(crate::moe::STAGING_RING_FIRST) as u32;
+                        let w = layer.wave_of_slot(pos).min(waves - 1);
+                        groups[w][t].push(hit.clone());
+                    }
+                }
+                for (w, group) in groups.iter().enumerate() {
+                    if group.iter().all(|row| row.is_empty()) {
+                        continue;
+                    }
+                    // Wave `w`'s own event, or the layer's final event for the last wave.
+                    if w + 1 < waves {
+                        layer.wait_staging_wave(w)?;
+                    } else {
+                        layer.wait_staging()?;
+                    }
+                    let (out, bank) = Gpu::submit(layer, group, &x2d, act)?;
+                    acc = Some(match acc {
+                        Some((a, ab)) => ((a + out)?, ab.or(bank)),
+                        None => (out, bank),
+                    });
+                }
+            }
+            let (staged_out, staged_bank) = match acc {
+                Some(v) => v,
+                None => Gpu::submit(layer, &hits_to_run, &x2d, act)?,
+            };
             Ok(((resident_out + staged_out)?, resident_bank.or(staged_bank)))
         }
     } else {

@@ -381,6 +381,11 @@ pub(crate) struct CachedLayer {
     /// step on the token thread** - deliberately not across a step boundary: a surviving `Arc` of a ring slot keeps
     /// its refcount above one, and `stage_misses` waits on that refcount (`wait_for_readers`).
     pub(crate) staged_now: Mutex<Vec<(u32, Arc<SlotBuf>)>>,
+    /// M26: the staged experts of this step split into waves, each wave's copies followed by one event,
+    /// so the compute of wave `w` runs while wave `w+1` is still crossing PCIe. Empty when the layer
+    /// stages in one go.
+    pub(crate) staging_waves: Mutex<Vec<Arc<crate::copy_stream::CopyDone>>>,
+    pub(crate) staged_wave_of: Mutex<Vec<(u32, usize)>>,
     pub(crate) hidden: usize,
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
@@ -599,6 +604,53 @@ impl CachedLayer {
     }
 
     /// Remember this step's staged experts, replacing anything left over (which drops those `Arc`s).
+    /// Replace this step's wave assignments (`expert -> wave index`).
+    pub(crate) fn set_wave_of(&self, v: Vec<(u32, usize)>) {
+        *self.staged_wave_of.lock().unwrap() = v;
+    }
+
+    /// The wave an expert was staged in this step, if the layer splits its staging.
+    pub(crate) fn wave_of_slot(&self, pos: u32) -> usize {
+        self.staged_wave_of
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| *p == pos)
+            .map(|(_, w)| *w)
+            .unwrap_or(0)
+    }
+
+    /// How many waves this step staged into; 0 when it staged in one go.
+    pub(crate) fn wave_count(&self) -> usize {
+        self.staging_waves.lock().unwrap().len() + 1
+    }
+
+    /// Grow the wave-event list to `n` events on the copy stream (cloned `Arc`s; the events live on
+    /// the copy stream and are re-recorded every step, so they never go stale).
+    pub(crate) fn ensure_wave_events(
+        &self,
+        cs: &crate::copy_stream::CopyStream,
+        n: usize,
+    ) -> candle_core::Result<Vec<Arc<crate::copy_stream::CopyDone>>> {
+        let mut events = self.staging_waves.lock().unwrap();
+        while events.len() < n {
+            events.push(Arc::new(crate::copy_stream::CopyDone::new(cs)?));
+        }
+        Ok(events[..n].to_vec())
+    }
+
+    /// Wait on candle's stream for wave `w`'s copies to land.
+    pub(crate) fn wait_staging_wave(&self, w: usize) -> candle_core::Result<()> {
+        let events = self.staging_waves.lock().unwrap();
+        match events.get(w) {
+            Some(done) => {
+                stats::record_cache_sync_wait();
+                done.wait_on(&self.slot_device)
+            }
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn set_staged_now(&self, v: Vec<(u32, Arc<SlotBuf>)>) {
         *self.staged_now.lock().unwrap() = v;
     }
