@@ -525,3 +525,76 @@ turn. At `2.2 GB` the same measurement leaves enough free VRAM and every turn ru
 
 The cache cost of that change is one slot per layer (**26 against 27** of 1 881 600 B), i.e. inside the +-5% band above -
 `g26b`/`g26c` are not measuring a smaller cache, they are measuring acceptance variance.
+
+## 16. Where the last 3% is: not cache, not acceptance - **the step itself is 1.4x slower** (2026-10-26)
+
+Asked to stop hiding behind "within noise" and compare strata's cache hits and speculative hit rate directly. Strata
+publishes both, per request, in its own log, and the derived table is decisive.
+
+### Strata's own numbers (g26b round 2, the same conversations naiwa ran)
+
+```
+strata serve: decode expert cache hit rate: 42.4% .. 56.0% (7736..83741 hits)
+              4300..31197 more read by the GPU over PCIe (14.2% .. 18.8% of all routed)
+strata serve: prompt 218 tokens = ..., 160 generated in 4258 ms (37.6 tok/s), drafts accepted 101 of 102
+strata serve: prompt 550 tokens = ..., 119 generated in 3032 ms (39.3 tok/s), drafts accepted  84 of  89
+strata serve: prompt 1858 tokens = ..., 317 generated in 12461 ms (25.4 tok/s), drafts accepted 12 of  28
+```
+
+| prompt | generated | drafts accepted / proposed | rate | steps (= gen - accepted) | **tokens/step** | **step ms** | TPOT |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 40 | 96 | 0 / 5 | 0.00 | 96 | 1.00 | **40.0** | 40.0 |
+| 687 | 56 | 0 / 0 | 0.00 | 56 | 1.00 | **38.9** | 38.9 |
+| 1723 | 96 | 0 / 0 | 0.00 | 96 | 1.00 | **38.8** | 38.8 |
+| 1858 | 317 | 12 / 28 | 0.43 | 305 | 1.04 | **40.9** | 39.3 |
+| 1724 | 102 | 37 / 47 | 0.79 | 65 | 1.57 | 49.9 | 31.8 |
+| 404 | 116 | 53 / 55 | 0.96 | 63 | 1.84 | 57.4 | 31.2 |
+| **218** | 160 | **101 / 102** | **0.99** | 59 | **2.71** | **72.2** | **26.6** |
+| 550 | 119 | 84 / 89 | 0.94 | 35 | **3.40** | 86.6 | 25.5 |
+
+Fitting step time against tokens per step (which is the verify window): **`step_ms = 21 + 18.8 x rows`**.
+
+### Ours, same arithmetic
+
+| class | TPOT | tokens/step | **step ms** |
+|---|---:|---:|---:|
+| code | 34.9 | 2.89 | **100.9** |
+| doc | 40.4 | 2.60 | **105.1** |
+| long | 41.6 | 2.51 | 104.3 |
+| short | 44.1 | 2.32 | 102.2 |
+
+and one row (from the M22.2 budget): **63.5 ms**, of which the expert kernels are **20.9 ms**. So
+`step_ms = 37.5 + 26 x rows`.
+
+### The comparison, term by term
+
+| | strata | naiwa | delta |
+|---|---:|---:|---:|
+| fixed cost per step | **21 ms** | **37.5 ms** | +16.5 ms |
+| cost per extra verified row | **18.8 ms** | **26 ms** | +7.2 ms |
+| one row | **40 ms** | **63.5 ms** | **+59%** |
+| at ~2.7 tokens/step | **72 ms** | **101 ms** | **+40%** |
+
+**At equal tokens per step our step is 1.4-1.6x slower, and that is the whole of the remaining TPOT gap.** The expert
+kernel is only part of it: 20.9 of our 63.5 ms, i.e. **our non-expert half (42.6 ms) alone is larger than strata's
+entire one-row step (40 ms)**.
+
+So the answer to "cache or acceptance?" is **neither**:
+
+- **Cache**: strata's decode hit rate is **42-56%** with 14-19% of routed experts read over PCIe. Ours is *at least*
+  as good by construction - 26 slots/layer x 48 layers of 1 881 600 B (2.2 GB) against their 800 blobs (~1.98 GiB) -
+  and TPOT barely moves with cache size (slope 0.4 ms/GB, M20). Their cache is not their advantage.
+- **Speculation**: their acceptance swings 0.00 -> 0.99 across conversations and their tokens/step 1.00 -> 3.40;
+  on the *hard* conversations (1858, 2201 tokens) they accept 0.43 and 0.71 and land at 1.04 tokens/step, i.e. they
+  simply run one row per step - where their 40 ms step still beats our 63.5 ms. Their drafting is **not** the moat;
+  it is what they can afford because the step is cheap.
+- Strata does carry a second draft source we do not have (`--suffix-draft N`, default 3: "prompt lookup: draft from
+  an earlier repeat of the last N+ tokens of context", which grows the verify window to at most 8), and on the
+  conversations where it fires acceptance is 0.94-0.99. It is worth having, but on the hard classes it fires 0-20
+  times per 96 tokens, so it cannot be the +18% on `code`.
+
+**Therefore the last 3% (and `code`'s 18%) is our per-step cost, and two thirds of it is the non-expert half of the
+layer**: 42.6 ms of a 63.5 ms one-row step, which no instrument has ever attributed - M22.2 measured only the expert
+kernels (20.9) and the doorbell phases (`plan` = the wait, which hides everything else). The next measurement is that
+half: attention (GDN grouped-packed prefill/decode), the router, the shared expert and the norms, per layer, on a
+one-row step versus strata's 40 ms total.
