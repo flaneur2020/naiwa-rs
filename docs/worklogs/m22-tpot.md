@@ -835,3 +835,56 @@ environment and CUPTI is not wired); every remaining candidate is below the +-8%
 non-determinism imposes on TPOT. **Recommendation: stop TPOT here** - the shipped configuration beats or matches
 strata on three of four classes, and the fourth (`code`, +14.6%) is the aligned-repack project in M22.4 §5, which is a
 layout change across five subsystems, not a tuning knob.
+
+## 22. nsys, finally: the GPU is idle 48% of a decode step, and 44% of its busy time is waiting for experts
+
+`ncu` cannot be used here - `/proc/driver/nvidia/params` has `RmProfilingAdminOnly: 1` and we are uid 1000, so every
+run dies on `ERR_NVGPUCTRPERM` (verified with a `vectorAdd`). `nsys` needs no such permission: CUPTI activity tracing
+works as a normal user. It gives kernel durations, launch gaps and stream overlap, which is what the open question
+needed; only counters (DRAM throughput, stall reasons) require the permission, and those were already covered by
+`clock64` and the isolated benches.
+
+Two runs, same probe (`code`, three 40-token turns, `MTP_N=1` for us):
+
+| | naiwa | strata |
+|---|---|---:|
+| TPOT seen while profiling | 37.9 / 38.0 ms | 40.2 / 35.0 / 34.5 ms |
+| kernel launches per token | 1219 | 2912 |
+| **GPU busy as a share of wall** | **52%** | **88%** |
+| GPU time per token | 16.2 ms | 52.5 ms |
+| **launch gap per token** (wall minus busy) | **15.1 ms** | **7.5 ms** |
+| expert-delivery wait | `doorbell_wait_copy_f32` **7.12 (44%)** | `fetch_blobs` 18.64 (35%) + `wait_flag_ge` 10.90 (21%) |
+| dense matvecs | `mmvq_q6_k` 2.01 | `native_q6_k_mmvq` 5.56 |
+| MoE experts | 1.90 | 7.33 |
+| mixer / attention | 0.39 | 1.05 |
+| router | 0.08 | 1.16 |
+
+Method note for strata: its engine is a **child process** spawned by `serve/server.py` and CUPTI does not follow it
+(the report came back with 148 kernels and 4.7k memcpys), so the config's `exe` was pointed at a wrapper that execs
+`nsys profile <engine> "$@"`. That still showed only 128 kernels - because **strata replays the decode step as a CUDA
+graph** (128 graph launches, 4.6 s of GPU time inside them), and graphs are opaque unless asked otherwise:
+`--cuda-graph-trace=node` expands them into 247k kernels, which is the table above.
+
+### What this says
+
+1. **Our kernel time is not the problem.** Of 16.2 ms GPU per token, 7.1 is the doorbell *spinning* waiting for the
+   expert copy, and only **~9 ms is compute** - against strata's 52.5 ms. On compute alone we are 5x cheaper. Every
+   "the shared expert costs 17.5 ms" reading from §18 was spin time attributed to whichever stage ran inside the wait,
+   which is exactly why §19's ablations could not find a mechanism: there was none in the compute.
+2. **The wall-clock loss is the pipeline, not the math.** We leave the GPU idle **48%** of a decode step while strata
+   leaves it idle 12%. Our 15.1 ms/token of launch gap is 4x strata's 7.5, at 1219 launches per token against their
+   2912 (they pay far fewer *visible* launches because a graph launch is one API call).
+3. **The largest single lever is expert delivery, not expert math**: 7.1 ms/token of our GPU time is the doorbell
+   wait (44%), the same shape as strata's 18.6 + 10.9 ms fetch/wait pair. Both engines are memory-pipeline bound; ours
+   just idles instead of overlapping.
+4. Strata's own compute is *heavier* per token than ours (52.5 vs 16.2 ms) and it still wins a little on TPOT,
+   because it keeps the GPU fed. That is the gap to close, and it is not a kernel-level gap.
+
+### Two levers this justifies, in order
+
+- **A CUDA graph over the decode step.** We measured this before as ~1% and shelved it; with 1219 launches per token
+  and 15.1 ms/token of gap that verdict needs re-testing, and strata's design (a graph per step) is direct evidence
+  that a captured step is what buys the launch gap back.
+- **Software pipelining of expert delivery**: start the next layer's H2D while the current layer computes, so the
+  doorbell wait overlaps with math instead of preceding it. §18's claim that "we overlap" was about host CPU versus
+  GPU, not about layer L+1's weights versus layer L's math; the 44% spin is that distinction.
