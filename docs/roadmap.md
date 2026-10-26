@@ -5,7 +5,7 @@ Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity 
 Design and current-state detail live in [`design.md`](design.md); per-milestone evidence lives in
 [`worklogs/`](worklogs/).
 
-Recorded 2026-10-16; last updated 2026-10-19 after M9c (doorbell events) and the M10 chat harness plan.
+Recorded 2026-10-16; last updated 2026-10-26 after M22 (§22 nsys component comparison) opened M24 (decode occupancy).
 
 ---
 
@@ -51,6 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
+| **M24** | whole-step CUDA graph (decode occupancy) | 🆕 open | nsys: our GPU is busy 52% of a decode step against strata's 88%; launch gap 15.1 ms/token against 7.5. Compute is 5x cheaper than theirs, so the gap is occupancy, not math |
 | **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–3 done | reuse + prefill fixed (e2e 1.9–2.8×); TPOT broken down: 19 ms GPU chain + 48 × 0.73 ms 1-row CPU gemv. That gemv is the last term |
 
 Current shipped path: eager MoE + eager attention, `S2` split, predictive preload, one
@@ -403,6 +404,13 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
+Worklog: [`worklogs/m24-occupancy.md`](worklogs/m24-occupancy.md) — M24 (**open, nothing built**: decode-step
+occupancy. nsys (§22 of M22) shows our GPU idle **48%** of a decode step against strata's **12%**, with a
+**15.1 ms/token** launch gap against their 7.5 - while our *compute* is 5x cheaper per token (≈9 ms against ≈23). The
+one mechanism is capturing **the whole decode step** as a single CUDA graph (M2/M4/M9.1's *per-layer* graphs were
+measured neutral and deleted; §5 of the worklog pre-registers that history as the main falsification). Everything is
+gated on first attributing the 15.1 ms to launch API, host work, or not-yet-uploaded experts - if it is the last, M24
+closes negative and the follow-up is delivery pipelining).
 Worklog: [`worklogs/m23-ttft.md`](worklogs/m23-ttft.md) — M23 (**open; first lever withdrawn, the law stands**: TTFT.
 Four cold requests give **`TTFT = 1.15 s per chunk + 1.67 ms per token`**. The constant has an exact explanation - a
 chunk streams the model's whole **23.4 GiB** expert set once, which at the ~20 GB/s pinned memory sustains here is
