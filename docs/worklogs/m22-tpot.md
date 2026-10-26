@@ -598,3 +598,58 @@ layer**: 42.6 ms of a 63.5 ms one-row step, which no instrument has ever attribu
 kernels (20.9) and the doorbell phases (`plan` = the wait, which hides everything else). The next measurement is that
 half: attention (GDN grouped-packed prefill/decode), the router, the shared expert and the norms, per layer, on a
 one-row step versus strata's 40 ms total.
+
+## 17. Component-by-component: both engines' own stage profilers, side by side
+
+Strata ships one (`STRATA_VERIFY_PROFILE=1`, documented in its `docs/DETAILS.md` §"Where a decode window's time goes");
+ours is new (`NAIWA_LAYER_PROFILE=1`, in `qwen4_exp/text.rs`, 12 buckets, 48 layers per report). Same conversations,
+same machine, `--mtp-n-predict 1` for ours so a step is a step.
+
+### Strata, one token per window (160 windows, from its own log)
+
+```
+36.24 ms/window = verify 33.15 (GPU-reach wait 12.04 + per-layer host 19.81 [plan .05 actq .07 jobs .01 CPU 19.60]
+                  + stage .08) + commit/emit .04 + draft .00
+per layer-window: CPU experts 3.75 (3.75 entries), VRAM hits 4.86, PCIe 1.40
+decode GPU stages (ms/window): GDN layers: qkv gemv 1.84 conv .09 ab .14 z 1.05 rec .47 out-proj 1.08
+   router 2.28 shared+quant .69 VRAM hits 1.05 PCIe grp .46 down .63 up .62 head 1.23
+ | QSA layers: q .83 attention .58 out-proj .37 router .75 shared+quant .22 hits .44 down .22 up .22
+```
+
+| component | strata (1 tok/window) | naiwa (per 48-layer step) | ratio |
+|---|---:|---:|---:|
+| mixer: GDN qkv gemv + conv + ab + z + rec | 3.6 ms | | |
+| mixer: out-proj (GDN) | 1.1 | | |
+| mixer: QSA q + attention + out-proj | 1.8 | | |
+| **mixer total (attention/GDN/out-proj)** | **~6.9 ms** | **9.3 ms** | **1.35x** |
+| norms + hyper-connection mix/inject/combine | ~1.0 ms | **3.8 ms** | **~4x** |
+| router (both kinds of layer) | 3.0 ms | inside the MoE block, ≤1 ms | - |
+| shared expert + activation quant | 0.9 ms | inside the MoE block | - |
+| **expert GPU** (hits + PCIe + down/up) | **4.2 ms** (for 49% of the experts) | **20.9 ms** (device events, ~all experts) | **2.5x per equal work** |
+| expert CPU | **22-33 ms**, overlapped with the GPU | 0.3 ms `cpu_join` | - |
+| MTP head / draft | 1.2 ms | n/a in this arm | - |
+| waits (GPU-reach, waitB, waitCPU) | 23 ms | folded into `plan` | - |
+| **step total** | **36-46 ms** | **53-75 ms** | **1.5-1.6x** |
+
+Our own per-component line, same run:
+
+```
+LAYER_PROFILE  48 layers, total 59.7 ms:  pre-attn norm+mix+inject 3.1  mixer (GDN or QSA) 8.9
+               post-attn combine+norm+mix 0.7  moe (router+experts+shared) 47.0
+```
+
+### The three differences that matter, in order
+
+1. **The expert kernels cost 2.5x more per unit of work** (20.9 ms for ~100% of a layer's experts against their 4.2 ms
+   for 49%). This is M22.4's finding - 2 bytes per load instruction, a layout property - and it is the `code` class's
+   +18%.
+2. **We do not overlap the host with the device; strata does.** Their window is `12.04 wait + 19.81 host`, i.e. the CPU
+   expert pool (22-33 ms) runs *under* the GPU's work. Our MoE call blocks the host for the whole device time
+   (`plan` = the doorbell wait in the step budget), so the mixer (9.3 ms), the hyper-connection work (3.8 ms) and the
+   expert time **add up** instead of overlapping. That is the +16.5 ms/step fixed cost of §16.
+3. **The dense plumbing around the experts is ~4x theirs**: norms + mix/inject/combine are 3.8 ms for us against ~1.0 ms
+   for them, on a 48-layer step.
+
+Their cache is *worse* than ours (49% VRAM hits, 14% over PCIe against our 26 slots/layer and 2.2 GB), and their
+speculative drafting is not what carries them (on the hard conversations they accept 43-71% and run 1.04 tokens/step).
+**The 3-7% on `doc`/`long`/`short` and the 18% on `code` are items 1-3 above, and they are measurable, not noise.**
