@@ -113,3 +113,61 @@ is **TPOT ~18 ms (-53%)**, and the same arithmetic at 2.5 tokens/step gives 31 m
 
 The estimate is pre-registered here so that the eventual result cannot be read backwards, and the falsifier is a single
 number: **accepted suffix tokens per drafted row on the `code` class.**
+
+## 8. Built, measured, closed: the suffix drafts are accepted (0.88-0.92) and add **nothing**, because the MTP head already accepts 0.90 on the same text
+
+The drafter already existed in the fork (`mistralrs-core/src/speculative/lookup.rs`, `MISTRALRS_LOOKUP_DRAFT` /
+`MISTRALRS_LOOKUP_MIN`, applied in `speculative/driver.rs`) and had never been enabled in the shipped configuration.
+Completing it took one real gap and one doc fix:
+
+- **Padding.** `apply` used to discard a lookup proposal shorter than the head's window (`if tokens.len() <
+  proposal.tokens.len() { continue }`), which threw away most hits - a match ends where the history ends, so a 2-token
+  hit inside a 3-token window was dropped even though the driver stages a sequence only at exactly `proposal_len`.
+  It now pads the window from the head's own drafts, and the policy counts only the lookup's own prefix.
+- The module doc claimed `MISTRALRS_LOOKUP_MIN` defaults to 6; the code defaults to 3. Corrected.
+
+### Measurement 1: the benchmark corpus - the drafter rarely fires
+
+`code`, three turns, `MTP_N=3` (4 rows), 40 and 200 tokens:
+
+| arm | TPOT (40 tok) | TPOT (200 tok) | lookup diagnostics |
+|---|---|---:|---|
+| lookup off | 36.6 / 38.6 / 38.9 | 33.7 / 35.5 / 36.5 | - |
+| lookup on (`DRAFT=3`) | 39.5 / 39.7 / 41.2 | 36.1 / 34.7 / 37.5 | **13-14% of steps have a proposal**, mean match **4.5** tokens |
+
+No gain, if anything a small loss. The reason is visible in the diagnostics: on this corpus the model's answer does not
+repeat its own history in runs long enough to be trusted, and the policy's cold-start gate (`COLD_MATCH = 6`) then
+refuses them. (Note the gate is a mild livelock by design: the 3-5 buckets are never taken while cold, so they never
+learn a rate - benign, since the W38 measurement says those matches lose 24%, but it means the feature is inert
+wherever the matches are short.)
+
+### Measurement 2: the workload the feature exists for - it fires, and it is redundant
+
+A prompt containing a 25-line Python module, asked to re-emit it verbatim with one rename (`repeat_probe.py`):
+
+| arm | TPOT | proposals exist | mean match | acceptance | **tokens/round** |
+|---|---|---:|---:|---:|---:|
+| lookup off | 32.8 / 33.9 / 32.5 | - | - | **0.896-0.938** | **3.69-3.81** |
+| lookup on | 34.3 / 34.6 / 33.4 | **90%** | **14.5** tokens | **0.917-0.927** (buckets 6-7: 0.89, 8+: 0.88) | **3.75** |
+
+This is the decisive table. The drafter does exactly what it promises - 90% of steps get a proposal, the match averages
+14.5 tokens, and the verifier accepts 0.88-0.92 of the drafts. **And the step produces the same number of tokens either
+way**, because the MTP head is *already* at 0.90 acceptance on verbatim repetition. The suffix chain competes with a
+drafter that has the same information and better conditioning.
+
+### Verdict
+
+`M25` closes **negative**, and the falsification is more interesting than the one §7 pre-registered:
+
+- §7 said: *"below 0.5 accepted suffix tokens per drafted row, the mechanism is dead"*. Measured: **0.88-0.92**, i.e.
+  three times past the bar.
+- But the pre-registered *estimate* (+2.5 tokens/step, TPOT -53%) assumed an MTP row returns ~0.38 accepted tokens. On
+  the text where the suffix chain fires, the MTP head returns **0.90**. The extra source of drafts buys nothing,
+  because the rows were already being won.
+
+That also settles §1's law from the other side: the denominator cannot be raised by *another drafter* on this model -
+only by a drafter that beats 0.90 acceptance on the tokens MTP misses. The open lever is the **numerator** (fewer bytes
+per miss: 394 MB/step, 22% miss, 2.2 GB cache), and it stays queued.
+
+Shipped state: the drafter stays **off by default** (`MISTRALRS_LOOKUP_DRAFT` unset), exactly as found, plus the
+padding fix and the doc correction. `cargo test` 53 passed / 4 ignored after the change.

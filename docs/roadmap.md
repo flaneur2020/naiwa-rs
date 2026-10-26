@@ -51,7 +51,7 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M25** | prompt-lookup suffix drafting (tokens per step) | 🆕 open | `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)`; ours is 394 MB per step and **1.13 tokens** per step. More tokens per step is the free side |
+| **M25** | prompt-lookup suffix drafting (tokens per step) | ❌ closed negative 2026-10-26 | The drafts are accepted **0.88-0.92** and add **nothing**: where the suffix chain fires (90% of steps, mean match 14.5 tokens) the MTP head already accepts **0.90**, so tokens/step is 3.75 against 3.69-3.81 without it | `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)`; ours is 394 MB per step and **1.13 tokens** per step. More tokens per step is the free side |
 | **M24** | whole-step CUDA graph (decode occupancy) | ❌ closed negative 2026-10-26 | nsys copy-engine attribution: **394 MB of expert upload per step = 31 ms of a 43.6 ms step (71% of the PCIe link)**; launch API is 2.4 ms (6%), so a graph's ceiling is 6% and the step cannot be shorter than the transfer |
 | **M10** | chat workload parity with Strata | 🔶 M10.3 items 1–3 done | reuse + prefill fixed (e2e 1.9–2.8×); TPOT broken down: 19 ms GPU chain + 48 × 0.73 ms 1-row CPU gemv. That gemv is the last term |
 
@@ -405,7 +405,7 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m25-tokens-per-step.md`](worklogs/m25-tokens-per-step.md) — M25 (**open, nothing built**:
+Worklog: [`worklogs/m25-tokens-per-step.md`](worklogs/m25-tokens-per-step.md) — M25 (**closed negative**:
 tokens per step. M24's law `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)` with the measured numerator
 **394 MB** and denominator **1.13 tokens** per 2-row verify; the bytes are already paid for both rows, so extra accepted
 tokens are nearly free. The one mechanism is a **prompt-lookup suffix drafter** (no new memory, no kernel) - strata has
