@@ -80,3 +80,74 @@ attribution experiment alone.
 - Anything in the kernels: §22 measured our compute at ~9 ms/token against strata's ~23, and M22.4 already closed the
   repack with an isolated A/B (1.08x, not worth five subsystems).
 - TTFT (M23 stands at its law) and the decode NaN after chunk (tracked separately).
+
+## 7. Attribution (§3 step 1): it is (c) - the decode is PCIe-bound, and it never needed NVTX
+
+The attribution turned out to need no instrumentation at all: nsys already captures the **CUDA runtime API trace** and
+the **copy-engine activity**, and those two answer §2's question directly. Same probe (`code`, three 40-token turns,
+`MTP_N=1`), 3 decode windows, 120 tokens:
+
+| per token | naiwa | strata |
+|---|---:|---:|
+| GPU kernel time | 21.4 ms (52% of wall) | 102.5 ms (87%) |
+| host CUDA API (serial, calling thread) | 33.9 ms | 20.2 ms |
+| **HtoD copies** | **348.7 MB in 27.1 ms** | **110.8 MB in 8.5 ms** |
+| small HtoD (`< 1 KB`) | 233 copies, 0.43 ms | - |
+| DtoD | 43.0 MB | 0.1 MB |
+
+The 348.7 MB is **509 copies of 685 KB per token** - 685 KB is exactly one `640 x 2560` IQ projection
+(640 x 10 x 98 B = 627 KB plus padding), so this is **3 projections x 170 expert slots per token**.
+
+Our own step instrument gives the denominators (`NAIWA_STEP_BUDGET=1`, same probe, TPOT 38.1 / 38.8 / 38.6 ms):
+
+```
+STEP_BUDGET layers 48 total 43.6 ms expert_dev 23.4 (48 layers) | plan 36.4 gpu 2.4 staging_wait 2.9 cpu_join 0.3
+             | pairs 960 distinct 739 (23% grouping headroom) | waits>200us preload 0/48 staging 0/48 cpu 0/48
+```
+
+- `pairs 960` = 48 layers x **2 rows x topk 10**, so a step verifies **2 rows**.
+- step 43.6 ms against TPOT 38.5 ms means **1.13 tokens per step** - the acceptance on this class is the worst we have.
+- 348.7 MB/token x 1.13 = **394 MB per step**, i.e. **209 expert slots**, i.e. **4.4 slots per layer of the 20 touched
+  (22% miss)** - consistent with the 26-slot-per-layer cache and with `distinct 739` of 960 pairs.
+
+### The arithmetic that decides it
+
+394 MB per step at the calibrated **12.8 GB/s** = **31 ms of PCIe inside a 43.6 ms step: 71% of the link, and the
+step cannot be shorter than the transfer.** Candidate (a) - launch API - is `gpu 2.4 ms` per step, i.e. **6%**; a graph
+can win at most that. Candidate (b) - host work between submissions - is `staging_wait 2.9 + cpu_join 0.3`, another
+7%. Candidate (c) is the step's dominant term by a factor of five.
+
+Strata's side of the same table, for scale: 110.8 MB/token in 8.5 ms, **3.1x less traffic per token**, because their
+speculation accepts more tokens per step (the same bytes are amortised over more output) and their misses per layer are
+comparable. Their own decode is not transfer-bound at all.
+
+### Verdict: M24 closes **negative**, by its own rule
+
+§3 said: *"if (c) dominates: close M24 as negative and write the pipelining milestone instead - the work then belongs
+in the expert upload path, not here."* (c) dominates, so the whole-step CUDA graph is **not** the lever: the ceiling it
+could reach is 6% of a step, while 71% of the step is a transfer that no launch mechanism can compress.
+
+Recorded for the record, in case anyone revisits: the §22 "launch gap 15.1 ms/token" label was **wrong**. It was wall
+time not covered by *kernels*, and most of it is the **copy engine** doing expert uploads - which is invisible in a
+kernel-only view. That mislabel is what made a graph look like a 40% opportunity.
+
+## 8. What the next milestone must move
+
+Two quantities, both measured, multiply to the cost:
+
+| quantity | ours | note |
+|---|---:|---|
+| **MB of expert traffic per step** | **394 MB** | 4.4 slots/layer of 20 touched (22% miss) x 1.88 MB |
+| **tokens produced per step** | **1.13** | 2 rows verified; the acceptance is the `code` class weakness from M22 §15 |
+
+`TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)`. To halve TPOT, halve the numerator or double the
+denominator - there is no third way, and both branches are delivery-side:
+
+- **Numerator**: fewer bytes per miss (fetch what is needed earlier, e.g. `gate_up` before `down`, so the matvec can
+  start while the rest lands), or fewer misses (capacity is capped at 2.2 GB by M20, so this is a policy question:
+  pinning and promote).
+- **Denominator**: more tokens per step. Strata gets there with `--suffix-draft 3` (prompt lookup, its doc quotes
+  0.94-0.99 hit on continuations); we have no suffix drafter at all, only the MTP head.
+
+Both are worth their own milestone and neither is a kernel change. M25 is opened for the denominator (cheapest, no
+memory ceiling involved); the numerator stays queued.
