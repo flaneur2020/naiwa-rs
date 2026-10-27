@@ -398,3 +398,41 @@ moment any tensor outlives the step (the prefix cache, the MTP state, the promot
 
 Graph first, pooling only as its fallback - and **before either**, the §7(a) instrumentation, because both are large
 changes justified by a host-API ledger that has so far been read one phase at a time.
+
+## 10. Yes - pooling is the small change, if it is done in candle rather than as an arena
+
+§9 overstated pooling's cost by describing only the arena variant. There is a much smaller version, and it has none of
+the graph's prerequisites:
+
+| | **candle size-keyed pool** | candle bump arena | whole-step graph |
+|---|---|---|---|
+| where | **one place in candle**: the CUDA alloc path + `Drop` of the storage | candle, everywhere storage is created | naiwa + candle |
+| size | ~100-150 lines | hundreds, fork-wide | capture plumbing + graph cache per (rows, depth) |
+| needs device-side routing (§5)? | **no** | no | **yes** |
+| needs fixed shapes / no host decisions? | **no** | no | **yes** |
+| breaks long-lived tensors? | no (they simply never return to the pool) | **yes** - prefix cache, MTP state, promote queue all outlive the step | no, as long as capture is re-done on shape change |
+| removes | `cuMemAlloc`/`cuMemFree` calls (~2.8 ms/token) | same | allocations **and** launches (11.7 ms/step) |
+| TPOT | 38.5 -> **~35.9 (-7%)** | ~35.9 | ~28.5 (-26%) |
+
+How it works, in one paragraph: candle allocates one device buffer per tensor through `CudaDevice::alloc_zeros` and frees
+it when the last `Arc` drops. A decode loop re-creates the **same shapes every layer and every step** (each layer has one
+shape), so a per-device free list keyed by `(bytes)` - or `(bytes, dtype)` - will hit on essentially every allocation
+after the first step. The `Drop` returns the buffer to the list instead of calling `cuMemFreeAsync`; the alloc pops it.
+Steady state: **no allocator API calls at all**, just a hash lookup.
+
+The two things that must be right, and they are the whole risk:
+
+1. **Stream safety.** We have a second stream (the expert staging copy stream). `cuMemAllocAsync` memory is
+   stream-ordered; a pool pop hands out memory that was last used on *another* stream, so a reuse can race a kernel that
+   is still reading it. The pool must therefore be **per stream**, or a returned buffer must carry the event of its last
+   use and the alloc must wait on it. Getting this wrong is a silent data corruption, not a crash.
+2. **Fragmentation and leaks.** A pool keyed by exact size is fine here because shapes repeat; but a tensor that is kept
+   alive (prefix cache, the promote queue) never returns and must not be counted on. Pool growth is then unbounded in
+   the worst case: cap it, and fall back to the plain allocator on a miss above the cap.
+
+This is why it should be first: it is **independent** of everything else on the line (routing, residency map, graph),
+it is measurable with the ledger already in place (count `cuMemAllocAsync` per token - it should fall from 3 107 to
+~0), and it does not change any numerics, so the M1 oracle and a `frac > 0` exact-token comparison both apply directly.
+
+Order: **pool -> measure the ledger again -> then decide whether the graph's extra 8.5 ms is worth the residency-map
+chain.**
