@@ -299,3 +299,56 @@ addition to M1's oracle.
 
 §6's ceiling arithmetic (0.85 -> 0.4 ms/layer, TPOT ~21-23 ms) is **conditional on (a) being the device read**, which is
 exactly what has not been measured yet.
+
+## 8. Measured from the existing trace: the device is **busy 74% of the time the host is reading routing**
+
+No rebuild needed - the nsys trace already holds both sides. For every one of the **9 995** `cuMemcpyDtoHAsync`
+calls in the decode windows, I intersected the *host*-blocked interval with the merged *device*-busy intervals:
+
+| | value |
+|---|---:|
+| D2H calls | 9 995 (83 per token) |
+| mean call | 183 us |
+| **calls during which the device was completely idle** | **6 081 (61%)**, mean **78 us** |
+| calls overlapping device work | 3 914 (39%), mean **346 us** |
+| per token: D2H total | 15.27 ms |
+| ... of which device **busy** | **11.30 ms** |
+| ... of which device **idle** | **3.97 ms** |
+
+So the picture is bimodal, and §6's model was the wrong one:
+
+- **Most of the read time (11.3 of 15.3 ms per token) is the host waiting while the device is busy** - that is the
+  host *following* the device, not the device idling for the host. §7(b) suspected this from the overlap arithmetic;
+  now it is measured. Making the resident wave device-side does **not** shorten those waits, because the device is
+  already working during them.
+- **The genuinely wasted part is 3.97 ms/token = ~4.5 ms/step** - the short reads (78 us mean) where the device has
+  nothing queued. That, not 19 ms, is what any routing-side change can win: **TPOT -10%, not -40%**.
+
+### And the rest of the device idle is not routing at all
+
+Device idle is ~17.5 ms per 41.7 ms step (52% busy), and only ~4.5 ms of it falls inside the routing reads. The other
+**~13 ms** is elsewhere, and the host-API ledger says where: per token the host makes
+
+```
+15.3 ms  D2H            (83 calls)
+ 7.5 ms  kernel launches (1568 calls)
+ 2.8 ms  cuMemAlloc/Free (3107 calls)
+```
+
+**4 675 host->device calls per token, 25.6 ms of host time in a 45 ms step.** The launches and allocator calls are
+**40% of the host's CUDA time** and they are pure overhead - 1 553 alloc/free *pairs* per token for buffers that could be
+pooled, which is the same "one extra tensor per layer" cost M22 §19 could not attribute (it is 0.3 ms/layer there,
+2.8 ms/token here).
+
+### Revised order of work for M28
+
+| # | change | ceiling | cost |
+|---|---|---|---|
+| 1 | **pool the per-layer temporaries** (1 553 alloc/free pairs/token) | up to 2.8 ms/token ≈ 3.2 ms/step | small, local |
+| 2 | **fewer launches**: 1 568 per token is 7.5 ms of host time; the decode sequence is fixed per shape, which is what a graph removes | up to 7.5 ms/token ≈ 8.5 ms/step | medium; M8/M9.1 measured per-layer graphs neutral, a whole-step graph was never re-tested after M24 |
+| 3 | routing reads (the original §5 idea) | ~4.5 ms/step (TPOT -10%) | large: device-side residency map, and the gate in §7(d) must be added first |
+| 4 | device-side residency map as a *prerequisite* of (2)? only if the graph cannot capture the routing read - the doorbell is host-mapped memory, so it can | - | - |
+
+So the campaign order inverts: the cheapest 12 ms/step is in **allocator pooling and launch count**, both of which were
+dismissed earlier (M22 §19: "the pool threshold changed nothing"; M24: "the launch gap is the copy engine"). §8's
+numbers say what §19 lacked: it is not the pool's *threshold*, it is the *number of allocations*.
