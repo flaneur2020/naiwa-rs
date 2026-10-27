@@ -476,3 +476,49 @@ are unambiguous about not doing.
    byte-identical, `frac > 0` exact-token comparison against today's binary, then three benchmark rounds.
 5. Expected by the ledger: **-2.8 ms/token = -3.2 ms/step, TPOT 38.5 -> ~35.9 (-7%)**. If the measured win is under 1 ms,
    the pool is not worth its corruption risk and should be reverted - the same standard M26 was held to.
+
+## 12. Better than the pool: **preallocate once, hand out by index** (no `Drop` hook at all)
+
+§11's pool needed a `Drop for CudaStorage` across eight dtype variants plus an event per recycled buffer. That whole
+problem disappears if nothing is ever *returned*: allocate the decode step's buffers **at init**, and make every later
+allocation a *carve* out of that slab, indexed by an offset that is reset at a known point. In that design:
+
+| | pool (§11) | **preallocated slab, index by offset** |
+|---|---|---|
+| `Drop` hook needed | yes, all 8 variants | **none** - memory is never returned |
+| per-use driver call | no (`cuMemAllocAsync` removed) | **no** (`CudaSlice::slice(off..)` is a pointer, not a call) |
+| event per buffer | yes, for cross-stream reuse | **none** - one stream, and the reset point is chosen where nothing is live |
+| failure mode | use-after-free across streams | **use-after-reset** (same class, but detectable by poisoning) |
+| long-lived tensors | they just never return | **must be excluded** and allocated outside the slab |
+
+The hook points are the same two functions as before (`CudaDevice::alloc_zeros` / `alloc_uninit`), but now they are
+trivial: `off += bytes; return slab.slice(off..off+bytes)` - no map, no mutex (a `Cell<usize>` per device is enough, since
+the token thread is the only allocator during decode), no events.
+
+### What makes it safe, and how to prove it
+
+The design's whole risk is a tensor that is still alive when the offset resets. Three rules make it checkable:
+
+1. **Reset at a point where the previous step's temporaries are provably dead**: candle drops each op's output when the
+   last `Arc` falls, and a decode layer's temporaries do not escape - the layer's output is written into the residual,
+   which is allocated *outside* the slab. So the reset belongs at the **start of each layer**, not per step.
+2. **Exclude the escapees by construction**: prefix-cache entries, MTP state, the promote queue and anything handed to
+   the loader are allocated through the ordinary allocator (a one-line opt-out flag on the request), because they
+   outlive the layer.
+3. **Poison the slab on every reset** in a debug/`NAIWA_SLAB_POISON=1` build (write NaN / `0xDEADBEEF` into the region
+   about to be handed out). A use-after-reset then shows up as NaN logits or a garbage token instead of a plausible
+   wrong answer - and it is exactly the must-fail control this change needs, since neither the M1 oracle nor the
+   `frac > 0` comparison would necessarily hit the boundary case.
+
+### What has to be measured before it can be sized
+
+The slab must be big enough for a layer's peak live bytes, and nothing yet says what that is. The 3 107 allocations per
+token are ~57 per layer per step; their **sizes** were never logged. So step one is a byte counter in the same two
+functions (`NAIWA_ALLOC_TRACE=1`: count, total bytes, peak live bytes, per layer), run for one probe. Two numbers come
+out of it - the per-layer peak (the slab size, with headroom) and the shape histogram (whether one slab suffices or the
+working set is dominated by a few big buffers that want their own slots).
+
+If the per-layer peak turns out to be large (say 500 MB) the slab is still fine - it replaces memory that candle was
+allocating and freeing every layer anyway - but it becomes a **fixed** cost that must fit the 12 GB card alongside the
+2.2 GB expert cache, which is the same budget fight M20 lost at 2.3 GB. That is the number to know before writing the
+allocator.
