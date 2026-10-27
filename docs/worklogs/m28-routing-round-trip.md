@@ -180,3 +180,44 @@ finished - which is exactly the window the round trip can hide in. That is a sch
 kernel moves earlier in the submission order), not a copy change, and it is the remaining item on this milestone. Its
 gate is unchanged (`plan` < 0.35 ms per layer), and its own must-fail control is that a deliberately stale routing read
 must change the output.
+
+## 5. Correcting §4: the router cannot move earlier - the pipeline is between the host read and the **resident** compute
+
+A fair objection, and §4's phrasing was wrong: **layer L's routing needs layer L's post-mixer state**, so the router
+kernel cannot be issued before layer L's attention/GDN has run. There is no "route one layer ahead". What can be
+overlapped is something else, and the distinction is the whole mechanism:
+
+```
+per layer today (serialised):
+  mixer -> router -> [device done, idles] -> host reads ids (0.7-0.8 ms)
+        -> host decides resident / staged / CPU -> device runs ALL experts
+
+what the dependency actually requires:
+  mixer -> router -> device runs the RESIDENT experts (ids are already on the device)
+                                      meanwhile: host reads ids, decides, queues staging DMA + CPU experts
+        -> device runs the STAGED experts when their DMA lands
+```
+
+The device does **not** need the host to start the experts whose weights are already resident - it has the ids. Only the
+misses need the host: a DMA has to be issued and a CPU worker has to be told what to compute. So the round trip can hide
+under the resident experts' kernels instead of preceding every kernel of the layer.
+
+That is also the shape of strata's number: `GPU-reach wait 11.51 ms/window` **plus** `per-layer host 19.26 [CPU 19.10]`
+- their host is in the loop for the CPU experts, and that work runs *under* GPU compute, which is why the same hand-off
+costs them 0.24 ms per layer instead of our 0.7-0.8.
+
+### What implementing it requires
+
+1. **A device-side residency map**: `[num_experts] u32` per layer, `slot` or `SENTINEL`, mirrored from the host's
+   bookkeeping whenever the cache changes (a 1 KB buffer; the host writes it on promote/evict, which is already a
+   device-side copy today).
+2. **A device-side compaction**: turn the step's `[rows, topk]` ids into a compacted `(row, slot, weight)` list of the
+   resident hits. The quant crate already has `moe_align_em` for exactly this shape.
+3. **Run the resident wave first**, with no host involvement at all - the existing `Gpu::submit` over the resident bank,
+   but with its hit list produced on the device instead of by `Route::submit`.
+4. **Then** the host's `Route` result arrives (the same doorbell), and the staging/CPU path proceeds as today, joining
+   as the second wave (M26 left the wave machinery in place for this).
+
+Gates are unchanged: `plan` under 0.35 ms per layer as the metric, oracle byte-identical, and the must-fail control
+that a deliberately stale residency map changes the output (it would make the device read a slot that holds a different
+expert).
