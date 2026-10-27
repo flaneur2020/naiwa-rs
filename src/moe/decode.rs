@@ -42,6 +42,26 @@ pub(crate) fn forward(
     let x2d = xs.reshape((rows, hidden))?;
     stats::record_step_layer(layer.slot_device(), layer.layer());
     // A step's first layer marks the boundary: print the previous step's budget (see `stats::budget`).
+    // M28: allocation ledger. Every `CudaDevice::alloc`/`alloc_zeros` between two layers belongs to the previous
+    // layer, so the window is taken at the layer boundary; at a step boundary the previous step's totals print.
+    if candle_core::cuda_backend::alloc_trace::enabled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MAXB: AtomicU64 = AtomicU64::new(0);
+        static SUMB: AtomicU64 = AtomicU64::new(0);
+        static SUMC: AtomicU64 = AtomicU64::new(0);
+        let (b, c) = candle_core::cuda_backend::alloc_trace::take();
+        SUMB.fetch_add(b, Ordering::Relaxed);
+        SUMC.fetch_add(c, Ordering::Relaxed);
+        MAXB.fetch_max(b, Ordering::Relaxed);
+        if layer.layer() == 0 && SUMB.load(Ordering::Relaxed) > 0 {
+            eprintln!(
+                "ALLOC_TRACE step: {} allocs, {:.1} MB total, {:.1} MB peak per layer",
+                SUMC.swap(0, Ordering::Relaxed),
+                SUMB.swap(0, Ordering::Relaxed) as f64 / 1e6,
+                MAXB.swap(0, Ordering::Relaxed) as f64 / 1e6
+            );
+        }
+    }
     if layer.layer() == 0 {
         stats::record_step_boundary(layer.layers().len());
     }
@@ -100,6 +120,11 @@ pub(crate) fn forward(
         stats::record_round_plan(n_hits, staged_n, n_cpu);
     }
 
+    // M28: this layer's allocation bytes (no reset here; the step boundary reads the window).
+    #[cfg(feature = "cuda")]
+    if candle_core::cuda_backend::alloc_trace::enabled() {
+        // Handled at the step boundary: the window accumulates across the step.
+    }
     let cpu = CpuMiss::submit(layer, &plan.misses, &x2d, rows)?;
     mark!(stats::BudgetPhase::Spawn);
 

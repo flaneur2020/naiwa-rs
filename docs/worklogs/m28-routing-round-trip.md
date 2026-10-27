@@ -522,3 +522,36 @@ If the per-layer peak turns out to be large (say 500 MB) the slab is still fine 
 allocating and freeing every layer anyway - but it becomes a **fixed** cost that must fit the 12 GB card alongside the
 2.2 GB expert cache, which is the same budget fight M20 lost at 2.3 GB. That is the number to know before writing the
 allocator.
+
+## 13. Measured: a layer allocates **6.3 MB peak, 52 allocations** - the slab is 16 MB, not 500 MB
+
+`NAIWA_ALLOC_TRACE=1` (a counter in `CudaDevice::alloc`/`alloc_zeros`, taken at each layer boundary in
+`moe/decode.rs`), `code`, 40 tokens, `--mtp-n-predict 1`, 2.2 GB cache:
+
+```
+ALLOC_TRACE step: 2478 allocs, 65.2 MB total, 6.3 MB peak per layer
+ALLOC_TRACE step: 2478 allocs, 65.4 MB total, 6.3 MB peak per layer
+ALLOC_TRACE step: 2481 allocs, 65.4 MB total, 6.3 MB peak per layer
+```
+
+Three numbers, all new:
+
+| | value | what it settles |
+|---|---:|---|
+| allocations per step | **2 478** (~52 per layer) | the thing to remove; nsys priced the pair at ~0.9 us each, so 2 478 allocs **+ 2 478 frees ≈ 4.5 ms/step** |
+| bytes per step | 65.2 MB | - |
+| **peak bytes per layer** | **6.3 MB** | **the slab window is 6-8 MB**, i.e. ~16 MB with 2.5x headroom |
+
+So §12's worry - "if the per-layer peak is 500 MB it becomes a fixed cost fighting M20's 2.2 GB cache" - does not
+apply. **16 MB against 2.2 GB is 0.7%**, and the reward is ~4.5 ms of a 45 ms step.
+
+Revised expectation for the slab: **step 45.0 -> ~40.5 ms, TPOT 38.5 -> ~34.7 (-10%)** - larger than §10's pool estimate
+because the ledger is now measured per step rather than extrapolated from a token, and because the slab also removes the
+*frees*, which the pool could only do by intercepting `Drop`.
+
+Everything needed to write it is now in hand: the two funnels (`CudaDevice::alloc`, `alloc_zeros`), the reset point (the
+layer boundary this counter already uses), the size (16 MB), the exclusions (anything that outlives a layer - prefix
+cache, MTP state, promote queue, loader tensors) and the must-fail control (`NAIWA_SLAB_POISON=1`, which turns a
+use-after-reset into NaN logits).
+
+The instrumentation is env-gated and inert by default; it stays in the tree as the gate for the slab.
