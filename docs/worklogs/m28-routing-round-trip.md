@@ -436,3 +436,43 @@ it is measurable with the ledger already in place (count `cuMemAllocAsync` per t
 
 Order: **pool -> measure the ledger again -> then decide whether the graph's extra 8.5 ms is worth the residency-map
 chain.**
+
+## 11. Where the candle pool would actually go - and why this session stops before writing it
+
+Checked the interception points, and they are clear:
+
+- **Allocation** funnels through exactly two methods: `CudaDevice::alloc_zeros` / `alloc_uninit`
+  (`candle-core/src/cuda_backend/device.rs:85,89`), which call `self.stream.alloc_zeros::<T>(len)` - cudarc, one driver
+  call per tensor. There is **no pool hook anywhere** between candle and cudarc.
+- **Release** has no hook at all: the
+  buffer lives in `CudaStorageSlice` (`cuda_backend/mod.rs:102`), an enum over **eight** dtypes
+  (`U8/U32/I16/I32/I64/BF16/F16/F32/F64`), and it is freed by cudarc's own `Drop` when the storage's `Arc` falls.
+
+So the patch is: a `Drop for CudaStorage` that moves each variant's slice into a per-`(stream, dtype, len)` free list, and
+`alloc_zeros`/`alloc_uninit` popping from it. Two consequences decide its size:
+
+1. Every variant must be moved out in `Drop`, so the enum's payloads become `Option<CudaSlice<T>>` (or the drop writes a
+   placeholder) - that touches every `match` over `CudaStorageSlice` in candle, which is a lot of them.
+2. **`Drop` does not know the stream.** The storage does not carry one, so "free list per stream" cannot be keyed
+   directly; the safe form is a single list plus a recorded event per returned buffer, and an `alloc` that makes the
+   caller's stream wait on it. That is a `CudaEvent` per recycled tensor - cheap, but it means the pool is only a win
+   because the *same* stream reuses it in the steady state, and the event wait is the correctness guard for the other
+   one.
+
+That is a genuine day's work with a silent-corruption failure mode, and this session no longer has the room to land it
+**validated** (build 2 min, server 4 min, M1 oracle, a `frac > 0` exact-token comparison, `cargo test`, three benchmark
+rounds). Starting it now would leave a fork-wide allocator change half-tested, which is the one thing the repo's rules
+are unambiguous about not doing.
+
+### Handoff specification, in the order it should be done
+
+1. Change `CudaStorageSlice` payloads to `Option<CudaSlice<T>>` and add `Drop for CudaStorage` that pushes each into a
+   global `Mutex<HashMap<(usize /*bytes*/, u8 /*dtype tag*/), Vec<CudaSlice<..>>>>` **plus** the event of its last use.
+2. `CudaDevice::alloc_zeros` / `alloc_uninit` pop a matching buffer, `stream.wait(&event)`, and zero it where the caller
+   asked for zeros; miss -> the existing cudarc path, and count the miss.
+3. Cap the pool (say 2 GB of pooled bytes) and drop half the list when it is exceeded, so a leak in the model cannot turn
+   into an OOM.
+4. Validation: `cuMemAllocAsync` per token from nsys (**3 107 -> ~0** is the gate), `cargo test`, M1 oracle
+   byte-identical, `frac > 0` exact-token comparison against today's binary, then three benchmark rounds.
+5. Expected by the ledger: **-2.8 ms/token = -3.2 ms/step, TPOT 38.5 -> ~35.9 (-7%)**. If the measured win is under 1 ms,
+   the pool is not worth its corruption risk and should be reverted - the same standard M26 was held to.
