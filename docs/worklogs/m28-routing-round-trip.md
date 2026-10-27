@@ -352,3 +352,49 @@ pooled, which is the same "one extra tensor per layer" cost M22 §19 could not a
 So the campaign order inverts: the cheapest 12 ms/step is in **allocator pooling and launch count**, both of which were
 dismissed earlier (M22 §19: "the pool threshold changed nothing"; M24: "the launch gap is the copy engine"). §8's
 numbers say what §19 lacked: it is not the pool's *threshold*, it is the *number of allocations*.
+
+## 9. Pooling vs "no allocations at all": what each is worth, and what the second one requires
+
+### The arithmetic
+
+Per token: **3 107 `cuMemAllocAsync` + 3 107 frees at 0.9 us = 2.82 ms**, and **1 568 kernel launches at 5 us =
+7.50 ms**. At 1.13 tokens/step that is **3.2 + 8.5 = 11.7 ms of a 45 ms step**.
+
+| change | allocations per token | host time removed | step | TPOT |
+|---|---|---:|---:|---:|
+| today | 3 107 | - | 45.0 ms | 38.5 ms |
+| **pool the temporaries** (reuse by shape+dtype) | ~120 | 3.1 ms | ~41.9 | **~35.9** |
+| **whole-step CUDA graph** (all allocs and launches baked) | **0** | **11.7 ms** | ~33.3 | **~28.5** |
+
+So pooling is worth about **2.5 ms of TPOT (7%)**, and it is strictly dominated by the graph, which removes the
+allocator *and* the launches. Pooling is only interesting if the graph turns out to be unavailable.
+
+### Why the allocation count is what it is
+
+Candle's CUDA backend allocates **one device buffer per tensor**, and a decode step builds roughly 900-1 000 tensors
+(about 19 ops per layer x 48 layers, each with a fresh output). 0.9 us per `cuMemAllocAsync` is already near the floor
+for the API call - the pool behind it makes the *allocator* cheap, which is exactly why M22 §19's "raise the pool's
+release threshold" changed nothing. What costs is the **call per tensor**, not the pool's policy. The number to attack
+is the count: 3 107 -> 0.
+
+### To get to zero, three things have to be true at once (they are not independent)
+
+1. **Allocations and launches must be baked**: a captured CUDA graph replay issues no `cuMemAlloc` and no
+   `cuLaunchKernel`; every buffer has a fixed address. That is the only mechanism that takes both terms to zero
+   together.
+2. **Nothing inside the step may depend on the host**: today the step reads routing from the device per layer
+   (83 D2H/token) and the host decides staging / promotion / CPU split. A graph cannot contain a host decision, so
+   **the device-side residency map of §5 (or its equivalent) is a prerequisite of the graph**, not an alternative to it.
+3. **Shapes must be fixed per variant**: rows x speculation depth vary per step (`--mtp` auto depth), so the graph must
+   be cached per (rows, depth) - a handful of variants, evicted on shape change, and a fallback to eager for anything
+   uncaptured (prefill, first token, CPU-heavy paths).
+
+If (2) cannot be made to hold, the fallback is **a candle-level bump arena**: one device slab per decoder, handed out as
+`Storage` sub-slices and reset at each step boundary. That removes the 3 107 allocations without touching launches
+(worth 3.1 ms), and it needs no capture - but it is a fork-wide change to how `CudaStorage` is created, and it breaks the
+moment any tensor outlives the step (the prefix cache, the MTP state, the promote queue all do).
+
+### Recommendation
+
+Graph first, pooling only as its fallback - and **before either**, the §7(a) instrumentation, because both are large
+changes justified by a host-API ledger that has so far been read one phase at a time.
