@@ -108,3 +108,45 @@ change that can reach it.
 doorbell's own result copy. Confirming it needs one grep-level trace rather than a run: the next step of this milestone
 is to instrument `Route::submit` and `doorbell::wait_copy` with a per-call counter and see which of them fires 1.5
 times per layer.
+
+## 3. Where the 83 copies come from - and the doorbell that already exists but is bypassed
+
+`Route::submit` (`src/moe/stages/route.rs`) **already has** the pipelined read this milestone was going to build: a
+doorbell ring that `publish_and_read`s the top-k ids and weights out of host-mapped memory, so "no stream sync, no D2H
+launch" (its own comment). Its fallback is the blocking pair
+
+```rust
+topk_ids.reshape((rows, ()))?.to_vec2::<u32>()?,          // D2H #1
+topk_weights.reshape((rows, ()))?.to_dtype(F32)?.to_vec2::<f32>()?,   // D2H #2
+```
+
+but the doorbell is only consulted when `device_flip` is **false**, and
+
+```rust
+let device_flip = layer.top_k() > 0
+    && topk_ids.elem_count() % layer.top_k() == 0
+    && topk_ids.elem_count() / layer.top_k() == rows;
+```
+
+is true for exactly the normal case (`elem_count == rows * top_k`). So the common path takes the doorbell *out* and
+pays **two blocking `to_vec2` round trips per layer** - 96 per step, which is the 83-per-token count nsys measured, and
+each costs 183 us because the copy cannot complete until the device's queue reaches it.
+
+That reframes §1's plan into something much smaller and better supported:
+
+1. **Route the common case through the doorbell** (the machinery exists and is already sized at warmup). Only the rare
+   non-`rows x top_k` shape should fall back. Expected: 96 blocking round trips per step -> 0, i.e. **~17 ms of the
+   37.8 ms `plan` phase**, which at 1.13 tokens/step is most of the 15.3 ms/token of D2H.
+2. **Then** look at the 1 554 allocator round trips per token (3.2 ms of host time) - the same "one extra tensor per
+   layer" cost M22 §19 could not attribute.
+3. Keep §1 step 1's pinned-ring pipeline only if the doorbell path turns out to be the slow half; the code comment
+   suggests it is the fast one.
+
+Why this is the highest-value change left on the line: it is **one condition**, it is already implemented and tested
+machinery, and it targets 17 of the 30 ms of host API time that make up 80% of a decode step.
+
+### Correction to §2's ordering
+
+§2 said "the next step is to instrument `Route::submit` and `doorbell::wait_copy` with per-call counters". That
+instrumentation is what this section would have produced, and reading the code answered it directly: the counter is
+1.5 per layer because the *fallback* runs, not because the doorbell is slow. No run was needed.
