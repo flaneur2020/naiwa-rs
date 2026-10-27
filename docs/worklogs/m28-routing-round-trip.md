@@ -221,3 +221,29 @@ costs them 0.24 ms per layer instead of our 0.7-0.8.
 Gates are unchanged: `plan` under 0.35 ms per layer as the metric, oracle byte-identical, and the must-fail control
 that a deliberately stale residency map changes the output (it would make the device read a slot that holds a different
 expert).
+
+## 6. The two numbers §5 turns on: resident compute **0.33-0.43 ms/layer**, round trip **0.72-0.93 ms/layer**
+
+Per layer, from the same `STEP_BUDGET` lines (48 layers):
+
+| quantity | per layer | from |
+|---|---:|---|
+| **round trip** (`plan`) | **0.72-0.93 ms** (median 0.85) | `plan` 34.7-44.8 ms / 48 |
+| **resident-expert compute** (78% of the touches) | **0.33-0.43 ms** | `expert_dev` 20.5-26.6 ms x 0.78 / 48 |
+| all-expert compute (for scale) | 0.43-0.55 ms | `expert_dev` / 48 |
+| mixer (lower bound on any wait for routing) | 0.17 ms | 8.1 ms / 48 |
+| **strata's same round trip** | **0.24 ms** | `GPU-reach wait 11.51 ms / 48` |
+
+So:
+
+1. **The round trip is 2x the resident compute.** Hiding the resident wave under the read does *not* make the layer
+   free: it covers ~0.4 of the ~0.6 ms of avoidable wait. What is left is the mixer+router latency itself, which is
+   unavoidable and is exactly what strata's 0.24 ms is made of.
+2. **The ceiling is therefore `plan` ~0.4 ms per layer**, i.e. **~19 ms off a 41.7 ms step** (0.45 x 48), which takes
+   the step to ~22-26 ms and TPOT from 38.5 to roughly **21-23 ms**: **-40%**, and it needs no change to bytes, cache,
+   drafting or kernels.
+3. If the round trip can also be overlapped with the *staged* wave (it cannot, the staged wave needs the host's
+   decision) the number would be better, but that is a second, separate idea.
+
+Order of work is unchanged: device-side residency map first, because it is the piece that lets the resident wave start
+without the host, and it is independently verifiable with the stale-map must-fail control.
