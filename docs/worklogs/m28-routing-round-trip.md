@@ -247,3 +247,55 @@ So:
 
 Order of work is unchanged: device-side residency map first, because it is the piece that lets the resident wave start
 without the host, and it is independently verifiable with the stale-map must-fail control.
+
+## 7. What §5 and §6 missed - read this before building anything from them
+
+Thinking it through properly, four things do not hold together, and the honest status of §5/§6 is **a hypothesis, not
+a diagnosis**.
+
+### (a) `plan` is not one thing, and §5's fix only touches one of them
+
+`plan` measures `Route::submit` + `DmaMiss::submit`. Inside that window there are at least four separate costs:
+
+| candidate | evidence | would §5's device-side residency fix it? |
+|---|---|---|
+| the device read (host waits for the router) | 183 us per D2H call in nsys | **yes** |
+| host bookkeeping: 20 expert ids -> slot lookups, `hit_counts`, mutex + HashMap | unmeasured | no |
+| **`copy_stream::wait_for_readers`** - `DmaMiss::submit` spins until the previous step's readers drop their `Arc`s | unmeasured; the code documents it as a spin | no |
+| **allocator**: 1 554 `cuMemAllocAsync` + 1 553 frees per token = 3.2 ms/token | nsys | no |
+
+So "the round trip" may be a fifth to a half of `plan`, and the rest would survive §5 untouched. **Splitting `plan`
+into those four is the actual first step**, not the residency map.
+
+### (b) The overlap arithmetic contradicts the strong form of the claim
+
+`plan` 34.7 ms inside a 41.7 ms step, with kernels at ~24 ms/step: 34.7 + 24 - 41.7 = **17 ms**, so **at least half of
+`plan` already overlaps device work**. That means the host is *ahead* of the device during much of `plan` - queueing the
+next layer while the device finishes this one - which is the opposite of "the device sits idle waiting for the host".
+Both can be true only if the idle is concentrated in specific windows; §5 assumed it was every layer's read, and that
+was not measured.
+
+### (c) There is a **second** serialisation that §5 ignores
+
+The GPU-side spin kernel (`doorbell_wait_copy_f32`) runs about 21 times per step at 382 us = **8 ms/step**, and it is
+*the device waiting for the CPU experts*. The `cpu_join 0.3 ms` in the budget does not capture that. So the step has
+**two** hand-offs - host-for-routing and device-for-CPU-results - and §6's 0.4 ms ceiling only reasoned about the first.
+
+### (d) The gate as written cannot test the new path
+
+The oracle runs at `frac 0`, where **staging is disabled**, so a device-side residency map would be exercised by
+neither the oracle nor the must-fail control at that setting. A wrong residency map means the device reads a *different
+expert's weights* - the most dangerous silent failure in the whole design. Any implementation must therefore add a
+`--pcie-frac > 0` correctness arm with **exact token comparison** against today's binary on the same prompt, in
+addition to M1's oracle.
+
+### What to do instead of building the residency map
+
+1. Split `plan` with four timestamps (`Route::submit` in-/out-, and inside it the read vs the bookkeeping; plus
+   `DmaMiss::submit` in-/out-). Cheap, and §3/§4 already showed how much a wrong hypothesis costs.
+2. Cross-check with nsys: in the decode window, measure **device idle inside each layer's `plan` window** (kernel gaps
+   that fall between the router kernel and the first expert kernel). That number either supports §5 or kills it.
+3. Only then decide between the three candidate mechanisms, of which the residency map is one.
+
+§6's ceiling arithmetic (0.85 -> 0.4 ms/layer, TPOT ~21-23 ms) is **conditional on (a) being the device read**, which is
+exactly what has not been measured yet.
