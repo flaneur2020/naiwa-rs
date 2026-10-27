@@ -150,3 +150,33 @@ machinery, and it targets 17 of the 30 ms of host API time that make up 80% of a
 §2 said "the next step is to instrument `Route::submit` and `doorbell::wait_copy` with per-call counters". That
 instrumentation is what this section would have produced, and reading the code answered it directly: the counter is
 1.5 per layer because the *fallback* runs, not because the doorbell is slow. No run was needed.
+
+## 4. Tried: route the common case through the doorbell - **neutral**, and that is the interesting part
+
+Changed the gate so the doorbell (`publish_and_read`, "no stream sync, no D2H launch") is used for **every** window
+that fits the ring, with the capacity check as the only condition, and the blocking `to_vec2` pair left as the fallback
+for prefill-sized windows.
+
+| check | result |
+|---|---|
+| oracle (`frac 0 + --no-lookahead`) | **byte-identical** |
+| `plan` | **34.7-44.8 ms** (was 37.8) - unchanged |
+| TPOT | 37.7 / 39.5 / 39.9 ms - unchanged |
+
+**Why it had to be neutral**: `publish_and_read` is *publish then `wait_and_read`* - the host spins on the device's seq
+counter until the copy lands. It removes the `cuMemcpyDtoH` **API call**, not the **round trip**. The 183 us per call was
+never the call; it was the wait for the device's queue to reach the copy, and the doorbell waits for exactly the same
+thing with the same latency, just more cheaply.
+
+So §3's premise ("one condition, 17 ms") is refuted, and the change was reverted to keep the tree pristine. What
+survives is the diagnosis: **the host cannot decide layer L's experts before the device has produced layer L's routing,
+and it waits 0.7-0.8 ms for that every layer.** No API choice fixes it.
+
+### The only change that can: pipeline the routing read by one layer
+
+Issue the router for layer L while layer L-1's **experts** are still computing, publish it, and consume it one layer
+later. The experts of layer L still need the routing of layer L, but they only need it *after* layer L-1's experts have
+finished - which is exactly the window the round trip can hide in. That is a schedule change across layers (the router
+kernel moves earlier in the submission order), not a copy change, and it is the remaining item on this milestone. Its
+gate is unchanged (`plan` < 0.35 ms per layer), and its own must-fail control is that a deliberately stale routing read
+must change the output.
