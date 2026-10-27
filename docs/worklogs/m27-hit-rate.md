@@ -125,3 +125,58 @@ ceiling - anything above ~42% has to come from short-horizon reuse.
   remaining prize. Measuring it needs one more instrumented run (`NAIWA_EXPERT_HIST` storing the **sequence** of
   ids per layer per step rather than counts) plus an offline LRU/Belady simulation - no model change, no kernel work,
   and it either finds real headroom or closes the TPOT line for good.
+
+## 8. Why strata looks better: **its hit rate is lower than ours**, and the difference is elsewhere (2026-10-27)
+
+strata's own `STRATA_DECODE_TIMING=1` prints the numbers nobody had compared before, per decode window:
+
+```
+36 windows, avg T 1.14, 1.11 tokens/window, 35.31 ms/window
+  = verify 32.81 (GPU-reach wait 11.51 + per-layer host 19.26 [CPU 19.10] + stage 0.01) + commit 0.04
+  per layer-window: CPU experts 3.80 (4.06 entries), VRAM hits 5.87, PCIe 1.44
+  expert cache 1028 experts, 1.98 GiB
+```
+
+Per layer-window it makes **11.11 lookups** (= rows x topk, so **1.11 rows**) split:
+
+| per layer-window | strata | naiwa (per layer-step, 2 rows) |
+|---|---:|---:|
+| touches | 11.11 | **20.0** |
+| cache hits | 5.87 = **52.8%** | ~**65%** |
+| over PCIe | 1.44 = **13.0%** | 4.4 = **22%** |
+| on the CPU | 3.80 = **34.2%** | ~2.6 = **13%** |
+| slots | 1 028 (1.98 GiB) | 1 248 (2.35 GB) |
+
+**Its hit rate is lower than ours** (52.8% against ~65%) with *fewer* slots. The premise this milestone was opened on
+was wrong. What strata does differently is send **34% of its expert touches to the CPU** (19.1 ms of host work per
+window, overlapped with the GPU) instead of pushing 22% of them across PCIe.
+
+### The experiment that follows, and what it killed
+
+If PCIe traffic were the binding constraint, halving it would show. `--pcie-frac` is exactly that knob (the share of
+misses streamed to the GPU instead of computed on the CPU):
+
+| arm | `expert_dev` | step | **TPOT** |
+|---|---:|---:|---:|
+| `--pcie-frac 0.4` (shipped) | 24.0 ms | 45.0 ms | 37.4 / 38.4 / 40.0 ms |
+| `--pcie-frac 0.15` (**62% less PCIe**) | **10.9 ms** | 41.0 ms | 37.5 / 38.5 / 38.7 ms |
+
+The GPU-side expert work **halved and TPOT did not move**. So the shipped configuration is **not PCIe-bound**, and
+M24's "71% of the step is the transfer" over-read its own evidence: the copy engine is busy 71% of the time, but it is
+not what the step waits on.
+
+### What the step actually waits on
+
+The same `STEP_BUDGET` lines put **`plan` at 33-38 ms of a 41-45 ms step - 80%**, i.e. **0.7-0.8 ms per layer** in the
+routing phase: the host cannot decide what to stage, promote or send to the CPU until it has the device's top-k, and
+the device cannot start the layer's experts until the host has decided. It is one **host/device round trip per layer,
+48 times a step**, and nsys showed the same thing from the GPU side (`doorbell_wait_copy_f32`: 3 000 calls, 382 us
+each).
+
+strata's equivalent line is **GPU-reach wait 11.51 ms/window = 0.24 ms per layer** - **3x cheaper**, which is the
+entire 34 ms against 11.5 ms difference in a step that is otherwise similar.
+
+So the next lever is not bytes and not hit rate: it is **the per-layer routing round trip**. Candidates, in the order
+their cost suggests: batch the router read for several layers (it is a 40-value D2H), overlap it with the previous
+layer's compute instead of following it, or - strata's answer - keep the decision on the device for the layers whose
+experts are already resident so only the *staged* layers need the host in the loop.

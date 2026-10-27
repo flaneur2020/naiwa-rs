@@ -51,7 +51,8 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 | **M7** | memory throughput / per-token cost | ✅ 2026-10-18 | np8 43.3 tok/s, 23.1 ms/token; perfect cache only +8% |
 | **M8** | cut the host launch chain | ✅ refuted | capture on/off identical; host term is not launches |
 | **M9** | cleanup, simplification, ablation | 🔶 M9.1 done | S2 kept (−20%); graphs/probes/knobs deleted; `NAIWA_*` names 38 → 7 |
-| **M27** | expert-cache hit rate (the numerator) | 🔶 Exp 1 done, allocation closed | Measured with a new `NAIWA_EXPERT_HIST` demand table: top-26 per layer covers **42.0%** of demand and a global pool of the same 1 248 slots **42.3%** - a **0.3-point** gap, so allocation across layers is dead (gate was 3). The shipped cache hits 78% of touches anyway, so the work is being done by *temporal* locality, not by hotness: the remaining question is the **replacement ceiling** (LRU/Belady on the recorded sequence), which is one more instrumented run |
+| **M28** | per-layer routing round trip (`plan`, 80% of a step) | 🆕 open | `STEP_BUDGET` puts `plan` at **33-38 ms of a 41-45 ms step** (0.7-0.8 ms/layer) against strata's **0.24 ms/layer** (`GPU-reach wait 11.51 ms/window`). Halving PCIe traffic (`--pcie-frac 0.4 -> 0.15`) halved `expert_dev` (24.0 -> 10.9 ms) and moved **nothing**, so the step waits on the round trip, not the bytes |
+| **M27** | expert-cache hit rate (the numerator) | ❌ closed 2026-10-27 | Measured with a new `NAIWA_EXPERT_HIST` demand table: top-26 per layer covers **42.0%** of demand and a global pool of the same 1 248 slots **42.3%** - a **0.3-point** gap, so allocation across layers is dead (gate was 3). The shipped cache hits 78% of touches anyway, so the work is being done by *temporal* locality, not by hotness: the remaining question is the **replacement ceiling** (LRU/Belady on the recorded sequence), which is one more instrumented run |
 | **M26** | gate_up before down (staging waves) | ❌ closed negative 2026-10-26 | Built every seam - the fused decode split into `indexed_moe_gate_up` + `indexed_moe_down_aggregate`, per-wave completion events, wave-by-wave submit - and measured **TPOT 38.1 against 38.5 ms with `staging_wait` up 1.6 ms**. The copy engine is already **71% busy**, so a wave boundary has no idle capacity to reorder into: **reordering does not reduce bytes** |
 | **M25** | prompt-lookup suffix drafting (tokens per step) | ❌ closed negative 2026-10-26 | The drafts are accepted **0.88-0.92** and add **nothing**: where the suffix chain fires (90% of steps, mean match 14.5 tokens) the MTP head already accepts **0.90**, so tokens/step is 3.75 against 3.69-3.81 without it | `TPOT = bytes_per_step / (12.8 GB/s x tokens_per_step)`; ours is 394 MB per step and **1.13 tokens** per step. More tokens per step is the free side |
 | **M24** | whole-step CUDA graph (decode occupancy) | ❌ closed negative 2026-10-26 | nsys copy-engine attribution: **394 MB of expert upload per step = 31 ms of a 43.6 ms step (71% of the PCIe link)**; launch API is 2.4 ms (6%), so a graph's ceiling is 6% and the step cannot be shorter than the transfer |
@@ -407,7 +408,13 @@ Evidence: [`worklogs/m9.md`](worklogs/m9.md) and
 
 ## M10 — chat workload parity with Strata — 🔶 M10.1–2 DONE
 
-Worklog: [`worklogs/m27-hit-rate.md`](worklogs/m27-hit-rate.md) — M27 (**open, research only**: the numerator. 22% miss
+Worklog: [`worklogs/m28-routing-round-trip.md`](worklogs/m28-routing-round-trip.md) — M28 (**open**: the per-layer
+routing round trip. `plan` is 33-38 ms of a 41-45 ms step, 0.7-0.8 ms per layer, against strata's 0.24 ms; halving the
+PCIe traffic moves TPOT not at all, which is what pointed here).
+Worklog: [`worklogs/m27-hit-rate.md`](worklogs/m27-hit-rate.md) — M27 (**closed**: the premise was wrong - strata's
+cache hit rate is **lower** than ours (52.8% against ~65%, on fewer slots). Its advantage is sending **34% of touches
+to an overlapping CPU path** instead of across PCIe, plus a 3x cheaper per-layer routing round trip. Allocation across
+layers measured at 0.3 points and closed. 22% miss
 against strata's ~13% is worth **162 MB per step and TPOT -16%**. Four levers: more slots (closed, M20's 2.2 GB), more
 tuned admission (at a local optimum - cap 8 cost 720 MB of d2d per step), bytes per miss (closed, M26), and
 **allocation across layers**, which has never been measured: 26 slots per layer is an assumption, and 1 248 slots in a
