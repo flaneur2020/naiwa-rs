@@ -76,3 +76,52 @@ Lever 3 is the only one left with real headroom, and its ceiling is *bounded by 
 similar top-26 coverage, a shared pool gains nothing. The number that decides it is Exp 1's `global - per_layer`, and
 it can be computed from a single run with no model change - which is exactly what a milestone that has already produced
 three negative results should buy before anyone writes cache code.
+
+## 6. Exp 1 done: the allocation lever is **worth 0.3 points**, so M27 closes it (2026-10-26)
+
+Built `NAIWA_EXPERT_HIST=<path>` (`src/stats/expert_hist.rs`): every `(layer, expert)` routing decision of a decode
+step, counted before any cache decision, dumped every 2 048 layer-steps and on shutdown. One run - the `code` class at
+200 tokens and `doc` at 120, `--mtp-n-predict 1`, cache 2.2 GB - gives 509 620 demand events over 48 layers.
+
+| allocation of the same 1 248 slots | coverage of demand |
+|---|---:|
+| **today: top-26 *per layer*** | **42.0%** mean (min 25.1%, max 67.7%) |
+| **shared pool: global top-1 248** | **42.3%** |
+
+**The gap is 0.3 points.** §4's pre-registered gate was "under 3 points of coverage and the lever closes", so it
+closes: handing the slots out where the demand is buys essentially nothing, because **every layer's demand is spread
+almost identically** (each layer carries exactly 2.09% of the touches - it routes `rows x topk` every step, so this is
+by construction; what differs is only the skew *within* a layer, and the mean of that skew is the same everywhere).
+
+For scale, the same table at other sizes:
+
+| slots | per-layer top-K | global pool |
+|---:|---:|---:|
+| 624 (13/layer) | 27.7% | - |
+| **1 248 (26/layer)** | **42.0%** | **42.3%** |
+| 1 920 (40/layer) | 53.5% | 50.7% |
+| 2 496 (52/layer) | - | 61.3% |
+
+Even a **50% larger cache** (1 920 slots) only reaches 53.5%, and it does not fit: 2.2 GB is M20's measured ceiling. So
+capacity and allocation are both dead ends.
+
+### The number that reframes the problem
+
+**Top-26 by frequency covers 42% of demand, but the shipped cache hits 78% of touches.** The difference is *temporal
+locality* - the two verify rows of a step share experts, and consecutive steps re-touch the same ones - which the
+current pin + second-sighting admission is already collecting. In other words the cache is **not** spending its 26
+slots on the globally hottest experts; it is spending them on the *recently* hot ones, and that is the right thing.
+
+So the remaining headroom is not "which experts", it is "how well the replacement policy tracks recent demand". Also
+worth recording: over a run this long the demand reaches **~233 of 256 experts per layer**, so pinning alone has a hard
+ceiling - anything above ~42% has to come from short-horizon reuse.
+
+## 7. What M27 leaves behind
+
+- **Closed (measured)**: more slots (M20), admission tuning (local optimum, §2), bytes per miss (M26), **allocation
+  across layers (0.3 points, §6)**.
+- **Open, and now the only question left on this line**: what is the *replacement* ceiling? A 26-slot cache on this
+  demand sequence could hit far above 78% with Belady's oracle, and the gap between 78% and that oracle is the whole
+  remaining prize. Measuring it needs one more instrumented run (`NAIWA_EXPERT_HIST` storing the **sequence** of
+  ids per layer per step rather than counts) plus an offline LRU/Belady simulation - no model change, no kernel work,
+  and it either finds real headroom or closes the TPOT line for good.

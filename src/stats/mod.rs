@@ -19,6 +19,8 @@ mod retired;
 mod round;
 mod step;
 
+pub(crate) mod expert_hist;
+pub(crate) use expert_hist::record_demand as record_expert_demand;
 pub(crate) use budget::{add as record_budget, record_pairs as record_budget_pairs, enabled as budget_enabled, step_boundary as record_step_boundary, Phase as BudgetPhase};
 #[cfg(feature = "cuda")]
 pub(crate) use budget::dev as budget_dev;

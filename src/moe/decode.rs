@@ -57,6 +57,12 @@ pub(crate) fn forward(
     }
     Preload::submit(layer, &x2d, rows, hidden)?;
 
+    // M27: the raw routing demand, before any cache decision, for the allocation study.
+    if let Ok(ids) = topk_ids.flatten_all() {
+        if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
+            stats::record_expert_demand(layer.layer(), &ids);
+        }
+    }
     let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
     let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
     stats::record_cache_hits(n_hits);
