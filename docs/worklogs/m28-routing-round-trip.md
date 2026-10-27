@@ -555,3 +555,47 @@ cache, MTP state, promote queue, loader tensors) and the must-fail control (`NAI
 use-after-reset into NaN logits).
 
 The instrumentation is env-gated and inert by default; it stays in the tree as the gate for the slab.
+
+## 14. Yes - without touching candle: capture each layer, and the allocator problem disappears
+
+The slab needed candle's alloc funnels because the 2 478 allocations per step are made by **candle's ops**, not by naiwa.
+But there is a mechanism that removes them **from outside candle**: during a CUDA graph *capture*, candle allocates
+normally; during **replay**, no allocation and no kernel launch happens at all - the buffers are baked at fixed
+addresses. So the requirement is not "patch the allocator", it is "capture the region".
+
+And a capture boundary is available **without any host decision inside it**: the routing read and the
+staging/promote/CPU decisions all happen *before* a layer's compute is submitted. So:
+
+```
+per step:  [host: read routing, decide, queue staging]  ->  [graph: layer's whole op sequence]  x 48
+```
+
+| what it removes | measured per step | how |
+|---|---:|---|
+| `cuMemAllocAsync`/free | **2 478 + 2 478 calls ≈ 4.5 ms** | baked at capture |
+| kernel launches (1 568/token ≈ 1 400/step) | **≈ 7 ms** | one graph launch per layer instead of ~29 |
+| **total** | **≈ 11 ms of a 45 ms step** | **TPOT 38.5 -> ~28** |
+
+This is exactly what M2/M4 built (per-layer capture, replayed bitwise) and what M9.1 deleted as "neutral". That verdict
+was taken when the diagnosis was wrong: nobody had priced the launch and allocator terms at 11 ms, and nsys could not
+be run then. The experiment is now cheap and unambiguous, because the gate is a **count**, not a time:
+
+- `cuMemAllocAsync` per token: 3 107 -> **~0**
+- `cudaLaunchKernel*` per token: 1 568 -> **~48**
+- and `cargo test`, M1 oracle byte-identical, `frac > 0` exact tokens, three benchmark rounds (the standard chain).
+
+Two caveats that decide feasibility, both checkable in an afternoon:
+
+1. **Capture legality.** The layer's ops must not synchronise or allocate through a path cudarc refuses to capture.
+   `CudaGraphHtodCacheGuard` already exists in candle's device, and M2/M4 captured this shape of region before, so the
+   risk is low but not zero; a capture failure is loud, not silent.
+2. **Input wiring.** The captured layer reads `x`, `topk_ids`, `topk_weights` and the slot banks; all are device
+   buffers that already exist per step, so a replay needs only a device-side copy of the new values into the captured
+   input addresses (a few KB per layer, on the same stream).
+
+Why this is better than the slab even though it is bigger machinery: **the slab removes 4.5 ms of the 11**, and the
+launches (7 ms) need capture anyway. And why it is better than the whole-step graph of §9: no device-side residency map
+is needed, because the capture boundary sits *after* the host's decision, per layer.
+
+So the order becomes: **per-layer capture first** (no candle change, big win, cheap gate), slab only if capture turns out
+to be impossible or if the remaining allocation traffic still matters after it.
