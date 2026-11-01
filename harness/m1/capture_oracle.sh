@@ -15,14 +15,21 @@ MAXTOK=${MAXTOK:-16}
 # A small KV budget: the server's auto-size reserving runtime memory too squeezed the KV pool
 # out on this 12 GB card. Context length does not affect a 16-token greedy decode.
 PA_CTX=${PA_CTX:-4096}
+# The frozen reference was captured from the `requant` checkpoint; `IQ1_M` was checked to produce
+# the same text at `frac 0` + `--no-lookahead`, so either can be used as MODEL.
+MODEL=${MODEL:-$HOME/Models/qwen3-coder/requant}
 FRAC=${FRAC:-0.55}
 EXTRA=${EXTRA:-}
 TAG=${TAG:-$(basename "$BIN")}
+if [ ! -d "$MODEL" ]; then
+    echo "model directory $MODEL is missing; set MODEL= to point at a checkpoint" >&2
+    exit 2
+fi
 mkdir -p "$OUT"
 LOG="$OUT/serve.$TAG.log"
 
 "$BIN" serve \
-    -m "$HOME/Models/qwen3-coder/requant" \
+    -m "${MODEL:-$HOME/Models/qwen3-coder/requant}" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
     --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
     --pa-context-len "$PA_CTX" --prefix-cache-n 0 ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
