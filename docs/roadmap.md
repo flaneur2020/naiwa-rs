@@ -36,6 +36,19 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 
 ---
 
+## M29-M32 aborted 2026-11-01
+
+The whole-step CUDA graph line (M29 design, M30 doorbell step graph, M31 capturable kernel library, M32 one-layer
+graph) is **withdrawn**. The tree is back at M28 §14 (`86242f9`) with the fork at `ed5831a1`, which is the state the
+TPOT parity was measured at; the withdrawn work is kept in the tag `abort-cuda-graph-2026-11-01` in both
+`naiwa-rs` and `mistral.rs-iq4xs`, worklogs included.
+
+Why: the graph never reached a replayable whole step, and the default path paid for it. With the shipped chat config
+(`engines/naiwa.json`, `--mtp-n-predict 1`, 2.2 GB cache, `--pcie-frac 0.4`) the reverted tree measures
+**TPOT 40.7 ms** (39.4 / 40.7 / 43.6, 3 rounds) against strata's 38-39, which is the parity the milestone chain had
+reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
+`frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
+
 ## Status summary
 
 | milestone | mechanism | status | decisive result |
