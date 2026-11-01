@@ -36,6 +36,14 @@ flags; liveness/memory claims need ≥ 6 runs; never report a mean where a media
 
 ---
 
+## Before M0 (2026-10-07 .. 10-15)
+
+The week before this repository's history starts was salvaged from a pre-git snapshot:
+`worklogs/pre-m0-benchmark.md` (W1-W59, one entry per piece of work with the anchor it moved) and
+`worklogs/pre-m0-design.md` (the design as it stood on 2026-10-09, superseded by `design.md`). They
+are kept verbatim - including the paths of the time - because they are the only record of how the
+first 8.7 tok/s became the numbers M0 started from.
+
 ## M29-M32 aborted 2026-11-01
 
 The whole-step CUDA graph line (M29 design, M30 doorbell step graph, M31 capturable kernel library, M32 one-layer
