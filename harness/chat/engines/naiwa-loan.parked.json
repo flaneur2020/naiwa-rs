@@ -1,7 +1,7 @@
 {
   "name": "naiwa-loan",
   "arm": "stream",
-  "exe": "~/naiwa-rs/target/release/naiwa-rs",
+  "exe": "~/code/naiwa-rs/target/release/naiwa-rs",
   "cwd": "~/code/naiwa-rs",
   "port": 18110,
   "args": [

@@ -335,13 +335,13 @@ The doorbell was the only clean extraction; everything else is a kernel or model
   src/executor.rs          single-thread CPU executor + result doorbell + idle signal
   harness/                  primitives, oracle, bandwidth harnesses
 ~/code/mistral.rs-iq4xs    fork
-~/naiwa-rs/target          crate target
+~/code/naiwa-rs/target          crate target
 ~/bench-rel/naiwa-v2/      binaries/logs
 ```
 
 ```bash
 # oracle (must be IDENTICAL)
-BIN=$HOME/naiwa-rs/target/release/naiwa-rs TAG=X FRAC=0 NO_LOOKAHEAD=1 \
+BIN=$HOME/code/naiwa-rs/target/release/naiwa-rs TAG=X FRAC=0 NO_LOOKAHEAD=1 \
   OUT=$HOME/bench-rel/naiwa-v2/m4 timeout 400 ./harness/m1/capture_oracle.sh
 diff ~/bench-rel/naiwa-v2/m4/reference.X.txt harness/m1/reference.oracle.txt
 

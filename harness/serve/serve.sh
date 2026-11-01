@@ -17,7 +17,7 @@ shift 2 || true
 
 MODEL=${MODEL:-$HOME/Models/qwen3-coder/IQ1_M}
 FILES="Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
-BIN=${BIN:-$HOME/naiwa-rs/target/release/naiwa-rs}
+BIN=${BIN:-$HOME/code/naiwa-rs/target/release/naiwa-rs}
 MTP_FLAG=${MTP_FLAG---mtp}
 
 exec "$BIN" serve -m "$MODEL" -f "$FILES" \
