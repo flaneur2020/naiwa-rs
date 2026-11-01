@@ -7,7 +7,7 @@
   "args": [
     "serve",
     "-m",
-    "~/models/qwen3-coder/IQ1_M",
+    "~/Models/qwen3-coder/IQ1_M",
     "-f",
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
     "--cpu-moe",
@@ -26,7 +26,7 @@
     "4",
     "--mtp",
     "--mmproj",
-    "~/bench-rel/mtp/mtp-component.gguf",
+    "~/Models/mtp/mtp-component.gguf",
     "--mtp-n-predict",
     "4",
     "--pa-context-len",

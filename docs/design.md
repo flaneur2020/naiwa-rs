@@ -256,7 +256,7 @@ hit rate to 26.5%.
 
 ### MTP
 
-Head is local (`~/bench-rel/mtp/mtp-component.gguf`, `--mmproj`). Steady-state speculation is the
+Head is local (`~/Models/mtp/mtp-component.gguf`, `--mmproj`). Steady-state speculation is the
 biggest lever (×2.5 tokens/pass). Open fault: prompt 512 faults with
 `CUDA_ERROR_ILLEGAL_ADDRESS` in `drafter_prefill_chunk` before `drafter_forward`; prompt 8 works.
 Suspects: drafter KV cache vs `context_lens`, and the MTP site's CPU-expert rows. The MTP site
@@ -351,7 +351,7 @@ cargo test --offline --release --features cuda     # 33/33
 Reference bench (np8):
 
 ```bash
-$BIN bench -m ~/models/qwen3-coder/requant -f '<shard1>;<shard2>' --cpu-moe \
+$BIN bench -m ~/Models/qwen3-coder/requant -f '<shard1>;<shard2>' --cpu-moe \
   --expert-cache-gb 4 --pcie-frac 0.2 --depth 4 --mtp-n-predict 8 \
   --prompt-file <predictable-prompt> --gen-len 96
 ```

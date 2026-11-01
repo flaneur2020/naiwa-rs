@@ -22,7 +22,7 @@ mkdir -p "$OUT"
 LOG="$OUT/serve.$TAG.log"
 
 "$BIN" serve \
-    -m "$HOME/models/qwen3-coder/requant" \
+    -m "$HOME/Models/qwen3-coder/requant" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
     --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
     --pa-context-len "$PA_CTX" --prefix-cache-n 0 ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
