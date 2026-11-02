@@ -1,7 +1,7 @@
 # M33 - the prompt path borrows the expert cache (strata's loan)
 
-**Status:** open, **nothing built**. Feasibility recorded 2026-11-02 (no code changed). Numbering note: M29-M32 are
-withdrawn (`roadmap.md`, "M29-M32 aborted 2026-11-01"), so this milestone takes the next free number.
+**Status:** open, **S1-S4 built** (2026-11-02) and measured; §11 is what the first pass found. Numbering note: M29-M32
+are withdrawn (`roadmap.md`, "M29-M32 aborted 2026-11-01"), so this milestone takes the next free number.
 **Parent:** M23 (the prompt law `1.15 s per chunk + 1.67 ms per token`), M18 (a second buffer buys overlap, 16-19%),
 M20 (the cache ceiling), M10.3 (the chat tail: `TTFT>=2` 1193 ms against strata's 651).
 **One mechanism:** the expert cache is sized **at full size**, and a prompt **borrows the tail of that same
@@ -254,3 +254,97 @@ estimate "predates the streamed ring", and the ring only appears from the 1024-t
 pricing is one function that already includes the ring term (`Prefill::bytes_needed`), which is why S3 takes
 `ring_slots` as an argument from the start (0 now) - the loan and its cap then need no rework when the ring lands.
 The ring itself is the large change (blob-ordered banks, §6 S6) and gets its own milestone.
+
+---
+
+## 11. What was built, and what the first measurement says (2026-11-02)
+
+### Built
+
+| step | what landed | where |
+|---|---|---|
+| **S1** | The cache's banks are carved from **one allocation** ("the lending window"), on by default (`NAIWA_CACHE_SLAB=0` is the pre-M33 layout). The window is sized to **two layer buffers** (1536 MiB) and falls back by halves on a refusal, because at `--expert-cache-gb 2.5` this card refuses the 1.5 GiB block outright - which cost a whole chat run its stream before the fallback existed. | `provider.rs` `slab()`, `staging.rs` |
+| S1b | The slab records its **layout** (`Range { offset, bytes }`, `overlapping`, `tail_start`), i.e. strata's `slot_offsets`: the loan needs to name the banks a byte range covers. Unit-tested without a device. | `slab.rs` |
+| **S2** | The loan holds **two disjoint ranges** (`buf * span`), so the double buffer exists when the stream borrows - the tree before this had "one range by construction" and therefore no overlap by construction. The clearing and the zeroing cover both ranges. | `prefill_stream.rs` `borrow_buffers` |
+| S2b | The two per-layer barriers (`after_device_work`, the copy-stream `synchronize`) became **once per chunk**. As per-layer calls they ordered layer L+1's prefetch behind layer L's own kernels, i.e. behind exactly the work it was meant to overlap. | `prefill_stream.rs` |
+| **S3** | `plan_with_lend(free, layer, ceiling, borrowing, kv_reserve, lend_bytes)`: with the loan, the buffer count follows the **pool** instead of the free VRAM. Unit tests pin both arms. | `prefill_stream.rs` |
+| **S4** | The **ledger**: `empty_range` records every `(layer, expert)` it displaces (`Layers::lent`) and the first decode step after a chunk refills them (`Layers::refill_lent`, one queued copy each, no wait - strata's `fill_slot_queued`). Logged as `the loan is given back, N of N displaced experts queued for refill` (719 of 719 on a 1239-token prompt). | `cached_layer.rs` |
+| S5 | The borrow reads `NAIWA_PREFILL_BORROW` as a **value** (`=1` on, anything else off) instead of presence - the presence test made `=0` mean *on*, and the first A/B of this milestone ran the loan twice. **The default stays off**, for the reason in §11.5. | `slab.rs` |
+
+### Measured
+
+Gates first: `frac 0` + `--no-lookahead` is **byte-identical** to `harness/m1/reference.oracle.txt` (three captures
+during the work), `cargo test` 54 passed, and `NAIWA_BORROW_CHECK=1` found no non-finite output in any arm.
+
+**1. The loan works as designed - and the double buffer is real.**
+
+| arm (chat config, 1239-token prompt, cold process, 3 interleaved rounds) | chunk wall | buffers |
+|---|---:|---|
+| `NAIWA_PREFILL_BORROW=0` | 3.791 / 3.769 / 3.762 (median **3.769** s) | 1 |
+| `NAIWA_PREFILL_BORROW=1` | 3.840 / 3.606 / 3.592 (median **3.606** s) | **2** |
+
+-4.3%, and the first-token text is identical in both arms, which is what says the chunk's math is unchanged (the
+prefill path never reads the cache's slots, so a correct loan cannot move it).
+
+**2. The 19% M18 measured is not there on this workload, and the reason is arithmetic.** M18's two privately-allocated
+buffers read 2.830 s on the same prompt. What a second buffer can hide here is the per-layer *compute*, and MoE
+prefill is weights-bound: a layer is 650 MiB of weights against ~1240 rows of activations, i.e. ~1-2 ms of compute
+behind ~50 ms of copy. The 3.6 s we measure is also **not** the link: 23.4 GiB at 13.4 GB/s is 1.87 s, so half the
+chunk is per-layer latency, not transfer. That gap, not the overlap, is the next prefill lever.
+
+**3. The prize was capacity, and it is half-blocked.** Decode TPOT tracks the cache closely, and the loan is what
+lets the cache grow *without* withholding the chunk's buffers:
+
+| cache | loan | loads? | long prompt | TPOT (median of 5 for the 2.2/2.5 rows) |
+|---:|---|---|---|---:|
+| 2.2 GB | off | yes | 3.27 s | 36.74 ms |
+| 2.2 GB | on | yes | 3.27 s | 36.74 / 35.15 ms (see below) |
+| 2.5 GB | on | yes | 3.14 s | 35.15 ms |
+| 2.9 GB | on | yes | **500** | 33.93 ms |
+| 3.2 GB | on | yes | **500** | **28.59 ms** |
+
+So 2.2 -> 3.2 GB is **-22% TPOT** (36.7 -> 28.6 ms) *if* the prompt still runs - and it does not, because the
+chunk's **scratch** (activations, `act * 2 + head`) is still paid from free VRAM beside the cache. The loan covers
+the layer buffers only; strata's `bytes_needed`/`relayout` price **every** buffer of the chunk. Putting the chunk's
+scratch in the pool too is therefore the step that buys the remaining ~7 ms, and it is the natural S6.
+
+**4. And it fixes M23's failure mode.** With the loan the plan stops charging a 650 MiB buffer against free VRAM, so
+the "after a warmup conversation 1 787 MiB is left, one buffer does not fit, the stream turns itself off and the turn
+fails" path (the reason `engines/naiwa.json` is pinned at 2.2 and not 2.3) cannot trigger. That is why 2.5 GB was
+tried at all - and why it was **not** shipped: at 2.5 the 1.5 GiB window did not fit, the fallback did not exist yet,
+the loan silently went away, and the M23 refusal came back and failed a turn. With the fallback in place the shipped
+config stays at 2.2 GB; raising it is the follow-up, once the chunk's scratch is in the pool.
+
+**5. On the shipped chat config the loan is net negative, and that is the result.** Same session, same config,
+`short`, 3 rounds, 8 measured turns each, 0 failed turns in both arms:
+
+| arm | TTFT t1 | TTFT >= 2 p50 | p90 | TPOT p50 | tok/s | e2e per conversation |
+|---|---:|---:|---:|---:|---:|---:|
+| loan **off** (shipped) | 942 ms | 1 105 ms | 2 264 ms | 43 ms | 23.4 | **30.2 s** |
+| loan **on** | 955 ms | **969 ms** | 2 239 ms | 43 ms | 23.1 | **39.2 s** |
+
+The loan buys the tail (-136 ms of TTFT p50, -12%) and costs **+9 s per conversation (+30%)**. The mechanism is
+one loan per conversation, not per turn (the logs show exactly one `the loan is given back` per round), and it
+displaces **719 of 1 474 slots** - half the cache - at the turn-1 chunk. Refilling those is 1.5 GB of PCIe, and the
+conversation's reuse then works against a cache whose residency was reset. This is strata's own warning in their
+source ("A LOAN IS NOT FREE PER REQUEST ... a 2K prompt read 37% slower on cards that hold nearly every expert of
+their layers"), met on a card that holds 10% of them.
+
+What would change the verdict is what §11.3 and §11.4 point at: a loan that is **sized to the request** (strata's
+`relayout`, which lends only what a prompt needs - our buffer is a whole layer, so a small loan needs the per-expert
+ring) and a cache that **grows into the bytes the loan frees** (S6). Until then the machinery stays behind
+`NAIWA_PREFILL_BORROW=1` and the shipped path is the pre-M33 one, with the window in place and unused.
+
+### Where this leaves M33
+
+- The mechanism is in, it is numerically clean (byte-exact oracle, no non-finite output, 54 unit tests), it needs no
+  VRAM, and it gives the plan a double buffer it could not afford otherwise.
+- On the config that ships it is **net negative** (+30% e2e for -12% tail TTFT), so it stays opt-in and the milestone
+  stays open rather than done.
+- What it proved is where the value actually is: **the cache's size**, worth **-22% TPOT at 3.2 GB** (36.7 -> 28.6
+  ms), which is blocked by the chunk's *scratch* still being paid from free VRAM. That is S6 - put the chunk's
+  activations in the pool like strata's `relayout` prices every buffer of a chunk - and it is worth more than the
+  loan itself.
+- Two smaller findings to keep: the prefill is **1.87 s of copy in a 3.6 s chunk**, i.e. half of it is per-layer
+  latency rather than transfer (an M23-shaped lever); and the window's allocation can be refused outright at a bigger
+  cache, which is why it now falls back by halves instead of taking the stream down with it.

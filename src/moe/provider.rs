@@ -77,36 +77,71 @@ pub struct GpuCacheMoeProvider {
 }
 
 impl GpuCacheMoeProvider {
-    /// The cache's slab, created on the first layer when `NAIWA_CACHE_SLAB=1`, sized from `--expert-cache-gb`.
+    /// The pool the prefill stream can lend from: **one allocation whose bytes the cache's banks actually use**.
     ///
-    /// A layer whose bank does not fit the remaining slab falls back to its own allocation inside
-    /// `alloc_bank_in`, so a slab that is slightly too small costs nothing but the lending opportunity.
+    /// It is a window, not the whole budget, and that is the point: reserved-but-empty bytes are bytes the chunk and
+    /// the decode reserve cannot have, and this card has no slack for them (measured 2026-11-02: with the oracle
+    /// config's flags, `--expert-cache-gb 2.2` fails to load with `CUDA_ERROR_OUT_OF_MEMORY` while 2.0 loads, and the
+    /// banks already overrun the flag by ~10% because `slot_bytes` is priced from layer 0). So the window is sized to
+    /// hold **two of the biggest layer buffer** - what the double buffer needs - and the banks fill it first; a bank
+    /// that does not fit allocates its own memory outside it, which costs nothing because it never was lendable.
+    ///
+    /// `NAIWA_SLAB_MIB` overrides the window (probe).
     fn slab(&self, device: &candle_core::Device) -> Option<Arc<super::slab::Slab>> {
         self.slab
             .get_or_init(|| {
                 if !super::slab::Slab::enabled() {
                     return None;
                 }
-                // `NAIWA_SLAB_EXTRA_MIB` (probe): reserve more than the cache can use, so a test can borrow from
-                // the slab's *unused* tail - inside the cache's allocation but overlapping no bank.
-                let extra = std::env::var("NAIWA_SLAB_EXTRA_MIB")
+                // Two layer buffers: the biggest this model's experts stack up to (650 MiB) doubled, rounded up. A
+                // window smaller than one layer buffer would be no pool at all (the chunk needs 2 x its own bytes
+                // for the double buffer); a bigger one takes VRAM from the plan for nothing.
+                // Largest first, and **never a failed load**: the window is a convenience - the loan gets a
+                // contiguous pool - while the cache behind it is not. At `--expert-cache-gb 2.5` this card refuses
+                // the 1.5 GiB block at the moment the first layer is built (measured 2026-11-02: a clean
+                // `CUDA_ERROR_OUT_OF_MEMORY`, the whole chat run then lost its stream and failed a turn), so a
+                // refusal halves the window and tries again; below `NAIWA_SLAB_MIN_MIB` there is no pool and the
+                // banks allocate individually, which is exactly the pre-M33 behaviour.
+                let ceiling = std::env::var("NAIWA_SLAB_MIB")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0)
-                    << 20;
-                let bytes = (self.cache_gb * 1e9) as usize + extra;
-                match super::slab::Slab::new(device, bytes) {
-                    Ok(slab) => {
-                        let slab = Arc::new(slab);
-                        info!(
-                            "expert cache: one {:.2} GB slab, banks carved from it (NAIWA_CACHE_SLAB)",
-                            slab.bytes() as f64 / 1e9
-                        );
-                        Some(slab)
-                    }
-                    Err(e) => {
-                        warn!("expert cache: slab allocation failed ({e}); banks allocate individually");
-                        None
+                    .unwrap_or(1536);
+                let min = std::env::var("NAIWA_SLAB_MIN_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(512);
+                let mut mib = ceiling;
+                loop {
+                    match super::slab::Slab::new(device, mib << 20) {
+                        Ok(slab) => {
+                            let slab = Arc::new(slab);
+                            info!(
+                                "expert cache: a {:.2} GiB lending window, carved out of the {:.1} GB budget \
+                                 (two layer buffers where it fits; the banks fill it first){}",
+                                slab.bytes() as f64 / (1u64 << 30) as f64,
+                                self.cache_gb,
+                                if mib < ceiling {
+                                    format!(" - {mib} of {ceiling} MiB, the rest did not fit")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            return Some(slab);
+                        }
+                        Err(e) if mib > min => {
+                            warn!(
+                                "expert cache: a {mib} MiB lending window did not fit ({e}); trying {} MiB",
+                                mib / 2
+                            );
+                            mib /= 2;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "expert cache: no lending window ({e}); banks allocate individually, and the \
+                                 prompt path keeps its own buffers"
+                            );
+                            return None;
+                        }
                     }
                 }
             })

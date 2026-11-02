@@ -64,23 +64,91 @@ pub(crate) fn borrowed() -> bool {
 /// One VRAM allocation, handed out as byte ranges.
 ///
 /// Every expert-cache bank is a range of this slab instead of its own `cudaMalloc`, which is what makes the memory
-/// *lendable*: the low end of the slab can later be re-viewed by the prefill stream, and the banks that overlap it
-/// are the ones whose slots get emptied to make room.
+/// *lendable*: a run of the slab can later be re-viewed by the prefill stream, and the banks that overlap it are the
+/// ones whose slots get emptied to make room.
 ///
 /// The ranges are a bump allocation, never freed: the cache's shape does not change after load, so there is
 /// nothing to reclaim, and a bump cursor keeps a layer's bank contiguous - which is the property the kernels and
-/// the eventual borrow both need.
+/// the borrow both need.
+///
+/// The layout is recorded as each range is carved ([`Layout`]), because the loan addresses the slab by **byte
+/// offset** and has to know which banks a range covers: strata's `slot_offsets`, which its cache keeps for exactly
+/// this (`expert_cache.cpp:561-583`).
 pub(crate) struct Slab {
     storage: QCudaStorage,
     cursor: Mutex<usize>,
+    layout: Mutex<Layout>,
     bytes: usize,
 }
 
+/// One carved range: where it starts and how many bytes it took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Range {
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+impl Range {
+    pub(crate) fn end(&self) -> usize {
+        self.offset + self.bytes
+    }
+}
+
+/// The slab's map from byte offsets to the ranges carved there.
+///
+/// Ranges are pushed in allocation order, which is also offset order (a bump allocator), so "the ranges a span
+/// covers" is a contiguous slice found by binary search. That is the whole query the loan needs: which banks does
+/// `[from, end)` displace, so their slots can be emptied before it and refilled after it.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct Layout {
+    ranges: Vec<Range>,
+}
+
+impl Layout {
+    fn push(&mut self, offset: usize, bytes: usize) {
+        self.ranges.push(Range { offset, bytes });
+    }
+
+    pub(crate) fn ranges(&self) -> &[Range] {
+        &self.ranges
+    }
+
+    /// Bytes carved so far: the end of the last range.
+    pub(crate) fn end(&self) -> usize {
+        self.ranges.last().map_or(0, |r| r.end())
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// The ranges a span touches, in offset order.
+    pub(crate) fn overlapping(&self, from: usize, to: usize) -> &[Range] {
+        let first = self.ranges.partition_point(|r| r.end() <= from);
+        let rest = &self.ranges[first..];
+        let n = rest.partition_point(|r| r.offset < to);
+        &rest[..n]
+    }
+
+    /// The offset where a span of `bytes` ending at the end of the carved region starts, or `None` when the slab
+    /// has not carved that much yet.
+    pub(crate) fn tail_start(&self, bytes: usize) -> Option<usize> {
+        self.end().checked_sub(bytes)
+    }
+}
+
 impl Slab {
-    /// `NAIWA_CACHE_SLAB=1` decides whether the provider carves banks from a slab at all.
+    /// Whether the provider carves banks from a slab at all. **On by default**: the cache's bytes are otherwise a
+    /// pile of separate `cudaMalloc`s and nothing can be lent from them. `NAIWA_CACHE_SLAB=0` turns it off (probe:
+    /// the pre-M33 layout, one allocation per bank).
     pub(crate) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("NAIWA_CACHE_SLAB").is_some())
+        *ON.get_or_init(|| {
+            !matches!(
+                std::env::var("NAIWA_CACHE_SLAB").as_deref(),
+                Ok("0") | Ok("off") | Ok("false") | Ok("no")
+            )
+        })
     }
 
     /// Allocate `bytes` of VRAM. The slab's own dtype is irrelevant - `F32` has a block size of one, so the element
@@ -94,6 +162,7 @@ impl Slab {
         Ok(Self {
             storage,
             cursor: Mutex::new(0),
+            layout: Mutex::new(Layout::default()),
             bytes,
         })
     }
@@ -106,10 +175,29 @@ impl Slab {
         *self.cursor.lock().unwrap()
     }
 
-    /// Whether the prefill stream borrows the slab's low end (`NAIWA_PREFILL_BORROW=1`).
+    /// What has been carved so far: the query side of [`Self::alloc`], for the loan's address arithmetic.
+    pub(crate) fn layout(&self) -> std::sync::MutexGuard<'_, Layout> {
+        self.layout.lock().unwrap()
+    }
+
+    /// Whether the prompt path borrows its layer buffers from the pool instead of holding VRAM of its own.
+    ///
+    /// **Off by default, measured** (strata's `--prefill-borrow` is on, and theirs buys the cache its size; ours does
+    /// not yet - see `docs/worklogs/m33-prompt-cache-loan.md` §11). On the shipped chat config the loan is net
+    /// negative: one loan per conversation wipes 719 of 1 474 slots (half the cache) at the turn-1 chunk, and the
+    /// conversation then ends **39.2 s against 30.2 s** with the loan off (3 rounds, `short`), for a tail TTFT of
+    /// 969 against 1 105 ms. `NAIWA_PREFILL_BORROW=1` is the arm that shows what it does; the same code is what a
+    /// bigger cache would run on (2.9-3.2 GB measured 33.9 / 28.6 ms TPOT against 36.7).
+    ///
+    /// Read as a **value**, not as presence: `=0` is the arm without the loan (a presence test made `=0` mean on,
+    /// and the first A/B of M33 ran the loan twice).
     pub(crate) fn borrowing() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("NAIWA_PREFILL_BORROW").is_some())
+        *ON.get_or_init(|| match std::env::var("NAIWA_PREFILL_BORROW").as_deref() {
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes") => true,
+            Ok(_) => false,
+            Err(_) => false,
+        })
     }
 
     /// The slab's device pointer: the borrow ranges are `[base, base + end)`.
@@ -147,7 +235,10 @@ impl Slab {
         // `borrow_from` pads the range the same way `zeros` does, so ask it for the range and roll back on failure.
         match QCudaStorage::borrow_from(&self.storage, *cursor, el_count, dtype, dev) {
             Ok(storage) => {
+                let offset = *cursor;
                 *cursor += storage.allocated_bytes();
+                drop(cursor);
+                self.layout.lock().unwrap().push(offset, storage.allocated_bytes());
                 Ok(Some(storage))
             }
             Err(_) => Ok(None),
@@ -197,5 +288,35 @@ mod tests {
             QStorage::Cuda(s) => assert_eq!(s.storage_size_in_bytes(), bytes),
             _ => unreachable!(),
         }
+    }
+
+    /// The loan addresses the slab by byte offset, so the map from offsets to carved ranges is what says which
+    /// banks a span displaces. Pure arithmetic - no device needed.
+    #[test]
+    fn the_layout_says_which_ranges_a_span_covers() {
+        // Three layers' banks, the middle one bigger, exactly as the mixed-quant packs come.
+        let mut layout = super::Layout::default();
+        for (offset, bytes) in [(0usize, 48usize), (48, 52), (100, 40)] {
+            layout.push(offset, bytes);
+        }
+        assert_eq!(layout.end(), 140);
+        assert_eq!(layout.count(), 3);
+
+        // A span inside one range touches only that range.
+        let one = layout.overlapping(60, 90);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].offset, 48);
+        // A span across a boundary touches both sides, in offset order.
+        let two = layout.overlapping(40, 60);
+        assert_eq!(two.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0, 48]);
+        // The whole region is all of them.
+        assert_eq!(layout.overlapping(0, 140).len(), 3);
+        // A span that starts in a gap or past the end touches nothing.
+        assert!(layout.overlapping(140, 200).is_empty());
+
+        // The tail: `tail_start` is the offset a `bytes`-long loan ending at the carved end begins at.
+        assert_eq!(layout.tail_start(40), Some(100));
+        assert_eq!(layout.tail_start(140), Some(0));
+        assert_eq!(layout.tail_start(141), None, "a loan bigger than the cache has no start");
     }
 }

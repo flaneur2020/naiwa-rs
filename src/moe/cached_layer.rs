@@ -26,12 +26,20 @@ use super::{
 /// Weak references: the model owns the layers, not this index.
 pub(crate) struct Layers {
     layers: RwLock<Vec<Weak<CachedLayer>>>,
+    /// The loan's ledger: every `(layer, expert)` the prompt path displaced, in the order it took them.
+    ///
+    /// A loan is not a loss (strata's `lent`, `generate.cpp:11176-11185`): the borrow takes the bytes of whichever
+    /// slots overlap it, and this remembers what they held so the first decode step can put it back. Without it the
+    /// slots come back empty "exactly as after an eviction" - which is a whole cache's worth of misses on the first
+    /// step after a long prompt.
+    lent: Mutex<Vec<(usize, usize)>>,
 }
 
 impl Default for Layers {
     fn default() -> Self {
         Self {
             layers: RwLock::new(Vec::new()),
+            lent: Mutex::new(Vec::new()),
         }
     }
 }
@@ -57,6 +65,9 @@ impl Layers {
     /// reader still holding a clone would make the wait spin forever (the trap `wait_for_readers` sets).
     pub(crate) fn empty_range(&self, base: u64, end: u64) -> usize {
         let layers = self.all();
+        // What the loan displaces, recorded as it goes: `held` carries the buffer, this carries the identity.
+        let mut ledger = self.lent.lock().unwrap();
+        ledger.clear();
         // Phase 1: take every overlapping slot's buffer out, holding only the locks that are needed for that. The
         // wait comes after every lock is released: a background fill holds a clone of the buffer it is filling and
         // needs `layer.state` to finish, so waiting under that lock deadlocks the two against each other (the
@@ -83,6 +94,9 @@ impl Layers {
                 let Some(buf) = slot.storage.lock().take() else {
                     continue;
                 };
+                if let Some(expert) = slot.expert {
+                    ledger.push((li, expert));
+                }
                 slot.expert = None;
                 slot.buf = None;
                 held.push((li, si, buf));
@@ -130,6 +144,43 @@ impl Layers {
             *slot.storage.lock() = Some(buf);
         }
         emptied
+    }
+
+    /// Put back what the loan displaced: one queued copy per `(layer, expert)`, no wait.
+    ///
+    /// Called from the first decode step after a chunk, which is exactly when the chunk's bytes stop being the
+    /// chunk's (`slab::borrowed` goes false there). The copies are asynchronous and each slot's `ReadFence` orders
+    /// whatever reads it, so this is strata's `fill_slot_queued` + `sync_queued` in the form this cache already has.
+    /// Returns how many were asked for; a slot that could not take its expert back stays a miss, which is the
+    /// pre-M33 behaviour, not a failure.
+    pub(crate) fn refill_lent(&self) -> usize {
+        let lent: Vec<(usize, usize)> = {
+            let mut ledger = self.lent.lock().unwrap();
+            std::mem::take(&mut *ledger)
+        };
+        let total = lent.len();
+        let mut asked = 0;
+        for (li, expert) in lent {
+            let Some(layer) = self.get(li) else { continue };
+            match layer.admit(expert, false) {
+                Ok(Some(_)) => asked += 1,
+                Ok(None) => {}
+                Err(e) => debug!("expert cache: refilling layer {li} expert {expert} failed: {e}"),
+            }
+        }
+        if total > 0 {
+            // Strata says the same thing at the same moment ("refilling N lent slots"); the number is the loan's
+            // price in copies, and a zero here with a non-zero loan means the ledger was lost.
+            tracing::info!(
+                "expert cache: the loan is given back, {asked} of {total} displaced experts queued for refill"
+            );
+        }
+        asked
+    }
+
+    /// How many entries the loan's ledger holds (diagnostics).
+    pub(crate) fn lent(&self) -> usize {
+        self.lent.lock().unwrap().len()
     }
 
     /// How many layers the cache holds: what a step's budget divides by.
@@ -527,6 +578,10 @@ impl RoutedExperts for CachedExperts {
         super::slab::set_borrowed(false);
         if layer.layer == 0 {
             super::quiesce(false);
+            // The chunk's loan is over: put the displaced experts back (one queued copy each).
+            if layer.layers.refill_lent() > 0 {
+                crate::dbg_note("prefill_borrow", "the loan was given back");
+            }
         }
         let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
         // `NAIWA_BORROW_CHECK=1`: the first layer whose decode output is not finite is where garbage entered; a

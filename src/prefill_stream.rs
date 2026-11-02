@@ -123,6 +123,23 @@ pub(crate) fn plan_with_reserve(
     borrowing: bool,
     kv_reserve: usize,
 ) -> Option<(usize, usize)> {
+    plan_with_lend(free, layer_bytes, ceiling, borrowing, kv_reserve, 0)
+}
+
+/// `lend_bytes`: how many bytes of the cache the prompt path may borrow, when it borrows at all.
+///
+/// The double buffer's price changes with the borrow: beside the cache it costs another `layer_bytes` of VRAM, which
+/// this card does not have; *inside* the cache it costs nothing but a wider loan (the slots it covers are refilled
+/// after the chunk). So the second buffer is granted when the pool can physically hold two ranges - which is what
+/// makes the double buffer free here where the beside-the-cache plan could not afford it.
+pub(crate) fn plan_with_lend(
+    free: usize,
+    layer_bytes: usize,
+    ceiling: usize,
+    borrowing: bool,
+    kv_reserve: usize,
+    lend_bytes: usize,
+) -> Option<(usize, usize)> {
     const GRID: usize = PLAN_GRID;
     let free = free.saturating_sub(kv_reserve);
     // The activation term is an estimate, so it carries slack: on this card the formula alone would
@@ -186,7 +203,19 @@ pub(crate) fn plan_with_reserve(
         .unwrap_or(700 << 20);
     let two = fits(best, 2)
         && free.saturating_sub(2 * layer_bytes + activation_bytes(best) + MAX_HEADROOM) >= reserve;
-    let stride = if !borrowing && two { 2 } else { 1 };
+    let stride = if borrowing {
+        // Two ranges inside the pool: the chunk's activations are priced by `fits` (the borrow branch), and the
+        // ranges cost VRAM not at all, so all the double buffer needs is room in the pool.
+        if lend_bytes >= 2 * layer_bytes {
+            2
+        } else {
+            1
+        }
+    } else if two {
+        2
+    } else {
+        1
+    };
     Some((stride, best))
 }
 
@@ -360,14 +389,23 @@ impl PrefillStream {
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let (stride, chunk) = plan_with_reserve(
+        let (stride, chunk) = plan_with_lend(
             free,
             self.layer_bytes(),
             prompt_step_ceiling(),
             self.borrows(),
             kv_reserve(),
+            self.lend_bytes(),
         )?;
         Some((Plan { stride, chunk }, free))
+    }
+
+    /// What the pool can lend: its size when the stream borrows, 0 when the buffers are its own.
+    fn lend_bytes(&self) -> usize {
+        if !self.borrows() {
+            return 0;
+        }
+        self.slab.as_ref().map_or(0, |slab| slab.bytes())
     }
 
     /// The warmup decision: run the plan once the cache, the KV and the mapped buffers exist, keep
@@ -482,6 +520,7 @@ impl PrefillStream {
     fn borrow_buffers(
         &self,
         layer: usize,
+        buf: usize,
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
         if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some()
@@ -491,7 +530,17 @@ impl PrefillStream {
         }
         let slab = self.slab.as_ref().expect("checked by borrows()");
         let mut out = Vec::with_capacity(3);
-        let mut offset = 0usize;
+        // **The second buffer is a second range, not a second allocation.** Both live in the same pool, one layer
+        // buffer apart: buffer 0 starts at the pool's base and buffer 1 at `layer_bytes` above it, rounded up so
+        // the two never touch (`borrow_from` pads by `MATRIX_ROW_PADDING`). That is what the double buffer needs -
+        // the upload of layer L+1 lands while layer L computes - and it costs no VRAM, because the pool's bytes
+        // already belong to the cache.
+        let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
+        // What the chunk holds of the pool: one range per buffer in the plan's force. `span` is the *biggest*
+        // layer's three projections, so a smaller layer's range leaves a hole - free, it is not uploaded.
+        let stride = self.current().stride.max(1);
+        let loaned = stride * span;
+        let mut offset = buf * span;
         for stack in stacks {
             let dims = stack.shape().dims();
             let el_count = stack.shape().elem_count();
@@ -547,7 +596,16 @@ impl PrefillStream {
         // it is **not** a fix, though - one run came out clean with it and the next two came out with 31 and 32
         // non-finite chunk outputs, which is the run-to-run noise this defect lives in. `CUDA_LAUNCH_BLOCKING=1`
         // (every launch serialised) does make it vanish, which is what says the cause is cross-stream ordering.
-        self.copy.after_device_work()?;
+        //
+        // **Once per chunk, not per layer.** As a per-layer barrier this is a full stop: the prefetch of layer L+1
+        // is queued before layer L computes, and ordering it after *everything* candle has queued makes it wait for
+        // exactly the layer it was meant to overlap (measured 2026-11-02: the double buffer bought 4% with it,
+        // against M18's 19% without). Inside a chunk the ordering a range needs is its own `released` fence -
+        // `upload_async` waits on it - and at layer 0 the range is emptied (which waits for its readers) and the
+        // chunk's first upload has nothing of its own to race.
+        if fresh_chunk {
+            self.copy.after_device_work()?;
+        }
         if fresh_chunk && std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
             // **Default** (disable with `NAIWA_BORROW_NOZERO`): zero the whole borrowed span before the upload. The
             // chunk only DMAs each projection's
@@ -559,12 +617,12 @@ impl PrefillStream {
             // SAFETY: the span is inside the slab and mapped; the memset is queued before the upload.
             // Zero the largest span any layer in this chunk can use (the biggest shape is 650 MiB), so every
             // layer's padding - which sits inside that span - is defined for the whole chunk.
-            let span = offset.max(650usize << 20).min(slab.bytes());
+            let zeroed = loaned.max(650usize << 20).min(slab.bytes());
             unsafe {
                 let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
                     base as u64,
                     0,
-                    span,
+                    zeroed,
                     stream.cu_stream(),
                 );
                 if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
@@ -578,17 +636,20 @@ impl PrefillStream {
             let emptied = if !fresh_chunk || std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
                 0
             } else {
-                cache.empty_range(base, base + offset as u64)
+                cache.empty_range(base, base + loaned as u64)
             };
             // Everything a fill queued on the copy stream has to land *before* the chunk writes these bytes,
             // otherwise it overwrites the layer buffer. `empty_range` has waited for the fills' buffers, this
-            // settles the copies they queued; no new fill starts while the borrow is held.
-            self.copy.synchronize()?;
+            // settles the copies they queued; no new fill starts while the borrow is held. Once per chunk: the
+            // per-layer version drained the copy stream and with it every prefetch.
+            if fresh_chunk {
+                self.copy.synchronize()?;
+            }
             crate::dbg_note(
                 "prefill_borrow",
                 &format!(
-                    "layer {layer}: borrowed {:.0} MiB of the slab, {emptied} slots emptied",
-                    (offset as f64) / (1u64 << 20) as f64
+                    "layer {layer}: borrowed {:.0} MiB of the pool in {stride} range(s), {emptied} slots emptied",
+                    (loaned as f64) / (1u64 << 20) as f64
                 ),
             );
         }
@@ -826,7 +887,8 @@ impl PrefillStream {
             trace_buffer_bytes(&self.device, layer, &stacks);
             crate::dbg_note("prefill_load", &format!("layer {layer}: allocating ({} bytes/stack)", stacks[0].storage_size_in_bytes()));
             let memory = if self.borrows() {
-                self.borrow_buffers(layer, &stacks)?
+                let which = layer % self.current().stride.max(1);
+                self.borrow_buffers(layer, which, &stacks)?
             } else {
                 [
                     self.copy.alloc_like(&stacks[0])?,
@@ -1222,7 +1284,7 @@ mod tests {
         Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
     }
 
-    use super::{activation_bytes, plan, SUB_ROWS};
+    use super::{activation_bytes, plan, plan_with_lend, SUB_ROWS};
 
     /// The plan is the only memory judgement the prefill path makes, so pin it: the chunk is as
     /// large as the free bytes allow, and the second buffer is taken only at the same chunk.
@@ -1247,11 +1309,26 @@ mod tests {
         // A big card: ceiling, both buffers.
         assert_eq!(plan(gb(12), layer, 8192, false).unwrap(), (2, 8192));
 
-        // Borrowing: the layer buffer is a range of the cache's slab, so it is not paid from free VRAM at all -
-        // a chunk that would only afford one buffer otherwise still gets the ceiling here. And there is one range
-        // (every layer borrows the same bytes), so the stride is one by construction.
+        // Borrowing: the layer buffer is a range of the cache's pool, so it is not paid from free VRAM at all -
+        // a chunk that would only afford one buffer otherwise still gets the ceiling here. The buffer count then
+        // follows the pool instead of the VRAM: `plan_with_lend` with no pool is the one-range borrow, and a pool
+        // that holds two ranges grants the double buffer that the beside-the-cache plan could not afford.
         assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 8192));
-        assert_eq!(plan(gb(12), layer, 8192, true).unwrap().0, 1);
+        // A 1.5 GiB pool: two 650 MiB ranges fit with room to spare, so the chunk gets its double buffer for free.
+        assert_eq!(
+            plan_with_lend(2049 << 20, layer, 8192, true, 0, 1536 << 20).unwrap(),
+            (2, 8192)
+        );
+        // One range only: a pool smaller than two layer buffers keeps the single-buffer upload.
+        assert_eq!(
+            plan_with_lend(gb(12), layer, 8192, true, 0, (1300 << 20) - 1).unwrap().0,
+            1
+        );
+        assert_eq!(
+            plan_with_lend(2049 << 20, layer, 8192, false, 0, 1536 << 20).unwrap().0,
+            1,
+            "without borrowing the pool is irrelevant: the buffers are real VRAM"
+        );
         // A borrowed chunk still pays its activations from free VRAM, and measured at 1.95x the estimate, so the
         // chunk shrinks where the non-borrow formula would still grant the ceiling.
         assert!(plan(2049 << 20, layer, 8192, true).unwrap().1 >= 1725);
@@ -1427,6 +1504,19 @@ fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
         mib(plan.stride * layer + act + MAX_HEADROOM),
         mib(free),
     );
+    // What the cache actually carved, and whether it all went inside one allocation: a pool that split is a pool
+    // whose tail is not the last layers' banks, which is what the loan's address arithmetic assumes.
+    if let Some(slab) = stream.slab.as_ref() {
+        let layout = slab.layout();
+        info!(
+            "prefill ({when}): cache pool {:.0} MiB of {:.0} MiB carved in {} ranges{} of the {:.0} MiB slab",
+            mib(layout.end()),
+            mib(slab.bytes()),
+            layout.count(),
+            if layout.end() == slab.bytes() { " (exactly full)" } else { "" },
+            mib(slab.bytes()),
+        );
+    }
 }
 
 /// A CUDA out-of-memory error, however deep in the wrapper it is.

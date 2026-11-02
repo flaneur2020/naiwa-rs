@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_core::quantized::QTensor;
 use candle_core::Device;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::copy_stream::{CopyStream, ReadFence};
 
@@ -149,6 +149,13 @@ pub(super) fn alloc_bank_in(
             if let Some(range) = slab.alloc(len * n * k, stack.dtype(), device)? {
                 return Ok(range);
             }
+            // The window is full: this bank takes VRAM of its own. Expected - the window holds two layer buffers,
+            // not the whole cache - and free, because those bytes were never lendable.
+            debug!(
+                "expert cache: the lending window is full ({} of {} bytes); this bank allocates its own memory",
+                slab.used(),
+                slab.bytes()
+            );
         }
         cs.bank_storage(stack, len)
     };

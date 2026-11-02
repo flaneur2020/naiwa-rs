@@ -58,11 +58,12 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M33 — the prompt path borrows the expert cache — 🆕 open 2026-11-02
+## M33 — the prompt path borrows the expert cache — 🔶 S1-S4 built, net negative on the shipped config
 
-Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache is sized at full size
-and a prompt borrows **the tail of that same allocation** for its layer buffers, refilling the displaced slots when
-the prompt ends (strata's `--prefill-borrow`, their default). Feasibility only; nothing built.
+Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache's banks are carved from
+**one allocation** ("the lending window", on by default) and a prompt can borrow **two ranges of it** for its layer
+buffers, with a ledger that refills the displaced slots after the chunk (strata's `--prefill-borrow`). S1-S4 are in
+the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 - The phases are already exclusive in memory: a chunk uses its layer buffers and never reads the cache, decode uses
   the cache and never the buffers. So the change is a bookkeeping one — the same bytes, alternating owners.
@@ -80,6 +81,17 @@ the prompt ends (strata's `--prefill-borrow`, their default). Feasibility only; 
 - Missing pieces, in order: the slab by default (with strata's per-layer slot sizes and offset table), the loan at
   the **tail** and in **two** ranges, a pure `bytes_needed` with the caps chosen per request, and strata's `lent`
   ledger + a queued refill with one wait and a byte check.
+- **Measured, same session, `short`, 3 rounds, 0 failed turns in both arms:** loan off 30.2 s per conversation vs
+  loan on **39.2 s** (TTFT>=2 1 105 -> 969 ms). One loan per conversation displaces 719 of 1 474 slots at the turn-1
+  chunk, and the refill plus the reset residency cost more than the prefill saves - strata's own "a loan is not free
+  per request", met on a card that holds 10% of the experts. So it is opt-in, not the default.
+- What it did prove is where the value is: TPOT tracks the cache size and the loan is what lets the cache grow
+  without withholding the chunk's buffers - **2.2 -> 3.2 GB measured 36.7 -> 28.6 ms TPOT (-22%)**, except the chunk's
+  *scratch* is still paid from free VRAM, so at 2.9 GB and above a long prompt fails. Putting the chunk's
+  activations in the pool (S6, strata's `relayout` prices every buffer of a chunk) is worth more than the loan.
+- Also measured: the prefill chunk is **1.87 s of PCIe in 3.6 s of wall**, i.e. half of it is per-layer latency, not
+  transfer; and the 1536 MiB window can be refused outright at a bigger cache, which is why it now falls back by
+  halves instead of silently taking the stream down with it (that cost a whole chat round its stream and one turn).
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
@@ -89,7 +101,7 @@ the prompt ends (strata's `--prefill-borrow`, their default). Feasibility only; 
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
-| **M33** | the prompt path borrows the expert cache | 🆕 open 2026-11-02 | Feasibility priced, nothing built. The phases are already exclusive in memory, so borrowing the cache's **tail** returns 650 MiB (one range) or 1300 MiB (two) to the cache: **2.2 -> ~2.8 GB, 26 -> 33 slots/layer**, loan 46% of it (strata caps at 90%). The tree's borrow is **one range by construction** (no overlap: 3.484 s vs 3.331 s forced serial; M18's two buffers 2.830 s), and it has **no ledger/refill** — the covered slots come back empty. Recorded kill: a 2.95 GB cache + borrow left 444 MiB and 1 conversation in 3 ended with no answer and no error |
+| **M33** | the prompt path borrows the expert cache | 🔶 S1-S4 built, loan opt-in 2026-11-02 | One lending window (1536 MiB, banks carved inside, falls back by halves), a **two-range** loan so the plan gets the double buffer it could not afford, and a **ledger** that refills what the loan displaced (719 of 719 slots on a 1239-token prompt). Gates clean: oracle byte-exact, 54 tests, no non-finite output, 0 failed turns. **But on the shipped chat config it is net negative** - 30.2 s vs **39.2 s** per conversation for TTFT>=2 1 105 -> 969 ms - because one loan resets half the cache. What it proved: TPOT tracks cache size and the loan is what lets the cache grow (**2.2 -> 3.2 GB = 36.7 -> 28.6 ms**), blocked only by the chunk's scratch still paying free VRAM -> S6 |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |
