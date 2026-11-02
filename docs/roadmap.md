@@ -5,7 +5,8 @@ Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity 
 Design and current-state detail live in [`design.md`](design.md); per-milestone evidence lives in
 [`worklogs/`](worklogs/).
 
-Recorded 2026-10-16; last updated 2026-10-26 after M22 (§22 nsys component comparison) opened M24 (decode occupancy).
+Recorded 2026-10-16; last updated 2026-11-02 after the CUDA-graph line was withdrawn (M29-M32) and M33 opened
+(the prompt path borrows the expert cache).
 
 ---
 
@@ -57,10 +58,38 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
+## M33 — the prompt path borrows the expert cache — 🆕 open 2026-11-02
+
+Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache is sized at full size
+and a prompt borrows **the tail of that same allocation** for its layer buffers, refilling the displaced slots when
+the prompt ends (strata's `--prefill-borrow`, their default). Feasibility only; nothing built.
+
+- The phases are already exclusive in memory: a chunk uses its layer buffers and never reads the cache, decode uses
+  the cache and never the buffers. So the change is a bookkeeping one — the same bytes, alternating owners.
+- The memory it recovers: today 650 MiB sits **beside** the cache for the chunk, plus a second buffer the planner
+  refuses. Borrowed, the cache goes **2.2 -> ~2.8 GB (26 -> 33 slots/layer)** and the loan is **46%** of it, well
+  under strata's 90% cap.
+- Overlap is the reason to prefer two ranges: the borrow in the tree is *one range by construction* and measures
+  the same wall clock as forced serial (`3.484` vs `3.331` s); M18's two-buffer arm is `2.830` s on the same prompt.
+- Closed by arithmetic: the earlier "borrow the slots of a layer with the same dtype" variant needs **3 991 MiB**
+  against today's 3 552, because this GGUF has **seven dtypes** and two of them are single-layer groups (21-30 GB
+  of cache to self-serve). See the worklog §4.
+- The tree already carries the borrow's pricing (`act * 2 + head`, measured 1.95x the activation estimate) and one
+  recorded kill: a **2.95 GB** cache with the borrow left 444 MiB and **one conversation in three produced no answer
+  and no error** — that shape is a gate here, not a comment.
+- Missing pieces, in order: the slab by default (with strata's per-layer slot sizes and offset table), the loan at
+  the **tail** and in **two** ranges, a pure `bytes_needed` with the caps chosen per request, and strata's `lent`
+  ledger + a queued refill with one wait and a byte check.
+- The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
+  no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
+  refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
+  takes its slot count as an argument now so the loan needs no rework when it lands.
+
 ## Status summary
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
+| **M33** | the prompt path borrows the expert cache | 🆕 open 2026-11-02 | Feasibility priced, nothing built. The phases are already exclusive in memory, so borrowing the cache's **tail** returns 650 MiB (one range) or 1300 MiB (two) to the cache: **2.2 -> ~2.8 GB, 26 -> 33 slots/layer**, loan 46% of it (strata caps at 90%). The tree's borrow is **one range by construction** (no overlap: 3.484 s vs 3.331 s forced serial; M18's two buffers 2.830 s), and it has **no ledger/refill** — the covered slots come back empty. Recorded kill: a 2.95 GB cache + borrow left 444 MiB and 1 conversation in 3 ended with no answer and no error |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |
