@@ -85,10 +85,16 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   loan on **39.2 s** (TTFT>=2 1 105 -> 969 ms). One loan per conversation displaces 719 of 1 474 slots at the turn-1
   chunk, and the refill plus the reset residency cost more than the prefill saves - strata's own "a loan is not free
   per request", met on a card that holds 10% of the experts. So it is opt-in, not the default.
-- What it did prove is where the value is: TPOT tracks the cache size and the loan is what lets the cache grow
-  without withholding the chunk's buffers - **2.2 -> 3.2 GB measured 36.7 -> 28.6 ms TPOT (-22%)**, except the chunk's
-  *scratch* is still paid from free VRAM, so at 2.9 GB and above a long prompt fails. Putting the chunk's
-  activations in the pool (S6, strata's `relayout` prices every buffer of a chunk) is worth more than the loan.
+- **S6-lite (2026-11-02): the chunk is now priced by what it measures - and the 3.2 GB premise is dead.** A
+  per-layer free-VRAM trace (`NAIWA_PREFILL_PEAK`) gives the chunk's real footprint: **801 MiB fixed + 0.448 MiB a
+  row** (288 rows -> 1 314 MiB, 1 216 -> 1 730), where the old estimate said 348 MiB - off by 4x, and the fixed part
+  is one-time and does not shrink with the chunk. `chunk_scratch()` now carries that line (pinned to both measured
+  points by a unit test), the borrow arm prices it, and the plan refuses honestly instead of dying inside the
+  experts forward. Consequence: the chunk needs ~2.0 GiB of free VRAM, so **the cache cannot exceed ~2.2 GB while a
+  prompt has to stream**; the 28.6 ms TPOT at 3.2 GB belongs to requests that never streamed. What holds the ceiling
+  is now measured, not suspected: the chunk's fixed 801 MiB (in the model's kernels; the MoE workspaces measure
+  **0 MiB**, so that hypothesis is dead) and the drafter's ~900 MiB (free VRAM 3 201 without `--mtp` against 2 305
+  with it) - and trading the drafter for the cache loses 8 ms to win 8 ms.
 - Also measured: the prefill chunk is **1.87 s of PCIe in 3.6 s of wall**, i.e. half of it is per-layer latency, not
   transfer; and the 1536 MiB window can be refused outright at a bigger cache, which is why it now falls back by
   halves instead of silently taking the stream down with it (that cost a whole chat round its stream and one turn).
@@ -101,7 +107,7 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
-| **M33** | the prompt path borrows the expert cache | 🔶 S1-S4 built, loan opt-in 2026-11-02 | One lending window (1536 MiB, banks carved inside, falls back by halves), a **two-range** loan so the plan gets the double buffer it could not afford, and a **ledger** that refills what the loan displaced (719 of 719 slots on a 1239-token prompt). Gates clean: oracle byte-exact, 54 tests, no non-finite output, 0 failed turns. **But on the shipped chat config it is net negative** - 30.2 s vs **39.2 s** per conversation for TTFT>=2 1 105 -> 969 ms - because one loan resets half the cache. What it proved: TPOT tracks cache size and the loan is what lets the cache grow (**2.2 -> 3.2 GB = 36.7 -> 28.6 ms**), blocked only by the chunk's scratch still paying free VRAM -> S6 |
+| **M33** | the prompt path borrows the expert cache | 🔶 S1-S4 + S6-lite, loan opt-in 2026-11-02 | One lending window (1536 MiB, banks carved inside, falls back by halves), a **two-range** loan so the plan gets the double buffer it could not afford, and a **ledger** that refills what the loan displaced (719 of 719 slots on a 1239-token prompt). Gates clean: oracle byte-exact, 54 tests, no non-finite output, 0 failed turns. **But on the shipped chat config it is net negative** - 30.2 s vs **39.2 s** per conversation for TTFT>=2 1 105 -> 969 ms - because one loan resets half the cache. What it proved: TPOT tracks cache size and the loan is what lets the cache grow (**2.2 -> 3.2 GB = 36.7 -> 28.6 ms**), blocked only by the chunk's scratch still paying free VRAM -> S6 |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |

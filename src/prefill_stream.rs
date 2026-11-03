@@ -90,6 +90,43 @@ pub(crate) const SUB_ROWS: usize = 256;
 /// `SUB_ROWS`, so it does not grow with the chunk. Everything else in a prompt step — attention's
 /// QKV/output, the gathered PLE rows, the copy-stream staging — does grow with the chunk, and this
 /// second term is its measured envelope: 24 KiB a token is ~3 × hidden × 2 bytes at this model.
+/// Device bytes a prompt chunk really takes on this card, measured rather than derived (M33 §12).
+///
+/// `activation_bytes` is a *shape* estimate - `chunk * 24 KiB` plus a per-MoE-call term - and on this model it is
+/// wrong by a factor, because the chunk's memory is not proportional to its rows at all: `NAIWA_PREFILL_PEAK` traced
+/// 48 layers of free VRAM and the peak is dominated by a few **one-time** blocks that the first prompt compute
+/// allocates and then keeps (the MoE's expert-major workspace, the per-layer embedding gather, the vocabulary-sized
+/// scratch of the fused kernels). Two measured points on the shipped chat config, same load, same request shape:
+///
+/// | rows | peak above the chunk's baseline | minus the KV reserve (384 MiB) |
+/// |---:|---:|---:|
+/// | 288 | 1 314 MiB | 930 MiB |
+/// | 1 216 | 1 730 MiB | 1 346 MiB |
+///
+/// which is `801 MiB + 0.448 MiB * rows`. That line reproduces the measurement it came from: at
+/// `--expert-cache-gb 2.2` with the loan, free was 2 113 MiB, the chunk used 1 346 of the 1 729 left after the KV
+/// reserve, and the probe read 383 MiB of low water - exactly the difference.
+///
+/// Why it matters: the plan used to price `act * 2 + head` = 1 184 MiB for **any** chunk, so at
+/// `--expert-cache-gb 2.9` it said "fits" with 1 121 MiB free and the chunk then died inside the experts forward
+/// (HTTP 500). A plan that is 700 MiB optimistic does not degrade, it lies.
+///
+/// Both terms are overridable (`NAIWA_CHUNK_FIXED_MIB`, `NAIWA_CHUNK_PER_ROW_KIB`) because they encode this model's
+/// shapes, not the hardware's.
+pub(crate) fn chunk_scratch(rows: usize) -> usize {
+    let fixed = std::env::var("NAIWA_CHUNK_FIXED_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mib| mib << 20)
+        .unwrap_or(801 << 20);
+    let per_row = std::env::var("NAIWA_CHUNK_PER_ROW_KIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|kib| kib << 10)
+        .unwrap_or(459 << 10);
+    (fixed + per_row * rows).max(activation_bytes(rows))
+}
+
 pub(crate) fn activation_bytes(chunk: usize) -> usize {
     let moe = (160 << 20) + (680 << 20) * chunk.min(SUB_ROWS) / 1024;
     let rest = chunk * (24 << 10);
@@ -162,13 +199,11 @@ pub(crate) fn plan_with_lend(
         let head = slack_override.unwrap_or_else(|| MAX_HEADROOM.max(free / 8));
         if borrowing {
             // The layer buffer is a range of the cache's slab, so it costs nothing here - but the chunk still pays
-            // its activations and the step's scratch out of free VRAM, and that is *more* than the estimate:
-            // measured 866 MiB for a 1696-row chunk whose `act` is 444 (1.95x, and 1.39x without the borrow at
-            // 8192 rows). Zeroing the buffer term while keeping the estimate let the chunk eat the head, which is
-            // the reserve the decode side needs (measured ~600 MiB): at a 2.95 GB cache the chunk left 444 MiB
-            // and about one conversation in three ended with no answer and no error. Price the chunk at twice its
-            // estimate and the reserve survives.
-            free >= act * 2 + head
+            // its own scratch out of free VRAM, and that is not the shape estimate: `chunk_scratch` is the measured
+            // line (801 MiB + 0.448 MiB/row on this model), which is what the old `act * 2` fudge was standing in
+            // for. The head stays smaller here than in the owning arm because the measured line already carries the
+            // per-chunk overheads the 512 MiB floor was covering.
+            free >= chunk_scratch(chunk) + head
         } else {
             free >= stride * layer_bytes + act + act / 8 + head
         }
@@ -294,12 +329,16 @@ pub struct PrefillStream {
 /// The planner sizes the chunk from `activation_bytes(chunk)`, a formula M19 measured to under-count the peak by
 /// more than 89 MiB at 2 816 rows. This records the number the formula is supposed to be: free VRAM before the
 /// chunk minus the low-water mark during it, i.e. layer buffer + activations + whatever else the step touches.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub(crate) struct Peak {
     /// Free VRAM just before the chunk allocated its layer buffer; 0 until a chunk starts.
     free_at_start: usize,
     /// Lowest free VRAM seen inside the chunk.
     min_free: usize,
+    /// The layer the low water was first seen at - a spike at layer 0 is a workspace built once, a slope is a cost
+    /// that follows the rows.
+    low_layer: usize,
+    trace: Vec<(usize, usize)>,
     layers: usize,
     /// The rows this chunk actually carried (not the plan's ceiling).
     rows: usize,
@@ -583,7 +622,7 @@ impl PrefillStream {
         // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
         // write into them. The lock is held from setting the flag until every copy a fill queued has landed, so a
         // fill cannot slip between the check and its DMA (the TOCTOU that survived until now).
-        let slab_access = if fresh_chunk {
+        let _slab_access = if fresh_chunk {
             let guard = crate::moe::slab::lock_access();
             crate::moe::slab::set_borrowed(true);
             Some(guard)
@@ -671,6 +710,8 @@ impl PrefillStream {
             *peak = Peak {
                 free_at_start: free,
                 min_free: free,
+                low_layer: layer,
+                trace: Vec::with_capacity(total),
                 layers: 0,
                 rows,
             };
@@ -678,7 +719,11 @@ impl PrefillStream {
                 return; // a mid-chunk first sample cannot know the baseline
             }
         }
+        if peak.min_free > free {
+            peak.low_layer = layer;
+        }
         peak.min_free = peak.min_free.min(free);
+        peak.trace.push((layer, free));
         peak.layers += 1;
         if total == 0 || peak.layers < total {
             return;
@@ -687,8 +732,10 @@ impl PrefillStream {
         let used = peak.free_at_start.saturating_sub(peak.min_free);
         let plan = self.current();
         info!(
-            "prefill peak: chunk {} rows, {} layers, {:.0} MiB used ({:.0} MiB free at start, \
-             {:.0} MiB low water); layer buffer {:.0} MiB, planner estimate {:.0} MiB (act {:.0})",
+            "prefill peak (low water at layer {}): chunk {} rows, {} layers, {:.0} MiB used \
+             ({:.0} MiB free at start, {:.0} MiB low water); layer buffer {:.0} MiB, planner estimate {:.0} MiB \
+             (act {:.0})",
+            peak.low_layer,
             peak.rows,
             peak.layers,
             mib(used),
@@ -697,6 +744,23 @@ impl PrefillStream {
             mib(self.layer_bytes() * plan.stride as u64 as usize),
             mib(activation_bytes(plan.chunk) + MAX_HEADROOM),
             mib(activation_bytes(plan.chunk)),
+        );
+        // Which layer took the bytes: the peak is 1.7x the planner's estimate on this card, and a single line of
+        // per-layer free memory is what says whether that is one spike (a workspace built once) or a slope (a cost
+        // that follows the rows). Printed as MiB below `free_at_start`, so 0 is "nothing allocated yet".
+        let base = peak.free_at_start;
+        let trace: Vec<String> = peak
+            .trace
+            .iter()
+            .map(|(l, f)| format!("{l}:{}", (base.saturating_sub(*f)) >> 20))
+            .collect();
+        info!("prefill peak trace (layer: MiB used): {}", trace.join(" "));
+        let (live, retired) = mistralrs_quant::gguf::cuda::moe_workspace_bytes();
+        info!(
+            "prefill peak: MoE workspaces {:.0} MiB live + {:.0} MiB retired (freed only when a graph may hold \
+             them)",
+            mib(live),
+            mib(retired)
         );
         peak.free_at_start = 0;
     }
@@ -743,11 +807,14 @@ impl PrefillStream {
                 let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
                 let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
                 // What the floor costs, and therefore what `--expert-cache-gb` would have to give up for the stream
-                // to run: the smallest chunk the grid can pick, one buffer, the activations and the slack.
-                let floor = self.layer_bytes()
-                    + activation_bytes(PLAN_GRID) * 9 / 8
-                    + MAX_HEADROOM
-                    + kv_reserve();
+                // to run: the smallest chunk the grid can pick, its measured scratch (`chunk_scratch`, which carries
+                // the chunk's one-time blocks - they do not shrink with the rows), one buffer unless the loan covers
+                // it, and the slack.
+                let floor = if self.borrows() {
+                    chunk_scratch(PLAN_GRID) + MAX_HEADROOM + kv_reserve()
+                } else {
+                    self.layer_bytes() + chunk_scratch(PLAN_GRID) + MAX_HEADROOM + kv_reserve()
+                };
                 // The exact amount the cache must give up: the smallest reduction (in MiB) at which `plan` starts
                 // returning a chunk. A closed form would be the floor minus what is free, but the floor moves with
                 // the grid and the slack, so measure it instead of arguing about it.
@@ -770,15 +837,21 @@ impl PrefillStream {
                     r
                 };
                 warn!(
-                    "prefill stream: off (one {:.0} MiB layer buffer + {:.0} MiB activations + \
-                     {:.0} MiB headroom + {:.0} MiB KV reserve does not fit in {:.0} MiB free, of which \
-                     the KV will take its own {:.0}). The whole prompt then runs on the CPU, 41x slower: \
+                    "prefill stream: off ({} + {:.0} MiB chunk scratch for a {}-row chunk + \
+                     {:.0} MiB headroom + {:.0} MiB KV reserve = {:.0} MiB does not fit in {:.0} MiB free, of \
+                     which the KV will take its own {:.0}). The whole prompt then runs on the CPU, 41x slower: \
                      drop --expert-cache-gb by at least {:.2} GB (or drop --prefill-stream, or set \
                      NAIWA_PREFILL_ALLOW_CPU=1 to accept the slow path)",
-                    mib(self.layer_bytes()),
-                    mib(activation_bytes(previous.chunk.max(256))),
+                    if self.borrows() {
+                        "no layer buffer (the pool lends them)".to_string()
+                    } else {
+                        format!("one {:.0} MiB layer buffer", mib(self.layer_bytes()))
+                    },
+                    mib(chunk_scratch(previous.chunk.max(PLAN_GRID))),
+                    previous.chunk.max(PLAN_GRID),
                     mib(MAX_HEADROOM),
                     mib(kv_reserve()),
+                    mib(floor),
                     mib(free),
                     mib(kv_reserve()),
                     (give_up as f64) / (1024.0 * 1024.0 * 1024.0),
@@ -1270,6 +1343,8 @@ impl Drop for PrefillStream {
 mod tests {
     use std::sync::Arc;
 
+    use super::{activation_bytes, chunk_scratch, plan, plan_with_lend, SUB_ROWS};
+
     use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
     use mistralrs_core::layers::Activation;
@@ -1284,10 +1359,19 @@ mod tests {
         Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
     }
 
-    use super::{activation_bytes, plan, plan_with_lend, SUB_ROWS};
-
     /// The plan is the only memory judgement the prefill path makes, so pin it: the chunk is as
     /// large as the free bytes allow, and the second buffer is taken only at the same chunk.
+    /// The chunk's price is the line through two measurements, not a shape estimate: `NAIWA_PREFILL_PEAK` traced
+    /// 1 314 MiB of peak at 288 rows and 1 730 at 1 216 on the shipped chat config, and 384 MiB of each is the KV
+    /// reserve the plan charges separately. If this test moves, the constants moved away from the measurement.
+    #[test]
+    fn the_chunk_line_is_the_two_points_that_were_measured() {
+        assert_eq!(chunk_scratch(288) >> 20, 930);
+        assert_eq!(chunk_scratch(1216) >> 20, 1346);
+        // Above the shape estimate everywhere the estimate is optimistic, which is the point of the line.
+        assert!(chunk_scratch(1216) > activation_bytes(1216) * 2);
+    }
+
     #[test]
     fn plan_spends_memory_on_the_chunk_before_the_second_buffer() {
         let layer = 650 << 20;
@@ -1313,11 +1397,13 @@ mod tests {
         // a chunk that would only afford one buffer otherwise still gets the ceiling here. The buffer count then
         // follows the pool instead of the VRAM: `plan_with_lend` with no pool is the one-range borrow, and a pool
         // that holds two ranges grants the double buffer that the beside-the-cache plan could not afford.
-        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 8192));
+        // The borrow arm prices the chunk's *measured* scratch (M33 §12), so at 2 049 MiB it picks a chunk that
+        // fits that line rather than the ceiling: 801 MiB + 0.448 MiB a row + 512 MiB of head is a 1 536-row chunk.
+        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 1536));
         // A 1.5 GiB pool: two 650 MiB ranges fit with room to spare, so the chunk gets its double buffer for free.
         assert_eq!(
             plan_with_lend(2049 << 20, layer, 8192, true, 0, 1536 << 20).unwrap(),
-            (2, 8192)
+            (2, 1536)
         );
         // One range only: a pool smaller than two layer buffers keeps the single-buffer upload.
         assert_eq!(
@@ -1329,9 +1415,12 @@ mod tests {
             1,
             "without borrowing the pool is irrelevant: the buffers are real VRAM"
         );
-        // A borrowed chunk still pays its activations from free VRAM, and measured at 1.95x the estimate, so the
-        // chunk shrinks where the non-borrow formula would still grant the ceiling.
-        assert!(plan(2049 << 20, layer, 8192, true).unwrap().1 >= 1725);
+        // A borrowed chunk still pays its scratch from free VRAM, and that scratch is the measured line - 801 MiB
+        // of one-time blocks that no chunk size shrinks - so the chunk lands well below the ceiling where the
+        // owning formula would still grant it. It must satisfy the line and leave the headroom.
+        let chunk = plan(2049 << 20, layer, 8192, true).unwrap().1;
+        assert!(chunk <= 1725, "priced the measured scratch, got {chunk} rows");
+        assert!(chunk_scratch(chunk) + (512 << 20) <= 2049 << 20);
 
         // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
         assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 8192));
@@ -1492,16 +1581,28 @@ fn trace_buffer_bytes(device: &Device, layer: usize, stacks: &[Arc<QTensor>; 3])
 fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
     let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
     let layer = stream.layer_bytes();
-    let act = activation_bytes(plan.chunk);
+    // What the plan *charged*, not what the buffers would cost beside the cache: with the loan the layer buffers
+    // are ranges of the cache's own bytes, and the chunk's scratch is the measured line. Printing the owning arm's
+    // sum next to a borrow plan read as "2 172 MiB of 2 113 MiB free - fits", which is how a plan loses its reader's
+    // trust (M33 §12).
+    let (buffers, scratch, head) = if stream.borrows() {
+        (0, chunk_scratch(plan.chunk), MAX_HEADROOM / 2)
+    } else {
+        (plan.stride * layer, chunk_scratch(plan.chunk), MAX_HEADROOM)
+    };
+    let _ = (layer, plan.stride);
     info!(
-        "prefill ({when}): chunk {}, {} × {:.0} MiB layer buffer(s) + {:.0} MiB activations + \
-         {:.0} MiB headroom = {:.0} MiB of {:.0} MiB free",
+        "prefill ({when}): chunk {}{} + {:.0} MiB chunk scratch + {:.0} MiB headroom = {:.0} MiB of \
+         {:.0} MiB free",
         plan.chunk,
-        plan.stride,
-        mib(layer),
-        mib(act),
-        mib(MAX_HEADROOM),
-        mib(plan.stride * layer + act + MAX_HEADROOM),
+        if stream.borrows() {
+            format!(", {} layer buffer(s) loaned from the cache", plan.stride)
+        } else {
+            format!(", {} x {:.0} MiB layer buffer(s)", plan.stride, mib(layer))
+        },
+        mib(scratch),
+        mib(head),
+        mib(buffers + scratch + head),
         mib(free),
     );
     // What the cache actually carved, and whether it all went inside one allocation: a pool that split is a pool

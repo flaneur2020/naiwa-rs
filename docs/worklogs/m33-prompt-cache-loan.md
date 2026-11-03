@@ -1,6 +1,8 @@
 # M33 - the prompt path borrows the expert cache (strata's loan)
 
-**Status:** open, **S1-S4 built** (2026-11-02) and measured; §11 is what the first pass found. Numbering note: M29-M32
+**Status:** open, **S1-S4 built** and measured (2026-11-02), **S6-lite investigated and priced** (2026-11-02, §12):
+the chunk's real footprint is a measured line, the plan now uses it, and the "unlock 3.2 GB" premise it was meant to
+serve is **false on this card**. Numbering note: M29-M32
 are withdrawn (`roadmap.md`, "M29-M32 aborted 2026-11-01"), so this milestone takes the next free number.
 **Parent:** M23 (the prompt law `1.15 s per chunk + 1.67 ms per token`), M18 (a second buffer buys overlap, 16-19%),
 M20 (the cache ceiling), M10.3 (the chat tail: `TTFT>=2` 1193 ms against strata's 651).
@@ -348,3 +350,88 @@ ring) and a cache that **grows into the bytes the loan frees** (S6). Until then 
 - Two smaller findings to keep: the prefill is **1.87 s of copy in a 3.6 s chunk**, i.e. half of it is per-layer
   latency rather than transfer (an M23-shaped lever); and the window's allocation can be refused outright at a bigger
   cache, which is why it now falls back by halves instead of taking the stream down with it.
+
+---
+
+## 12. S6-lite: pricing the chunk by what it measures, and the ceiling that came out of it
+
+S6 was "put the chunk's scratch in the pool like strata's `relayout` prices every buffer of a chunk". The cheap
+version - S6-lite - was to price the chunk honestly and let the plan pick a size that fits, so a bigger cache could
+be used. What the measurements say is: the price was wrong, the pricing is now right, and **the bigger cache still
+does not fit** - for a reason that has nothing to do with the loan.
+
+### 12.1 How it was measured
+
+`NAIWA_PREFILL_PEAK=1` already logged a chunk's peak above its own baseline. It now also logs the **per-layer free
+VRAM trace** and the **live/retired bytes of the MoE workspaces** (`mistralrs_quant::gguf::cuda::moe_workspace_bytes`,
+new). Same load, same chat config, one long request, `--expert-cache-gb 2.2`, loan on:
+
+```
+prefill peak (low water at layer 47): chunk 1216 rows, 48 layers, 1730 MiB used
+  (2113 MiB free at start, 383 MiB low water); layer buffer 1300 MiB, planner estimate 1034 MiB (act 522)
+prefill peak trace (layer: MiB used): 0:0 1:1090 2:1122 3:1506 ... 7:1570 ... 35:1666 ... 47:1730
+prefill peak: MoE workspaces 0 MiB live + 0 MiB retired
+```
+
+Three things fall out of that one line and one repeat at 288 rows:
+
+| rows | peak | peak − 384 MiB KV reserve |
+|---:|---:|---:|
+| 288 | 1 314 MiB | 930 MiB |
+| 1 216 | 1 730 MiB | 1 346 MiB |
+
+1. **The chunk's footprint is not proportional to its rows.** Four times the rows bought 416 MiB, i.e.
+   **0.448 MiB a row over a fixed 801 MiB**. The old estimate (`chunk * 24 KiB` + a per-batch MoE term) called it
+   348 MiB for 1 216 rows: **off by 4x**, and in the dangerous direction.
+2. **The fixed part is one-time, not per chunk.** It appears in big steps at the first prompt compute
+   (layer 1: +1090, layer 3: +416 more, then a few +64/+96) and never comes back, which is why free VRAM after a
+   long prompt stays low and why decode's reserve matters. Shrinking the chunk does not shrink it.
+3. **It is not ours.** The MoE workspaces the fork keeps per (device, stream) - with a `retired` list that never
+   frees - measure **0 MiB** for this model. That hypothesis is dead, cleanly, which is what the probe is for.
+
+### 12.2 What changed
+
+`chunk_scratch(rows) = 801 MiB + 0.448 MiB * rows`, floored by the old shape estimate, both terms overridable
+(`NAIWA_CHUNK_FIXED_MIB`, `NAIWA_CHUNK_PER_ROW_KIB`), and **pinned by a unit test to the two measured points**
+(`the_chunk_line_is_the_two_points_that_were_measured`: 288 -> 930, 1 216 -> 1 346). The borrow arm of the plan uses
+it plus the 512 MiB headroom instead of the `act * 2` fudge; the owning arm is untouched, because its behaviour is
+what the shipped config was measured with. `log_plan` and the "stream is off" warning now print **what the plan
+charged**, not the owning arm's sum - the old line read "2 172 MiB of 2 113 MiB free" on a plan that had been
+accepted, which is how a plan loses its reader.
+
+The line reproduces the measurement it came from: at 2.2 GB the chunk used 1 346 of the 1 729 MiB left after the KV
+reserve and the probe read 383 MiB of low water - exactly the difference.
+
+### 12.3 The ceiling, and why 3.2 GB is not reachable this way
+
+The plan is honest now, so it refuses instead of dying mid-chunk. What it refuses at:
+
+| cache | free before the first chunk | needs (chunk scratch + head + KV) | outcome |
+|---:|---:|---:|---|
+| 2.2 GB | 2 113 MiB | 1 346 + 512 + 384 = 2 242 (a 768-row chunk: 1 640) | runs, 383 MiB of low water |
+| 2.5 GB | 1 793 MiB | 1 346 + 512 + 384 = 2 242 | 768-row chunk planned, and the **second** chunk OOM'd in `moe experts forward` with 191 MiB left |
+| 2.9 GB | 1 505 MiB | floor is 1 697 | refused at the plan; with the old optimistic price it used to die inside the experts forward (HTTP 500) |
+| 3.2 GB | ~1 305 MiB | — | does not start |
+
+So the honest statement, replacing the one in §11: **the cache cannot exceed ~2.2 GB while a prompt has to stream**,
+because the chunk needs ~2.0 GiB of free VRAM and a chunk is required for every prompt of 64 tokens or more (i.e.
+most continued turns). The 28.6 ms TPOT measured at 3.2 GB belongs to requests that never streamed (short prompts),
+not to a config that works.
+
+Two blocks hold that ceiling, and both are now measured rather than suspected:
+
+- **the chunk's fixed 801 MiB** - inside the model's kernels, not in this crate and not in the fork's workspaces;
+- **the MTP drafter's ~900 MiB** (free VRAM at the same point is 3 201 MiB without `--mtp` against 2 305 with it).
+
+Trading the drafter for the cache is the wrong trade by the numbers already recorded: MTP is worth ~8 ms of TPOT
+(51 -> 43), and 2.2 -> 3.2 GB is worth ~8 ms at best while it breaks long prompts outright.
+
+### 12.4 Where the next real lever is
+
+1. **The chunk's fixed 801 MiB**: it is a handful of one-time blocks in the prompt compute. Finding them is a
+   `nsys`/allocation-trace job, and it is the only thing between this card and a 3 GB cache.
+2. **Per-layer slot sizing** (the open half of S1): `slot_bytes` is priced from layer 0, so a 2.147 GB slab filled
+   after 129 of 144 banks and 15 spilled - the cache is ~10% smaller than its nominal size at the same VRAM. Fixing
+   it is pure bookkeeping in `provider.rs`/`slot.rs` and buys ~0.2 GB of residency for free.
+3. **The prefill's 1.87 s of copy in 3.6 s of wall** (§11.2): half a chunk is per-layer latency, which is an M23-shaped
+   lever and independent of all of the above.
