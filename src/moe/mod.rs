@@ -66,7 +66,7 @@ pub(crate) use cached_layer::{
     MAX_DECODE_ROWS,
 };
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
-pub(crate) use slot::{slot_bytes_from_qtensor, Bank, Projections, Slot, SlotBuf, SlotData};
+pub(crate) use slot::{slot_bytes_from_qtensor, slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;

@@ -16,7 +16,7 @@ use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpert
 use mistralrs_core::MoEExperts;
 
 use super::{
-    staging::alloc_bank_in, slot_bytes_from_qtensor, CachedExperts, CachedLayer, LayerState, Layers,
+    staging::alloc_bank_in, slot_bytes_from_stack, CachedExperts, CachedLayer, LayerState, Layers,
     LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
 };
 
@@ -365,10 +365,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // the dtype and per-expert slot bytes, and whether we're in quantized or dense mode.
         let (slot_bytes, is_quantized) = {
             let qt_opt = cpu_experts.expert_qtensors();
-            match qt_opt
-                .as_ref()
-                .and_then(|(gate, _, _)| slot_bytes_from_qtensor(gate))
-            {
+            // The three projections, each in its own format: pricing them from gate's dtype alone charged this layer
+            // wrong by up to 25% (see `slot_bytes_from_stack`), which is what let a nominal 2.2 GB cache hold 2.4 GB.
+            match qt_opt.as_ref().and_then(slot_bytes_from_stack) {
                 Some(sb) => (sb, true),
                 None => {
                     // Dense fallback: estimate from hidden/inter in BF16
@@ -401,7 +400,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             let per_layer = inner.remaining_bytes / estimated_layers;
             inner.bytes_per_layer = Some(per_layer);
             info!(
-                "expert cache: {:.1} GB total, ~{} slots/layer (estimated {} layers, {} bytes/slot)",
+                "expert cache: {:.1} GB total, ~{} slots/layer (estimated {} layers, {} bytes/slot for layer 0; \
+                 every layer's slots are priced from its own three projections, so the count varies by layer)",
                 self.cache_gb,
                 per_layer / slot_bytes.max(1),
                 estimated_layers,

@@ -1,6 +1,6 @@
 # M33 - the prompt path borrows the expert cache (strata's loan)
 
-**Status:** open. S1-S4 built; §12 and §13 are two rounds of the same investigation and they **contradict each other
+**Status:** open; S1-S4 built, plus **S6-lite (§13) and the per-layer slot price (§14)**; §12 and §13 are two rounds of the same investigation and they **contradict each other
 on purpose**: §12 priced the chunk from a measurement that was silently contaminated, §13 found the contamination and
 replaced both the number and the conclusions of §11/§12. The loan stays **opt-in**, for a reason that survived the
 correction (the wipe), not for the one §11 gave (whether it lent at all). Numbering note: M29-M32
@@ -543,3 +543,62 @@ partly an accounting artifact.
 - Two things must happen before a cache ladder means anything: **per-layer slot sizing** (so nominal == resident) and
   the refill's silent-failure path understood. Then the ladder is worth running again, on the chat harness, with the
   loan, and the shipping cache size can be chosen from numbers that repeat.
+
+---
+
+## 14. The cache's size was a lie of ~16%: per-layer slot pricing (2026-11-03)
+
+§13.4 blamed the cache ladder on `slot_bytes` being priced from layer 0. That was the right suspect for the wrong
+reason: the price is computed per layer already, but **from one projection**. `slot_bytes_from_qtensor(gate) * 3`
+assumes gate, up and down share a quant, and in this model they never do:
+
+| what the GGUF says (parsed 2026-11-03) | |
+|---|---|
+| layers whose three projections differ in format | **48 of 48** |
+| typical layer | `ffn_down_exps` IQ4_NL, `ffn_gate/up_exps` IQ2_S |
+| real bank / (`3 x gate`) | **0.885 - 1.252** |
+
+So the budget was charged 12-25% too little on most layers, and the cache quietly kept more experts than it was
+told it could. Measured consequences before the fix: a nominal **2.2 GB** cache held **1 310 slots** (~2.55 GB of
+experts) and left 2 369 MiB free; a 2.147 GB slab filled after **129 of 144** banks and spilled 15.
+
+The fix is `slot_bytes_from_stack`: the three projections, each in its own dtype, summed - the same number the bank
+actually allocates. Pinned by `slot_bytes_price_each_projection_in_its_own_format` (a mixed stack must cost more than
+`3 x gate`; a uniform one must cost exactly that).
+
+### 14.1 What it changed
+
+| | before | after |
+|---|---:|---:|
+| slots resident at a "2.2 GB" cache | 1 310 | **1 145** |
+| free VRAM after load (chat config) | 2 369 MiB | **2 687 MiB** |
+| nominal cache that holds the same residency | 2.2 GB (really 2.55) | **2.5 GB** (really 2.5) |
+
+165 fewer slots and 318 MiB more free VRAM at the same nominal size is the overshoot, recovered. The shipped config
+moved to **2.5 GB** so the number means what it says and the residency the previous pin was actually getting is kept.
+
+### 14.2 Measured, chat harness, `short`, 3 rounds, 0 failed turns everywhere
+
+| config | TTFT >= 2 p50 | TPOT p50 | e2e per conversation |
+|---|---:|---:|---:|
+| 2.2 GB, old pricing (really 2.55 GB, 1 310 slots) | 1 083 ms | 43 ms | 36.4 s |
+| 2.2 GB, honest pricing (1 145 slots) | 1 091 ms | 46 ms | 39.8 s |
+| 2.5 GB, honest pricing (same residency as the old 2.2) | 1 107 / 1 021 ms | 42 / 45 ms | 43.5 / 37.4 s |
+| 2.5 GB, shipped, repeat | 1 107 ms | 42 ms | 43.5 s |
+
+Two things to read out of that. The overshoot was worth ~3 ms of TPOT at a fixed nominal size, which is the price of
+an honest budget and is now paid knowingly. And **e2e varies 36-43.5 s across loads with the same config**, so it is
+not an instrument for a 1-3 ms TPOT question - TPOT is (42-46 ms across configs, its spread inside one load is
+±5 ms).
+
+### 14.3 State of the milestone
+
+- The chunk is priced by measurement (0.35 MiB a row), the loan lends by default when asked for, and the cache's
+  nominal size is now the resident one.
+- What is **not** established: that any particular cache size is faster. The ladder measurements contradict each
+  other run to run (43.9 vs 44.98 ms for 2.2 vs 3.2; 42 vs 46 for 2.5 vs 2.2; the historical 36.7 -> 28.6 is
+  withdrawn), and the honest conclusion is that this card/config does not resolve cache-size steps with the
+  instruments in the harness today.
+- What is left, in order: (1) the refill's silent empty answer (§13.3, 1 turn in 72 - a correctness question, not a
+  performance one); (2) a TPOT measurement that can resolve a cache step - e.g. many rounds of one fixed prompt with
+  the *same* load, which removes the per-load variance, instead of reloading per arm; (3) only then the cache default.

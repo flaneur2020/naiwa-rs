@@ -65,6 +65,35 @@ pub(crate) struct SlotBuf {
     pub(crate) fence: ReadFence,
 }
 
+/// Bytes one expert of a **layer** takes on the device: the three projections, each in its own format.
+///
+/// This is the number the cache's budget is charged with, so it has to be the number the bank actually allocates -
+/// and `slot_bytes_from_qtensor(gate) * 3` is not: **every layer of this model mixes formats across its projections**
+/// (measured 2026-11-03 from the GGUF: 40 of 48 layers run `ffn_down_exps` in IQ4_NL with gate/up in IQ2_S or
+/// IQ3_XXS, and the ratio of the real bank to `3 x gate` runs 0.885-1.252). Pricing three projections from gate's
+/// dtype therefore over- or under-charged every layer by up to **25%**, which is why a nominal 2.2 GB cache held
+/// ~2.4 GB of experts and a 2.147 GB slab filled after 129 of 144 banks.
+pub(crate) fn slot_bytes_from_stack(stacks: &(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>)) -> Option<u64> {
+    let gate = projection_bytes(&stacks.0)?;
+    let up = projection_bytes(&stacks.1)?;
+    let down = projection_bytes(&stacks.2)?;
+    Some(gate + up + down)
+}
+
+/// One projection's bytes per expert.
+fn projection_bytes(qt: &QTensor) -> Option<u64> {
+    let dims = qt.shape().dims();
+    if dims.len() < 2 {
+        return None;
+    }
+    let (n, k) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+    let block_size = qt.dtype().block_size();
+    if k % block_size != 0 {
+        return None;
+    }
+    Some((n * (k / block_size) * qt.dtype().type_size()) as u64)
+}
+
 /// Slot-bytes estimate for a single expert from a `QTensor` stack.
 /// Returns `None` when the stack is not accessible (dense/float).
 pub(crate) fn slot_bytes_from_qtensor(qt: &QTensor) -> Option<u64> {

@@ -98,6 +98,14 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 - **And the ladder does not reproduce:** 2.2 -> 3.2 GB measured 43.9 -> 44.98 ms TPOT today against the 36.7 -> 28.6
   §11.3 recorded, with 34-55 ms inside a single load. The -22% claim is withdrawn. `slot_bytes` priced from layer 0
   (a 2.147 GB slab filled after 129 of 144 banks) has to be fixed before a cache rung means what it says.
+- **The cache's nominal size was ~16% off** (§14): `slot_bytes` priced all three expert projections from gate's
+  dtype, but every layer of this model runs `ffn_down_exps` in a different quant (ratio 0.885-1.252), so a "2.2 GB"
+  cache held 1 310 slots (~2.55 GB) and the budget overshot by up to 25%. Each layer is now priced from its own three
+  projections: 1 145 slots at 2.2 GB, **+318 MiB of free VRAM at load**, and the shipped config moved to **2.5 GB**
+  so the number is the resident one. Honest budget costs ~3 ms of TPOT at a fixed nominal size.
+- **The cache ladder still does not resolve.** 2.2 vs 3.2 GB measured 43.9 vs 44.98 ms, 2.5 vs 2.2 measured 42 vs 46,
+  e2e swings 36-43.5 s across loads with one config. The instruments cannot answer "which cache size" yet: TPOT needs
+  many rounds on one load, not a reload per arm. Until then no cache default is claimed.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
