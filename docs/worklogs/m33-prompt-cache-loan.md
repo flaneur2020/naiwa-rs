@@ -1,8 +1,9 @@
 # M33 - the prompt path borrows the expert cache (strata's loan)
 
-**Status:** open, **S1-S4 built** and measured (2026-11-02), **S6-lite investigated and priced** (2026-11-02, §12):
-the chunk's real footprint is a measured line, the plan now uses it, and the "unlock 3.2 GB" premise it was meant to
-serve is **false on this card**. Numbering note: M29-M32
+**Status:** open. S1-S4 built; §12 and §13 are two rounds of the same investigation and they **contradict each other
+on purpose**: §12 priced the chunk from a measurement that was silently contaminated, §13 found the contamination and
+replaced both the number and the conclusions of §11/§12. The loan stays **opt-in**, for a reason that survived the
+correction (the wipe), not for the one §11 gave (whether it lent at all). Numbering note: M29-M32
 are withdrawn (`roadmap.md`, "M29-M32 aborted 2026-11-01"), so this milestone takes the next free number.
 **Parent:** M23 (the prompt law `1.15 s per chunk + 1.67 ms per token`), M18 (a second buffer buys overlap, 16-19%),
 M20 (the cache ceiling), M10.3 (the chat tail: `TTFT>=2` 1193 ms against strata's 651).
@@ -435,3 +436,110 @@ Trading the drafter for the cache is the wrong trade by the numbers already reco
    it is pure bookkeeping in `provider.rs`/`slot.rs` and buys ~0.2 GB of residency for free.
 3. **The prefill's 1.87 s of copy in 3.6 s of wall** (§11.2): half a chunk is per-layer latency, which is an M23-shaped
    lever and independent of all of the above.
+
+---
+
+## 13. The loan never lent: what `NAIWA_BORROW_ALIAS` was costing, and the corrected chunk line (2026-11-03)
+
+### 13.1 The defect
+
+`borrow_buffers` reached the slab - the whole point of the milestone - only when `NAIWA_BORROW_ALIAS` was set:
+
+```rust
+if std::env::var_os("NAIWA_BORROW_ALIAS").is_some() {
+    ... slab.borrow_at(offset, ...)          // the pool's bytes are the buffer
+} else {
+    // Probe: keep everything else ... but give the chunk memory of its own
+    let mem = self.copy.alloc_like(stack)?;  // <- the default, and an allocation beside the cache
+}
+```
+
+So the default arm did **all of the loan's bookkeeping and none of its lending**: the plan charged the chunk as if the
+layer buffers were free, the cache's tail was emptied (719 slots) and refilled afterwards, and the memory still came
+out of free VRAM. Both of §11's chat arms, and every probe behind §11 and §12, ran that way.
+
+One request, one load, only that switch changed (`NAIWA_PREFILL_PEAK=1`):
+
+| rows | chunk peak, private buffers (the default) | chunk peak, pool ranges (the loan) |
+|---:|---:|---:|
+| 288 | 1 314 MiB | **66 MiB** |
+| 1 216 | 1 730 MiB | **386 MiB** |
+
+What the two "private" numbers actually contain is one or two **650 MiB layer buffers**; the chunk's own footprint is
+the difference, and it is **~0.35 MiB a row with no meaningful fixed term**. The shape estimate the plan started from
+(`24 KiB a token`) was 14x short, and §12's replacement (`801 MiB + 0.448 MiB a row`) was 3.5x long - it had absorbed a
+privately allocated buffer into what it called the chunk.
+
+### 13.2 What changed
+
+- **The loan lends by default.** `NAIWA_BORROW_PRIVATE=1` is the beside-the-cache arm (what M18 measured);
+  `NAIWA_BORROW_UNUSED=1` stays as the in-slab probe.
+- **`chunk_scratch(rows) = 32 MiB + 354 KiB * rows`**, pinned by unit test to both measured points (`131` and `452`
+  MiB, a few percent over 66/386 because the probe samples per layer and a chunk's transients live between samples).
+  The `max(activation_bytes(...))` floor was **removed**: the shape estimate is 337 MiB at 288 rows, so a floor would
+  price a small chunk 5x too high - which is exactly how the first attempt refused a 3.2 GB stream that then ran.
+- **The lent arm prices `chunk_scratch + 256 MiB`** (`CHUNK_HEAD`), not `+ 512`: the measured peak already carries the
+  growth the "head" used to stand in for, and charging both refused a 1 024-row chunk at 3.2 GB that ran at 386 MiB of
+  961 free. The owning arm keeps the 512 MiB block and now pays the measured line too.
+- **Consequence for the double buffer**: with a row-priced chunk, the owning arm's "the same chunk must still afford
+  the second buffer" condition becomes `free >= free + 650 MiB`, i.e. never on this card. That is the honest answer -
+  the plan has always preferred rows to a second buffer, and M33 §11.1 measured the second buffer at -4.3% against
+  ~1 900 more rows. The double buffer is still granted where it is free (the loan, and an 8 GiB card).
+
+### 13.3 Measured
+
+Gates: `frac 0` + `--no-lookahead` **byte-identical** to `harness/m1/reference.oracle.txt`; **55 tests** pass;
+`NAIWA_BORROW_CHECK` clean.
+
+**The chunk, with the loan, at every cache size that has room:**
+
+| cache | first-chunk plan | peak | long prompt (1 216 tokens) |
+|---:|---|---:|---:|
+| 2.2 GB | 4 096 rows, 2 ranges | 386 of 2 113 MiB | 3.90 s |
+| 3.2 GB | 768 rows, 2 ranges | 386 of 959 MiB | **3.67 s** |
+
+So `--expert-cache-gb 3.2` runs a long prompt, which §12 recorded as impossible. The chunk is no longer what stops it.
+
+**But the loan is still not the shipping default, and now for the measured reason.** Chat harness, `short`, 3 rounds,
+8 measured turns each, shipped 2.2 GB config:
+
+| arm | failed turns | TTFT >= 2 p50 | TPOT p50 | e2e per conversation |
+|---|---:|---:|---:|---:|
+| loan off (shipped) | 0 | 1 083 ms | 43 ms | **36.4 s** |
+| loan on, run A | **1** | - | - | - |
+| loan on, run B | 0 | 915 ms | 45 ms | 38.8 s |
+
+The wipe is the cost: one loan per conversation still displaces 719 of 1 310 slots, and at 2.2 GB the cache is worth
+more to decode than a free layer buffer is to prefill. Run A's failure is the M23-class silent one ("no content delta,
+finish None"), with nothing in the log - it lands right after `the loan is given back`, so the refill path is the
+suspect, and 1 in 72 turns is enough to keep the loan off by default until that is understood.
+
+### 13.4 And the cache ladder does not reproduce
+
+Same session, `harness/tpot` 5 rounds, loan on, honest pricing:
+
+| cache | TPOT rounds | median | long prompt |
+|---:|---|---:|---:|
+| 2.2 GB | 48.4 / 41.4 / 34.1 / 43.9 / 47.8 | 43.9 ms | 3.90 s |
+| 3.2 GB | 55.2 / 39.0 / 47.0 / 36.9 / 45.0 | **44.98 ms** | 3.67 s |
+
+**The -22% TPOT that M33 §11.3 recorded for 2.2 -> 3.2 GB (36.7 -> 28.6 ms) is withdrawn.** Today's repeat measures
++1.1 ms, and the spread inside a single load (34-55 ms) is larger than any cache-size effect this instrument can
+resolve. Two things are true at once: the cache genuinely matters to decode (the T0 slope, 0.4-10.7 ms/GB depending on
+`--pcie-frac`), and this card/config cannot resolve a 1 GB step with 5 rounds of a single-request probe. The chat
+harness is the instrument that can (24 turns, per-turn median), and it says the loan is not free at 2.2 GB.
+
+There is a second, structural reason the ladder cannot be trusted yet: **`slot_bytes` is priced from layer 0**, so the
+nominal cache is not the resident one. Measured: a 2.147 GB slab filled after **129 of 144** banks and spilled 15. At
+3.2 GB that overshoot costs ~10% of the budget, so a "3.2 GB" cache is really ~3.0 and the step between two rungs is
+partly an accounting artifact.
+
+### 13.5 Where this leaves the milestone
+
+- The mechanism is correct now, and it is the only way this card can stream a prompt without paying 650-1 300 MiB for
+  the privilege: **386 MiB instead of 1 730** for a 1 216-token chunk, and a 3.2 GB cache that starts.
+- It stays opt-in because the wipe costs more than the buffer it frees at 2.2 GB, and because one run in two produced
+  a silent empty answer right after a refill.
+- Two things must happen before a cache ladder means anything: **per-layer slot sizing** (so nominal == resident) and
+  the refill's silent-failure path understood. Then the ladder is worth running again, on the chat harness, with the
+  loan, and the shipping cache size can be chosen from numbers that repeat.

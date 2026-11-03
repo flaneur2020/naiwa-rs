@@ -69,6 +69,12 @@ fn prompt_step_ceiling() -> usize {
 /// than it did.
 const MAX_HEADROOM: usize = 512 << 20;
 
+/// The slack a **lent** chunk keeps on top of its measured peak. The peak is sampled inside the chunk (so it
+/// already carries the growth the plan used to charge separately), which leaves the step's own transients - the
+/// paged-attention scratch, the copy-stream staging, the driver's bookkeeping. 256 MiB is the 512 MiB block halved,
+/// and it is what the 3.2 GB / 1 024-row chunk measured (386 used, 575 low water: 189 MiB of it spare).
+pub(crate) const CHUNK_HEAD: usize = 256 << 20;
+
 /// The prefill path's memory decision: how many layer buffers, and the prompt step they were
 /// priced with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,41 +96,44 @@ pub(crate) const SUB_ROWS: usize = 256;
 /// `SUB_ROWS`, so it does not grow with the chunk. Everything else in a prompt step — attention's
 /// QKV/output, the gathered PLE rows, the copy-stream staging — does grow with the chunk, and this
 /// second term is its measured envelope: 24 KiB a token is ~3 × hidden × 2 bytes at this model.
-/// Device bytes a prompt chunk really takes on this card, measured rather than derived (M33 §12).
+/// Device bytes a prompt chunk really takes on this card, measured rather than derived (M33 §12/§13).
 ///
-/// `activation_bytes` is a *shape* estimate - `chunk * 24 KiB` plus a per-MoE-call term - and on this model it is
-/// wrong by a factor, because the chunk's memory is not proportional to its rows at all: `NAIWA_PREFILL_PEAK` traced
-/// 48 layers of free VRAM and the peak is dominated by a few **one-time** blocks that the first prompt compute
-/// allocates and then keeps (the MoE's expert-major workspace, the per-layer embedding gather, the vocabulary-sized
-/// scratch of the fused kernels). Two measured points on the shipped chat config, same load, same request shape:
+/// `activation_bytes` is a *shape* estimate - `chunk * 24 KiB` plus a per-MoE-call term - and it is ~14x short:
+/// the chunk's real footprint is **0.35 MiB a row**, dominated by a handful of row-shaped buffers per layer
+/// (attention Q/K/V/O, the per-layer embedding gather, the MoE's row staging) that the shape formula does not see.
 ///
-/// | rows | peak above the chunk's baseline | minus the KV reserve (384 MiB) |
-/// |---:|---:|---:|
-/// | 288 | 1 314 MiB | 930 MiB |
-/// | 1 216 | 1 730 MiB | 1 346 MiB |
+/// Measured with `NAIWA_PREFILL_PEAK=1` on the shipped chat config, one long request, **with the pool ranges
+/// actually lent** (`NAIWA_BORROW_ALIAS` while it still existed):
 ///
-/// which is `801 MiB + 0.448 MiB * rows`. That line reproduces the measurement it came from: at
-/// `--expert-cache-gb 2.2` with the loan, free was 2 113 MiB, the chunk used 1 346 of the 1 729 left after the KV
-/// reserve, and the probe read 383 MiB of low water - exactly the difference.
+/// | rows | chunk peak |
+/// |---:|---:|
+/// | 288 | 66 MiB |
+/// | 1 216 | 386 MiB |
 ///
-/// Why it matters: the plan used to price `act * 2 + head` = 1 184 MiB for **any** chunk, so at
-/// `--expert-cache-gb 2.9` it said "fits" with 1 121 MiB free and the chunk then died inside the experts forward
-/// (HTTP 500). A plan that is 700 MiB optimistic does not degrade, it lies.
+/// a line through those is `-33 MiB + 0.345 MiB * rows`, i.e. no meaningful fixed term: the peak is the rows. This
+/// matters twice over. The same probe run *without* the loan reads 1 314 and 1 730 MiB for the same two chunks -
+/// which is not the chunk but the two privately allocated layer buffers beside it - and an earlier pass took that
+/// number at face value, concluded "801 MiB fixed + 0.448 a row, chunking cannot help", and priced the chunk so
+/// high that `--expert-cache-gb 3.2` was refused a stream it can run (measured: 3.64 s for a 1 216-token prompt,
+/// 386 MiB of 961 free).
 ///
-/// Both terms are overridable (`NAIWA_CHUNK_FIXED_MIB`, `NAIWA_CHUNK_PER_ROW_KIB`) because they encode this model's
-/// shapes, not the hardware's.
+/// The constants stay overridable (`NAIWA_CHUNK_FIXED_MIB`, `NAIWA_CHUNK_PER_ROW_KIB`) because they encode this
+/// model's shapes, not the hardware's.
 pub(crate) fn chunk_scratch(rows: usize) -> usize {
     let fixed = std::env::var("NAIWA_CHUNK_FIXED_MIB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|mib| mib << 20)
-        .unwrap_or(801 << 20);
+        .unwrap_or(32 << 20);
     let per_row = std::env::var("NAIWA_CHUNK_PER_ROW_KIB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|kib| kib << 10)
-        .unwrap_or(459 << 10);
-    (fixed + per_row * rows).max(activation_bytes(rows))
+        .unwrap_or(354 << 10);
+    // **No floor from `activation_bytes`**: the shape estimate is 337 MiB for 288 rows (it carries a fixed per-call
+    // MoE term that the measurement says is not there) and 359 MiB for 1 216 where the measurement reads 386 - so a
+    // `max` would price a small chunk 5x too high and refuse chunks that run. The line is the measurement.
+    fixed + per_row * rows
 }
 
 pub(crate) fn activation_bytes(chunk: usize) -> usize {
@@ -198,14 +207,14 @@ pub(crate) fn plan_with_lend(
         let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| MAX_HEADROOM.max(free / 8));
         if borrowing {
-            // The layer buffer is a range of the cache's slab, so it costs nothing here - but the chunk still pays
-            // its own scratch out of free VRAM, and that is not the shape estimate: `chunk_scratch` is the measured
-            // line (801 MiB + 0.448 MiB/row on this model), which is what the old `act * 2` fudge was standing in
-            // for. The head stays smaller here than in the owning arm because the measured line already carries the
-            // per-chunk overheads the 512 MiB floor was covering.
-            free >= chunk_scratch(chunk) + head
+            // The layer buffers are ranges of the cache's own bytes, so they cost nothing here; the chunk pays only
+            // its own scratch, and `chunk_scratch` is that line as measured *during* a chunk (KV growth included).
+            // The head is therefore only the step's transients, not the owning arm's 512 MiB block: charging both
+            // the measured peak and that block is what refused `--expert-cache-gb 3.2` a 1 024-row chunk that then
+            // ran at 386 MiB of 961 free.
+            free >= chunk_scratch(chunk) + head.min(CHUNK_HEAD)
         } else {
-            free >= stride * layer_bytes + act + act / 8 + head
+            free >= stride * layer_bytes + chunk_scratch(chunk) + head
         }
     };
     // Largest chunk with one buffer: `fits` is monotone in the chunk, so bisect.
@@ -237,7 +246,7 @@ pub(crate) fn plan_with_lend(
         .map(|mib| mib << 20)
         .unwrap_or(700 << 20);
     let two = fits(best, 2)
-        && free.saturating_sub(2 * layer_bytes + activation_bytes(best) + MAX_HEADROOM) >= reserve;
+        && free.saturating_sub(2 * layer_bytes + chunk_scratch(best) + MAX_HEADROOM) >= reserve;
     let stride = if borrowing {
         // Two ranges inside the pool: the chunk's activations are priced by `fits` (the borrow branch), and the
         // ranges cost VRAM not at all, so all the double buffer needs is room in the pool.
@@ -562,9 +571,9 @@ impl PrefillStream {
         buf: usize,
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
-        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some()
-            || std::env::var_os("NAIWA_BORROW_UNUSED").is_some()
-        {
+        // Diagnostic arm only: the loan is meant to be the pool's own bytes, and `NAIWA_BORROW_PRIVATE=1` is how the
+        // beside-the-cache chunk is measured against it (that arm is what M18 measured).
+        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some() {
             return self.borrow_private(stacks);
         }
         let slab = self.slab.as_ref().expect("checked by borrows()");
@@ -585,27 +594,29 @@ impl PrefillStream {
             let el_count = stack.shape().elem_count();
             let _ = dims;
             let _ = el_count;
-            if std::env::var_os("NAIWA_BORROW_ALIAS").is_some() {
-                // `NAIWA_BORROW_UNUSED=1`: carve from the slab's *unused* tail (the banks only took `cursor` bytes),
-                // so the buffer is inside the cache's allocation but overlaps no bank and nothing points at it.
-                // That separates "the alias with live slots" from "merely being inside the slab".
-                let storage = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
-                    match slab.alloc(stack.shape().elem_count(), stack.dtype(), &self.device)? {
-                        Some(st) => st,
-                        None => candle_core::bail!("slab is full"),
-                    }
-                } else {
-                    slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?
-                };
-                offset += storage.allocated_bytes();
-                out.push(self.copy.like_from_storage(stack, storage)?);
+            // **The pool's bytes are the buffer.** This was behind `NAIWA_BORROW_ALIAS` (a probe left over from
+            // bisecting the alias), which meant the default arm emptied the cache's slots, refilled them afterwards,
+            // and *still* allocated the chunk's memory beside the cache - the worst of both. Measured on the shipped
+            // chat config, the difference is the whole loan:
+            //
+            // | rows | chunk peak, private buffers | chunk peak, pool ranges |
+            // |---:|---:|---:|
+            // | 288 | 1 314 MiB | 66 MiB |
+            // | 1 216 | 1 730 MiB | 386 MiB |
+            //
+            // `NAIWA_BORROW_UNUSED=1` (probe): carve from the slab's *unused* tail (the banks only took `cursor`
+            // bytes), so the buffer is inside the cache's allocation but overlaps no bank - which separates "the
+            // alias with live slots" from "merely being inside the slab".
+            let storage = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
+                match slab.alloc(stack.shape().elem_count(), stack.dtype(), &self.device)? {
+                    Some(st) => st,
+                    None => candle_core::bail!("slab is full"),
+                }
             } else {
-                // Probe: keep everything else (the empty, the sync, the gate) but give the chunk memory of its
-                // own, to tell "the alias is wrong" from "the bookkeeping around it is wrong".
-                let mem = self.copy.alloc_like(stack)?;
-                offset += mem.len();
-                out.push(mem);
-            }
+                slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?
+            };
+            offset += storage.allocated_bytes();
+            out.push(self.copy.like_from_storage(stack, storage)?);
         }
         if std::env::var_os("NAIWA_PREFILL_QUIESCE").is_some() {
             // Make the non-overlap a fact rather than an assumption: no prediction job runs during a chunk, and the
@@ -1343,7 +1354,7 @@ impl Drop for PrefillStream {
 mod tests {
     use std::sync::Arc;
 
-    use super::{activation_bytes, chunk_scratch, plan, plan_with_lend, SUB_ROWS};
+    use super::{activation_bytes, chunk_scratch, plan, plan_with_lend, CHUNK_HEAD, SUB_ROWS};
 
     use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
@@ -1366,10 +1377,16 @@ mod tests {
     /// reserve the plan charges separately. If this test moves, the constants moved away from the measurement.
     #[test]
     fn the_chunk_line_is_the_two_points_that_were_measured() {
-        assert_eq!(chunk_scratch(288) >> 20, 930);
-        assert_eq!(chunk_scratch(1216) >> 20, 1346);
-        // Above the shape estimate everywhere the estimate is optimistic, which is the point of the line.
-        assert!(chunk_scratch(1216) > activation_bytes(1216) * 2);
+        // Measured with the pool ranges lent: 66 MiB at 288 rows, 386 at 1 216. The line is 32 MiB + 354 KiB a row,
+        // i.e. 131 and 452 - a deliberate few percent over the points, because the peak is sampled per layer and a
+        // chunk's own transients live between two samples.
+        assert_eq!(chunk_scratch(288) >> 20, 131);
+        assert_eq!(chunk_scratch(1216) >> 20, 452);
+        // And it is far above the old shape estimate, which was 14x short: 1 216 rows cost 452 MiB, not 359.
+        assert!(chunk_scratch(1216) > activation_bytes(1216));
+        // The old constant pair (801 MiB + 0.448 MiB/row) measured a *privately allocated* layer buffer as if it
+        // were the chunk; a regression back to it would price 1 216 rows at 1 346 MiB again.
+        assert!(chunk_scratch(1216) < 1346 << 20);
     }
 
     #[test]
@@ -1397,13 +1414,13 @@ mod tests {
         // a chunk that would only afford one buffer otherwise still gets the ceiling here. The buffer count then
         // follows the pool instead of the VRAM: `plan_with_lend` with no pool is the one-range borrow, and a pool
         // that holds two ranges grants the double buffer that the beside-the-cache plan could not afford.
-        // The borrow arm prices the chunk's *measured* scratch (M33 §12), so at 2 049 MiB it picks a chunk that
-        // fits that line rather than the ceiling: 801 MiB + 0.448 MiB a row + 512 MiB of head is a 1 536-row chunk.
-        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 1536));
+        // The borrow arm prices the chunk's *measured* scratch (0.35 MiB a row) plus 256 MiB of transients, so at
+        // 2 049 MiB it takes the ceiling: 8192 rows are 2 864 MiB and do not fit, 4 864 rows are ~1 715 and do.
+        assert_eq!(plan(2049 << 20, layer, 8192, true).unwrap(), (1, 4864));
         // A 1.5 GiB pool: two 650 MiB ranges fit with room to spare, so the chunk gets its double buffer for free.
         assert_eq!(
             plan_with_lend(2049 << 20, layer, 8192, true, 0, 1536 << 20).unwrap(),
-            (2, 1536)
+            (2, 4864)
         );
         // One range only: a pool smaller than two layer buffers keeps the single-buffer upload.
         assert_eq!(
@@ -1415,46 +1432,38 @@ mod tests {
             1,
             "without borrowing the pool is irrelevant: the buffers are real VRAM"
         );
-        // A borrowed chunk still pays its scratch from free VRAM, and that scratch is the measured line - 801 MiB
-        // of one-time blocks that no chunk size shrinks - so the chunk lands well below the ceiling where the
-        // owning formula would still grant it. It must satisfy the line and leave the headroom.
-        let chunk = plan(2049 << 20, layer, 8192, true).unwrap().1;
-        assert!(chunk <= 1725, "priced the measured scratch, got {chunk} rows");
-        assert!(chunk_scratch(chunk) + (512 << 20) <= 2049 << 20);
+        // A borrowed chunk pays only its scratch, and the scratch is row-shaped, so the *owning* arm is the one
+        // that shrinks: 2 049 MiB is 650 of buffer plus 1 399 of scratch, i.e. a 3 968-row chunk where the borrow
+        // arm takes 4 864. This is the arm the shipped config runs.
+        let lent = plan(2049 << 20, layer, 8192, true).unwrap().1;
+        let owned = plan(2049 << 20, layer, 8192, false).unwrap().1;
+        assert!(owned < lent, "{owned} owned rows should be fewer than {lent} lent");
+        assert!(chunk_scratch(lent) + CHUNK_HEAD <= 2049 << 20);
 
-        // This 12 GB card at a 1 GB cache: 2049 MiB of free VRAM is one buffer at the ceiling.
-        assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 8192));
-        // 2400 MiB is the edge where the second buffer's *chunk* just fits (2399 needed) - but not the decode
-        // reserve, so the plan keeps one buffer. This is the arm that OOM'd: a 1.85 GB cache left 2620 MiB free,
-        // two buffers were granted with 606 MiB to spare, and a 1725-row prompt died in
-        // `moe experts forward: CUDA_ERROR_OUT_OF_MEMORY`.
-        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (1, 8192));
-        assert_eq!(plan(2620 << 20, layer, 8192, false).unwrap(), (1, 8192));
-        // The second buffer's churn is 2334 MiB (2 buffers + act 522 + head 512); the decode reserve makes the
-        // edge 2334 + 700 = 3034 MiB.
-        assert_eq!(plan((3034 << 20) - 1, layer, 8192, false).unwrap().0, 1);
-        assert_eq!(plan(3034 << 20, layer, 8192, false).unwrap(), (2, 8192));
+        // This 12 GB card at a 1 GB cache: 2 049 MiB is one 650 MiB buffer + 512 MiB of head + 887 of measured chunk
+        // scratch, i.e. a 2 304-row chunk - the ceiling is no longer affordable because the price is now the rows.
+        assert_eq!(plan(2049 << 20, layer, 8192, false).unwrap(), (1, 2304));
+        assert_eq!(plan(2400 << 20, layer, 8192, false).unwrap(), (1, 3328));
+        // **A row-priced chunk makes the second buffer unaffordable on this card, and that is the honest answer.**
+        // The plan takes the largest chunk one buffer can carry and then asks whether the *same* chunk affords a
+        // second; with `scratch(rows) = 0.35 MiB * rows` that condition is `free >= free + 650 MiB`, i.e. never. The
+        // trade the plan has always preferred is the chunk, and the measurement now says the chunk is what the money
+        // buys: -4.3% of prefill for a second buffer (M33 §11.1) against ~1 900 more rows. The double buffer is
+        // still granted where it is free - inside the loan - and on a card whose VRAM is not the constraint.
+        assert_eq!(plan(3034 << 20, layer, 8192, false).unwrap(), (1, 5120));
 
         // The operator's ceiling is a ceiling, not a target.
         assert_eq!(plan(gb(12), layer, 512, false).unwrap().1, 512);
 
-        // The second buffer only when the same chunk affords it.
-        let need2 = |free_guess: usize| {
-            // Solve for the free memory where two buffers at 8192 just fit.
-            let mut free = free_guess;
-            while !fits(free, 8192, 2) {
-                free += 8 << 20;
-            }
-            free
-        };
-        // With the 512 MiB floor, a 12 GB card's ~2.3 GiB buys one buffer at the ceiling and
-        // 8 GiB buys two; the floor is what keeps a prompt step's own scratch out of the way.
+        // 8 GiB of free VRAM buys the ceiling *and* the second buffer (2 x 650 + 2 864 + 512 = 4 676), so the
+        // double buffer is still there where the card can afford it - it is this card's 2-3 GiB that cannot.
         assert_eq!(plan(gb(8), layer, 8192, false).unwrap(), (2, 8192));
-        let just = need2(gb(1)) + (700 << 20);
-        assert_eq!(plan(just, layer, 8192, false).unwrap(), (2, 8192));
-        // Well below it, one buffer at the same ceiling: the buffer count is what gives first.
-        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().0, 1);
-        assert_eq!(plan(just * 8 / 10, layer, 8192, false).unwrap().1, 8192);
+        // The loan is where the double buffer belongs here: the same 2 049 MiB that owns a 2 304-row chunk lends a
+        // 4 864-row one with two ranges, because the pool pays for the buffers and only the scratch is real.
+        assert_eq!(
+            plan_with_lend(2049 << 20, layer, 8192, true, 0, 1536 << 20).unwrap(),
+            (2, 4864)
+        );
 
         // Nothing fits: the stream stays off rather than OOM-ing mid-chunk.
         assert_eq!(plan(layer, layer, 1024, false), None);
@@ -1666,7 +1675,9 @@ mod reserve_tests {
     #[test]
     fn the_kv_reserve_is_not_spendable() {
         let layer = 650 << 20;
-        let free = 1730 << 20;
+        // A 1 GB cache: one buffer (650) plus the 512 MiB head is 1 162, so 1 300 MiB of free VRAM plans a chunk -
+        // and the same 1 300 MiB does not once the 384 MiB the KV will take is subtracted from it.
+        let free = 1300 << 20;
         let refused = plan_with_reserve(free, layer, 8192, false, 384 << 20);
         assert!(
             refused.is_none(),
@@ -1674,8 +1685,10 @@ mod reserve_tests {
         );
         // Without the reserve the same free VRAM looks fine - which is exactly the bug the reserve removes.
         assert!(plan_with_reserve(free, layer, 8192, false, 0).is_some());
-        // The card's shipping configuration stays comfortable: 2 498 MiB free at a 2.3 GB cache.
+        // The card's shipping configuration plans a chunk, and the chunk it plans is the one the measurements
+        // support: at a 2.3 GB cache the free VRAM after the KV reserve buys 650 MiB of buffer and 1 272 of scratch,
+        // i.e. ~3 584 rows - enough for the chat harness's continued turns, and honest about a 32 K prompt.
         let shipping = plan_with_reserve(2498 << 20, layer, 8192, false, 384 << 20);
-        assert!(shipping.is_some_and(|(_, chunk)| chunk >= 8192), "{shipping:?}");
+        assert!(shipping.is_some_and(|(_, chunk)| chunk >= 2048), "{shipping:?}");
     }
 }

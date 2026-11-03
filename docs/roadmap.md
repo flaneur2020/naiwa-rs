@@ -85,19 +85,19 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   loan on **39.2 s** (TTFT>=2 1 105 -> 969 ms). One loan per conversation displaces 719 of 1 474 slots at the turn-1
   chunk, and the refill plus the reset residency cost more than the prefill saves - strata's own "a loan is not free
   per request", met on a card that holds 10% of the experts. So it is opt-in, not the default.
-- **S6-lite (2026-11-02): the chunk is now priced by what it measures - and the 3.2 GB premise is dead.** A
-  per-layer free-VRAM trace (`NAIWA_PREFILL_PEAK`) gives the chunk's real footprint: **801 MiB fixed + 0.448 MiB a
-  row** (288 rows -> 1 314 MiB, 1 216 -> 1 730), where the old estimate said 348 MiB - off by 4x, and the fixed part
-  is one-time and does not shrink with the chunk. `chunk_scratch()` now carries that line (pinned to both measured
-  points by a unit test), the borrow arm prices it, and the plan refuses honestly instead of dying inside the
-  experts forward. Consequence: the chunk needs ~2.0 GiB of free VRAM, so **the cache cannot exceed ~2.2 GB while a
-  prompt has to stream**; the 28.6 ms TPOT at 3.2 GB belongs to requests that never streamed. What holds the ceiling
-  is now measured, not suspected: the chunk's fixed 801 MiB (in the model's kernels; the MoE workspaces measure
-  **0 MiB**, so that hypothesis is dead) and the drafter's ~900 MiB (free VRAM 3 201 without `--mtp` against 2 305
-  with it) - and trading the drafter for the cache loses 8 ms to win 8 ms.
-- Also measured: the prefill chunk is **1.87 s of PCIe in 3.6 s of wall**, i.e. half of it is per-layer latency, not
-  transfer; and the 1536 MiB window can be refused outright at a bigger cache, which is why it now falls back by
-  halves instead of silently taking the stream down with it (that cost a whole chat round its stream and one turn).
+- **The loan only lent when `NAIWA_BORROW_ALIAS` was set** (a leftover probe) - so every measurement behind §11 and
+  §12 ran the loan's bookkeeping without its lending: the cache's tail was emptied and refilled, and the chunk still
+  allocated beside it. With the pool ranges actually lent, the same chunk reads **66 MiB at 288 rows and 386 at
+  1 216**, against 1 314 / 1 730 for the private arm - the "fixed 801 MiB" of §12 was a privately allocated layer
+  buffer, not the chunk. The loan is now the default path, and `chunk_scratch` is the measured line (**0.35 MiB a
+  row**, no fixed term, pinned by unit test).
+- **What that buys:** `--expert-cache-gb 3.2` runs a 1 216-token prompt (3.67 s, 386 MiB of 959 free) where §12
+  recorded it as impossible, and the owning arm now prefers rows to a second buffer (the double buffer lives in the
+  loan instead). What it does **not** buy: a TPOT win at 2.2 GB - the loan is +2.4 s per conversation (36.4 -> 38.8 s)
+  and one of two chat runs produced a silent empty answer right after the refill, so it stays opt-in.
+- **And the ladder does not reproduce:** 2.2 -> 3.2 GB measured 43.9 -> 44.98 ms TPOT today against the 36.7 -> 28.6
+  §11.3 recorded, with 34-55 ms inside a single load. The -22% claim is withdrawn. `slot_bytes` priced from layer 0
+  (a 2.147 GB slab filled after 129 of 144 banks) has to be fixed before a cache rung means what it says.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
@@ -107,7 +107,7 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
-| **M33** | the prompt path borrows the expert cache | 🔶 S1-S4 + S6-lite, loan opt-in 2026-11-02 | One lending window (1536 MiB, banks carved inside, falls back by halves), a **two-range** loan so the plan gets the double buffer it could not afford, and a **ledger** that refills what the loan displaced (719 of 719 slots on a 1239-token prompt). Gates clean: oracle byte-exact, 54 tests, no non-finite output, 0 failed turns. **But on the shipped chat config it is net negative** - 30.2 s vs **39.2 s** per conversation for TTFT>=2 1 105 -> 969 ms - because one loan resets half the cache. What it proved: TPOT tracks cache size and the loan is what lets the cache grow (**2.2 -> 3.2 GB = 36.7 -> 28.6 ms**), blocked only by the chunk's scratch still paying free VRAM -> S6 |
+| **M33** | the prompt path borrows the expert cache | 🔶 built, loan opt-in 2026-11-03 | The cache's banks are carved from one 1.5 GiB lending window, a prompt borrows **two ranges of it** for its layer buffers, and a ledger refills the displaced slots (719 of 719). Gates clean: oracle byte-exact, 55 tests, 0 failed turns in the shipped arm. The chunk's cost is now **measured** (0.35 MiB a row; 386 MiB for 1 216 tokens, against 1 730 when the buffers are allocated beside the cache) and a 3.2 GB cache can stream a long prompt. Left opt-in because the wipe costs +2.4 s per conversation at 2.2 GB and one run in two refilled into a silent empty answer. The 2.2 -> 3.2 GB TPOT claim was **withdrawn**: it does not reproduce (43.9 vs 44.98 ms), and `slot_bytes` priced from layer 0 makes nominal cache size != resident |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |
