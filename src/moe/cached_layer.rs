@@ -9,7 +9,7 @@ use mistralrs_core::layers::Activation;
 use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
 use parking_lot::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::copy_stream::{self, CopyDone, CopyStream, ReadFence};
 use crate::doorbell::{PassCell, TopkDoorbell};
@@ -158,6 +158,18 @@ impl Layers {
             let mut ledger = self.lent.lock().unwrap();
             std::mem::take(&mut *ledger)
         };
+        // `NAIWA_REFILL=0`: the displaced experts stay empty and come back on demand, which is the pre-M33
+        // behaviour. It is here because it is the one-step bisection of the loan's NaN (M33 §15): if the failure
+        // survives without the refill, the refill is not what corrupts the slots.
+        if std::env::var("NAIWA_REFILL").is_ok_and(|v| v == "0") {
+            if !lent.is_empty() {
+                tracing::info!(
+                    "expert cache: the loan is given back, 0 of {} displaced experts refilled (NAIWA_REFILL=0)",
+                    lent.len()
+                );
+            }
+            return 0;
+        }
         let total = lent.len();
         let mut asked = 0;
         for (li, expert) in lent {
@@ -169,6 +181,24 @@ impl Layers {
             }
         }
         if total > 0 {
+            // **One wait, and it is not optional.** `admit(expert, false)` queues each fill on the copy stream with
+            // no completion event of its own - the lookahead's batch is the only caller that records one, and this
+            // is not it - so without a wait here the *next* decode step reads slots whose copies are still in
+            // flight. That is not a small race: it is what put NaN in the logits. Measured 2026-11-03, before the
+            // wait existed: `invalid CUDA top-1 output: max_logit=NaN argmax=NaN`, one request in 24-72, always on
+            // a turn after a chunk. One `synchronize` on the copy stream is strata's `sync_queued` and costs the
+            // loan's transfer once (~1.4 GB, ~110 ms) at the end of a prompt, which is where it belongs.
+            if asked > 0 {
+                if let Some(cs) = self
+                    .all()
+                    .iter()
+                    .find_map(|layer| layer.copy_stream().map(Arc::clone))
+                {
+                    if let Err(e) = cs.synchronize() {
+                        warn!("expert cache: waiting for the refill's copies failed: {e}");
+                    }
+                }
+            }
             // Strata says the same thing at the same moment ("refilling N lent slots"); the number is the loan's
             // price in copies, and a zero here with a non-zero loan means the ledger was lost.
             tracing::info!(

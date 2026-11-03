@@ -602,3 +602,90 @@ not an instrument for a 1-3 ms TPOT question - TPOT is (42-46 ms across configs,
 - What is left, in order: (1) the refill's silent empty answer (§13.3, 1 turn in 72 - a correctness question, not a
   performance one); (2) a TPOT measurement that can resolve a cache step - e.g. many rounds of one fixed prompt with
   the *same* load, which removes the per-load variance, instead of reloading per arm; (3) only then the cache default.
+
+---
+
+## 15. The silent failure is a NaN, it belongs to the loan, and it is not the refill (2026-11-03)
+
+§13.3 left "one chat run in two refilled into a silent empty answer" as a correctness question. It is now three
+things: a *visibility* fix, a *diagnosis*, and two eliminated hypotheses.
+
+### 15.1 It was never silent - the harness was
+
+The server answered `{"error": {"message": "Internal server error.", ...}}` on the SSE stream (and as a 500 body when
+it failed earlier), and `harness/chat/run.py` dropped any payload it did not recognise as a delta or a finish reason.
+So a failed request surfaced as `no content delta (finish None)` with nothing to act on - the harness was the silent
+half. It now raises on an `error` payload, keeps non-SSE lines, and records them as `server_said`, so the same failure
+reads `server error: {...}` and names itself.
+
+With the reason visible (`NAIWA_LOG_INTERNAL=1`, a hook that already existed for exactly this), the failure is:
+
+```
+ERROR mistralrs_server_core::handler_core: internal error, client sees the generic message:
+      invalid CUDA top-1 output: max_logit=NaN argmax=NaN
+```
+
+**The loan puts NaN in the logits.** Not an OOM, not a refused stream, not an empty answer - the top-1 sampler refuses
+to sample a non-finite logit, and the request dies.
+
+### 15.2 What the probes rule out
+
+| probe | result | what it rules out |
+|---|---|---|
+| 5 chat runs, loan **off** (120 turns) | 0 failures | that the failure is the chat path's baseline flakiness |
+| 4 chat runs, loan **on** (96 turns) | 4 failures, every run | that it is unrelated to the loan |
+| `NAIWA_LOG_INTERNAL=1` | `max_logit=NaN` | an OOM, a plan refusal, a swallowed engine error |
+| `NAIWA_PREFILL_PEAK` (`PREFILL_NAN`, new) | never fires | a chunk whose **inputs** are already garbage; the hidden states entering every layer are finite |
+| `NAIWA_BORROW_CHECK=1` (`DECODE_NAN`, existing) | `DECODE_NAN layer 0 (rows 14)` | that it starts in the dense part: the *first* layer's MoE output is already non-finite |
+| refill given one `synchronize` (`sync_queued`) | still NaN | that the refill's copies were being read in flight - the fix is right and stays, but it is not the cause |
+| `NAIWA_REFILL=0` (new) | **still NaN** | the refill entirely: a loan with no refill at all still corrupts the logits |
+| `NAIWA_PREFILL_QUIESCE=1` | still NaN | lookahead/prefetch work in flight during the chunk |
+
+So the corruption is in the **loan itself**: a chunk writes into the cache's bytes, and afterwards something reads a
+slot whose contents the chunk overwrote - or the chunk's own compute reads a buffer that is not what was uploaded.
+`empty_range`'s `BORROW_STILL` never prints, so it is not the "a slot still claims an expert" defect it was written
+for.
+
+### 15.3 Where the next probe has to look
+
+The two candidates left, and the probe for each:
+
+1. **A slot published after the chunk.** `empty_range` clears `slot.expert` twice (phases 1 and 3) precisely because a
+   fill reserved before the borrow can publish after it. `admit`/`load_reserved` check `slab::borrowed()` under
+   `lock_access` - so the question is whether some *other* path publishes a slot or a route entry without that gate
+   (the mapped route table, the lookahead's publish, the promotion of a staged expert).
+2. **The chunk reading the wrong bytes**, i.e. `borrow_at(offset)` landing on memory the pool does not own for that
+   layer (the second range is at `span = layer_bytes`; the pool holds two of them and 236 MiB besides). Strata's
+   `verify_slot` exists for this: after an upload, compare the device range against the host stack.
+
+Either way the loan stays **off by default**, which is where it already is.
+
+---
+
+## 16. A cache ladder that can answer the question (§13.4 said the old one could not)
+
+`harness/tpot/ladder.py`, plus a small change to `serve`: it now shuts down gracefully on SIGTERM/Ctrl-C, and with
+`NAIWA_STATS=1` prints the process's expert-cache counters at exit. The script runs **one cold load per rung** with
+**many rounds on that load** and reports the median with the *within-load* interquartile spread, next to the
+mechanism's own numbers.
+
+Measured on the shipped config (loan off, 1 216-token prompt, 96 tokens out):
+
+| cache | TPOT p50 [p25, p75] | decode tok/s | decode hit rate | PCIe MiB/round |
+|---|---|---|---|---|
+| 2.2 GB | 33.78 ms [32.61, 41.00] | 29.6 | 65.9% | 16 695 |
+| 2.5 GB | 32.83 ms [31.68, 35.83] | 30.5 | 68.5% | 16 059 |
+| 2.9 GB | 33.71 ms [32.46, 35.01] | 29.7 | 70.8% | 17 041 |
+
+and the repeat (2.2 vs 2.9, 10 rounds): 34.35 [32.75, 38.91] vs 35.45 [34.39, 36.36), i.e. **+1.10 ms against a
+6.16 ms spread**.
+
+**The ladder is flat.** 0.7 GB more cache buys 5 points of hit rate and no time. That is the answer the previous
+instrument could not give, and it says the same thing the mechanism does: at these sizes the cache is not the
+constraint on this workload, so **the cache size is not where the remaining time is** - and the earlier "2.2 -> 3.2 GB
+= -22% TPOT" is now not merely unreproduced but contradicted by a measurement with error bars around it.
+
+Two by-products worth keeping: a rung's TPOT is **bimodal** (33 ms typical, 93-101 ms for a round that re-prefills),
+which is why the protocol's median is the right statistic and a mean is not; and the counters show **~16.6 GiB of PCIe
+a round**, which is the prompt's own 23.4 GiB of layer uploads - i.e. the prompt path, not decode, is what moves bytes
+on this card.

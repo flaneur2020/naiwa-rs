@@ -354,15 +354,25 @@ def stream_turn(base: str, body: dict, timeout: float) -> dict:
     usage = None
     finish = None
     t_last = None
+    other: list[str] = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data: "):
+                # A non-SSE line is the server's own message (or an HTTP error page): keep it rather than skip it.
+                if line and not line.startswith(("event:", ":", "id:", "retry:")):
+                    other.append(line)
                 continue
             payload = line[6:]
             if payload == "[DONE]":
                 break
             event = json.loads(payload)
+            # **An error is data, not an empty answer.** The server reports a failed step as an `error` payload on
+            # the same SSE stream (and as `{"error": ...}` when it fails before the stream starts). Both used to be
+            # dropped on the floor, so the turn surfaced as "no content delta (finish None)" with nothing to act on -
+            # and the first thing that has to happen to a silent failure is that it stops being silent.
+            if event.get("error"):
+                raise RuntimeError(f"server error: {json.dumps(event['error'])[:600]}")
             if event.get("usage"):
                 usage = event["usage"]
             for choice in event.get("choices") or []:
@@ -415,6 +425,7 @@ def stream_turn(base: str, body: dict, timeout: float) -> dict:
         "content_chars": content_chars,
         "reasoning_chars": reasoning_chars,
         "finish": finish,
+        "server_said": " | ".join(other[:4]) or None,
     }
 
 
@@ -514,10 +525,12 @@ def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, 
                                 conversation_messages(conv, i, answers), turn["max_tokens"]
                             )
                         )
-                        if rec["n_deltas"] == 0:
-                            # The server closed the stream without a token: an OOM or an engine
-                            # error, not a short answer. Data, but the round cannot continue.
-                            raise RuntimeError(f"no content delta (finish {rec['finish']!r})")
+                        if rec["n_deltas"] == 0 and not rec.get("finish"):
+                            # The server closed the stream without a token and without a finish reason: an OOM or
+                            # an engine error, not a short answer. Say what the server said, if it said anything.
+                            raise RuntimeError(
+                                f"no content delta (finish None, server said {rec.get('server_said')!r})"
+                            )
                     except Exception as e:  # noqa: BLE001 - a failed turn is data, not a crash
                         rec["error"] = f"{type(e).__name__}: {e}"
                         sink.write(json.dumps(rec) + "\n")

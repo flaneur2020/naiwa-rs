@@ -74,8 +74,56 @@ pub async fn run_serve(
     info!("Server listening on http://{}:{}", server.host, server.port);
     log_api_surfaces(&server.host, server.port);
 
-    axum::serve(listener, app).await?;
+    // **Graceful shutdown, because the counters are the instrument.** `harness/tpot/ladder.py` compares cache sizes
+    // by the *mechanism* (hits, misses, PCIe bytes a token) as well as by wall time, and the process has to survive
+    // long enough to print them: SIGTERM used to kill `axum::serve` outright, taking the numbers with it.
+    // `NAIWA_STATS=1` is the switch, so a normal serve is unchanged.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    if std::env::var_os("NAIWA_STATS").is_some() {
+        let s = crate::stats::dump_cache_stats();
+        if s.installed {
+            info!(
+                "expert cache (process totals): {:.1}% hit rate ({} hits, {} misses, {} staged, {} promotions); \
+                 lookahead {} loaded / {} swaps / {} dropped; --pcie-frac {} misses, {:.1} MiB",
+                100.0 * s.hit_rate(),
+                s.hits,
+                s.misses,
+                s.staged,
+                s.promotions,
+                s.lookahead_loads,
+                s.swaps,
+                s.lookahead_dropped,
+                s.pcie_misses,
+                s.pcie_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
     Ok(())
+}
+
+/// SIGTERM or Ctrl-C, whichever comes first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            // No handler available: fall back to the other arm rather than exiting early.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn tcp_nodelay_listener(

@@ -58,7 +58,7 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M33 — the prompt path borrows the expert cache — 🔶 S1-S4 built, net negative on the shipped config
+## M33 — the prompt path borrows the expert cache — 🔶 built, loan blocked on a NaN (2026-11-03)
 
 Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache's banks are carved from
 **one allocation** ("the lending window", on by default) and a prompt can borrow **two ranges of it** for its layer
@@ -106,6 +106,20 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 - **The cache ladder still does not resolve.** 2.2 vs 3.2 GB measured 43.9 vs 44.98 ms, 2.5 vs 2.2 measured 42 vs 46,
   e2e swings 36-43.5 s across loads with one config. The instruments cannot answer "which cache size" yet: TPOT needs
   many rounds on one load, not a reload per arm. Until then no cache default is claimed.
+- **The silent failure is a NaN, and it belongs to the loan.** With the server's reason visible
+  (`NAIWA_LOG_INTERNAL=1`) and the harness no longer dropping error payloads, the failure reads
+  `invalid CUDA top-1 output: max_logit=NaN`. Loan on: 4 failures in 96 chat turns, every run. Loan off: 0 in 120.
+  Ruled out by probe: a chunk with garbage *inputs* (`PREFILL_NAN` never fires), a dense-part origin (`DECODE_NAN
+  layer 0` first), an in-flight refill (a `sync_queued` wait and `NAIWA_REFILL=0` both still NaN), and lookahead work
+  during the chunk (`NAIWA_PREFILL_QUIESCE=1` still NaN). So the loan corrupts memory in a way neither the refill nor
+  the quiesce reaches - next probe: who publishes a slot/route entry outside `lock_access`, or whether
+  `borrow_at(offset)` lands on bytes the pool does not own (strata's `verify_slot` is the check for that).
+- **A cache ladder that can answer the question** (`harness/tpot/ladder.py`, and `serve` now prints its expert-cache
+  counters on SIGTERM under `NAIWA_STATS=1`): one cold load per rung, many rounds on that load, median with the
+  within-load spread. It says the ladder is **flat** - 2.2 / 2.5 / 2.9 GB read 33.78 / 32.83 / 33.71 ms TPOT (p25-p75
+  inside 8 ms), hit rate 65.9 -> 70.8%, and the repeat gives +1.10 ms against a 6.16 ms spread. The cache is not the
+  constraint on this workload; a round's TPOT is bimodal (33 ms typical, 93-101 ms when it re-prefills), which is why
+  the protocol asks for a median.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
@@ -115,7 +129,7 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
-| **M33** | the prompt path borrows the expert cache | 🔶 built, loan opt-in 2026-11-03 | The cache's banks are carved from one 1.5 GiB lending window, a prompt borrows **two ranges of it** for its layer buffers, and a ledger refills the displaced slots (719 of 719). Gates clean: oracle byte-exact, 55 tests, 0 failed turns in the shipped arm. The chunk's cost is now **measured** (0.35 MiB a row; 386 MiB for 1 216 tokens, against 1 730 when the buffers are allocated beside the cache) and a 3.2 GB cache can stream a long prompt. Left opt-in because the wipe costs +2.4 s per conversation at 2.2 GB and one run in two refilled into a silent empty answer. The 2.2 -> 3.2 GB TPOT claim was **withdrawn**: it does not reproduce (43.9 vs 44.98 ms), and `slot_bytes` priced from layer 0 makes nominal cache size != resident |
+| **M33** | the prompt path borrows the expert cache | 🔶 built, loan off (NaN) 2026-11-03 | The cache's banks come from one 1.5 GiB lending window, a prompt borrows **two ranges of it** and a ledger refills what it displaced. The chunk's cost is measured (0.35 MiB a row; 386 MiB for 1 216 tokens against 1 730 when the buffers are allocated beside it), the cache's nominal size is now the resident one (per-layer slot pricing, +318 MiB free at load), oracle byte-exact and 56 tests. **The loan itself is not safe yet:** it puts NaN in the logits (4 failures in 96 chat turns, none in 120 without it); a `sync_queued` refill, `NAIWA_REFILL=0` and a quiesced chunk all still fail, so the cause is neither the refill nor lookahead. And the cache ladder is **flat** (2.2 / 2.5 / 2.9 GB = 33.78 / 32.83 / 33.71 ms), so cache size is not the remaining lever |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |

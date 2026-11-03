@@ -1099,6 +1099,25 @@ impl PrefillStream {
                 );
             }
         }
+        // `NAIWA_BORROW_CHECK=1`: is the chunk itself producing NaN, or is it made later? A NaN in a prompt step
+        // lands in the KV cache and only shows up as `max_logit=NaN` a turn or two afterwards, so the decode-side
+        // check is blind to it. This names the layer and the side (input hidden states vs the experts' output).
+        if crate::vram_peak::checking() {
+            let finite = |t: &Tensor| -> bool {
+                t.flatten_all()
+                    .and_then(|f| f.to_dtype(candle_core::DType::F32))
+                    .and_then(|f| f.to_device(&candle_core::Device::Cpu))
+                    .and_then(|f| f.to_vec1::<f32>())
+                    .map(|v| v.iter().all(|x| x.is_finite()))
+                    .unwrap_or(true)
+            };
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if !finite(xs) || !finite(topk_weights) {
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    eprintln!("PREFILL_NAN layer {layer}: the chunk's row inputs are not finite");
+                }
+            }
+        }
         let buf = self.bufs[layer % stride].lock().unwrap();
         let experts = buf.experts.as_ref().expect("loaded");
         let t_wait = std::time::Instant::now();
