@@ -1018,3 +1018,37 @@ Gates: oracle byte-exact, 56 tests, and the chat harness is the better arm with 
 With that in, the standing comparison against strata on the same cold prompts is **1.24x at 3.4 k tokens** (4 313
 against 3 447 ms) and **1.31x at 1 k** (2 913 against 2 224), and the profile says where the rest is: attention and the
 quantized GEMMs at ~0.22 ms a row each, with attention the superlinear one.
+
+### 20.3 Is dequantization in the prompt path? No - and the attention kernel's problem is that it has no tensor cores
+
+§20 put attention and the quantized GEMMs at ~0.22 ms a row each. Asked directly: does either of them
+**dequantize weights** first? The profile answers both questions, and the answer changes where the work is.
+
+**Dequantization: absent from the prompt path.**
+
+- Every one of the model's nine quantized types runs ggml's **MMQ** kernel - `mul_mat_q<(ggml_type)12/13/14/18/20/21/22/23/42>` -
+  which dequantizes *inside* the dot product against a q8_1-quantized activation (`quantize_mmq_q8_1`, 47 ms) and never
+  materializes a dequantized block. The profile contains **no `dequantize_*` kernel at all**.
+- The only conversion kernels are activation-sized: `cast_f32_bf16` 29.9 ms (1.3%, 695 launches), `cast_bf16_f32`
+  5.6 ms, plus elementwise `ucopy_bf16`/`bmul_bf16`/`badd_bf16` (21/18/8 ms). Nothing weight-sized.
+- One kernel really does dequantize: `mmvq_gguf_q6_k_bf16_plain_cuda1`, 9.2 ms, 205 launches - a Q6_K-to-bf16 matvec
+  for the one-row case, i.e. **decode**, not the prompt.
+- The upload path does not dequantize either: a chunk copies the stacks' raw quantized bytes (386 MiB for a 1 216-row
+  chunk at 13 GB/s, §13), which is why the transfer is that small in the first place.
+- `q4_qsa_attention_kernel`'s "q4" is the **model family (Qwen4)**, not 4-bit: its K/V are `const T *__restrict__` in
+  bf16 (`qwen4_exp.cu:777`). The KV cache is not quantized, so there is nothing to dequantize.
+
+**Attention's actual limit: it is a scalar-FMA kernel.** From `qwen4_exp.cu`:
+
+- head dim is fixed at 256 and **each lane owns 8 dims** (`qv[hh][8]`, `acc[hh][8]`, `q4_load8`), 4 warps a block, up to
+  4 q heads a warp; grid is `(tokens, kv_heads=2, splits)`. K/V are loaded per warp and reused across that warp's q
+  heads, and one kv head's selection (3.5 MiB) lives in L2 - so this is **not** a DRAM-bandwidth problem.
+- The arithmetic is plain `float` FFMA: for a 3 404-token prompt, 12 QSA layers x (3 404^2 / 2) pairs x 24 heads x 256
+  dims x 2 = **~854 GFLOP in 0.525 s = 1.6 TFLOP/s**, against ~29 TFLOP/s of bf16 tensor-core peak on this card.
+  **~5% of peak** - the kernel never touches an MMA pipe.
+- That is also why the cost is superlinear (1 k rows ~0, 3.4 k rows 0.525 s): the pairs grow with the square of the
+  prefix while the throughput per pair stays at a scalar-FMA rate.
+
+So the next prompt-path milestone is not "avoid dequantization" (there is none) and not the copy (at the link): it is
+**moving `q4_qsa_attention_kernel` onto tensor cores**, which is worth ~0.4-0.5 s of a 3.4 k prompt (~10%) today and
+grows quadratically with context. Second is the MMQ aggregate (0.86 s), which is already the efficient path.

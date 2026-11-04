@@ -170,6 +170,14 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   `NAIWA_PREFILL_NOQUIESCE=1` is the A/B arm): 3 404 tokens 4 313 ms / 789 tok/s, chat p90 2 124 ms and e2e 29.9 s
   against 2 347 / 37.1 with it off, oracle byte-exact, 56 tests. Standing gap to strata on the same cold prompts:
   **1.24x at 3.4 k, 1.31x at 1 k**.
+- **No dequantization in the prompt path, and attention has no tensor cores** (§20.3). All nine quantized types run
+  ggml MMQ (`mul_mat_q<type>`), which dequantizes inside the dot product with no materialized block - the profile has
+  **no `dequantize_*` kernel**, and the only conversion kernels are activation-sized casts (30 ms of 2 340). The one
+  real dequantize kernel (`mmvq_gguf_q6_k_bf16`, 9 ms) is decode-side; the upload copies raw quantized bytes. The
+  `q4_` in `q4_qsa_attention_kernel` is the *model family* - its K/V are bf16. What that kernel is missing is tensor
+  cores: head dim 256, 8 dims a lane, plain float FFMA, measured **1.6 TFLOP/s against ~29 TFLOP/s of bf16 peak
+  (~5%)**, 854 GFLOP for a 3.4 k prompt. That is the next milestone: ~0.4-0.5 s today and quadratic in context; MMQ
+  (0.86 s) is already the efficient path.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
