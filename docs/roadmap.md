@@ -177,7 +177,13 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   `q4_` in `q4_qsa_attention_kernel` is the *model family* - its K/V are bf16. What that kernel is missing is tensor
   cores: head dim 256, 8 dims a lane, plain float FFMA, measured **1.6 TFLOP/s against ~29 TFLOP/s of bf16 peak
   (~5%)**, 854 GFLOP for a 3.4 k prompt. That is the next milestone: ~0.4-0.5 s today and quadratic in context; MMQ
-  (0.86 s) is already the efficient path.
+  (0.86 s) is already the efficient path. **The code comparison says the same thing** (§20.4): strata's
+  `qsa_prompt_attn.cu` runs the *identical* selection scheme on `mma.sync.m16n8k16.f16` with `cp.async`, 4 warps,
+  `G = 12`, 32-cell chunks, and feeds it **int8/q4_0 KV** (codes packed as exact halves, per-64/per-32 FP32 scales);
+  ours is the scalar kernel they kept as a pre-sm_75 fallback (`native_flash_attn.cu`, 0 MMA intrinsics), and the fork
+  has no `mma.sync` in the attention path at all. At 3 404 tokens the engines differ by 866 ms and attention is 525 ms
+  of our side: tensor cores at 25-40% of peak would make it 0.05-0.11 s, **about half the remaining gap**, growing
+  quadratically with context.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

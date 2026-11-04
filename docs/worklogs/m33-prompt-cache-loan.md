@@ -1052,3 +1052,28 @@ quantized GEMMs at ~0.22 ms a row each, with attention the superlinear one.
 So the next prompt-path milestone is not "avoid dequantization" (there is none) and not the copy (at the link): it is
 **moving `q4_qsa_attention_kernel` onto tensor cores**, which is worth ~0.4-0.5 s of a 3.4 k prompt (~10%) today and
 grows quadratically with context. Second is the MMQ aggregate (0.86 s), which is already the efficient path.
+
+### 20.4 The code-level comparison with strata on this exact part: they run the same math on tensor cores
+
+`qsa_prompt_attn.cu` (1 525 lines) against our `qwen4_exp.cu:777`, for the same model and the same selection scheme:
+
+| | strata | naiwa |
+|---|---|---|
+| selection | indexer top-k + compress ratio, per-token item list, split-K partials + reduce | **same scheme** (`selected`/`n_selected`, `ratio`, `part_acc`/`part_ml`, reduce kernel) |
+| block shape | 4 warps (128 threads), `HD = 256`, `G = 12` q heads a kv head, 32-cell chunks | 4 warps, `HD = 256`, up to 4 q heads a warp, 4-item inner loop, **8 dims a lane** |
+| math | **`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`** (and m16n8k8) + `cp.async` (sm80+) | `q4_load8` + **`float` FFMA** |
+| KV | **quantized**: mode 0 fp16, mode 1 int8 codes + a fp16 scale a 64, mode 3 K8V4, mode 4 q4_0 + a scale a 32. The codes are made into *exact halves* (mantissa tricks, "1024 + (c + 128) ... minus 1152") and fed to the same fp16 MMA, scales applied in FP32 per group | bf16 only (`const T *k_cache`) |
+| fallback | keeps a scalar kernel (`native_flash_attn.cu`, **0** MMA intrinsics, from llama.cpp's fattn-vec) for pre-sm_75 and AMD | - |
+
+Two things follow, and they are both about code, not about scheduling.
+
+1. **Ours is their *fallback*.** Strata went through the scalar kernel, kept it for old cards, and moved the prompt
+   path to `mma.sync`; the fork has **no `mma.sync` anywhere in the attention path** (`qwen4_exp.cu` has none, only
+   `moe_gemm_wmma.cu` for bf16 experts, which our quantized experts do not use). That is the 1.6 TFLOP/s of §20.3
+   against ~29 TFLOP/s of fp16 tensor-core peak - and it is a kernel to write, not a flag to flip.
+2. **They quantize what we do not.** Their int8/q4 KV halves the bytes a pair costs *and* rides the same fp16 MMA by
+   packing codes as exact halves; our KV is bf16 and every pair pays 2 bytes and four FFMA per 8 dims.
+
+The size of the prize, against the measured gap: at 3 404 tokens the two engines differ by 866 ms (4 313 against
+3 447) and attention is 525 ms of our side. Moving it onto tensor cores at a conservative 25-40% of peak would take it
+to 0.05-0.11 s, i.e. **0.4-0.45 s, about half of the remaining gap** - and the share grows quadratically with context.
