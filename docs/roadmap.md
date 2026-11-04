@@ -201,6 +201,14 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   exp + rescale) and nothing can be removed for much. The ceiling is the instruction count: one
   `mma.sync.m16n8k16` is 2 048 FMA where a whole item costs 1 536 FMA of warp work, i.e. 10-20x less instruction work
   per item. Fork unchanged, oracle byte-exact, 56 tests.
+- **The tensor-core score primitive is verified, and its ceiling is measured** (§20.7). `NAIWA_QSA_MMA_CHECK=1` at
+  startup computes a 16x8 score tile of head_dim 256 both ways - `mma.sync.m16n8k16.bf16` over 16 k-steps and a
+  per-element f32 dot - and prints **worst |mma - ref| = 0** (exact: bf16 inputs, exact products, same k order, so a
+  layout error could not hide). The same primitive measures **4.78 TFLOP/s** against the running kernel's 1.63 - 2.9x,
+  from a deliberately naive one-warp-a-block, no-smem, no-tiling version. On a 3.4 k prompt that is attention
+  525 -> ~180 ms, **~8% of the prompt**. What is left is structure, not arithmetic: warps split over items for the
+  score phase, scores through shared memory, value phase split over dims (16 rows x 64 dims a warp), which is what
+  strata's 1 525-line kernel does.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

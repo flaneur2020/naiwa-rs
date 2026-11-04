@@ -1153,3 +1153,35 @@ actually short of - not bytes, not occupancy, not one instruction family.
 
 **The fork is unchanged** (the switches were reverted; `git status` clean), and the tree is back to the committed
 baseline: oracle byte-exact, 56 tests, attention 523.6 ms.
+
+### 20.7 The tensor-core score primitive, verified on device, and what it is worth
+
+§20.6 killed every cheap explanation of the attention kernel's 523 ms and left one lever: instruction count. The
+risky part of that rewrite is not the loop structure but the **fragment layout** - get it wrong and the kernel still
+runs, just with quietly wrong numbers - so it was done first and on its own, with a check.
+
+`NAIWA_QSA_MMA_CHECK=1` runs `qwen4_qsa_mma_check` once at startup (`src/cuda/qwen4_exp.cu`, called from
+`load::qsa_mma_check`). It computes a **16x8 score tile of head_dim 256** two ways - `mma.sync.m16n8k16.row.col.f32.bf16.bf16.f32`
+over 16 k-steps, and a per-element f32 dot product - and prints the difference:
+
+```
+QSA_MMA_CHECK head_dim=256: worst |mma - ref| = 0 (relative 0) at row 0 item 0;
+                            ref[0][0] = -0.78125, mma[0][0] = -0.78125
+QSA_MMA_CHECK throughput: 4.78 TFLOP/s over 16384 tiles x 8 iters (1.8 ms)
+```
+
+Exact equality is expected here and is still the right test: the inputs are exactly representable in bf16, a
+bf16-by-bf16 product is exact in f32, and both paths sum the 256 products in the same k order - so any layout error
+would show up as a large difference, and none does. The fragment mapping is now known-good, in the tree, next to the
+kernel that will use it.
+
+**What it is worth: 4.78 TFLOP/s against the current kernel's 1.63** - 2.9x, from a deliberately naive measurement:
+one warp a block, fragments read straight from global memory, no shared-memory staging, no tiling. On the prompt of
+§20.3 that would take attention from 525 ms to ~180 ms, i.e. **~340 ms of a 4.3 s prompt (~8%)**, before the
+staging that the real kernel will have.
+
+The remaining work is the structure, not the arithmetic: warps must split over *items* for the score phase (one
+warp uses all 16 rows, so the 12 q heads are shared rather than split three a warp), the exponentiated scores have to
+go through shared memory to be consumed in the value phase, and the value phase must split over *dims* (16 rows x 64
+dims a warp) or the accumulator alone is 128 registers a lane. That is what strata's 1 525-line kernel does, and it
+is the next step - the part of it that fails silently is now checked.
