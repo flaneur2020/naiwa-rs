@@ -792,3 +792,21 @@ So the floor is real: **23.4 GiB at 13.4 GB/s = 1.87 s**, and a chunk of 1 216 r
 2. **The first two transfers (10.5-10.9 GB/s against 13.4)** - cold-allocation effects: `NAIWA_SHAPE_TRIM` shows the
    pool reuse that follows costs ~31 us, so this is cudaMalloc's first-touch, not the link. Worth ~30 ms a chunk.
 3. Everything else is the link. On this card, the prompt path is a copy job.
+
+### 18.5 So should the loan be on by default? Not on this evidence
+
+Two more chat runs after the NaN fix, 3 rounds and 24 measured turns each, 0 failures in both:
+
+| arm | TTFT t1 | TTFT >= 2 p50 | p90 | TPOT p50 | e2e per conversation |
+|---|---:|---:|---:|---:|---:|
+| loan on | 1 031 ms | 1 062 ms | 2 280 ms | 44 ms | 33.5 s |
+| loan off | 976 ms | 971 ms | 2 326 ms | 44 ms | 36.2 s |
+
+against the earlier 5-round run with the loan on (TTFT >= 2 997 ms, p90 1 946, TPOT 42, e2e 36.3). The three arms
+overlap: on the `short` corpus the loan is **neutral** - which is what the corpus predicts, since its first turn is
+40 prompt tokens and the loan only pays on a prompt long enough to be a chunk worth overlapping.
+
+So the default stays **off**, and the reason is now precise: on the workload the harness measures, the loan is a wash;
+its measured value is on a long single prompt (**-270 ms a chunk, -10.5%**) and on being the only way to run a cache
+larger than free VRAM. The measurement that would decide it is a `long`/`doc` class A/B, which the corpus has: `doc`
+is 7 turns and `long` 3, both of which grow into real chunks.
