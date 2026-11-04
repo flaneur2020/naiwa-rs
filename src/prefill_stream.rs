@@ -320,6 +320,10 @@ pub struct PrefillStream {
     min_tokens: usize,
     /// `NAIWA_PREFILL_PEAK=1`: what a chunk actually costs in VRAM, against what the planner estimates.
     peak: Mutex<Peak>,
+
+    /// When the previous layer entered `forward`. The entry-to-entry delta is a whole layer - our expert path plus
+    /// the model's own dense work for it - which is the decomposition a chunk's wall time needs. `NAIWA_STREAM_DBG=1`.
+    last_entry: std::sync::Mutex<Option<std::time::Instant>>,
     /// `NAIWA_BORROW_PRIVATE=1`: borrow the three projections from a private allocation instead of the cache's slab,
     /// exercising the same `borrow_from` + offset views with no aliasing at all. What it separates: a bug in the
     /// borrowed *view* versus a bug that needs the bytes to be cache slots.
@@ -382,6 +386,7 @@ impl PrefillStream {
             }))
         };
         Ok(Some(Self {
+            last_entry: std::sync::Mutex::new(None),
             device: device.clone(),
             bufs: [buf()?, buf()?],
             copy,
@@ -1087,6 +1092,14 @@ impl PrefillStream {
             }
             return Ok(None);
         }
+        // Entry-to-entry is a whole layer: our upload/dispatch plus the model's own dense work for it.
+        let entry = std::time::Instant::now();
+        let gap = {
+            let mut last = self.last_entry.lock().unwrap();
+            let prev = if layer == 0 { None } else { *last };
+            *last = Some(entry);
+            prev.map(|p| entry.duration_since(p))
+        };
         self.sample_peak(layer, batch * seq);
         let mut stride = self.reserve()?;
         if stride == 0 {
@@ -1232,7 +1245,8 @@ impl PrefillStream {
         crate::dbg_note(
             "prefill_stream",
             &format!(
-                "layer {layer} stride {stride} dma_wait={waited:?} compute={:?}{}",
+                "layer {layer} rows {} stride {stride} gap={gap:?} dma_wait={waited:?} compute={:?}{}",
+                batch * seq,
                 t_compute.elapsed(),
                 transport.unwrap_or_default()
             ),

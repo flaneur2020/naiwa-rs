@@ -739,3 +739,56 @@ It still stays **off by default**, for the reason §16 established and this sect
 bigger cache is not worth what the loan charges (one wipe of ~714 slots and its refill, 2.4 s per conversation at
 2.2 GB). The mechanism is kept because it is the only way to run a cache larger than the free VRAM allows, and its
 cost is now known to be bounded by the refill rather than by correctness.
+
+---
+
+## 18. Where a prompt chunk's time actually goes: 75% PCIe at the link rate, 25% dense work, and overlap gets half of it (2026-11-03)
+
+§11.2 and §14.3 both pointed at "half of a chunk is per-layer latency rather than transfer". That was a guess made
+from a division (23.4 GiB / 13.4 GB/s = 1.87 s against a 3.6 s wall). With the loan repaired it can be measured, and
+it was wrong: the transfers are already at the link rate, and the "per-layer latency" is the model's own dense work.
+
+### 18.1 The instrument
+
+`NAIWA_STREAM_DBG=1` already printed, per layer, `dma_wait`, `compute` and the upload's queue time. It now also
+prints **`gap`**: the time from one layer's entry into `forward` to the next layer's, which is a whole layer - our
+expert path *plus* the model's attention/mixer/PLE work for it. Summing the 48 gaps of a chunk gives its host
+timeline, so `sum(gap) - sum(compute)` is exactly what the model does outside the expert path.
+
+Two runs, one long prompt (1 216 tokens, one chunk of 1 216 rows), shipped 2.2 GB cache:
+
+| | chunk, entry-to-entry | of which our expert path | of which model-side | per-layer gap p50 |
+|---|---:|---:|---:|---:|
+| stride 1 (shipped, no loan) | **2.55 s** | 0.14 s | **0.62 s** | 55.4 ms |
+| stride 2 (loan, two ranges) | **2.29 s** | 0.17 s | **0.36 s** | 48.8 ms |
+
+### 18.2 The transfers are not the problem, and the 10 GB/s was a mirage
+
+With `NAIWA_STREAM_SYNC=1` (blocking uploads, so the copy's own wall time is what is reported) every layer moves at
+**13.0-13.4 GB/s**, i.e. the link's ceiling: 96 transfers, 47.9 GiB, 3.86 s, **12.1 GB/s aggregate** including the
+first two slower ones (10.9, 10.5 - cold cudaMalloc and page-table work). The async path reported 10.0-12.8 GB/s
+because `copy` there is the *queue* latency, not the transfer.
+
+So the floor is real: **23.4 GiB at 13.4 GB/s = 1.87 s**, and a chunk of 1 216 rows takes 2.55 s (stride 1) or 2.29 s
+(stride 2) - **1.36x and 1.22x the link floor**, not 2x.
+
+### 18.3 What that means for the two levers people reach for
+
+- **Overlap (the double buffer) is worth ~0.27 s a chunk (-10.5% of its wall, -270 ms)**, which is what it can hide
+  of the 0.62 s the model spends outside the expert path. It cannot do better than that on this card, because the
+  copy is 75% of the layer and there is only ~13 ms of compute a layer to hide behind ~40 ms of transfer. So M18's
+  19% was never available here, and M33's -4.3% was measured under the broken loan (private buffers, cache emptied);
+  with the loan sound and the alias real it is **-10.5%**.
+- **Chunking bigger does not help either**: every chunk streams every layer once, so the traffic per token is
+  23.4 GiB / chunk, and the wall is that traffic at the link rate plus a fixed ~13 ms a layer of dense work. Only
+  fewer bytes per token helps, and the ways to get them are the expert cache (too small - §16 measured the ladder
+  flat) or a smaller quant.
+
+### 18.4 What is left in the prompt path
+
+1. **The ~0.36 s a chunk the double buffer still leaves on the table** (0.62 - 0.27). It is the pipeline's fill and
+   drain: layer 0's upload cannot overlap anything and the last layer's compute cannot hide behind a copy. That is a
+   few percent and it needs a different mechanism (a ring, i.e. more than two buffers), which §9 already deferred.
+2. **The first two transfers (10.5-10.9 GB/s against 13.4)** - cold-allocation effects: `NAIWA_SHAPE_TRIM` shows the
+   pool reuse that follows costs ~31 us, so this is cudaMalloc's first-touch, not the link. Worth ~30 ms a chunk.
+3. Everything else is the link. On this card, the prompt path is a copy job.

@@ -132,6 +132,13 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   72.4%, PCIe 14.9 -> 13.1 GiB a round. The loan stays **off by default** anyway, because §16's ladder is flat: a
   bigger cache does not buy time, so it is not worth the wipe the loan charges. It is kept for the case where the
   cache has to be larger than the free VRAM allows, and its cost is now known to be the refill, not correctness.
+- **A prompt chunk is 75% PCIe at the link rate, not per-layer latency** (§18). `NAIWA_STREAM_DBG` now prints a
+  per-layer `gap` (entry-to-entry, i.e. our expert path *plus* the model's dense work), and with blocking uploads
+  every layer moves at **13.0-13.4 GB/s** (96 transfers, 12.1 GB/s aggregate). A 1 216-row chunk is 2.55 s at stride 1
+  and **2.29 s at stride 2** against a 1.87 s link floor - 1.36x and 1.22x, where the old note guessed 2x. The double
+  buffer's share of that is **-270 ms a chunk (-10.5%)**; the ~0.36 s left is pipeline fill and would need a ring.
+  Bigger chunks do not help (every chunk streams every layer once), so the only remaining levers are fewer bytes per
+  token (the cache - flat - or a smaller quant) and the link itself.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
