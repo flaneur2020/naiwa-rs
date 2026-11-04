@@ -1077,3 +1077,49 @@ Two things follow, and they are both about code, not about scheduling.
 The size of the prize, against the measured gap: at 3 404 tokens the two engines differ by 866 ms (4 313 against
 3 447) and attention is 525 ms of our side. Moving it onto tensor cores at a conservative 25-40% of peak would take it
 to 0.05-0.11 s, i.e. **0.4-0.45 s, about half of the remaining gap** - and the share grows quadratically with context.
+
+### 20.5 Attempting attention: the GPU numbers are stable, the wall clock is not, and the kernel's real defect is a shuffle chain
+
+Before rewriting anything, two things had to be established. Both were.
+
+**1. The kernel profile is stable; the wall clock is not.** The same build and prompt, profiled twice hours apart:
+
+| | first | second |
+|---|---:|---:|
+| `q4_qsa_attention_kernel` | 524.5 ms | 526.2 ms |
+| `mul_mat_q` (all types) | 861.8 ms | 862.6 ms |
+| `gated_delta_rule_recurrence` | 237.9 ms | 239.9 ms |
+| kernel total | 2.34 s | **2.20 s** (the doorbell stall of §20 is gone) |
+
+while TTFT for the same configuration moved from **4 313 ms to 6 303 ms** and repeated requests degrade within a run
+(4 963 -> 6 422 -> 6 303 ms). The cause is host memory, not the GPU: this model is 54 GiB of weights (23.4 experts +
+26.8 PLE) in 60 GiB of RAM, swap is in use (1.5 GB), and the prompt path reads the expert stacks from host memory. The
+GPU-side profile sampled a 4.00 s prompt in the same session. **So: kernel numbers are comparable across sessions,
+wall clocks are only comparable within one run, and the box needs the page cache left alone (or more RAM) before any
+prompt-path wall-clock claim.**
+
+**2. The cheap knob is not the lever.** `Q4_ATTN_MAX_HEADS_PER_WARP` was 4 for a GQA group of exactly 12 q heads, so
+a quarter of the head loop is skipped by its guard; setting it to 3 covers 12 exactly. Measured: slower in the one
+clean run (5 607 against 4 313 ms), and with the host thrashing the comparison cannot be trusted either way.
+**Reverted** - the fork is unchanged.
+
+**What the code says the defect is.** The inner loop computes each score with a lane-local 8-dim dot and then
+**reduces it across all 32 lanes with a five-step `__shfl_xor` chain, for every item batch**:
+
+```cpp
+for (int o = 16; o > 0; o >>= 1) for (int j = 0; j < 4; ++j) dot[j] += __shfl_xor_sync(0xffffffff, dot[j], o);
+```
+
+That is 20 shuffles (five dependent steps, ~25 cycles each) per 4 items per q head, against 32 FMAs of actual work - so
+the kernel spends its time in shuffle latency, not arithmetic, which is why 854 GFLOP lands at 1.6 TFLOP/s, ~7% of
+even the *scalar* FP32 peak and ~5% of bf16 tensor peak. Batching more items to amortise it is not available either:
+`kf`/`vf` are already 64 registers at 4 items, and 8 items would spill.
+
+Strata does not have this problem because `mma.sync` produces the whole 16x8 score tile in one instruction and the
+softmax needs a 2-level (4-lane) reduction instead of a 5-level (32-lane) one. That is the rewrite, and the design is:
+
+- `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, m = 16 q-head rows (12 real), n = 8 items, k = 16 dims
+  (16 k-steps for head_dim 256); the indexer selection and split-K partials stay exactly as they are.
+- softmax per row over the 8 columns held by 4 lanes: `__shfl_xor` with masks 1 and 2 only.
+- PV as m = 16 heads, n = 8 dims (32 tiles for head_dim 256), k = 16 items, with K/V staged through shared memory
+  (`cp.async`) so the fragments are loaded once per block instead of once per warp.

@@ -184,6 +184,15 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   has no `mma.sync` in the attention path at all. At 3 404 tokens the engines differ by 866 ms and attention is 525 ms
   of our side: tensor cores at 25-40% of peak would make it 0.05-0.11 s, **about half the remaining gap**, growing
   quadratically with context.
+- **Two facts before any attention rewrite** (§20.5): the **kernel profile is stable across sessions** (attention
+  524.5 -> 526.2 ms, GEMM 861.8 -> 862.6, kernel total 2.34 -> 2.20 s with the doorbell stall gone) while **TTFT for
+  the same config moved 4 313 -> 6 303 ms** - the box holds 54 GiB of weights in 60 GiB of RAM, swap is in use, and
+  the prompt path reads the expert stacks from host memory, so wall clocks are only comparable within one run. And the
+  cheap knob is not the lever: `HEADS_PER_WARP` 4 -> 3 (exact 12-head cover) was not faster and is reverted. The defect
+  in the kernel is a **five-step `__shfl_xor` chain per item batch** (20 shuffles against 32 FMAs), which is why
+  854 GFLOP lands at 1.6 TFLOP/s; batching more items spills registers (kf/vf are 64 at 4 items). The rewrite is
+  `mma.sync.m16n8k16.bf16` with the same selection and split-K, softmax on 4-lane reductions, and K/V staged through
+  shared memory - the design is written down in §20.5.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
