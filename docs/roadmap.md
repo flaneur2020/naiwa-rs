@@ -209,6 +209,15 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   525 -> ~180 ms, **~8% of the prompt**. What is left is structure, not arithmetic: warps split over items for the
   score phase, scores through shared memory, value phase split over dims (16 rows x 64 dims a warp), which is what
   strata's 1 525-line kernel does.
+- **The mma score path: correct, and 56% slower as a naive port** (§20.8). `Q4_ATTN_MMA_QK=1` replaces the lane-local
+  dot and its five-step reduction with `mma.sync.m16n8k16` over the 16-row tile, Q/K staged through shared memory.
+  Numerically it is right - the score tile matches the scalar dot exactly, a token's attention output matches to six
+  decimals, and greedy text is identical for 35 tokens before a low-margin token flips (which is also the gate rule:
+  **an arithmetic change cannot pass the byte-exact oracle**, so the oracle stays pinned to the scalar path). But it
+  measures **816.7 ms against 523.6 ms** for the same prompt: the tile is 16 rows for 12 heads and only 4 of 8 item
+  columns are filled, K is re-staged per 4 items, and fragments are per-element shared-memory loads instead of
+  `ldmatrix`. It stays in the tree, defaulted **off**, as the starting point for the full-tile version (8-item
+  batches, one stage per batch, `ldmatrix`, value phase on tensor cores - the FA2 dim split).
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

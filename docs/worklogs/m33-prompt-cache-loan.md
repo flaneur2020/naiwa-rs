@@ -1185,3 +1185,41 @@ warp uses all 16 rows, so the 12 q heads are shared rather than split three a wa
 go through shared memory to be consumed in the value phase, and the value phase must split over *dims* (16 rows x 64
 dims a warp) or the accumulator alone is 128 registers a lane. That is what strata's 1 525-line kernel does, and it
 is the next step - the part of it that fails silently is now checked.
+
+### 20.8 The mma score path, built and measured: correct, and 56% slower as a naive port
+
+§20.7 verified the fragment layout. This is the port into the kernel: `Q4_ATTN_MMA_QK` replaces the
+lane-local 8-dim dot **and** its five-step reduction with `mma.sync.m16n8k16` over the 16-row tile (12 heads
+padded), with Q and K staged through shared memory and the resulting scores read back as a broadcast. The value
+phase is untouched.
+
+**It is numerically right.** On a 3 404-token prompt at a real layer, the tile and the scalar dot agree exactly
+(`QK_CMP … mma=[3.44711 …] scalar=[3.44711 …]`), and the attention output for a token is identical to six decimals
+(`OUT_ATT h=0 m=3.447114 s=1.000000 acc=0.171875 0.110352 -0.558594` in both builds). Greedy text is identical for
+**35 tokens** before a low-margin token flips - which is the expected consequence of a different summation order, and
+worth stating as a gate rule: **an arithmetic change cannot pass the byte-exact oracle by construction**, so the
+oracle has to stay pinned to the scalar path (`Q4_ATTN_MMA_QK=0`, the default) and a numerics change is gated on
+"same text for N tokens plus these equal-value probes" instead.
+
+**And it is slower.** Same prompt, `nsys` kernel duration:
+
+| | attention | kernel total |
+|---|---:|---:|
+| scalar (`Q4_ATTN_MMA_QK=0`, default) | **523.6 ms** | 2.20 s |
+| mma score (`=1`) | **816.7 ms** (+56%) | 2.49 s |
+
+The reasons are structural and were all visible in the design before the measurement:
+
+1. the tile is **16 rows for a 12-head group**, and only **4 of its 8 item columns** are filled because
+   `Q4_ATTN_ITEMS` is 4 - so half of every mma and a quarter of every row is padding;
+2. **K is re-staged into shared memory every 4 items** (4 KB per warp per batch) with a `__syncwarp()` around it;
+3. the fragments are built with **per-element shared-memory loads** instead of `ldmatrix` - 8 smem reads per lane per
+   k-step, 16 k-steps, per batch;
+4. Q is staged per token (8 KB) and read 16 times a batch for the A fragments.
+
+The instruction count did fall, but staging plus barriers cost more than the FMAs they replaced. This is the same
+lesson the reference implementation encodes: what makes `mma` pay is the **full tile** - 8-item batches, one K stage
+per batch, `ldmatrix` fragments, and the value phase on tensor cores too (which is the FA2 dimension split). The
+switch stays in the tree, defaulted **off**, as the correct starting point for that work rather than a dead end: the
+part that fails silently is verified, the arithmetic is right, and the accounting of what is missing is now measured
+rather than guessed.
