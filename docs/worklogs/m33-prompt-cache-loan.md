@@ -689,3 +689,53 @@ Two by-products worth keeping: a rung's TPOT is **bimodal** (33 ms typical, 93-1
 which is why the protocol's median is the right statistic and a mean is not; and the counters show **~16.6 GiB of PCIe
 a round**, which is the prompt's own 23.4 GiB of layer uploads - i.e. the prompt path, not decode, is what moves bytes
 on this card.
+
+---
+
+## 17. The NaN is found and fixed: the loan emptied its slots once per *allocation*, not once per chunk (2026-11-03)
+
+§15 narrowed the NaN to "the loan corrupts memory in a way neither the refill nor the quiesce reaches". It is now
+found, and it was a scope mistake in this milestone's own code.
+
+### 17.1 How it was pinned
+
+1. **`NAIWA_BORROW_VERIFY=1`** (new, strata's `verify_slot`): after a layer's upload lands, read the device range back
+   (`QTensor::data()` on a CUDA tensor is a d2h of the whole projection) and compare it byte for byte with the host
+   stack. It ran on layers 0 and 32 of every chunk and found **zero differing bytes, zero length mismatches**. So the
+   chunk is computing with exactly the weights it uploaded: the corruption is on the **read** side.
+2. The router only accepts a hit when `slot.expert == Some(id) && slot.buf.is_some()`, so a hit cannot point at the
+   wrong id. What is left is a slot whose `expert` is set while its **bytes** belong to something else - i.e. the
+   chunk wrote over a slot that was still resident.
+3. `empty_range` is what prevents that, and it was reachable only from `borrow_buffers`... which runs only when the
+   layer buffer is **(re)allocated**. A chunk whose shapes match the ones already in `buf.memory` skips
+   `borrow_buffers` entirely - and with it the gate, the zeroing and the emptying - then uploads over the loan range
+   anyway. The cache's slots there had been refilled (the ledger from the *previous* chunk), so they were resident
+   with `expert = Some` when the upload overwrote them. That is the NaN, and it explains all three of its shapes: it
+   needs a **second** chunk (turn 2 onwards), it needs the refill to have repopulated the range first (a turn or two
+   later), and `BORROW_STILL` never fired because the check never ran.
+
+### 17.2 The fix
+
+The once-per-chunk work moved out of `borrow_buffers` into `begin_chunk`, called from `forward` at layer 0 - the same
+place the chunk's identity is decided - so it runs **whether or not the chunk had to allocate**: gate, order the copy
+stream after the cache's work, zero the span, empty every slot the loan covers, settle the queued copies. Plus a
+counter in `empty_range` for the other silent path (`BORROW_SKIPPED`: a resident slot with no storage, which cannot be
+tested for overlap and used to be skipped without a word).
+
+### 17.3 Measured after the fix
+
+| measurement | before | after |
+|---|---|---|
+| chat, loan on, 40 measured turns | **4 failures in 96 turns, every run** | **0 failures**, 0 `internal error`, 0 `BORROW_STILL` |
+| chat, loan on | - | TTFT >= 2 p50 997 ms, p90 **1 946 ms**, TPOT 42 ms, e2e 36.3 s |
+| chat, loan off (shipped) | TTFT >= 2 1 083, p90 2 264, TPOT 43, e2e 36.4 s | - |
+| 1 216-token prompt x 5 on one load, loan on | NaN | 33.86 ms TPOT, no NaN |
+| cache ladder with the loan | 3.2 GB unusable | **2.2 vs 3.2 GB = 33.50 vs 32.36 ms**, hit rate 66.0 -> 72.4%, PCIe 14.9 -> 13.1 GiB a round |
+
+Gates: oracle `frac 0` + `--no-lookahead` **byte-identical**; 56 tests.
+
+The loan is therefore **sound** on this workload, and it is also why `--expert-cache-gb 3.2` now runs a long prompt.
+It still stays **off by default**, for the reason §16 established and this section repeats: the ladder is flat, so a
+bigger cache is not worth what the loan charges (one wipe of ~714 slots and its refill, 2.4 s per conversation at
+2.2 GB). The mechanism is kept because it is the only way to run a cache larger than the free VRAM allows, and its
+cost is now known to be bounded by the refill rather than by correctness.

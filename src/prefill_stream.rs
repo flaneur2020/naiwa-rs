@@ -625,21 +625,43 @@ impl PrefillStream {
             crate::moe::quiesce(true);
             let _ = self.device.synchronize();
         }
-        // **Once per chunk**, keyed on the layer index (a chunk always starts at layer 0 - and a flag reset elsewhere
-        // would be missed when two requests run chunks back to back): the gate, the emptying and the zeroing. What
-        // must stay per layer is the *ordering* - `after_device_work` and the synchronise below - because with the
-        // alias layer L+1's upload writes the bytes layer L's kernels are still reading.
-        let fresh_chunk = layer == 0;
+        // The once-per-chunk work - the gate, the emptying, the zeroing - is `begin_chunk`, called from `forward` at
+        // layer 0. It used to live here, i.e. it ran only when the layer buffer was **(re)allocated**: a second chunk
+        // of the same shape reused `buf.memory`, skipped the emptying, and its upload overwrote slots that were still
+        // resident - decode then computed on the chunk's layer weights (M33 §15). A chunk has to empty the loan's
+        // slots whether or not it had to allocate.
+        Ok([out.remove(0), out.remove(0), out.remove(0)])
+    }
+
+    /// Sample this layer's free VRAM and, on the chunk's last layer, report the footprint.
+
+    /// A chunk's **once-per-chunk** work, at layer 0: raise the borrow gate, order the copy stream after the cache's
+    /// queued work, zero the span, empty every slot the loan covers, and settle the copies the fills left behind.
+    ///
+    /// Separate from `borrow_buffers` on purpose. It used to live there, which made it run only when the layer buffer
+    /// was reallocated; a chunk that reused the existing buffer skipped it entirely and its upload overwrote slots
+    /// that were still marked resident (M33 §15 - the NaN). Emptying is a property of *taking the loan*, not of
+    /// allocating.
+    fn begin_chunk(&self, layer: usize) -> candle_core::Result<()> {
+        if !self.borrows() {
+            return Ok(());
+        }
+        if layer != 0 {
+            return Ok(());
+        }
+        let Some(slab) = self.slab.as_ref() else {
+            return Ok(());
+        };
+        let stride = self.current().stride.max(1);
+        let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
+        let loaned = stride * span;
         // From here until the layer's compute has finished, the cache's bytes are the chunk's buffer: no fill may
         // write into them. The lock is held from setting the flag until every copy a fill queued has landed, so a
         // fill cannot slip between the check and its DMA (the TOCTOU that survived until now).
-        let _slab_access = if fresh_chunk {
-            let guard = crate::moe::slab::lock_access();
+        {
+            let _guard = crate::moe::slab::lock_access();
             crate::moe::slab::set_borrowed(true);
-            Some(guard)
-        } else {
-            None
-        };
+        }
         let base = slab.base()?;
         // The borrowed bytes are the cache's, so a kernel or a fill the cache queued can still be reading them.
         // Ordering the copy stream after everything candle has queued is the semantically right thing to do here;
@@ -653,10 +675,8 @@ impl PrefillStream {
         // against M18's 19% without). Inside a chunk the ordering a range needs is its own `released` fence -
         // `upload_async` waits on it - and at layer 0 the range is emptied (which waits for its readers) and the
         // chunk's first upload has nothing of its own to race.
-        if fresh_chunk {
-            self.copy.after_device_work()?;
-        }
-        if fresh_chunk && std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
+        self.copy.after_device_work()?;
+        if std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
             // **Default** (disable with `NAIWA_BORROW_NOZERO`): zero the whole borrowed span before the upload. The
             // chunk only DMAs each projection's
             // `size_in_bytes`; `MATRIX_ROW_PADDING` bytes at the end - which a kernel may legitimately read - are
@@ -683,7 +703,7 @@ impl PrefillStream {
         if let Some(cache) = self.cache.as_ref() {
             // Probe: keep everything identical but skip the emptying, to tell "the chunk writing into the cache's
             // bytes" from "the cache's slot metadata being cleared".
-            let emptied = if !fresh_chunk || std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
+            let emptied = if std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
                 0
             } else {
                 cache.empty_range(base, base + loaned as u64)
@@ -692,21 +712,18 @@ impl PrefillStream {
             // otherwise it overwrites the layer buffer. `empty_range` has waited for the fills' buffers, this
             // settles the copies they queued; no new fill starts while the borrow is held. Once per chunk: the
             // per-layer version drained the copy stream and with it every prefetch.
-            if fresh_chunk {
-                self.copy.synchronize()?;
-            }
+            self.copy.synchronize()?;
             crate::dbg_note(
                 "prefill_borrow",
                 &format!(
-                    "layer {layer}: borrowed {:.0} MiB of the pool in {stride} range(s), {emptied} slots emptied",
+                    "chunk: borrowed {:.0} MiB of the pool in {stride} range(s), {emptied} slots emptied",
                     (loaned as f64) / (1u64 << 20) as f64
                 ),
             );
         }
-        Ok([out.remove(0), out.remove(0), out.remove(0)])
+        Ok(())
     }
 
-    /// Sample this layer's free VRAM and, on the chunk's last layer, report the footprint.
     fn sample_peak(&self, layer: usize, rows: usize) {
         if std::env::var_os("NAIWA_PREFILL_PEAK").is_none() {
             return;
@@ -1075,6 +1092,9 @@ impl PrefillStream {
         if stride == 0 {
             return Ok(None);
         }
+        // A chunk starts here: gate the cache's fillers out, zero the span and empty every slot the loan covers -
+        // **once per chunk, and whether or not this chunk had to allocate** (see `begin_chunk`).
+        self.begin_chunk(layer)?;
         let loaded = match self.load(layer, stride) {
             Ok(loaded) => loaded,
             Err(e) if is_out_of_memory(&e) => {

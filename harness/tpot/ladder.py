@@ -165,9 +165,9 @@ def main() -> None:
     for i, cache in enumerate([c.strip() for c in args.caches.split(",") if c.strip()]):
         r = rung(cache, args.port + i, args.rounds, prompt, args.max_tokens, extra, env_extra)
         rows.append(r)
-        print(f"[{cache} GB] load {r['load_s']:.0f}s  TPOT {r['tpot_med']:.2f} ms "
-              f"[{r['tpot_p25']}, {r['tpot_p75']}]  ({r['tok_s']:.1f} tok/s)  "
-              f"rounds {r['raw']}", flush=True)
+        med = f"{r['tpot_med']:.2f} ms" if r["tpot_med"] else "no data"
+        print(f"[{cache} GB] load {r['load_s']:.0f}s  TPOT {med} "
+              f"[{r['tpot_p25']}, {r['tpot_p75']}]  rounds {r['raw']}", flush=True)
 
     # The counters are **process totals**, so they carry the prompts' own transfers (a prompt step streams every
     # layer, ~23 GiB) as well as decode's. Reporting them a token of output would be nonsense; per measured round,
@@ -178,8 +178,10 @@ def main() -> None:
         c = r["counters"] or {}
         pcie = float(c["mib"]) / max(1, r["rounds"]) if c else None
         gbs = float(c["mib"]) / 1024.0 / r["wall_s"] if c and r["wall_s"] else None
-        print(f"| {r['cache']} GB | {r['tpot_med']:.2f} ms [{r['tpot_p25']:.2f}, {r['tpot_p75']:.2f}] "
-              f"| {r['tok_s']:.1f} | {c.get('rate', '?')}% | {pcie:.0f} | {gbs:.2f} |")
+        med = (f"{r['tpot_med']:.2f} ms [{r['tpot_p25']:.2f}, {r['tpot_p75']:.2f}]"
+               if r["tpot_med"] else "no data")
+        print(f"| {r['cache']} GB | {med} | {r['tok_s'] or 0:.1f} | {c.get('rate', '?')}% "
+              f"| {pcie or 0:.0f} | {gbs or 0:.2f} |")
 
     if len(rows) > 1:
         print("\nDeltas against the first rung (a delta smaller than the spreads is not a result):")

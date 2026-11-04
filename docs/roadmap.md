@@ -58,7 +58,7 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M33 — the prompt path borrows the expert cache — 🔶 built, loan blocked on a NaN (2026-11-03)
+## M33 — the prompt path borrows the expert cache — 🔶 built, loan repaired and opt-in (2026-11-03)
 
 Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache's banks are carved from
 **one allocation** ("the lending window", on by default) and a prompt can borrow **two ranges of it** for its layer
@@ -120,6 +120,18 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   inside 8 ms), hit rate 65.9 -> 70.8%, and the repeat gives +1.10 ms against a 6.16 ms spread. The cache is not the
   constraint on this workload; a round's TPOT is bimodal (33 ms typical, 93-101 ms when it re-prefills), which is why
   the protocol asks for a median.
+- **The NaN is fixed, and it was this milestone's own scope mistake** (§17). The loan's once-per-chunk work (gate,
+  zero, **empty the slots it covers**) lived in `borrow_buffers`, which only runs when the layer buffer is
+  reallocated; a chunk that reused the buffer skipped the emptying and uploaded over slots that were still resident,
+  so decode computed on layer weights. `NAIWA_BORROW_VERIFY=1` (read the upload back and byte-compare it to the host
+  stack, strata's `verify_slot`) proved the uploads are exact, which is what left the read side as the only suspect.
+  The work is now `begin_chunk`, called at layer 0 whether or not a chunk allocates.
+- **After the fix:** chat with the loan on reads 0 failures in 40 turns (it was 4 in 96, every run), TTFT >= 2 p50
+  997 ms with p90 1 946 ms (against 1 083 / 2 264 with the loan off), TPOT 42 ms, e2e 36.3 s. A 1 216-token prompt
+  runs 5 times on one load with no NaN, and the ladder's 3.2 GB rung works: 33.50 -> 32.36 ms TPOT, hit rate 66.0 ->
+  72.4%, PCIe 14.9 -> 13.1 GiB a round. The loan stays **off by default** anyway, because §16's ladder is flat: a
+  bigger cache does not buy time, so it is not worth the wipe the loan charges. It is kept for the case where the
+  cache has to be larger than the free VRAM allows, and its cost is now known to be the refill, not correctness.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
@@ -129,7 +141,7 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
-| **M33** | the prompt path borrows the expert cache | 🔶 built, loan off (NaN) 2026-11-03 | The cache's banks come from one 1.5 GiB lending window, a prompt borrows **two ranges of it** and a ledger refills what it displaced. The chunk's cost is measured (0.35 MiB a row; 386 MiB for 1 216 tokens against 1 730 when the buffers are allocated beside it), the cache's nominal size is now the resident one (per-layer slot pricing, +318 MiB free at load), oracle byte-exact and 56 tests. **The loan itself is not safe yet:** it puts NaN in the logits (4 failures in 96 chat turns, none in 120 without it); a `sync_queued` refill, `NAIWA_REFILL=0` and a quiesced chunk all still fail, so the cause is neither the refill nor lookahead. And the cache ladder is **flat** (2.2 / 2.5 / 2.9 GB = 33.78 / 32.83 / 33.71 ms), so cache size is not the remaining lever |
+| **M33** | the prompt path borrows the expert cache | 🔶 built, loan repaired, off by default | The cache's banks come from one 1.5 GiB lending window, a prompt borrows **two ranges of it**, and a ledger refills what it displaced. The chunk's cost is measured (0.35 MiB a row: 386 MiB for 1 216 tokens against 1 730 when the buffers sit beside the cache), the cache's nominal size is now the resident one (per-layer slot pricing, +318 MiB free at load), oracle byte-exact, 56 tests. The loan's NaN is fixed (its once-per-chunk emptying ran only on reallocation); after the fix 0 failures in 40 turns and 3.2 GB runs a long prompt. Left **off by default** because the ladder is flat (2.2 / 2.9 / 3.2 GB = 33.5 / 33.7 / 32.4 ms TPOT, inside the spread), so a bigger cache is not worth the loan's wipe |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
 | **M2** | per-layer MoE segment graph | ✅ 2026-10-16 | replay bitwise; 150 captures 11.6 ms |

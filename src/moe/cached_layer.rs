@@ -73,12 +73,21 @@ impl Layers {
         // needs `layer.state` to finish, so waiting under that lock deadlocks the two against each other (the
         // W105 family of hang, and the first version of this function did exactly that).
         let mut held: Vec<(usize, usize, Arc<SlotBuf>)> = Vec::new();
+        let mut skipped = 0usize;
         for (li, layer) in layers.iter().enumerate() {
             let mut state = layer.state.lock().unwrap();
             for (si, slot) in state.slots.iter_mut().enumerate() {
                 let overlaps = {
                     let storage = slot.storage.lock();
-                    let Some(buf) = storage.as_ref() else { continue };
+                    let Some(buf) = storage.as_ref() else {
+                        // A slot with no storage cannot be tested for overlap, and it used to be skipped in silence -
+                        // which would leave `expert = Some` pointing at bytes the chunk is about to overwrite, i.e.
+                        // exactly the garbage a decode step then computes on (M33 §17).
+                        if slot.expert.is_some() {
+                            skipped += 1;
+                        }
+                        continue;
+                    };
                     let SlotData::Banked { memory, .. } = &buf.data else {
                         continue;
                     };
@@ -107,6 +116,9 @@ impl Layers {
             crate::copy_stream::wait_for_readers(buf);
         }
         let emptied = held.len();
+        if skipped > 0 {
+            eprintln!("BORROW_SKIPPED {skipped} slots with no storage while resident");
+        }
         // After emptying, no slot in the range may still claim an expert: if one does, some path re-published it
         // (or never cleared it) and the chunk is about to overwrite bytes a decode step would trust.
         let mut still = 0usize;
