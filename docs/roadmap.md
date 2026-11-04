@@ -218,6 +218,18 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   columns are filled, K is re-staged per 4 items, and fragments are per-element shared-memory loads instead of
   `ldmatrix`. It stays in the tree, defaulted **off**, as the starting point for the full-tile version (8-item
   batches, one stage per batch, `ldmatrix`, value phase on tensor cores - the FA2 dim split).
+- **The full tile: attention 535 -> 179 ms (2.99x), both phases on tensor cores** (§20.9).
+  `qwen4_qsa_attention_tile_kernel` (on with `NAIWA_QSA_MMA_KERNEL=1`, `splits == 1` only) answers §20.8's list: 16-item
+  batches so no column is padding, K and V staged once per batch for the whole block (also removing the 4x redundant
+  KV read), and the value phase on mma with the output dims split 64 per warp. What makes it work is that the score
+  tile's C layout *is* the value phase's A layout, so `p` never leaves the registers and the softmax needs no
+  cross-warp exchange - one barrier per batch, for the staging only. Same session, back to back: attention kernels
+  535 -> **179 ms**, kernel total 2.361 -> **1.974 s** (-16.4%), attention 22.7% -> **8.8%** of kernel time; `REG:64`
+  against 167. Verified by an equal-value probe (mma / staged dot / fresh global dot agree to 1e-6), an identical
+  attention output for the same token, and 24 chat turns with 0 failures. Default stays **off** - the arithmetic
+  order changes, and the byte-exact oracle can only be pinned to one order; flipping it needs a one-time re-baseline
+  of the reference, which is a gate decision. **Attention is no longer the lever**: the quantised MoE/dense GEMM is
+  now 43.9% of kernel time.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

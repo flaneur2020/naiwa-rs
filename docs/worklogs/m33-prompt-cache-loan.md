@@ -1223,3 +1223,54 @@ per batch, `ldmatrix` fragments, and the value phase on tensor cores too (which 
 switch stays in the tree, defaulted **off**, as the correct starting point for that work rather than a dead end: the
 part that fails silently is verified, the arithmetic is right, and the accounting of what is missing is now measured
 rather than guessed.
+
+### 20.9 The full tile: both phases on tensor cores, attention 535 -> 179 ms (2.99x)
+
+§20.8 ended with the accounting of what the naive port was missing. This is the kernel that does it:
+`qwen4_qsa_attention_tile_kernel`, a separate kernel (`splits == 1` only, so the split-K decode path keeps the
+scalar one), switched on with `NAIWA_QSA_MMA_KERNEL=1`.
+
+**What changed, item by item against §20.8's list**
+
+| §20.8's gap | now |
+|---|---|
+| 4 of 8 item columns filled | **16-item batches**: two 8-column n-tiles for the scores, and exactly the k the value phase wants - nothing is padding |
+| K re-staged every 4 items | K **and** V staged **once per batch for the whole block** (same kv head, same items for all four warps), which also removes the 4x redundant KV read the scalar kernel does |
+| per-element shared-memory fragments | fragments are still built per element, but there are 4x fewer of them per item because the batch is 4x bigger - and the value phase reads **no** fragments for its A operand (below) |
+| value phase still scalar | value phase on mma, output dims split 64 per warp |
+
+**The property that makes it work** is that the score tile's C layout *is* the value phase's A layout: rows `g, g+8`
+and columns `2t, 2t+1` of the score tile are exactly rows `g, g+8` and columns `2t, 2t+1, 2t+8, 2t+9` of the A
+fragment the next mma reads. So `p` goes from the score mma straight into the value mma **without touching shared
+memory**, and the only thing the dimension split costs is that each warp keeps its own quarter of the accumulator.
+That in turn is why the softmax needs no cross-warp exchange at all: every warp computes the *same* scores for the
+*same* items, so every warp derives the same row max, row sum and rescale factor and rescales its own quarter. One
+block-wide barrier per batch guards the staged K/V, and that is the only communication.
+
+**Numbers** (3 404-token prompt, `nsys`, same session, back to back, cleaned build):
+
+| | attention kernels | kernel total |
+|---|---:|---:|
+| scalar (default) | 529.8 ms (70 launches) + 5.3 ms reduce | 2.361 s |
+| **tile** | **173.6 ms (13 launches)** + 5.3 ms reduce | **1.974 s** |
+
+- prompt attention **535 -> 179 ms, 2.99x**, i.e. 13.4 ms per launch against 40.9 ms at the worst one before;
+- kernel total **-386 ms (-16.4%)**; attention falls from 22.7% of kernel time to **8.8%**;
+- the tile kernel is `REG:64`, no local memory, 25 KB of dynamic shared memory, so 3 blocks/SM - against `REG:167`
+  for the scalar kernel. The scalar kernel's resource usage is back to exactly its pre-experiment form.
+
+**Correctness.** Verified three ways on the same run, at the same token and layer:
+
+1. the tile's score, a per-element f32 dot over the *staged* rows and the same dot straight from global memory agree
+   to 1e-6 (`mma=3.437984 staged=3.437985 global=3.437985`);
+2. the token's attention output is identical to the scalar kernel's at printed precision
+   (`m=3.437985 s=1.000000 acc=0.176758 0.111328 -0.562500` in both);
+3. the chat harness on the `short` corpus, 3 rounds, 24 turns, **0 failures**, TTFT p50 1 011 ms and TPOT p50 44.4 ms
+   - the same as the scalar arm, which is expected: prompts that short do not reach the sparse path at all.
+
+The default stays **off**, because the kernel changes the arithmetic order and the byte-exact oracle can only be
+pinned to one order (this is the rule §20.8 wrote down). Flipping it is one line plus a one-time re-baseline of
+`harness/m1/reference.oracle.txt`; that is a gate decision, not an implementation one, so it is left open.
+
+**Where the time is now.** With attention at 8.8%, the largest kernel family is the quantised MoE/dense GEMM at
+0.866 s (43.9%), then the GDN recurrence at 0.298 s (15.1%). The prompt attention is no longer the lever.
