@@ -831,3 +831,30 @@ cannot be made faster on this machine.
 The only copy-side slack left is the first two layers of a chunk (10.5 and 10.9 GB/s against 13.2 steady, ~30 ms a
 chunk, cold first-touch of the slab), and the copy stream's idle time while the model computes (0.62 s a chunk at
 stride 1, 0.36 s at stride 2) - which is the overlap question of §18.3, not a bandwidth question.
+
+### 18.7 Per layer, transfer against everything else
+
+One chunk of 1 216 rows, blocking uploads (`NAIWA_STREAM_SYNC=1`, so the copy's own wall time is what is reported),
+stride 1, grouped by the layer's weight group (the model has seven, one per quant mix):
+
+| layer bytes | layers | copy p50 | copy rate | layer total p50 | "everything else" p50 |
+|---:|---:|---:|---:|---:|---:|
+| 368 MiB | 5 | 29.7 ms | 13.0 GB/s | 55.6 ms | 25.5 ms |
+| 418 MiB | 3 | 33.8 ms | 13.0 GB/s | 52.6 ms | 18.8 ms |
+| 456 MiB | 1 | 36.7 ms | 13.0 GB/s | 46.8 ms | 10.1 ms |
+| 481 MiB | 15 | 38.7 ms | 13.0 GB/s | 54.9 ms | 16.4 ms |
+| 531 MiB | 14 | 42.8 ms | 13.0 GB/s | 53.8 ms | 10.5 ms |
+| 568 MiB | 9 | 45.7 ms | 13.1 GB/s | 55.2 ms | 9.3 ms |
+| 650 MiB | 1 | 52.3 ms | 13.0 GB/s | 59.1 ms | 6.8 ms |
+| **all 48** | 48 | **40.4 ms** | **13.0 GB/s** | **~55 ms** | **13.9 ms** |
+
+Per chunk that is **1 940 ms of copying and 615 ms of everything else** (2 555 ms), i.e. 76% / 24%. Over 1 216 rows
+that is **1.6 ms of transfer and 0.5 ms of compute a prompt token**.
+
+Two things the table says that a single average hides. A layer costs ~55 ms whatever its size, because the copy and
+the rest trade places: the 368 MiB group moves 40% fewer bytes than the 650 MiB one and spends 3.7x more time outside
+the copy. And the copy rate is flat at 13.0 GB/s across all seven groups, i.e. the transfer is at the link for every
+shape - the per-layer differences are bytes, not efficiency.
+
+What overlap buys, measured the same way at stride 2: the chunk's "everything else" drops from 615 to ~360 ms, so a
+second buffer hides about 40% of the non-copy time; the copy's 1 940 ms is untouched, because it is the link.
