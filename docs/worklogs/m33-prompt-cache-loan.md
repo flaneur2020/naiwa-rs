@@ -948,3 +948,73 @@ still faster. Batch size is therefore not what this gap is made of.
 `0.26 ms a row` x 3 400 rows is ~0.9 s - the larger half of the gap, and it is ordinary model work (attention, PLE
 gather, the chunk's MoE GEMM) rather than streaming. That is where a prompt-path milestone should start, with the
 fixed part's remaining 0.3 s (a ring, §18.8) second.
+
+---
+
+## 20. Where the per-row work is: a kernel profile, and a 0.45 s stall the profile found (2026-11-03)
+
+§19 left the gap at "0.78 ms a row against strata's 0.52". This is the profile of one cold 3 404-token prompt
+(`nsys`, `harness/profile`), split by kernel family, next to the same for a 1 072-token one:
+
+| kernel family | 1 072 rows | 3 404 rows | slope |
+|---|---:|---:|---:|
+| quantized GEMM (`mul_mat_q`, all dtypes, + `quantize_mmq`) | 0.352 s | **0.862 s** | +0.22 ms/row |
+| attention (`q4_qsa_attention_kernel`) | 0.001 s | **0.525 s** | +0.22 ms/row |
+| GDN recurrence (`gated_delta_rule_*`, `gdn_*`) | 0.092 s | 0.294 s | +0.09 ms/row |
+| **CPU-expert doorbell wait** | **0.486 s** | 0.214 s | fixed |
+| bf16 GEMM | 0.050 s | 0.116 s | |
+| hyper-connection mix/combine | 0.028 s | 0.092 s | |
+| MoE route/reduce | 0.071 s | 0.075 s | |
+| everything else (cast/copy/other) | 0.122 s | 0.164 s | |
+| **kernel total** | **1.20 s** | **2.34 s** | |
+| wall (first token) | 3.19 s | 4.63 s | |
+
+Three things to read out of it.
+
+**1. `doorbell_wait_copy_f32_kernel` is a stall, not work.** It is this crate's own handshake - the device spins on a
+mapped counter until the *CPU* has published a CPU-computed expert's result (`src/doorbell/`). During a prompt chunk
+the GPU has every expert it needs (the chunk uploaded the layer), so nothing should be waiting on the CPU at all. It
+is 40% of the kernel time at 1 k rows and 9% at 3.4 k, and it is **fixed per step**, which is why it is invisible at
+long prompts and dominant at short ones. The cause is the lookahead/prediction machinery still running per layer
+during a prompt step.
+
+**2. Killing it is worth 0.45 s.** `NAIWA_PREFILL_QUIESCE=1` (no prediction work during a chunk, and the previous
+step's queued jobs dropped) on the same prompts:
+
+| prompt | default | quiesced |
+|---|---:|---:|
+| 1 072 tok | 2 917 ms (367 tok/s) | 2 911 ms (368) |
+| 3 404 tok | 4 729 ms (720 tok/s) | **4 280 ms (795 tok/s)** |
+
+-9.5% at 3.4 k, nothing at 1 k (the stalled work is fixed, so it hides at larger sizes). Against strata's 3 447 ms
+that moves the gap from 1.37x to **1.24x**.
+
+**3. The remaining per-row cost is attention and the quantized GEMMs, in equal parts (0.22 ms a row each).** The
+attention term is the one that will not age well: `q4_qsa_attention_kernel` is ~nothing at 1 k rows and 0.525 s at
+3.4 k, i.e. it is strongly superlinear (the compressed/indexed attention path), so at longer contexts it becomes the
+whole prompt.
+
+### 20.1 What the profile says to do next
+
+- **Make the chunk quiesce the default** (pending the chat A/B: it must not cost decode hit rate after a prompt).
+- **Attention first, then GEMM**: 0.22 ms a row each today, and attention is the one that grows superlinearly. That is
+  the milestone after this one - it is a kernel question in the fork, not a scheduling question here.
+- The copy is not on this list at all: it is the 2.3 s of wall that no kernel occupies, and §18.8 already has the only
+  remaining answer for it (a ring behind the two buffers).
+
+### 20.2 The chunk quiesce is the default now, and what that leaves
+
+`forward` quiesces the prediction machinery at layer 0 of a chunk (`NAIWA_PREFILL_NOQUIESCE=1` for the A/B arm), and
+the old `NAIWA_PREFILL_QUIESCE` block in `borrow_buffers` is gone with it. Verified with the default in place:
+
+| prompt | before (§19) | now |
+|---|---:|---:|
+| 1 072 tok | 2 917 ms -> 367 tok/s | 2 913 ms -> 368 tok/s |
+| 3 404 tok | 4 729 ms -> 720 tok/s | **4 313 ms -> 789 tok/s** |
+
+Gates: oracle byte-exact, 56 tests, and the chat harness is the better arm with it (p90 2 124 against 2 347 ms, e2e
+29.9 against 37.1 s, 0 failures in 48 measured turns across the two arms).
+
+With that in, the standing comparison against strata on the same cold prompts is **1.24x at 3.4 k tokens** (4 313
+against 3 447 ms) and **1.31x at 1 k** (2 913 against 2 224), and the profile says where the rest is: attention and the
+quantized GEMMs at ~0.22 ms a row each, with attention the superlinear one.

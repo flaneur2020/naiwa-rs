@@ -158,6 +158,18 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   (attention, PLE gather, the chunk's MoE GEMM) plus a less-hidden copy, not the transport and not the batch.**
   Also structural: naiwa's prompt path ignores the expert cache (it uploads every layer's full stack), so a 2.5 GB
   cache takes nothing off its prompt traffic, where strata's 1.98 GiB takes ~8%.
+- **The per-row gap is attention and the quantized GEMMs, and the profile found a 0.45 s stall** (§20). `nsys` on one
+  cold 3 404-token prompt: quantized GEMM 0.862 s (+0.22 ms/row), attention 0.525 s (**+0.22 ms/row, ~nothing at
+  1 k - strongly superlinear**), GDN 0.294 s, bf16 GEMM 0.116, hyper-connection 0.092 - and
+  **`doorbell_wait_copy_f32_kernel` 0.214 s, which is not work at all**: it is this crate's own handshake, the device
+  spinning until the *CPU* publishes a CPU-computed expert, during a prompt chunk that already has every expert on the
+  GPU. It is 40% of kernel time at 1 k rows and 9% at 3.4 k, i.e. a fixed stall of the lookahead running during prompt
+  steps. `NAIWA_PREFILL_QUIESCE=1` removes it: 3 404 tokens **4 729 -> 4 280 ms (720 -> 795 tok/s)**, which against
+  strata's 3 447 ms narrows the gap from 1.37x to **1.24x**. Next: make the chunk quiesce the default (subject to the
+  chat A/B), then attention (the superlinear term) in the fork. **The quiesce is now the default** (`forward`, layer 0;
+  `NAIWA_PREFILL_NOQUIESCE=1` is the A/B arm): 3 404 tokens 4 313 ms / 789 tok/s, chat p90 2 124 ms and e2e 29.9 s
+  against 2 347 / 37.1 with it off, oracle byte-exact, 56 tests. Standing gap to strata on the same cold prompts:
+  **1.24x at 3.4 k, 1.31x at 1 k**.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

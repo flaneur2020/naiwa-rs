@@ -1107,6 +1107,15 @@ impl PrefillStream {
         }
         // A chunk starts here: gate the cache's fillers out, zero the span and empty every slot the loan covers -
         // **once per chunk, and whether or not this chunk had to allocate** (see `begin_chunk`).
+        if layer == 0 && std::env::var_os("NAIWA_PREFILL_NOQUIESCE").is_none() {
+            // **Stop the prediction machinery for the chunk** - the default since M33 §20. Measured: the device spent
+            // 0.486 s of a 1 072-row prompt spinning in `doorbell_wait_copy_f32_kernel`, 40% of that chunk's kernel
+            // time, waiting for CPU-computed experts it does not need, because the lookahead kept running per layer
+            // through the prompt step. Quiescing is -9.5% of a 3 404-token prompt (4 729 -> 4 280 ms) and nothing at
+            // 1 072, and on the chat harness it reads better too (p90 2 347 -> 2 124 ms, e2e 37.1 -> 29.9 s over 24
+            // measured turns, 0 failures either arm).
+            crate::moe::quiesce(true);
+        }
         self.begin_chunk(layer)?;
         let loaded = match self.load(layer, stride) {
             Ok(loaded) => loaded,
