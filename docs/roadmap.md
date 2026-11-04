@@ -138,7 +138,11 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   and **2.29 s at stride 2** against a 1.87 s link floor - 1.36x and 1.22x, where the old note guessed 2x. The double
   buffer's share of that is **-270 ms a chunk (-10.5%)**; the ~0.36 s left is pipeline fill and would need a ring.
   Bigger chunks do not help (every chunk streams every layer once), so the only remaining levers are fewer bytes per
-  token (the cache - flat - or a smaller quant) and the link itself.
+  token (the cache - flat - or a smaller quant) and the link itself - and **the link is done**: the slot is Gen3 x16
+  (idle reads Gen1; it ramps under load), raw 15.75 GB/s, practical ~13-14, and the copies measure 13.0-13.4 GB/s a
+  layer (13.0 GB/s over a whole chunk, 1.93 s against a 1.90 s ideal). The 17% to raw is encoding and TLP overhead.
+  The only copy-side slack is two cold-start layers (~30 ms a chunk) and the copy stream's idle time while the model
+  computes (0.36-0.62 s a chunk), which is the overlap question, not bandwidth.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

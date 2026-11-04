@@ -810,3 +810,24 @@ So the default stays **off**, and the reason is now precise: on the workload the
 its measured value is on a long single prompt (**-270 ms a chunk, -10.5%**) and on being the only way to run a cache
 larger than free VRAM. The measurement that would decide it is a `long`/`doc` class A/B, which the corpus has: `doc`
 is 7 turns and `long` 3, both of which grow into real chunks.
+
+### 18.6 Is the copy at the link's ceiling? Yes - and the link is Gen3 x16, not the 13.4 GB/s the notes assumed
+
+`nvidia-smi` reads `pcie.link.gen.current = 1` at rest (the card downclocks an idle link); sampling it **during** a
+load shows **Gen3, x16** (with Gen2 in between), which is the slot's maximum (`link.gen.max = 3`, `width.max = 16`).
+
+| | |
+|---|---|
+| Gen3 x16, one direction, raw | 8 GT/s x 16 = 15.75 GB/s |
+| practical H2D on this link | ~13-14 GB/s |
+| **measured, blocking uploads** | **13.0-13.4 GB/s** a layer; 50.3 GB in 3.86 s = **13.0 GB/s** aggregate |
+| measured, and the ideal for the same bytes | 1.93 s a chunk against 1.90 s at 13.2 GB/s |
+
+So the copy runs at **~83% of the raw link and at the top of what a Gen3 x16 slot delivers in practice** (the 17% is
+128b/130b encoding plus TLP overhead, not this code). The 13.4 GB/s in the earlier notes was right by accident - it is
+the *practical* rate, not the theoretical one - and the conclusion it supported is unaffected: a chunk's transfers
+cannot be made faster on this machine.
+
+The only copy-side slack left is the first two layers of a chunk (10.5 and 10.9 GB/s against 13.2 steady, ~30 ms a
+chunk, cold first-touch of the slab), and the copy stream's idle time while the model computes (0.62 s a chunk at
+stride 1, 0.36 s at stride 2) - which is the overlap question of §18.3, not a bandwidth question.
