@@ -1123,14 +1123,19 @@ impl PrefillStream {
         if !loaded {
             return Ok(None);
         }
-        // Stream the next layer in while this one computes — only with a second buffer.
+        // Stream the next layer in while this one computes - only with a second buffer. The host time this takes is
+        // the pipeline's own cost: if it is not ~0, the enqueue is blocking (a `released` fence, an allocation) and
+        // the copy stream is idle for that long every layer.
+        let mut prefetch = std::time::Duration::ZERO;
         if stride == 2 {
+            let t = std::time::Instant::now();
             if let Err(e) = self.load(layer + 1, stride) {
                 warn!(
                     "prefill stream: could not prefetch layer {}: {e}",
                     layer + 1
                 );
             }
+            prefetch = t.elapsed();
         }
         // `NAIWA_BORROW_CHECK=1`: is the chunk itself producing NaN, or is it made later? A NaN in a prompt step
         // lands in the KV cache and only shows up as `max_logit=NaN` a turn or two afterwards, so the decode-side
@@ -1245,7 +1250,7 @@ impl PrefillStream {
         crate::dbg_note(
             "prefill_stream",
             &format!(
-                "layer {layer} rows {} stride {stride} gap={gap:?} dma_wait={waited:?} compute={:?}{}",
+                "layer {layer} rows {} stride {stride} gap={gap:?} pf={prefetch:?} dma_wait={waited:?} compute={:?}{}",
                 batch * seq,
                 t_compute.elapsed(),
                 transport.unwrap_or_default()

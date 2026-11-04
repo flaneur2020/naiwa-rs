@@ -858,3 +858,34 @@ shape - the per-layer differences are bytes, not efficiency.
 
 What overlap buys, measured the same way at stride 2: the chunk's "everything else" drops from 615 to ~360 ms, so a
 second buffer hides about 40% of the non-copy time; the copy's 1 940 ms is untouched, because it is the link.
+
+### 18.8 The prefetch exists, it is off by default, and with it the link is still idle 22%
+
+`forward` has prefetched the next layer since the two-buffer design landed:
+
+```rust
+if stride == 2 { self.load(layer + 1, stride)?; }   // queued before this layer's compute
+```
+
+and `NAIWA_STREAM_DBG` now reports the host time that costs (`pf`): **p50 66 us, max 86 us**, so it is a real async
+prefetch, not a disguised wait. What decides whether it runs is `stride == 2`, i.e. whether a second 650 MiB layer
+buffer exists. In the shipped configuration it does not - it is exactly what the loan buys - so **the shipped prompt
+path has no overlap at all**: per layer, `[copy 40 ms] -> [compute 14 ms]`, and the chunk is the sum of both.
+
+With the loan (stride 2), on the same 1 216-row chunk:
+
+| | Σ over 48 layers | effective rate | link idle |
+|---|---:|---:|---:|
+| stride 1 (shipped) | 2 555 ms | 10.1 GB/s | 25% |
+| stride 2 (loan, prefetching) | **2 322 ms** | 11.1 GB/s | **22%** |
+| the same 23 961 MiB at 13.0 GB/s | **1 800 ms** | 13.0 GB/s | 0% |
+
+So the prefetch is worth 233 ms a chunk, and **0.5 s is still on the table** - but not from more prefetch depth in
+the sense of "start earlier". One layer of lookahead is exactly one copy's worth of buffer, so the copy stream runs
+dry the moment the host is late by a few milliseconds (the per-layer host work between one `forward` call and the
+next is ~8 ms, and the link idles for it). Keeping the link busy needs **more than two buffers** - a ring - which is
+the item §9 deferred, and the number above is what it is worth: **up to 0.5 s of a 2.3 s chunk, ~16%**.
+
+The counterpart in the other direction: overlap cannot shorten the copy itself, so no arrangement of buffers gets a
+chunk below its 1.80 s of transfer. Everything else in the prompt path is the model's own dense work (615 ms at
+stride 1, ~360 ms at stride 2).

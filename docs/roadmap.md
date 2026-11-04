@@ -143,6 +143,12 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   layer (13.0 GB/s over a whole chunk, 1.93 s against a 1.90 s ideal). The 17% to raw is encoding and TLP overhead.
   The only copy-side slack is two cold-start layers (~30 ms a chunk) and the copy stream's idle time while the model
   computes (0.36-0.62 s a chunk), which is the overlap question, not bandwidth.
+- **The prefetch exists and the shipped config does not use it** (§18.8). `forward` queues `load(layer + 1)` when
+  `stride == 2` (host cost p50 66 us), and stride 2 needs a second 650 MiB layer buffer - what the loan buys - so the
+  shipped prompt path is `[copy 40 ms] -> [compute 14 ms]` a layer with no overlap. With the loan it is 2 322 ms
+  against 2 555 ms for one chunk, i.e. **-233 ms**, and the link is still **22% idle** against the same bytes at
+  13.0 GB/s (1 800 ms): one layer of lookahead starves whenever the host is ~8 ms late, so **a ring of more than two
+  buffers is worth up to 0.5 s of a 2.3 s chunk (~16%)** - the item §9 deferred, now with a number on it.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
