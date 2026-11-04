@@ -1123,3 +1123,33 @@ softmax needs a 2-level (4-lane) reduction instead of a 5-level (32-lane) one. T
 - softmax per row over the 8 columns held by 4 lanes: `__shfl_xor` with masks 1 and 2 only.
 - PV as m = 16 heads, n = 8 dims (32 tiles for head_dim 256), k = 16 items, with K/V staged through shared memory
   (`cp.async`) so the fragments are loaded once per block instead of once per warp.
+
+### 20.6 Five controlled experiments on the attention kernel, and what they rule out
+
+Before writing a tensor-core kernel, the `q4_qsa_attention_kernel`'s 523 ms was attacked with switches that each keep
+everything else identical and produce wrong output - the point is the *time*, not the numbers. All five were temporary
+edits in the fork, run one at a time on the same 3 404-token prompt, measured by `nsys` kernel duration (the only
+number that is stable across sessions, §20.5):
+
+| experiment | attention | vs 523.6 ms | rules out |
+|---|---:|---:|---|
+| baseline (`__launch_bounds__(128)`, ITEMS 4) | 523.6 ms | - | - |
+| **five-level score reduction -> one** | 452.3 ms | **-13.6%** | the `__shfl_xor` chain as *the* cost |
+| K/V global reads replaced by constants | 523.0 ms | -0.1% | memory / L2 as the limit |
+| `__launch_bounds__(128, 4)`: 167 -> 128 registers, 19% -> 25% occupancy | 549.8 ms | +5.0% (spills 96 B) | occupancy as the limit |
+| ITEMS 4 -> 2 (128 registers, **no** spill, 25% occupancy) | 513.9 ms | -1.9% | registers/occupancy again |
+| `p / block_size`, `p % block_size`, `it % ratio` -> shifts | 514.5 ms | -1.8% | the per-item integer divides |
+| `__expf` -> a cheap ramp in the softmax | 511.2 ms | -2.4% | the SFU (exp) pipe |
+
+Nothing is a hot spot: the largest single effect is the reduction at 13.6%, and the rest are noise. Together with
+`cuobjdump --dump-resource-usage` (**REG 167**, 128 threads, no shared memory, so 3 blocks an SM at 19% occupancy) that
+says the kernel is **issue/latency-bound across the whole per-item chain** - one item costs 16 FMA a lane, a
+five-step reduction, a max, an exp and a rescale, and no single one of those can be removed for very much.
+
+Which is exactly the case for tensor cores, and puts a number on the ceiling: one `mma.sync.m16n8k16` is 2 048 FMA in a
+single instruction, where a whole item currently costs 1 536 FMA of warp work (3 heads x 256 dims for QK, the same
+again for PV). A kernel built that way does 10-20x less *instruction* work per item, which is the resource this one is
+actually short of - not bytes, not occupancy, not one instruction family.
+
+**The fork is unchanged** (the switches were reverted; `git status` clean), and the tree is back to the committed
+baseline: oracle byte-exact, 56 tests, attention 523.6 ms.

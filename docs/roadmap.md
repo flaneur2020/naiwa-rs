@@ -193,6 +193,14 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   854 GFLOP lands at 1.6 TFLOP/s; batching more items spills registers (kf/vf are 64 at 4 items). The rewrite is
   `mma.sync.m16n8k16.bf16` with the same selection and split-K, softmax on 4-lane reductions, and K/V staged through
   shared memory - the design is written down in §20.5.
+- **Five controlled experiments on the attention kernel, none of them a hot spot** (§20.6). With temporary switches
+  in the fork (wrong output, right time), on the same 3 404-token prompt: score reduction 5 -> 1 levels **-13.6%**,
+  K/V reads removed **-0.1%**, occupancy 19 -> 25% (or with 96 B of spills) **+5% / -1.9%**, per-item integer divides
+  -> shifts **-1.8%**, `__expf` -> ramp **-2.4%**. `cuobjdump` says REG 167, 128 threads, no smem, 3 blocks an SM.
+  So the kernel is issue/latency-bound across the whole per-item chain (16 FMA a lane + a 5-step reduction + max +
+  exp + rescale) and nothing can be removed for much. The ceiling is the instruction count: one
+  `mma.sync.m16n8k16` is 2 048 FMA where a whole item costs 1 536 FMA of warp work, i.e. 10-20x less instruction work
+  per item. Fork unchanged, oracle byte-exact, 56 tests.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
