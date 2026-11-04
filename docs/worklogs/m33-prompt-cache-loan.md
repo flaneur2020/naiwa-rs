@@ -889,3 +889,62 @@ the item §9 deferred, and the number above is what it is worth: **up to 0.5 s o
 The counterpart in the other direction: overlap cannot shorten the copy itself, so no arrangement of buffers gets a
 chunk below its 1.80 s of transfer. Everything else in the prompt path is the model's own dense work (615 ms at
 stride 1, ~360 ms at stride 2).
+
+---
+
+## 19. Prefill against Strata, with overlap on: 1.31-1.37x behind, and the batch size is not the reason (2026-11-03)
+
+Same GGUF pack, same card, same context (4 096), both **cold** (`cached_tokens = 0` on every measured request; strata's
+own accounting prints `0 reused + N read`), three unique random prompts a size, median of three:
+
+| prompt | naiwa (loan on, stride 2, 2.5 GB cache) | strata (`--prefill auto`, 1.98 GiB cache) | strata's own |
+|---|---:|---:|---:|
+| 1 072 tok | TTFT **2 917 ms** -> 367 tok/s | TTFT **2 224 ms** -> 482 tok/s | 471-497 tok/s |
+| 3 404 tok | TTFT **4 729 ms** -> 720 tok/s | TTFT **3 447 ms** -> 988 tok/s | 984-1003 tok/s |
+
+So strata reads a prompt **1.31x** (1 k) to **1.37x** (3.4 k) faster. Splitting each arm by its own two terms
+(TTFT = fixed + per-row, from the two sizes):
+
+| | fixed part | per extra row |
+|---|---:|---:|
+| naiwa | 2 084 ms | 0.78 ms |
+| strata | 1 662 ms | 0.52 ms |
+
+### 19.1 The batch size: strata's is *smaller* here, not larger
+
+Strata's chunk is chosen by `--prefill auto` as the largest 256-aligned chunk whose *loan* fits, capped by
+`prefill_auto_max = 8192`, the context, and the ring that competes for the same budget (`generate.cpp:5760-5800`).
+On this card its log says:
+
+```
+strata serve: prompt chunk auto: 2816 tokens, a 199-slot ring
+strata serve: the prompt path borrows 874 CUDA0 cache slots (1.68 GiB)
+```
+
+**2 816 tokens**, not 8 192 - the 8 192 is the ceiling, and the 90%-of-slots loan cap plus the ring bring it down. The
+chunk ladder it falls back through is `{6144, 4096, 3072, 2048, 1536, 1024, 512}`, and below
+`stream_all_min = 1024` tokens it stops streaming every non-resident expert and streams only the routed ones (with the
+CPU share taking some).
+
+Naiwa's chunk on the same card is **4 608** (planned 5 376 at warmup, re-decided to 4 608 at the first chunk), so for
+the 3 404-token prompt **naiwa runs one chunk and strata runs two** (2 816 + 588) - strata moves *more* bytes and is
+still faster. Batch size is therefore not what this gap is made of.
+
+### 19.2 What it is made of
+
+- **The fixed part (2 084 against 1 662 ms, +422 ms)**: both engines stream the experts they do not hold, so this is
+  the copy. Naiwa's copy of a chunk is 1 940 ms at 13.0 GB/s (§18.7) - i.e. it is already at the link - and strata's
+  1 662 ms corresponds to ~21.5 GiB at the same rate. Strata hides more of its copy (its dense work runs behind it);
+  naiwa's prefetch, one layer deep, cannot (§18.8).
+- **The per-row part (0.78 against 0.52 ms a row, +50%)**: this is the model's own work - attention over the growing
+  prefix, the per-layer embedding gather, the MoE GEMM for the chunk's rows - in *our* forward path. At 3 400 rows it
+  costs naiwa ~2.7 s against strata's ~1.8 s. Nothing about the link or the cache enters here.
+- A structural difference worth naming: **naiwa's prompt path ignores the expert cache entirely** - a chunk uploads
+  every layer's full stack (23.4 GiB per chunk) whether or not those experts are resident. Strata streams only the
+  non-resident ones, so its 1.98 GiB cache takes ~8% off its prompt traffic. Ours takes nothing off it.
+
+### 19.3 So the next prompt-path lever is the per-row work, not the transport
+
+`0.26 ms a row` x 3 400 rows is ~0.9 s - the larger half of the gap, and it is ordinary model work (attention, PLE
+gather, the chunk's MoE GEMM) rather than streaming. That is where a prompt-path milestone should start, with the
+fixed part's remaining 0.3 s (a ring, §18.8) second.

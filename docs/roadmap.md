@@ -149,6 +149,15 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   against 2 555 ms for one chunk, i.e. **-233 ms**, and the link is still **22% idle** against the same bytes at
   13.0 GB/s (1 800 ms): one layer of lookahead starves whenever the host is ~8 ms late, so **a ring of more than two
   buffers is worth up to 0.5 s of a 2.3 s chunk (~16%)** - the item §9 deferred, now with a number on it.
+- **Against Strata, with overlap on, prefill is 1.31-1.37x behind - and not because of batch size** (§19). Both cold,
+  `cached_tokens = 0`, three unique prompts a size: 1 072 tokens naiwa 367 tok/s against strata 482, 3 404 tokens 720
+  against 988 (strata's own accounting: 471-497 and 984-1003). Strata's chunk on this card is **2 816 tokens**, not
+  the 8 192 its `--prefill auto` ceiling allows (the 90%-of-slots loan cap plus a 199-slot ring bring it down), while
+  naiwa plans **4 608** - so at 3.4 k tokens naiwa runs one chunk and strata two, and strata is still faster.
+  Decomposed: fixed part 2 084 ms against 1 662, per-row 0.78 ms against 0.52. **The gap is the per-row model work
+  (attention, PLE gather, the chunk's MoE GEMM) plus a less-hidden copy, not the transport and not the batch.**
+  Also structural: naiwa's prompt path ignores the expert cache (it uploads every layer's full stack), so a 2.5 GB
+  cache takes nothing off its prompt traffic, where strata's 1.98 GiB takes ~8%.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`
