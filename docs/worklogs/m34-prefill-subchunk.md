@@ -383,3 +383,41 @@ That is the next measurement, and it is cheap with the probe that now exists: re
 report `delay = (first copy starts) - (batch queued)`. If the delay is the fence, `NAIWA_STREAM_SYNC=1`'s arm should
 show it too, and removing the per-layer `after_device_work` (by not reallocating on a shape change, which §13 proposed
 for the wrong reason and is still worth doing for this one) should remove most of it.
+
+---
+
+## 15. Depth beyond two: granted, and it breaks the request. Which is the argument for splitting
+
+With §14 establishing that every layer's copy already runs at 13.4 GB/s, the only thing left to improve is how much of
+it is *hidden*, so the depth knob was tested properly. The borrow branch grants `lend_bytes / layer_bytes` ranges, so
+depth needs the lending window to grow (`NAIWA_SLAB_MIB`, which is carved out of the expert-cache budget). Same prompt,
+one cold request each:
+
+| slab | `--prefill-stream-depth` | granted | request | per-layer |
+|---:|---:|---|---|---:|
+| 1 536 MiB | 2 | 2 ranges | ok | 70.2 ms |
+| 2 048 MiB | 2 | 2 ranges | ok | **65.0 ms** |
+| 2 048 MiB | 3 | **3 ranges** | **HTTP 500, twice of two** | 65.0 ms |
+| 2 560 MiB | 4 | 3 ranges | **HTTP 500** | 65.0 ms |
+
+Two separate findings, and neither is the one the knob was added for:
+
+1. **The 70.2 -> 65.0 ms is the window, not the depth.** 2 048 MiB with depth *2* gives 65.0 as well. A bigger window
+   means the pool is carved into fewer, larger contiguous ranges (117 of them) and the chunk's three projections land
+   in one, which is worth 5 ms a layer (~0.25 s a chunk) - for cache budget, since the window is carved out of it.
+2. **Depth 3 completes the chunk and then the request dies.** The prefill itself is clean: 48 layers, `stride 3`, the
+   copy at 41.6 ms own, `borrowed 1 950 MiB of the pool in 3 range(s), 1051 slots emptied`, the loan given back with
+   `1051 of 1051 displaced experts queued for refill`, and then 48 verify-step layers run and the stream produces
+   **zero decode tokens** (`prefill 579.20, decode 0.00` in the engine's own summary). No CUDA error, no panic, twice
+   out of two. The one number that stands out is the wipe: **1 051 of 1 145 slots emptied (92%)** against 719 at two
+   ranges.
+
+So the flag is **capped at 2 in the borrow branch** (`plan_with_lend_depth`, with the reason next to the clamp), which
+is the behaviour that shipped plus a knob that can only make it shallower.
+
+**And that is the strongest argument for the split half of this milestone that this file has produced.** The cost of
+borrowing is not the bytes while the chunk runs, it is the wipe and the give-back afterwards, and that cost is
+proportional to the *range* borrowed, not to what the chunk uses of it. Splitting the unit does not raise the bytes in
+flight for a given VRAM (a layer still has to be whole to be consumed), but it does make each borrowed range 1/g of a
+layer - so the same pool can hold g times as many units *and* the wipe, the refill and the give-back all shrink by g.
+Depth 3 failed on exactly the term that splitting reduces.

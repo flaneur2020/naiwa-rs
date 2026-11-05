@@ -276,7 +276,13 @@ pub(crate) fn plan_with_lend_depth(
     if borrowing {
         // The buffers are ranges of the pool: they cost VRAM not at all, so the only question is whether the pool
         // physically holds that many ranges (`fits` is the activation term alone on this branch).
-        stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max);
+        //
+        // **Capped at two while the wipe is per-chunk** (M34 §15): a third range is granted and the chunk completes,
+        // but the loan then empties 1 051 of the cache's 1 145 slots against 719 at two ranges, and the request after
+        // it produced **zero decode tokens** (HTTP 500, twice out of two). The copy side is identical either way, so
+        // there is nothing to gain before the wipe is made proportional to what is actually borrowed - which is what
+        // splitting the unit does (a 1/g of a layer range empties 1/g of the slots).
+        stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max.min(2));
     } else {
         for d in (2..=depth_max).rev() {
             let owns_fits = fits(best, d)
