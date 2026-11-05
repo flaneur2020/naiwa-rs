@@ -539,3 +539,78 @@ measured and neither pays on this model: the overlap (§9) is already realised, 
 buys. What is left standing from the milestone is the instrument set - `NAIWA_COPY_TIME` for a copy's own duration,
 `NAIWA_COPY_SPLIT` for granularity, `NAIWA_SPLIT_CHECK` for the numeric gate - and the two negative results, which is
 what §13/§14/§16/§18 together cost.
+
+---
+
+## 19. Where the prompt's time goes, ours against strata's, and the PLE question
+
+Asked for the stage distribution and a specific suspicion about PLE. Both are answerable from today's measurements,
+and the first finding is about the machine rather than the code.
+
+### 19.1 The card is shared with a 6.6 GB GPU process, and that is the variance
+
+```
+NVIDIA GeForce RTX 4070, 12282 MiB, used 7285, free 4591
+  2174282  C+G  ...\game\game\sp26\sp26-cod.exe   6597 MiB
+```
+
+A game holds **6.6 GiB of this 12 GiB card** for the whole session. Consequences that were being read as engine
+properties:
+
+- the **chunk plan** (which is sized from free VRAM) lands anywhere between 768 and 2 816 tokens, and TTFT is
+  `chunks x ~2.1 s` (M33 §20.13) - so the same request is 3.7 s or 8.3 s depending on what else is on the card;
+- the §20.13 comparison against strata (4 791 ms against 3 741) was made in a squeezed state; §19.3 below has the
+  un-squeezed one;
+- depth 3 (§15) asks for 1 950 MiB of pool - unavailable;
+- and as this was being written the shipped configuration **stopped loading at all** (`CUDA_ERROR_OUT_OF_MEMORY`, even at
+  a 2.0 GiB cache with 4 596 MiB free), so no further profiling was possible without freeing the card.
+
+Every VRAM-sensitive number in this file should be read with that in mind. It is also the honest answer to "why is our
+prefill unstable": not the host, not the kernel, but a plan that re-derives itself from whatever VRAM is left.
+
+### 19.2 Our distribution, one 2 896-token prompt, chunk 2 560, loan on
+
+Measured with `NAIWA_STREAM_DBG` (per layer) and `NAIWA_COPY_TIME` (the copy's own duration), 48 layers:
+
+| stage | per layer | per chunk | share of the chunk |
+|---|---:|---:|---:|
+| expert stream (copy, own duration) | 41.6 ms | **1 997 ms** | **65%** |
+| everything else the layer does | ~23 ms | ~1 104 ms | 35% |
+| of which: quant GEMM (nsys, scaled) | | ~740 ms | 24% |
+| GDN recurrence (nsys) | | ~254 ms | 8% |
+| prompt attention (nsys) | | ~152 ms | 5% |
+| bf16 GEMM / hyper-connection / routing | | ~240 ms | 8% |
+| **PLE** (host gather + upload, `PLE_DBG`) | | **~94 ms** | **3%** |
+| chunk wall (`sum gap`) | 64.8 ms | 3 048 ms | 100% |
+| **overlap achieved** | | **~19 ms/layer (45%)** | |
+
+The copy and the layer's work are therefore **45% overlapped, not hidden**: 64.8 ms a layer against 41.6 of copy and
+~42 of kernels means the pipeline alternates for about half of each layer. That - not the copy rate, which is at the
+link's ceiling (§14) - is the structural difference to a ring that never lets the engine idle.
+
+### 19.3 PLE is 3% of the chunk, not the gap
+
+The suspicion is worth answering with numbers, because PLE is the one stage whose *source* is not contiguous.
+
+- the host gather is **94 ms per prefill step** (14 344 rows in one call, `PLE_DBG`; two calls' worth of statistics in
+  §20.12's 354 ms over 17 calls including decode);
+- its traffic is tiny: 14 344 rows x a 160-value IQ4_NL row (~90 B) = **1.3 MB** per step, against 24 GiB of experts -
+  five orders of magnitude smaller;
+- and it is *serial* (a host memcpy loop plus an upload), so what it can buy is that 94 ms, i.e. **3% of the chunk**.
+
+So even making PLE free would move a 3.05 s chunk by 0.09 s. It cannot be the term that separates us from strata, and
+the table above says the term that is: the 65% of the chunk that is the expert stream, and the 55% of it that is not
+overlapped.
+
+### 19.4 Against strata, at the same chunk size, we are at parity
+
+| | tokens | prefill wall | tok/s |
+|---|---:|---:|---:|
+| naiwa, chunk 2 560 (loan, unsqueezed) | 2 896 | 3 048 ms | **950** |
+| naiwa, chunk 768-2 304 (VRAM squeezed) | 3 433 | 4 791 ms | 717 |
+| strata (`serve`, chunk 2 816) | 3 433 | 3 741 ms | **918** |
+
+**950 against 918 tok/s**: with the chunk the loan was designed to buy, the prefill rate is at parity, and the 28% in
+§20.13 was the squeezed plan rather than the engine. What is left is not a rate but a *robustness* difference - strata's
+plan does not collapse when the card is busy, ours does - and the 55% of the copy that is not yet overlapped, which is
+what a ring would recover if the VRAM for it existed.

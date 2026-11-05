@@ -91,6 +91,13 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
   and it is expressible without a kernel change (§11).
+- **The stage distribution, and why PLE is not it (§19):** of a 3 048 ms chunk at chunk 2 560, **65% is the expert
+  stream** (41.6 ms a layer at the link's ceiling), ~33% is the rest of the layer (quant GEMM 24%, GDN 8%, attention
+  5%), and **PLE is 3%** (94 ms a step, 1.3 MB of traffic against 24 GiB). The copy is only **45% overlapped** (64.8 ms
+  a layer against 41.6 + ~42), which is the ring's real advantage. And at chunk 2 560 the prefill rate is **950 tok/s
+  against strata's 918** - the "+28%" of §20.13 was the squeezed plan, not the engine. What separates us is robustness:
+  the chunk plan re-derives from free VRAM, and a 6.6 GiB game on this 12 GiB card drives it from 2 816 down to 768
+  (3.7 s against 8.3 s for the same request), to the point that the shipped config no longer loads.
 - **Both halves are measured and neither pays.** The overlap is already realised (§9: `NAIWA_STREAM_SYNC=1` against the
   default is 69.6 against 75.9 ms a layer, so there is at most 8% to hide), and the split costs **+23% a layer at split
   2 and +32% at split 4** (§18: masked launches plus `g` combines) against that 8% ceiling. The copies themselves are
