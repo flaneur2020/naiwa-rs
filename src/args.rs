@@ -293,6 +293,18 @@ pub struct ModelOptions {
         default_value_t = NonZeroUsize::new(crate::prefill_stream::DEFAULT_MIN_TOKENS).unwrap()
     )]
     pub prefill_stream_min_tokens: NonZeroUsize,
+
+    /// Layer buffers the prompt path may keep in flight (`1`-`4`, default 2). The upload of a
+    /// layer is issued before the previous one is waited for, so a deeper queue keeps the copy
+    /// engine busy across layer boundaries instead of refilling it once per layer. Each buffer is
+    /// one layer's expert set, borrowed from the expert cache when the loan is on.
+    #[arg(
+        long,
+        requires = "prefill_stream",
+        value_parser = clap::value_parser!(u8).range(1..=4),
+        default_value_t = crate::prefill_stream::DEFAULT_DEPTH as u8
+    )]
+    pub prefill_stream_depth: u8,
 }
 
 #[derive(Args, Clone, Default)]

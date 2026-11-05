@@ -205,3 +205,82 @@ Added by this milestone:
 So the target is a 2 896-token prompt's first token at **3.7 s -> 3.0-3.2 s** with the same 2.5 GB cache and the loan
 on, and the honest possibility that S0 shows the ceiling is lower than that, in which case this file's conclusion is
 the measurement and the ring moves up instead.
+
+---
+
+## 9. S0 — the overlap is already there, and it is worth 8%
+
+Before building anything, `NAIWA_STREAM_SYNC=1` (blocking uploads, every overlap removed) against the default, same
+prompt, same session, `NAIWA_STREAM_DBG=1` on both:
+
+| arm | TTFT | per-layer `gap` | sum `gap` | sum `copy` | sum `compute` |
+|---|---:|---:|---:|---:|---:|
+| async (default, 2 buffers) | 4 099 ms | **69.6 ms** | 3 273 ms | 3 499 ms | 228 ms |
+| sync (no overlap at all) | 3 863 ms | **75.9 ms** | 3 570 ms | 5 434 ms | 30 ms |
+
+The two arms differ by **8% per layer** (69.6 against 75.9), i.e. the async path already hides nearly all of the 6 ms a
+layer that is not the copy. **The premise this milestone was written on - that the compute is exposed at layer
+granularity and finer units would hide it - is false.** The per-layer wall time *is* the copy, and the copy is already
+continuous: there is nothing left for a finer unit to overlap.
+
+Two consequences:
+
+1. the ceiling for the split half of this milestone is that same ~8%, not the 0.4 s a chunk §8 estimated;
+2. the term that is actually wrong is the **rate**: this session's copies ran at **7.0-7.3 GB/s** (24 GiB in 3.3-3.5 s),
+   against 11.1 GB/s when §20.13 measured and strata's 13.1. The gap to strata is in the copy, not in the pipeline.
+
+## 10. S1 (the depth half) — built, and it says the same thing
+
+`--prefill-stream-depth 1..4` is in the tree: the plan grants up to that many layer buffers
+(`plan_with_lend_depth`), and `forward` issues `depth - 1` layers of upload ahead of the one it waits for. Depth 1 is
+the arm without prefetch. Same prompt, same session:
+
+| depth | plan granted | TTFT | per-layer |
+|---:|---|---:|---:|
+| 1 | 1 buffer | 4 353 ms | **77.9 ms** |
+| 2 (default) | 2 buffers | 3 817 ms | **69.8 ms** |
+| 3 | 2 buffers | 3 722 ms | 65.0 ms |
+| 4 | 2 buffers | 3 722 ms | 65.0 ms |
+
+- **depth 1 -> 2 is a real 12% per layer** - the double buffer is the whole of the available overlap, and 12% is the
+  same number M18 measured for it;
+- **depth 3 and 4 are not granted**: the loan is 1 526 MiB and a layer range is ~650 MiB, so the pool holds two. The
+  step from 2 to 3 in the table is session drift, not mechanism - depth 3 and depth 4 produce identical numbers, and
+  both log `2 layer buffer(s) loaned`.
+
+That is the design's own prediction from §4.2 arriving as a measurement: **the deeper queue needs a smaller unit, so
+the split has to exist before the depth can be spent.** At split 2 a unit is 325 MiB and four of them fit the same
+1 526 MiB pool, which is exactly the `(split 4, depth 4) = one layer's worth of bytes` row in §8.
+
+## 11. What S2 has to be, now that it is the only half left
+
+The consumer has to be able to start on a sub-range, and the survey of the two sides says that is expressible without
+touching a kernel:
+
+- **candle has no `QTensor::narrow`**, so a sub-range tensor has to be built by hand: `QCudaStorage` wraps a byte
+  tensor, so narrowing *that* by `a * bytes_per_expert` and rewrapping it with `QTensor::new(.., [n, ..])` gives a
+  valid quantized view of experts `[a, a+n)` - and the buffers are ours (`SlotMemory`, owned or borrowed), so the
+  bytes are addressable;
+- **the MoE kernels already take per-row expert ids** (`indexed_moe_forward`, `ggml_mul_mat_id`), so the sub-launch
+  is `MoEExperts::from_qtensors(gate_sub, up_sub, down_sub, n, top_k, ..)` with the ids remapped into `0..n` and the
+  weights of the experts outside the range masked to 0, then the per-sub-chunk outputs summed.
+
+The cost side, which S2 must measure rather than assume: `split` launches a layer instead of one, each with its own
+combine of `[tokens, hidden]`, and most of the rows in each launch are masked to weight 0 - if `ggml_mul_mat_id` pays
+per row regardless of the mask, the MoE's compute doubles at split 2. Against a 6 ms a layer budget that is the whole
+of what is left to win, so it may well be a wash; the honest expectation after S0 is that this milestone's result is
+**the measurement that the prompt path is copy-bound and rate-limited**, and that the next lever is the copy itself
+(one merge window instead of three per layer, `io_submit`-style queueing, or a larger loan window so the depth can
+grow without splitting).
+
+## 12. The knob as built
+
+```
+--prefill-stream-depth <1-4>   (default 2, requires --prefill-stream)
+```
+
+`plan_with_lend_depth(free, layer_bytes, ceiling, borrowing, kv_reserve, lend_bytes, max_depth)` takes the ceiling;
+the borrow branch grants `min(lend_bytes / layer_bytes, max_depth)` ranges, the owning branch walks `max_depth..=2`
+down and takes the first that fits with the decode reserve. `(depth 1)` is the no-prefetch arm and `(depth 2)` is
+byte-for-byte the behaviour before this milestone, which is why the oracle gate is unaffected - and it is: `frac 0` +
+`--no-lookahead` is still byte-identical, and `cargo test` is 56 passed.

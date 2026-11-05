@@ -58,7 +58,7 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — 📐 proposed (2026-11-05)
+## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — 🔶 S0/S1 measured, premise falsified (2026-11-05)
 
 Worklog: [`worklogs/m34-prefill-subchunk.md`](worklogs/m34-prefill-subchunk.md) — the prompt path's unit of prefetch
 becomes **1/split of a layer's expert set** (`--prefill-split 1|2|4|8`) with **`--prefill-depth N`** sub-chunks in
@@ -70,9 +70,14 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   chunk at 11.1 GB/s against 1.87 s at 13.1 GB/s. Same bytes, so the difference is the pipeline's shape.
 - **The knobs are the point:** sub-chunking decouples the unit from the depth. Depth 2 costs two whole layers today;
   at split 4, depth 4 costs one layer's worth of bytes and buys four units in flight.
-- **S0 first:** price the overlap with `NAIWA_STREAM_SYNC=1` (every overlap removed) against the default before
-  building anything, because the ceiling here is `min(copy, compute)` a layer ≈ 9 ms x 48 ≈ 0.4 s a chunk, and no
-  amount of pipeline work beats that.
+- **S0 falsified the premise** (§9): `NAIWA_STREAM_SYNC=1` against the default is **69.6 against 75.9 ms per layer**,
+  i.e. the async path already hides nearly all of the non-copy time, so the per-layer wall clock *is* the copy and a
+  finer unit has ~8% to win, not 0.4 s a chunk. The term that is wrong is the **rate**: 7.0-7.3 GB/s this session
+  against 11.1 when §20.13 measured and strata's 13.1.
+- **`--prefill-stream-depth 1..4` is built** (§10): depth 1 -> 2 is a real **12% per layer** (77.9 -> 69.8 ms), depth 3
+  and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
+  as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
+  and it is expressible without a kernel change (§11).
 - **Not this milestone:** strata's 199-slot model-wide ring. It needs an id -> slot map and a routing-independent
   schedule; M34 is the same idea one axis at a time (finer unit, deeper queue, still per layer and routing-driven), and
   S4 decides whether the ring is the next step by showing whether the layer boundary still stalls the copy engine.

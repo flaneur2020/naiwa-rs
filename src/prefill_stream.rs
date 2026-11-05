@@ -153,6 +153,13 @@ pub(crate) fn activation_bytes(chunk: usize) -> usize {
 /// chunk affords it.
 const PLAN_GRID: usize = 256;
 
+/// The most layer buffers `--prefill-depth` may ask for. Four is the point where the copy queue is fed by more than
+/// one layer's worth of work; beyond that the plan's arithmetic is the limit, not the pipeline.
+pub(crate) const MAX_DEPTH: usize = 4;
+
+/// Default for `--prefill-depth`: the double buffer this file was built around (M18's 16-19% overlap).
+pub const DEFAULT_DEPTH: usize = 2;
+
 pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool) -> Option<(usize, usize)> {
     plan_with_reserve(free, layer_bytes, ceiling, borrowing, 0)
 }
@@ -185,6 +192,24 @@ pub(crate) fn plan_with_lend(
     borrowing: bool,
     kv_reserve: usize,
     lend_bytes: usize,
+) -> Option<(usize, usize)> {
+    plan_with_lend_depth(
+        free, layer_bytes, ceiling, borrowing, kv_reserve, lend_bytes, 2,
+    )
+}
+
+/// `max_depth`: how many layer buffers the plan may use (`--prefill-depth`). Depth 2 is the double buffer this file
+/// was built around; the knob exists because the upload of layer L+1 is issued before waiting for layer L, so a third
+/// and fourth buffer keep the copy engine's queue non-empty across a layer boundary instead of refilling it once per
+/// layer (M34).
+pub(crate) fn plan_with_lend_depth(
+    free: usize,
+    layer_bytes: usize,
+    ceiling: usize,
+    borrowing: bool,
+    kv_reserve: usize,
+    lend_bytes: usize,
+    max_depth: usize,
 ) -> Option<(usize, usize)> {
     const GRID: usize = PLAN_GRID;
     let free = free.saturating_sub(kv_reserve);
@@ -245,21 +270,23 @@ pub(crate) fn plan_with_lend(
         .and_then(|v| v.parse::<usize>().ok())
         .map(|mib| mib << 20)
         .unwrap_or(700 << 20);
-    let two = fits(best, 2)
-        && free.saturating_sub(2 * layer_bytes + chunk_scratch(best) + MAX_HEADROOM) >= reserve;
-    let stride = if borrowing {
-        // Two ranges inside the pool: the chunk's activations are priced by `fits` (the borrow branch), and the
-        // ranges cost VRAM not at all, so all the double buffer needs is room in the pool.
-        if lend_bytes >= 2 * layer_bytes {
-            2
-        } else {
-            1
-        }
-    } else if two {
-        2
+    let depth_max = max_depth.clamp(1, MAX_DEPTH);
+    // Walk the depth down from the ceiling: deeper is preferred, the first one that fits wins, and 1 always can.
+    let mut stride = 1;
+    if borrowing {
+        // The buffers are ranges of the pool: they cost VRAM not at all, so the only question is whether the pool
+        // physically holds that many ranges (`fits` is the activation term alone on this branch).
+        stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max);
     } else {
-        1
-    };
+        for d in (2..=depth_max).rev() {
+            let owns_fits = fits(best, d)
+                && free.saturating_sub(d * layer_bytes + chunk_scratch(best) + MAX_HEADROOM) >= reserve;
+            if owns_fits {
+                stride = d;
+                break;
+            }
+        }
+    }
     Some((stride, best))
 }
 
@@ -307,7 +334,9 @@ pub struct PrefillStream {
     act: Activation,
     comm: Arc<Comm>,
     layers: RwLock<Vec<Option<HostStacks>>>,
-    bufs: [Mutex<LayerBuf>; 2],
+    bufs: Vec<Mutex<LayerBuf>>,
+    /// `--prefill-depth`: the most buffers the plan may use (the plan picks fewer when the bytes are not there).
+    depth: usize,
     /// The memory plan in force (buffers and prompt step), from warmup and re-checked at the first
     /// long chunk. `None` until someone decides; `stride == 0` means the stream is off.
     plan: Mutex<Option<Plan>>,
@@ -367,6 +396,7 @@ impl PrefillStream {
         act: Activation,
         comm: Arc<Comm>,
         min_tokens: usize,
+        depth: usize,
         slab: Option<Arc<crate::moe::slab::Slab>>,
         cache: Option<Arc<crate::moe::Layers>>,
     ) -> candle_core::Result<Option<Self>> {
@@ -388,7 +418,12 @@ impl PrefillStream {
         Ok(Some(Self {
             last_entry: std::sync::Mutex::new(None),
             device: device.clone(),
-            bufs: [buf()?, buf()?],
+            // One per depth the plan may use: allocated lazily on first use, so a deeper ceiling costs nothing
+            // until the plan actually picks it.
+            bufs: (0..depth.clamp(1, MAX_DEPTH))
+                .map(|_| buf())
+                .collect::<candle_core::Result<Vec<_>>>()?,
+            depth: depth.clamp(1, MAX_DEPTH),
             copy,
             num_experts,
             top_k,
@@ -442,13 +477,14 @@ impl PrefillStream {
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
-        let (stride, chunk) = plan_with_lend(
+        let (stride, chunk) = plan_with_lend_depth(
             free,
             self.layer_bytes(),
             prompt_step_ceiling(),
             self.borrows(),
             kv_reserve(),
             self.lend_bytes(),
+            self.depth,
         )?;
         Some((Plan { stride, chunk }, free))
     }
@@ -1136,13 +1172,17 @@ impl PrefillStream {
         // the pipeline's own cost: if it is not ~0, the enqueue is blocking (a `released` fence, an allocation) and
         // the copy stream is idle for that long every layer.
         let mut prefetch = std::time::Duration::ZERO;
-        if stride == 2 {
+        if stride > 1 {
+            // `stride - 1` layers ahead: each `load` is a no-op if that buffer already holds the layer, so this issues
+            // only what the previous layers did not (and the first layer of a chunk issues all of them).
             let t = std::time::Instant::now();
-            if let Err(e) = self.load(layer + 1, stride) {
-                warn!(
-                    "prefill stream: could not prefetch layer {}: {e}",
-                    layer + 1
-                );
+            for ahead in 1..stride {
+                if let Err(e) = self.load(layer + ahead, stride) {
+                    warn!(
+                        "prefill stream: could not prefetch layer {}: {e}",
+                        layer + ahead
+                    );
+                }
             }
             prefetch = t.elapsed();
         }
@@ -1336,14 +1376,17 @@ impl PrefillStream {
 pub struct PrefillStreams {
     streams: Mutex<Vec<(Device, Arc<PrefillStream>)>>,
     min_tokens: usize,
+    /// `--prefill-depth`: what `PrefillStream::new` is given (see `MAX_DEPTH`).
+    depth: usize,
 }
 
 impl PrefillStreams {
     /// Streams that run prefill chunks of `min_tokens` or more on the GPU.
-    pub fn new(min_tokens: usize) -> Self {
+    pub fn new(min_tokens: usize, depth: usize) -> Self {
         Self {
             streams: Mutex::default(),
             min_tokens,
+            depth,
         }
     }
 
@@ -1394,6 +1437,7 @@ impl PrefillStreams {
                     ctx.act,
                     Arc::clone(ctx.comm),
                     self.min_tokens,
+                    self.depth,
                     slab,
                     cache,
                 )?
