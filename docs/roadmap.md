@@ -237,6 +237,16 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   against 60 GiB of memory, the prefill is mostly host-to-device copy (1 940 ms of PCIe against 615 ms of everything
   else), so our long-prompt TTFT is both worse and unpredictable - and neither is a kernel problem. One `doc` round
   also died with CUDA OOM where strata (800 MB cache against our 2.5 GB) did not; recorded, not retried.
+- **The prefill wall clock was the chunk count, and the loan halves it (§20.13).** Aggregating the per-layer debug
+  lines by step: the 8 005 ms TTFT of a 2 896-token prompt is 48-layer steps whose `gap` sums to 7 563 ms, while
+  `copy` is 162 ms in total - and the per-layer cost is 62 / 51 / 45 ms for 1 792 / 768 / 352 rows, i.e. it does not
+  scale with tokens. It is the per-chunk re-stream of the whole routed expert set (≈0.5 GiB per layer at ~11 GB/s =
+  45 ms), so **TTFT ≈ chunks x 2.2 s**. Controlled: cache 2.5 GB -> chunk **768**, 4 chunks, 8 267 ms; cache 0.6 GB ->
+  chunk **2 816**, 2 chunks, 4 265 ms; cache 2.5 GB **+ `NAIWA_PREFILL_BORROW`** -> chunk **2 560** and two layer
+  buffers, **3 730 ms**. On a 3 433-token cold request the loan takes 10 475 -> **4 791 ms** against strata's 3 741, so
+  the gap is +180% -> +28%. **The loan is now on by default**; the negative `short`-corpus result that kept it off did
+  not survive §20.4's fixes (the later A/B is neutral: 33.5 against 36.2 s end to end), and the long prompt wins 2x.
+  The remaining 28% is per-chunk overlap depth (two layer buffers against strata's 199-slot ring), not residency.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

@@ -1404,3 +1404,61 @@ request on a freshly booted machine, since every number above moved between sess
 from clause 3, because 26.8 GiB of page-cache pressure next to 23.4 GiB of pinned experts is what makes a 60 GiB host
 the binding constraint on a 54 GiB model, and because a bounded row cache makes the PLE path's cost a constant
 instead of a function of what else is cached.
+
+### 20.13 The missing time, found and halved: it is the chunk count, and the loan is the knob
+
+§20.12 left the 8-11 s wall clock against ~2 s of kernels unattributed. Aggregating the per-layer `NAIWA_STREAM_DBG`
+lines **by step** answers it without a new run. Same 2 896-token prompt, shipped config:
+
+| step | rows | layers | sum of `gap` | `copy` | `compute` |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1 792 | 48 | **2 961 ms** | 154 ms | 153 ms |
+| 1 | 768 | 48 | **2 428 ms** | 3.7 ms | 2.7 ms |
+| 2 | 352 | 48 | **2 175 ms** | 4.0 ms | 2.9 ms |
+| | | | **7 563 ms ≈ the 8 005 ms TTFT** | | |
+
+Two things fall out:
+
+1. **The wall is inside the layer loop, and it is not the measured copies** - `copy` is 162 ms across the whole
+   request, so the staging DMA the log does account for is nearly free;
+2. **the per-layer cost barely moves with the row count**: 62 / 51 / 45 ms for 1 792 / 768 / 352 rows. A cost that
+   does not scale with tokens is a cost per *layer per chunk*, i.e. what a chunk must re-stream regardless of its
+   size: the layer's routed expert set (all 256 experts, ≈0.5 GiB) at ~11 GB/s is 45 ms. **Every chunk streams the
+   whole expert set again**, so a prompt's TTFT is essentially `chunks × 2.2 s` plus a small per-token part.
+
+That predicts a controlled experiment: **shrink the cache to free VRAM, and the planner picks a bigger chunk**. Same
+prompt, same session, only `--expert-cache-gb` changed:
+
+| cache | chunk the planner picked | chunks for 2 896 tokens | TTFT |
+|---|---|---:|---:|
+| 2.5 GB (shipped) | **768** | 4 | 8 267 ms |
+| 0.6 GB | **2 816** | 2 | 4 265 ms |
+| 2.5 GB + `NAIWA_PREFILL_BORROW` | **2 560**, 2 layer buffers | 2 | **3 730 ms** |
+
+So the 2.5 GB expert cache - a decode optimisation the ladder measured as flat - was costing the *prompt* 4x its
+wall clock by squeezing the chunk. The loan is the resolution, and it is the same one strata ships: keep the cache for
+decode, borrow its VRAM for the prompt chunk. Borrowing is better than a small cache at equal chunk count (3 730
+against 4 265 ms) because the plan then also affords **two** layer buffers, so the streaming overlaps.
+
+Measured with the loan on, shipped cache (same session, one cold request each):
+
+| prompt | borrow off | borrow on | strata, same prompt |
+|---|---:|---:|---:|
+| 2 896 tokens | 8 267 ms | **3 730 / 3 843** | - |
+| 2 912 tokens | 9 629 ms | **3 356** | - |
+| 3 433 tokens | 10 475 ms | **4 791** | **3 741 / 3 721 / 3 752** |
+
+**-55% on every prompt, and the gap to strata on a 3 433-token cold request goes from +180% to +28%.**
+
+**Decision: the loan is now on by default** (`NAIWA_PREFILL_BORROW=0` is the arm without it). It had been off on the
+strength of a `short`-corpus measurement that said one loan wiped 719 of 1 474 slots and cost the conversation
+39.2 s against 30.2 s. That measurement did not survive §20.4's fixes: the later A/B on the same corpus is **neutral**
+(33.5 s against 36.2 s end to end, TPOT 44 ms both, tail TTFT 2 280 against 2 326), because the chunk it buys there is
+already one chunk. So the question was only which case to favour, and the long prompt wins by 2x while the short one
+does not move. The oracle is unaffected and still byte-identical - the arm that gates it has no expert cache, so
+there is nothing to lend.
+
+**What the remaining 28% is.** With the loan both engines are at two chunks for 3 433 tokens, so the difference is now
+per-chunk efficiency: 4 791 against 3 741 ms is 2.05 s against 1.87 s per chunk, and strata gets there with a 199-slot
+ring where we have two layer buffers. That is the overlap-depth question §20.9 ended on, not a residency question -
+and the PLE measurement in §20.12 (354 ms for two long prompts) rules the host table out as well.

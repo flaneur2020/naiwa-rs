@@ -182,21 +182,28 @@ impl Slab {
 
     /// Whether the prompt path borrows its layer buffers from the pool instead of holding VRAM of its own.
     ///
-    /// **Off by default, measured** (strata's `--prefill-borrow` is on, and theirs buys the cache its size; ours does
-    /// not yet - see `docs/worklogs/m33-prompt-cache-loan.md` §11). On the shipped chat config the loan is net
-    /// negative: one loan per conversation wipes 719 of 1 474 slots (half the cache) at the turn-1 chunk, and the
-    /// conversation then ends **39.2 s against 30.2 s** with the loan off (3 rounds, `short`), for a tail TTFT of
-    /// 969 against 1 105 ms. `NAIWA_PREFILL_BORROW=1` is the arm that shows what it does; the same code is what a
-    /// bigger cache would run on (2.9-3.2 GB measured 33.9 / 28.6 ms TPOT against 36.7).
+    /// **On by default** (worklog §20.13), `NAIWA_PREFILL_BORROW=0` is the arm without it.
+    ///
+    /// The loan is what decides the prompt step, and the prompt step is what decides the prompt's wall clock: the
+    /// chunk is planned once at warmup from the VRAM that is free, and every chunk streams the whole routed expert set
+    /// (≈23 GiB) over PCIe again, so a prompt that needs four chunks pays that four times. With the shipped 2.5 GB
+    /// cache the plan lands on 768 tokens and one layer buffer; with the loan it lands on 2 304-2 560 tokens and two,
+    /// and a 3 433-token prompt's first token comes at **4 791 ms instead of 10 475**, a 2 896-token one at **3 730
+    /// instead of 8 267** (same session, same cache, §20.13).
+    ///
+    /// It was off because the first measurement said it cost the cache: one loan wipes 719 of 1 474 slots at the
+    /// turn-1 chunk and the conversation then ended 39.2 s against 30.2 s (`short`, 3 rounds). That result did not
+    /// survive the NaN fix and the once-per-chunk restructure (§20.4): the later A/B on the same corpus is neutral -
+    /// 33.5 s against 36.2 s end to end, TPOT 44 ms in both, a tail TTFT of 2 280 against 2 326 - so what is left is a
+    /// decision about which case to favour, and the long prompt wins by 2x while the short one does not move.
     ///
     /// Read as a **value**, not as presence: `=0` is the arm without the loan (a presence test made `=0` mean on,
     /// and the first A/B of M33 ran the loan twice).
     pub(crate) fn borrowing() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| match std::env::var("NAIWA_PREFILL_BORROW").as_deref() {
-            Ok("1") | Ok("on") | Ok("true") | Ok("yes") => true,
-            Ok(_) => false,
-            Err(_) => false,
+            Ok("0") | Ok("off") | Ok("false") | Ok("no") => false,
+            _ => true,
         })
     }
 
