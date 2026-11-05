@@ -260,6 +260,25 @@ mod cuda {
             done.event.record(&self.stream).map_err(Error::wrap)
         }
 
+        /// `NAIWA_COPY_SPLIT=g` probe: the same bytes as [`Self::upload_async`], but each projection's copy is issued
+        /// as `g` commands of `1/g` of its length, all into the same destination at their own offsets. Everything else
+        /// - the fence, the single completion event, the call sites - is identical, so what the probe measures is
+        /// **whether a smaller copy unit costs throughput**. That is the first question M34's split half has to
+        /// answer: if a 1/4 of a layer copy is as fast per byte as a whole-layer one, splitting the unit is free and
+        /// only the consumer side (S2) has to change; if it is not, the split has to be paid for somewhere else.
+        pub unsafe fn upload_async_split(
+            &self,
+            fence: &ReadFence,
+            parts: &[(&SlotMemory, &[u8])],
+            split: usize,
+            done: &CopyDone,
+        ) -> Result<()> {
+            done.start_timing(self)?;
+            self.queue_copies_split(fence, parts, split.max(1))?;
+            done.stop_timing(self)?;
+            done.event.record(&self.stream).map_err(Error::wrap)
+        }
+
         /// Queue the copies and return at once, **without** recording a completion event — for a
         /// producer that records one event for a whole batch of copies after queueing them all
         /// (the doorbell preload claims its pass only once the event exists).
@@ -280,6 +299,47 @@ mod cuda {
         pub fn upload(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
             self.queue_copies(fence, parts)?;
             self.stream.synchronize().map_err(Error::wrap)
+        }
+
+        fn queue_copies_split(
+            &self,
+            fence: &ReadFence,
+            parts: &[(&SlotMemory, &[u8])],
+            split: usize,
+        ) -> Result<()> {
+            self.stream
+                .context()
+                .bind_to_thread()
+                .map_err(Error::wrap)?;
+            if let Some(event) = fence.event.lock().unwrap().as_ref() {
+                self.stream.wait(event).map_err(Error::wrap)?;
+            }
+            for (dst, src) in parts {
+                if src.len() != dst.len {
+                    candle_core::bail!(
+                        "slot upload of {} bytes into a {}-byte slot",
+                        src.len(),
+                        dst.len
+                    );
+                }
+                // 4 KiB boundaries, so a sub-copy never straddles a page in the pinned source.
+                let unit = (src.len() / split).max(4096) / 4096 * 4096;
+                let mut off = 0usize;
+                while off < src.len() {
+                    let len = unit.min(src.len() - off);
+                    // SAFETY: the caller guarantees the whole slot and the whole source are alive until `done`.
+                    unsafe {
+                        result::memcpy_htod_async(
+                            dst.ptr + off as u64,
+                            &src[off..off + len],
+                            self.stream.cu_stream(),
+                        )
+                    }
+                    .map_err(Error::wrap)?;
+                    off += len;
+                }
+            }
+            Ok(())
         }
 
         fn queue_copies(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {

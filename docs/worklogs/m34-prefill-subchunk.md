@@ -421,3 +421,35 @@ proportional to the *range* borrowed, not to what the chunk uses of it. Splittin
 flight for a given VRAM (a layer still has to be whole to be consumed), but it does make each borrowed range 1/g of a
 layer - so the same pool can hold g times as many units *and* the wipe, the refill and the give-back all shrink by g.
 Depth 3 failed on exactly the term that splitting reduces.
+
+---
+
+## 16. Splitting the copy is free, so the whole price of the split is on the consumer
+
+§14 showed every layer's copy already runs at 13.4 GB/s, so before designing the consumer side (S2) the obvious
+question is whether a *smaller* copy unit costs throughput. If it does, the split is dead on arrival; if it does not,
+the only thing S2 has to justify is the MoE's masked launches.
+
+`NAIWA_COPY_SPLIT=g` answers it: the same bytes into the same destination, but each projection's copy is issued as `g`
+commands of `1/g` of its length (4 KiB boundaries), with the same fence, the same single completion event and the same
+call site. Same prompt, same session, the copy's own duration from the `NAIWA_COPY_TIME` pair, 48 layers each:
+
+| `NAIWA_COPY_SPLIT` | median | max |
+|---:|---:|---:|
+| 1 (today) | **41.6 ms** | 51.0 ms |
+| 2 | **41.6 ms** | 50.9 ms |
+| 4 | **41.6 ms** | 50.9 ms |
+| 8 | **41.7 ms** | 51.0 ms |
+
+**Granularity is free**: the link reaches 13.4 GB/s whether a layer arrives as one copy or as twenty-four. So the split
+has no bandwidth cost to pay, and the entire cost of S2 is the consumer side - the masked launches and the extra
+combine - which is what S2 exists to measure.
+
+Two consequences for the design:
+
+1. the split can be introduced incrementally: the copy path is proven free, so the risk is all in the MoE, and the
+   probe (`NAIWA_COPY_SPLIT`) stays in the tree as the control arm;
+2. it also means **the depth-3 failure in §15 is not a granularity problem**: 92% of the cache was wiped and the
+   request produced no decode tokens. That is the wipe and the give-back, and it has to be fixed on its own terms
+   before a deeper queue can be measured at all - splitting the unit does not shrink the wipe, because the bytes a
+   layer occupies while it is being consumed are the same however they are subdivided.

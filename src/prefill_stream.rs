@@ -1085,7 +1085,12 @@ impl PrefillStream {
             // It also removes every overlap, so this mode measures throughput and nothing else.
             self.copy.upload(&buf.released, &parts)?;
         } else {
-            unsafe { self.copy.upload_async(&buf.released, &parts, &buf.ready)? };
+            // `NAIWA_COPY_SPLIT=g` (probe): the same upload as g sub-copies per projection.
+            let split = std::env::var("NAIWA_COPY_SPLIT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            unsafe { self.copy.upload_async_split(&buf.released, &parts, split, &buf.ready)? };
         }
         buf.queued = Some(queued);
         buf.loaded = Some(layer);
