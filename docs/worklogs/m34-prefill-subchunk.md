@@ -284,3 +284,60 @@ the borrow branch grants `min(lend_bytes / layer_bytes, max_depth)` ranges, the 
 down and takes the first that fits with the decode reserve. `(depth 1)` is the no-prefetch arm and `(depth 2)` is
 byte-for-byte the behaviour before this milestone, which is why the oracle gate is unaffected - and it is: `frac 0` +
 `--no-lookahead` is still byte-identical, and `cargo test` is 56 passed.
+
+---
+
+## 13. Where the copy rate actually goes: per-layer reallocation, then the pages
+
+S0/S1 said the prompt path is copy-bound and that the copy runs at 7-9.8 GB/s where the link idles at 13.4. This is
+the investigation of that gap. It is **not** the copy stream and **not** the number of parts - the repo's own
+`h2d_` probes (in `src/host_memory.rs`) answer both on this machine, today:
+
+| probe | rate |
+|---|---:|
+| 512 MiB, pageable source | 8.0 GB/s |
+| 512 MiB, registered (`cuMemHostRegister`) | 13.4 GB/s |
+| 511 MiB in 3 parts, registered, **4 KiB pages** | **5.5 GB/s** |
+| 511 MiB in 3 parts, registered, **+ `MADV_HUGEPAGE`/`MADV_COLLAPSE`** | **13.4 GB/s** |
+| the same 3 parts on the *default* stream | 13.3 GB/s |
+| the same 3 parts on a **second stream** (the way `CopyStream` builds one) | 13.3 GB/s |
+| a second pass over an already-written destination | 10.7 GB/s |
+
+So: the copy stream costs nothing, one copy costs the same as three, and **the host page size of the source is worth
+2.4x** - which is the mechanism strata's `pinned.cu` calls out ("large pages first, then the largest alignment the OS
+will give us"). Our process does have 89% of its anonymous memory on 2 MiB pages
+(`smaps_rollup: AnonHugePages 23.6 GiB of Anonymous 26.4 GiB`), so this is not the main term any more - worth about a
+tenth of the time, not a doubling.
+
+**The main term is per-layer reallocation.** Reading the per-layer rates out of one chunk's debug log, the pattern is
+a strict function of whether that layer had to be reallocated:
+
+| layer | copy | rate | what happened |
+|---|---:|---:|---|
+| 1 | **415 ms** | **0.9 GB/s** | the *second buffer's first* allocation (368 MiB into a fresh block) |
+| 3, 7, 11, 15, ... 43 (every 4th) | 80-90 ms | **5.8-6.8 GB/s** | shape change -> reallocation |
+| 4, 5, 6, 9, ... 46 | 54-63 ms | **9.2-9.8 GB/s** | the block is reused as-is |
+
+A chunk pays **35 reallocations** of 48 layers, because this model has seven layer shapes (mixed quant) and two buffers
+alternate between them. The reallocation call itself is cheap (15-82 us, ~2 ms a chunk) - what it costs is the copy
+into **freshly allocated device memory**, which runs 35% slower than into a block that has already been written. The
+first-touch case is the extreme: 415 ms for 368 MiB.
+
+### So the ordering of the levers changes
+
+| lever | expected | status |
+|---|---|---|
+| **no reallocation on a shape change**: the buffer is a borrowed range sized by the *largest* layer's span, so a smaller layer needs new *views*, not new memory - carve the range once and re-wrap the projection tensors with the layer's shape | **+35% on two thirds of the layers**, ~0.5 s a chunk, and it removes the 415 ms outlier | not built; needs the same "quantized view over our own bytes" helper S2 needs (§11) |
+| complete 2 MiB coverage on the stacks (hugetlb first, then `MADV_HUGEPAGE`, and *verify* rather than best-effort) | up to 10%, since 89% of the pages are already large | not built |
+| depth / split (S1, S2) | 0-12%, measured | depth built, split not |
+| merging the 3 copies into fewer | **0**: 3 parts and 1 part both reach 13.4 | measured, closed |
+
+### Calibration, which matters for what to expect
+
+The expert set is streamed once per chunk whatever the chunk's token count: 48 layers x 531 MiB = 24 GiB. At the link's
+13.4 GB/s that is **2.0 s a chunk, at 40 ms a layer** - a floor no pipeline work moves, because those bytes have to
+cross PCIe. With the loan's two chunks for a 3 433-token prompt that floor is ~4.0 s, against strata's measured
+3 741 ms (which pays the same bytes) and our 4 791 ms.
+
+Which is the whole story in one line: **strata is at the byte floor and we are 28% above it, and the 28% is the
+reallocation penalty on two thirds of the layers, not the pipeline's shape.**

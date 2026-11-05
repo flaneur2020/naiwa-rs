@@ -74,6 +74,12 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   i.e. the async path already hides nearly all of the non-copy time, so the per-layer wall clock *is* the copy and a
   finer unit has ~8% to win, not 0.4 s a chunk. The term that is wrong is the **rate**: 7.0-7.3 GB/s this session
   against 11.1 when §20.13 measured and strata's 13.1.
+- **The copy rate gap is the reallocation penalty, not the stream (§13):** the repo's `h2d_` probes give 13.4 GB/s
+  for one copy, for three, and on a second stream alike, but 5.5 GB/s from 4 KiB pages against 13.4 from 2 MiB pages -
+  and the per-layer rates in a real chunk show 9.2-9.8 GB/s on layers whose buffer is reused against **5.8-6.8 on the
+  35 of 48 that reallocate** (7 layer shapes, 2 buffers), with the second buffer's first use at 0.9 GB/s / 415 ms. The
+  byte floor is 48 x 531 MiB at 13.4 GB/s = **2.0 s a chunk, 40 ms a layer**; at two chunks strata's 3 741 ms is that
+  floor and our 4 791 ms is 28% above it.
 - **`--prefill-stream-depth 1..4` is built** (§10): depth 1 -> 2 is a real **12% per layer** (77.9 -> 69.8 ms), depth 3
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
