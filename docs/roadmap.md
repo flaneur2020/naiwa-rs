@@ -230,6 +230,13 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
   order changes, and the byte-exact oracle can only be pinned to one order; flipping it needs a one-time re-baseline
   of the reference, which is a gate decision. **Attention is no longer the lever**: the quantised MoE/dense GEMM is
   now 43.9% of kernel time.
+- **Against strata, same session (§20.11): TPOT at parity, TTFT not, and the gap is host memory.** `short` TPOT p50
+  44.2 vs 41.3 ms, `doc` 40.0 vs 40.4 (parity) with strata ahead in the tail (p90 42.4 vs 49.1); but TTFT p50 1 010 vs
+  **654** ms and p90 2 622 vs **1 096** ms, and on one 3 433-token cold request strata is **3.72-3.75 s (stable to
+  20 ms)** against naiwa's **5.08 s earlier in the session and 10.5-11.1 s later**. The host runs a 54 GiB model
+  against 60 GiB of memory, the prefill is mostly host-to-device copy (1 940 ms of PCIe against 615 ms of everything
+  else), so our long-prompt TTFT is both worse and unpredictable - and neither is a kernel problem. One `doc` round
+  also died with CUDA OOM where strata (800 MB cache against our 2.5 GB) did not; recorded, not retried.
 - The three open decisions are closed the way strata closes them (worklog §10): the loan is the **tail, layer-major,
   no heat re-ordering** (`layer_slot_range` is `l*q`; heat decides *which* experts fill a slot, not where it is); the
   refill is **eager, queued, one wait, then `verify_slot`**; the **ring is a later milestone**, but `bytes_needed`

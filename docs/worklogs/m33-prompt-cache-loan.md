@@ -1303,3 +1303,57 @@ M33 changes that could plausibly touch decode are the cache repricing (2.5 GB = 
 and `quiesce` becoming the default - and the cache ladder was already measured flat (33.78 / 32.83 / 33.71 ms at
 2.2 / 2.5 / 2.9 GB), so neither is expected to move TPOT. A definitive A/B would rebuild the pre-M33 commit
 (`86242f9` with the fork at `ed5831a1`) and run this same three-load protocol against it.
+
+### 20.11 Against strata, same session: TPOT at parity, TTFT not, and the gap is host memory
+
+Both engines, same card, same session, alternating, cold process per round, the repo's own chat harness
+(`harness/chat/run.py --engines naiwa,strata --rounds 3 --classes short,doc`; strata from
+`harness/chat/engines/strata-engine.json`, naiwa from `nawa.json`'s shipped config):
+
+| | naiwa | strata |
+|---|---|---|
+| `short` TTFT p50 / p90 | 1 010 / 2 622 ms | **654 / 1 096** ms |
+| `short` TPOT p50 / p90 | 44.2 / 52.0 ms | **41.3 / 43.9** ms |
+| `doc` TTFT p50 / p90 | 1 404 / 5 929 ms | **671 / 2 412** ms |
+| `doc` TPOT p50 / p90 | **40.0** / 49.1 ms | 40.4 / **42.4** ms |
+
+(14-24 turns per cell, two complete rounds; the third naiwa `doc` round died - see below.)
+
+**TPOT is at parity on the median** and strata wins the tail: 42.4 against 49.1 ms p90 on `doc`, 43.9 against 52.0 on
+`short`. Standalone the shipped config measures **36.2 ms** (§20.10, three loads). The medians are therefore where the
+milestone chain left them; what strata still has is *consistency*.
+
+**TTFT is not at parity, and the reason is not the attention kernel.** One cold request, the same 3 433-token prompt,
+`ttft` = time to the first streamed token:
+
+| arm | runs | tok/s |
+|---|---|---:|
+| strata | 3 741 / 3 721 / 3 752 ms | **915** |
+| naiwa (scalar attention) | 10 475 / 10 810 / 11 064 ms | 315 |
+| naiwa, same prompt **earlier in this session** | 5 080 ms | 676 |
+
+strata's three runs agree to 20 ms. naiwa's **quadruple** over the session for a byte-identical request. The host is
+running a 54 GiB model against 60 GiB of memory, so a cold process finds only part of the PLE table and the expert
+weights in page cache (30 GiB buff/cache at the time of the last run) and reads the rest from disk; the prefill then
+pays for it, because the prefill *is* mostly host-to-device copies (1 940 ms of PCIe copy against 615 ms of everything
+else, §20.5). This is the same drift recorded as a standing block ("同配置 TTFT 4 313 -> 6 303 ms"), now with a
+strata reference beside it: **strata is stable at 3.7 s where we are 5.1-11.1 s**, i.e. our long-prompt TTFT is both
+worse and unpredictable, and neither property is a kernel problem.
+
+**One failure, recorded not retried.** Round 3's `doc` turn 1 died with `CUDA_ERROR_OUT_OF_MEMORY`; the run reports
+"ready in 54.6s" against 38-42 s for the other rounds, i.e. it loaded into a tighter VRAM budget. naiwa runs a 2.5 GB
+expert cache where strata runs 800, which is the structural difference behind that margin - and the reason the OOM
+appeared on our side only. Per the harness rule the round was not retried.
+
+**Two configurations, stated plainly**: naiwa 2.5 GB expert cache and strata 800 (its own unit), same pack and same
+card. The cache ladder is flat for naiwa (§20.9's predecessor, 33.78 / 32.83 / 33.71 ms at 2.2 / 2.5 / 2.9 GB), so
+this is not what the TPOT difference is made of; it *is* where the VRAM headroom difference is made.
+
+### What this changes about the next step
+
+The attention kernel is now 179 ms of a ~2 s kernel budget (§20.9) and the 356 ms it removed does not show up in a
+10.5 s TTFT. Two conclusions:
+
+1. the remaining **kernel-side** lever is the quantised MoE/dense GEMM (0.866 s, 43.9% of kernel time);
+2. the remaining **end-to-end** lever is host residency - the prefill is mostly host-to-device copy, and the gap to
+   strata on a long cold prompt is 2-3x, which no kernel in this file can close.
