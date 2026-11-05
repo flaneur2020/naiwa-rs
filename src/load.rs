@@ -39,12 +39,14 @@ pub fn install_cpu_moe(
     expert_cache_gb: f64,
     prefill_stream: Option<usize>,
     prefill_depth: usize,
+    prefill_split: usize,
     pcie_frac: f32,
     lookahead_swaps: usize,
     lookahead: bool,
     profile: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let prefill = prefill_stream.map(|min_tokens| PrefillStreams::new(min_tokens, prefill_depth));
+    let prefill = prefill_stream
+        .map(|min_tokens| PrefillStreams::new(min_tokens, prefill_depth, prefill_split));
     if let Some(min_tokens) = prefill_stream {
         info!(
             "--prefill-stream: prefill chunks of {min_tokens} tokens or more run their experts on the GPU"
@@ -329,6 +331,7 @@ pub fn base_builder(
                 .prefill_stream
                 .then_some(model.prefill_stream_min_tokens.get()),
             model.prefill_stream_depth as usize,
+            model.prefill_split as usize,
             model.pcie_frac,
             model.lookahead_swaps,
             !model.no_lookahead,

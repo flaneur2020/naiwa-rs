@@ -104,6 +104,11 @@ mod cuda {
     /// One expert projection's device memory, overwritten in place.
     pub struct SlotMemory {
         tensor: Arc<QTensor>,
+        /// The slot's storage, kept so a *sub-range* of it can be viewed without a copy: `QCudaStorage::borrow_from`
+        /// takes the base storage, and `QTensor` does not expose one (M34 S2). `None` when the slot's last bytes are
+        /// inside the bank's row padding, i.e. when no view can be validated - the caller then uses the whole layer,
+        /// which is always correct.
+        storage: Option<QCudaStorage>,
         ptr: sys::CUdeviceptr,
         len: usize,
     }
@@ -120,6 +125,25 @@ mod cuda {
 
         pub fn len(&self) -> usize {
             self.len
+        }
+
+        /// A view of `el_count` elements at `byte_offset` inside this slot's bytes, shaped `shape`. No copy: it is the
+        /// same device memory, which is what lets a layer be consumed in expert sub-ranges (M34 S2) - and it is the
+        /// same call the loan uses to carve its ranges out of the pool.
+        pub fn sub_view(
+            &self,
+            byte_offset: usize,
+            el_count: usize,
+            shape: candle_core::Shape,
+            dev: &candle_core::CudaDevice,
+        ) -> Result<QTensor> {
+            let base = self
+                .storage
+                .as_ref()
+                .ok_or_else(|| Error::Msg("this slot has no viewable storage".into()))?;
+            let storage =
+                QCudaStorage::borrow_from(base, byte_offset, el_count, self.tensor.dtype(), dev)?;
+            QTensor::new(QStorage::Cuda(storage), shape)
         }
     }
 
@@ -191,14 +215,25 @@ mod cuda {
                 );
             }
             let base = storage.device_ptr()? as sys::CUdeviceptr;
+            let views_storage = storage.clone();
+            let dev = self.device.as_cuda_device()?;
             let tensor = Arc::new(QTensor::new(QStorage::Cuda(storage), (slots, n, k))?);
             let views = (0..slots)
-                .map(|i| SlotMemory {
-                    tensor: Arc::clone(&tensor),
-                    ptr: base + (i * stride) as sys::CUdeviceptr,
-                    len: stride,
+                .map(|i| {
+                    // Each slot is a view of the bank's storage, so a slot can later be sub-divided again into
+                    // expert sub-ranges without another allocation (M34 S2).
+                    // Best effort: the last slot's range can run into the bank's row padding, which `borrow_from`
+                    // counts against the slab. That costs the sub-view, not the bank.
+                    let storage =
+                        QCudaStorage::borrow_from(&views_storage, i * stride, n * k, dtype, dev).ok();
+                    Ok(SlotMemory {
+                        tensor: Arc::clone(&tensor),
+                        storage,
+                        ptr: base + (i * stride) as sys::CUdeviceptr,
+                        len: stride,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Ok((tensor, views))
         }
 
@@ -216,10 +251,15 @@ mod cuda {
             let len = storage.storage_size_in_bytes();
             let ptr = storage.device_ptr()? as sys::CUdeviceptr;
             let tensor = Arc::new(QTensor::new(
-                QStorage::Cuda(storage),
+                QStorage::Cuda(storage.clone()),
                 stack.shape().clone(),
             )?);
-            Ok(SlotMemory { tensor, ptr, len })
+            Ok(SlotMemory {
+                tensor,
+                storage: Some(storage),
+                ptr,
+                len,
+            })
         }
 
         /// Wait for everything queued on this stream so far.

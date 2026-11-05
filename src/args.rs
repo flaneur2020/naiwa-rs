@@ -305,6 +305,17 @@ pub struct ModelOptions {
         default_value_t = crate::prefill_stream::DEFAULT_DEPTH as u8
     )]
     pub prefill_stream_depth: u8,
+
+    /// Expert sub-ranges a prompt layer's MoE is consumed in (`1`-`8`, default 1 = the whole layer). A masked
+    /// launch per sub-range; the split is what would let a layer be consumed while the rest of it is still
+    /// arriving (M34 S2).
+    #[arg(
+        long,
+        requires = "prefill_stream",
+        value_parser = clap::value_parser!(u8).range(1..=8),
+        default_value_t = 1
+    )]
+    pub prefill_split: u8,
 }
 
 #[derive(Args, Clone, Default)]

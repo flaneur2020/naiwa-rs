@@ -337,6 +337,8 @@ pub struct PrefillStream {
     copy: Arc<CopyStream>,
     num_experts: usize,
     top_k: usize,
+    /// `--prefill-split g`: the layer's experts are consumed in `g` sub-ranges (M34 S2). 1 is the whole layer.
+    split: usize,
     act: Activation,
     comm: Arc<Comm>,
     layers: RwLock<Vec<Option<HostStacks>>>,
@@ -403,6 +405,7 @@ impl PrefillStream {
         comm: Arc<Comm>,
         min_tokens: usize,
         depth: usize,
+        split: usize,
         slab: Option<Arc<crate::moe::slab::Slab>>,
         cache: Option<Arc<crate::moe::Layers>>,
     ) -> candle_core::Result<Option<Self>> {
@@ -433,6 +436,7 @@ impl PrefillStream {
             copy,
             num_experts,
             top_k,
+            split: split.clamp(1, 8),
             act,
             comm,
             layers: RwLock::default(),
@@ -1097,6 +1101,177 @@ impl PrefillStream {
         Ok(true)
     }
 
+    /// The MoE for one uploaded layer, either as one launch over the whole expert set or as `split` masked launches
+    /// over expert sub-ranges (M34 S2).
+    ///
+    /// The sub-range form exists because a layer's experts do not all have to be *resident* at once if the consumer
+    /// takes them a piece at a time: a masked launch only touches the experts it is given, so the next sub-range can
+    /// still be arriving. That is the only way to get a deeper upload queue out of the same VRAM, since the bytes a
+    /// layer occupies while it is consumed are the same however they are subdivided (M34 §16).
+    fn dispatch(
+        &self,
+        experts: &MoEExperts,
+        buf: &LayerBuf,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let whole = |experts: &MoEExperts| experts.forward(xs, topk_weights.clone(), topk_ids);
+        let g = self.split;
+        if g <= 1 || self.num_experts % g != 0 {
+            return whole(experts);
+        }
+        let per = self.num_experts / g;
+        let Some(memory) = buf.memory.as_ref() else {
+            return whole(experts);
+        };
+        // The split path falls back to the whole layer on any error, once, with the reason in the log: it is a
+        // mechanism under measurement, and a chunk that cannot use it must still produce the right answer (M34 S2).
+        match self.dispatch_split(experts, memory, xs, topk_weights, topk_ids, g, per) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if ONCE.set(()).is_ok() {
+                    tracing::warn!(
+                        "prefill split {g}: {e}; the chunk runs its experts as whole layers from here"
+                    );
+                }
+                whole(experts)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_split(
+        &self,
+        experts: &MoEExperts,
+        memory: &[SlotMemory; 3],
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        g: usize,
+        per: usize,
+    ) -> candle_core::Result<Tensor> {
+        let mask = std::env::var_os("NAIWA_SPLIT_CHECK").is_some();
+        let whole = if mask {
+            Some(experts.forward(xs, topk_weights.clone(), topk_ids)?)
+        } else {
+            None
+        };
+        let mut acc: Option<Tensor> = None;
+        let mut built = 0usize;
+        for k in 0..g {
+            let a = k * per;
+            let Some(sub) = self.sub_experts(memory, a, per)? else {
+                // The views did not line up (a shape or dtype this path does not handle): whole layer, not a guess.
+                return experts.forward(xs, topk_weights.clone(), topk_ids);
+            };
+            built += 1;
+            let (w, ids) = self.mask_range(topk_weights, topk_ids, a, per)?;
+            let part = sub.forward(xs, w, &ids)?;
+            acc = Some(match acc {
+                None => part,
+                Some(prev) => prev.add(&part)?,
+            });
+        }
+        let out = acc.expect("at least one sub-range");
+        if let Some(whole) = whole {
+            let (a, b) = (whole.flatten_all()?.to_dtype(candle_core::DType::F32)?, out.flatten_all()?.to_dtype(candle_core::DType::F32)?);
+            let (av, bv) = (a.to_vec1::<f32>().map_err(candle_core::Error::wrap)?, b.to_vec1::<f32>().map_err(candle_core::Error::wrap)?);
+            let mut worst = 0f32;
+            let mut scale = 0f32;
+            for (x, y) in av.iter().zip(&bv) {
+                worst = worst.max((x - y).abs());
+                scale = scale.max(x.abs());
+            }
+            crate::dbg_note(
+                "prefill_split",
+                &format!(
+                    "split {g} in {built} sub-ranges: worst |diff| {worst:.3e} (scale {scale:.3e}, relative {:.2e})",
+                    (worst / scale.max(1e-30)) as f64
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// `MoEExperts` over experts `[a, a + n)` of one uploaded layer, as views of the buffer's own bytes.
+    ///
+    /// The stacks are `[num_experts, …]` and quantised rows are whole blocks, so a sub-range is a byte offset plus a
+    /// new element count - `QCudaStorage::borrow_from` over the slot's storage, which is the same call the loan uses
+    /// to carve its ranges. `None` when the arithmetic does not land on whole rows (the caller then runs the whole
+    /// layer, which is always correct).
+    fn sub_experts(
+        &self,
+        memory: &[SlotMemory; 3],
+        a: usize,
+        n: usize,
+    ) -> candle_core::Result<Option<MoEExperts>> {
+        let dev = self.device.as_cuda_device()?;
+        let mut out: Vec<Arc<QTensor>> = Vec::with_capacity(3);
+        for mem in memory {
+            let dims = mem.tensor().shape().dims().to_vec();
+            let rows = dims[0];
+            if rows != self.num_experts || a + n > rows {
+                return Ok(None);
+            }
+            let cols: usize = dims[1..].iter().product();
+            let dt = mem.tensor().dtype();
+            let per_row = (cols + dt.block_size() - 1) / dt.block_size() * dt.type_size();
+            let mut shape = dims.clone();
+            shape[0] = n;
+            match mem.sub_view(
+                a * per_row,
+                n * cols,
+                candle_core::Shape::from_dims(&shape),
+                dev,
+            ) {
+                Ok(view) => out.push(Arc::new(view)),
+                // The view did not line up (padding at the end of the slot): whole layer, which is always correct.
+                Err(_) => return Ok(None),
+            }
+        }
+        let mut it = out.into_iter();
+        Ok(Some(MoEExperts::from_qtensors(
+            it.next().expect("gate"),
+            it.next().expect("up"),
+            it.next().expect("down"),
+            n,
+            self.top_k,
+            &self.comm,
+            self.act,
+        )?))
+    }
+
+    /// `topk_weights` and `topk_ids` restricted to experts `[a, a + n)`: weights outside the range become 0 and the
+    /// ids are rebased, so the masked launch contributes exactly nothing for the other sub-ranges.
+    fn mask_range(
+        &self,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        a: usize,
+        n: usize,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        use candle_core::DType;
+        let dev = topk_ids.device();
+        let shape = topk_ids.shape().clone();
+        let ids = topk_ids.to_dtype(DType::I64)?;
+        let lo = Tensor::full(a as i64, &shape, dev)?;
+        let hi = Tensor::full((a + n) as i64, &shape, dev)?;
+        let inside = ids
+            .broadcast_ge(&lo)?
+            .mul(&ids.broadcast_lt(&hi)?)?
+            .to_dtype(DType::I64)?;
+        // Weights outside the range are exactly zero, so the masked launch contributes nothing for the other
+        // sub-ranges. Ids are rebased and clamped at 0 - `relu` before the mask, so an underflow cannot wrap.
+        let w = topk_weights
+            .to_dtype(DType::F32)?
+            .mul(&inside.to_dtype(DType::F32)?)?
+            .to_dtype(topk_weights.dtype())?;
+        let rebased = ids.broadcast_sub(&lo)?.relu()?.broadcast_mul(&inside)?;
+        Ok((w, rebased.to_dtype(topk_ids.dtype())?))
+    }
+
     /// Run `layer`'s routed experts on the GPU. `None`: this chunk or layer stays on the CPU.
     pub fn forward(
         &self,
@@ -1312,7 +1487,7 @@ impl PrefillStream {
             self.copy.synchronize()?;
         }
         let t_compute = std::time::Instant::now();
-        let out = experts.forward(xs, topk_weights.clone(), topk_ids);
+        let out = self.dispatch(experts, &buf, xs, topk_weights, topk_ids);
         let transport = buf.queued.map(|queued| {
             let copy = queued.elapsed();
             let gbs = buf.bytes as f64 / copy.as_secs_f64().max(1e-9) / 1e9;
@@ -1404,15 +1579,18 @@ pub struct PrefillStreams {
     min_tokens: usize,
     /// `--prefill-depth`: what `PrefillStream::new` is given (see `MAX_DEPTH`).
     depth: usize,
+    /// `--prefill-split`: expert sub-ranges a layer is consumed in.
+    split: usize,
 }
 
 impl PrefillStreams {
     /// Streams that run prefill chunks of `min_tokens` or more on the GPU.
-    pub fn new(min_tokens: usize, depth: usize) -> Self {
+    pub fn new(min_tokens: usize, depth: usize, split: usize) -> Self {
         Self {
             streams: Mutex::default(),
             min_tokens,
             depth,
+            split,
         }
     }
 
@@ -1464,6 +1642,7 @@ impl PrefillStreams {
                     Arc::clone(ctx.comm),
                     self.min_tokens,
                     self.depth,
+                    self.split,
                     slab,
                     cache,
                 )?

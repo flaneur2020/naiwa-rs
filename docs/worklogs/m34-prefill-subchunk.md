@@ -453,3 +453,36 @@ Two consequences for the design:
    request produced no decode tokens. That is the wipe and the give-back, and it has to be fixed on its own terms
    before a deeper queue can be measured at all - splitting the unit does not shrink the wipe, because the bytes a
    layer occupies while it is being consumed are the same however they are subdivided.
+
+---
+
+## 17. S2's consumer side is built - and blocked on one CUDA symbol lookup
+
+The split needs the consumer to take a layer's experts a piece at a time, and the two sides of that are now in the
+tree behind `--prefill-split g` (default 1 = the whole layer):
+
+1. **A sub-range is a view, not a copy.** `SlotMemory::sub_view` wraps `QCudaStorage::borrow_from` over the slot's own
+   storage - the same call the loan uses to carve ranges out of the pool - at `a * bytes_per_expert` for
+   `n * cols` elements. `SlotMemory` had to keep its `QCudaStorage` for that, because `QTensor` does not expose one.
+2. **The consumer runs `g` masked launches.** `mask_range` zeroes the weights of the experts outside the sub-range and
+   rebases the ids into `0..n` (in i64, `relu` before the mask, so a rebase cannot wrap), and the sub-launch outputs are
+   summed. `NAIWA_SPLIT_CHECK=1` runs the whole-layer launch *as well* and prints `worst |diff|` against it, which is the
+   numerical gate this path will be held to.
+
+**And it does not run yet**: the masked launch fails with `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not
+found")` from candle's `indexed_moe_forward`, which is a kernel-module lookup rather than a shape check - so the
+sub-view is built and passed, and the MoE's CUDA entry cannot find the symbol for it. The cause is not yet identified.
+
+What is in the tree is therefore the **safe** form of it: `dispatch` falls back to the whole-layer launch on any error
+from the split path, once, with the reason in the log
+(`prefill split 2: DriverError(CUDA_ERROR_NOT_FOUND, ...); the chunk runs its experts as whole layers from here`), and
+the arm measures exactly what the whole-layer arm measures (TTFT 3 829 ms and 69.7 ms a layer against split 1's
+3 890 / 70.2 - it is the same code path, as the warning says).
+
+Gates on the shipped defaults: oracle byte-identical, `cargo test` 56 passed.
+
+**Next**: find what `indexed_moe_forward` looks up. The candidates, in order of likelihood, are (a) a kernel name built
+from the stack's *first* dim, (b) a module compiled lazily per dtype where the borrowed offset breaks the code path's
+expectation, (c) `MoEExperts::from_qtensors`' backend choice (`Fused` vs `Cutlass` vs `Fast`) switching on the expert
+count. Each is a grep and a print, and the numeric gate (`NAIWA_SPLIT_CHECK`) is already in place to validate the first
+one that works.
