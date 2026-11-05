@@ -58,6 +58,25 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
+## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — 📐 proposed (2026-11-05)
+
+Worklog: [`worklogs/m34-prefill-subchunk.md`](worklogs/m34-prefill-subchunk.md) — the prompt path's unit of prefetch
+becomes **1/split of a layer's expert set** (`--prefill-split 1|2|4|8`) with **`--prefill-depth N`** sub-chunks in
+flight (today: one whole layer, depth 2), so a layer's MoE can start on the first sub-chunk instead of the last and the
+copy engine sees a continuous queue across layer boundaries instead of a burst with a stall in the middle.
+
+- **Why:** M33 §20.13's per-layer decomposition — 62/51/45 ms per layer for 1 792/768/352 rows, i.e. the layer's
+  expert stream (≈0.5 GiB at 11.1 GB/s) and not the tokens — and the same-session comparison against strata: 2.05 s a
+  chunk at 11.1 GB/s against 1.87 s at 13.1 GB/s. Same bytes, so the difference is the pipeline's shape.
+- **The knobs are the point:** sub-chunking decouples the unit from the depth. Depth 2 costs two whole layers today;
+  at split 4, depth 4 costs one layer's worth of bytes and buys four units in flight.
+- **S0 first:** price the overlap with `NAIWA_STREAM_SYNC=1` (every overlap removed) against the default before
+  building anything, because the ceiling here is `min(copy, compute)` a layer ≈ 9 ms x 48 ≈ 0.4 s a chunk, and no
+  amount of pipeline work beats that.
+- **Not this milestone:** strata's 199-slot model-wide ring. It needs an id -> slot map and a routing-independent
+  schedule; M34 is the same idea one axis at a time (finer unit, deeper queue, still per layer and routing-driven), and
+  S4 decides whether the ring is the next step by showing whether the layer boundary still stalls the copy engine.
+
 ## M33 — the prompt path borrows the expert cache — 🔶 built, loan repaired and opt-in (2026-11-03)
 
 Worklog: [`worklogs/m33-prompt-cache-loan.md`](worklogs/m33-prompt-cache-loan.md) — the cache's banks are carved from
