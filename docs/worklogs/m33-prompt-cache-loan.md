@@ -1274,3 +1274,32 @@ pinned to one order (this is the rule §20.8 wrote down). Flipping it is one lin
 
 **Where the time is now.** With attention at 8.8%, the largest kernel family is the quantised MoE/dense GEMM at
 0.866 s (43.9%), then the GDN recurrence at 0.298 s (15.1%). The prompt attention is no longer the lever.
+
+### 20.10 Decode after M33: TPOT 36.2 ms, and the tile kernel is neutral there
+
+Asked for the current TPOT, so measured with the shipped chat configuration (`engines/naiwa.json`'s own arguments
+and env: 2.5 GB cache, `--pcie-frac 0.4`, MTP greedy drafting, `--pa-context-len 4096`, `--max-seqs 4`), five greedy
+rounds per cold load, `harness/tpot/tpot.py`:
+
+| load | TPOT per round (ms) | median |
+|---|---|---:|
+| shipped, load 1 | 35.37 36.37 33.65 37.04 37.83 | **36.37** |
+| shipped, load 2 | 37.95 36.08 36.86 33.55 35.42 | **36.08** |
+| shipped, load 3 | 39.32 35.13 38.65 31.43 36.16 | **36.16** |
+| `NAIWA_QSA_MMA_KERNEL=1` | 38.62 35.39 37.57 36.43 30.13 | **36.43** |
+
+**36.2 ms**, and the three loads agree to 0.3 ms - unusually tight for this card, where the in-load spread is
+±2 ms (33.6-37.8) and the between-session spread has been much worse (the host runs 54 GiB of model against 60 GiB of
+memory, and a same-config TTFT has drifted 4 313 -> 6 303 ms between sessions).
+
+The two attention arms are 0.06 ms apart, which is what has to be true: TPOT is decode, decode is one token per
+step, and the tile kernel only runs when `splits == 1` - the prompt shape. So the 2.99x does not pay for itself in
+decode and does not cost anything there either.
+
+Against the **40.7 ms** recorded at the revert point (`docs/roadmap.md`, 39.4 / 40.7 / 43.6 at the same shipped
+config), that is -11%. It is reported as an observation, not a result: the two numbers come from different sessions,
+and this repo's rule is that wall clock does not cross a session boundary (kernel time, from `nsys`, does). The
+M33 changes that could plausibly touch decode are the cache repricing (2.5 GB = 1 145 slots against 2.2 GB = 1 310)
+and `quiesce` becoming the default - and the cache ladder was already measured flat (33.78 / 32.83 / 33.71 ms at
+2.2 / 2.5 / 2.9 GB), so neither is expected to move TPOT. A definitive A/B would rebuild the pre-M33 commit
+(`86242f9` with the fork at `ed5831a1`) and run this same three-load protocol against it.

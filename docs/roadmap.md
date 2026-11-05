@@ -54,7 +54,7 @@ TPOT parity was measured at; the withdrawn work is kept in the tag `abort-cuda-g
 
 Why: the graph never reached a replayable whole step, and the default path paid for it. With the shipped chat config
 (`engines/naiwa.json`, `--mtp-n-predict 1`, 2.2 GB cache, `--pcie-frac 0.4`) the reverted tree measures
-**TPOT 40.7 ms** (39.4 / 40.7 / 43.6, 3 rounds) against strata's 38-39, which is the parity the milestone chain had
+**TPOT 40.7 ms** (39.4 / 40.7 / 43.6, 3 rounds; 36.2 ms re-measured after M33, worklog §20.10) against strata's 38-39, which is the parity the milestone chain had
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
