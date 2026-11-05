@@ -58,7 +58,7 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — 🔶 S0/S1 measured, premise falsified (2026-11-05)
+## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — ⛔ closed by measurement, both halves lose (2026-11-05)
 
 Worklog: [`worklogs/m34-prefill-subchunk.md`](worklogs/m34-prefill-subchunk.md) — the prompt path's unit of prefetch
 becomes **1/split of a layer's expert set** (`--prefill-split 1|2|4|8`) with **`--prefill-depth N`** sub-chunks in
@@ -91,6 +91,14 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
   and it is expressible without a kernel change (§11).
+- **Both halves are measured and neither pays.** The overlap is already realised (§9: `NAIWA_STREAM_SYNC=1` against the
+  default is 69.6 against 75.9 ms a layer, so there is at most 8% to hide), and the split costs **+23% a layer at split
+  2 and +32% at split 4** (§18: masked launches plus `g` combines) against that 8% ceiling. The copies themselves are
+  already at the link's ceiling of 13.4 GB/s (§14, which withdraws §13) and are free at any granularity (§16), while
+  the bytes a layer occupies are unchanged by subdividing them, so depth still costs wipe (§15: three ranges wipe
+  1 051 of 1 145 slots and the request then produces no decode tokens). Left standing: the instruments
+  (`NAIWA_COPY_TIME`, `NAIWA_COPY_SPLIT`, `NAIWA_SPLIT_CHECK`), `--prefill-stream-depth` (capped at 2) and
+  `--prefill-split` (default 1, falls back to whole layers with the reason logged).
 - **Not this milestone:** strata's 199-slot model-wide ring. It needs an id -> slot map and a routing-independent
   schedule; M34 is the same idea one axis at a time (finer unit, deeper queue, still per layer and routing-driven), and
   S4 decides whether the ring is the next step by showing whether the layer boundary still stalls the copy engine.

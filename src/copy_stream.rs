@@ -355,7 +355,9 @@ mod cuda {
                 self.stream.wait(event).map_err(Error::wrap)?;
             }
             for (dst, src) in parts {
-                if src.len() != dst.len {
+                // `<=`: a slot is carved with `MATRIX_ROW_PADDING` more elements than the stack holds, so the last
+                // expert sub-range can be viewed (M34 §17).
+                if src.len() > dst.len {
                     candle_core::bail!(
                         "slot upload of {} bytes into a {}-byte slot",
                         src.len(),

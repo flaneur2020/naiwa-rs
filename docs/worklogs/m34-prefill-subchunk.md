@@ -486,3 +486,56 @@ from the stack's *first* dim, (b) a module compiled lazily per dtype where the b
 expectation, (c) `MoEExperts::from_qtensors`' backend choice (`Fused` vs `Cutlass` vs `Fast`) switching on the expert
 count. Each is a grep and a print, and the numeric gate (`NAIWA_SPLIT_CHECK`) is already in place to validate the first
 one that works.
+
+---
+
+## 18. S2 works and closes its own route: the split costs more than the overlap can win
+
+Three defects stood between §17's plumbing and a running split, and they were all found by making the fallback print
+its reason instead of swallowing it:
+
+1. **Integer tensor kernels.** `mask_range` first did the rebase in i64 with a `relu`, and candle compiles its unary
+   kernels per dtype, so an i64 `relu` asks the CUDA module for a symbol it does not have -
+   `CUDA_ERROR_NOT_FOUND: "named symbol not found"`, which is what §17 reported. Everything is F32 now: the ids are
+   < 256 so they are exact, the mask is a 0/1 multiply, and an out-of-range id becomes `(id - a) * 0 = 0`, a valid
+   index with zero weight.
+2. **`MATRIX_ROW_PADDING` on the last sub-range.** `QCudaStorage::borrow_from` validates `offset + padded`, so a view of
+   the *second* half of a stack needs 512 elements more than the stack holds and was refused by 196 bytes
+   (`borrow of 80 281 796 bytes at 80 281 600 does not fit in a 160 563 200-byte slab`). The slot is now carved with
+   `MATRIX_ROW_PADDING` extra elements and the upload's length check is `<=` rather than `==`.
+3. With those two, the split runs: `split 2 in 2 sub-ranges`.
+
+**Numerical gate** (`NAIWA_SPLIT_CHECK=1`, which also runs the whole-layer launch and prints the difference):
+
+| layer | worst abs | scale | relative |
+|---|---:|---:|---:|
+| 0 | 9.77e-4 | 5.31e-1 | 1.8e-3 |
+| 1 | 9.77e-4 | 2.20e-1 | 4.4e-3 |
+| 2 | 1.78e-2 | 4.28e0 | 4.2e-3 |
+| 3 | 9.77e-4 | 1.53e-1 | 6.4e-3 |
+
+The absolute steps are `2^-10`-sized and the relative error sits at bf16's own resolution (`2^-8` = 3.9e-3), which is
+what the two paths can differ by: the outputs are combined per sub-range and added in f32, where the whole layer
+combines them in one pass and the result is rounded to bf16 either way. **So the split is numerically right and cannot
+be bit-exact** - the same rule M33 §20.8 wrote down.
+
+**And it costs more than it can ever win.** Same prompt, same session, whole-layer upload, only the consumer split:
+
+| `--prefill-split` | TTFT | per layer | request |
+|---:|---:|---:|---|
+| 1 (whole layer) | 3 712 ms | **64.8 ms** | ok |
+| 2 | - | 79.7 ms | **HTTP 500** |
+| 4 | 4 788 ms | **85.5 ms** | ok |
+
++23% at split 2 and +32% at split 4 per layer, from the masked launches (every row is processed in every sub-range, the
+mask only zeroes its weight) plus `g` combines instead of one. Against §9's measured ceiling - **8%** of the layer is
+non-copy work that a finer unit could hide - this is not a trade, it is a loss. **So the split route is closed by
+measurement on this model**, and the flag stays at its default of 1 with the whole-layer fallback in place.
+
+The remaining question the split was supposed to answer - whether a *smaller unit* makes the depth affordable - is
+answered by §16 instead: the copy is free at any granularity, and the bytes a layer occupies while it is consumed do
+not shrink by subdividing them, so depth still costs wipe. The honest state of M34 is that both of its halves are
+measured and neither pays on this model: the overlap (§9) is already realised, and the unit (§18) costs more than it
+buys. What is left standing from the milestone is the instrument set - `NAIWA_COPY_TIME` for a copy's own duration,
+`NAIWA_COPY_SPLIT` for granularity, `NAIWA_SPLIT_CHECK` for the numeric gate - and the two negative results, which is
+what §13/§14/§16/§18 together cost.

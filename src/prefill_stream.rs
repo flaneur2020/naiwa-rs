@@ -658,13 +658,17 @@ impl PrefillStream {
             // `NAIWA_BORROW_UNUSED=1` (probe): carve from the slab's *unused* tail (the banks only took `cursor`
             // bytes), so the buffer is inside the cache's allocation but overlaps no bank - which separates "the
             // alias with live slots" from "merely being inside the slab".
+            // `MATRIX_ROW_PADDING` more elements than the stack holds: `QCudaStorage::borrow_from` validates
+            // `offset + padded`, so without those bytes the *last* expert sub-range of a layer cannot be viewed
+            // (it overran by exactly the padding and the split fell back to whole layers - M34 §17).
+            let padded = stack.shape().elem_count() + candle_core::quantized::cuda::MATRIX_ROW_PADDING;
             let storage = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
-                match slab.alloc(stack.shape().elem_count(), stack.dtype(), &self.device)? {
+                match slab.alloc(padded, stack.dtype(), &self.device)? {
                     Some(st) => st,
                     None => candle_core::bail!("slab is full"),
                 }
             } else {
-                slab.borrow_at(offset, stack.shape().elem_count(), stack.dtype(), &self.device)?
+                slab.borrow_at(offset, padded, stack.dtype(), &self.device)?
             };
             offset += storage.allocated_bytes();
             out.push(self.copy.like_from_storage(stack, storage)?);
@@ -1118,6 +1122,12 @@ impl PrefillStream {
     ) -> candle_core::Result<Tensor> {
         let whole = |experts: &MoEExperts| experts.forward(xs, topk_weights.clone(), topk_ids);
         let g = self.split;
+        {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                crate::dbg_note("prefill_split", &format!("dispatch: g={g} experts={}", self.num_experts));
+            }
+        }
         if g <= 1 || self.num_experts % g != 0 {
             return whole(experts);
         }
@@ -1213,6 +1223,10 @@ impl PrefillStream {
             let dims = mem.tensor().shape().dims().to_vec();
             let rows = dims[0];
             if rows != self.num_experts || a + n > rows {
+                crate::dbg_note(
+                    "prefill_split",
+                    &format!("no view: rows {rows} against {} experts, range {a}+{n}", self.num_experts),
+                );
                 return Ok(None);
             }
             let cols: usize = dims[1..].iter().product();
@@ -1228,7 +1242,13 @@ impl PrefillStream {
             ) {
                 Ok(view) => out.push(Arc::new(view)),
                 // The view did not line up (padding at the end of the slot): whole layer, which is always correct.
-                Err(_) => return Ok(None),
+                Err(e) => {
+                    crate::dbg_note(
+                        "prefill_split",
+                        &format!("no view at {}+{n} rows ({per_row} B/row, {cols} cols): {e}", a),
+                    );
+                    return Ok(None);
+                }
             }
         }
         let mut it = out.into_iter();
@@ -1253,23 +1273,26 @@ impl PrefillStream {
         n: usize,
     ) -> candle_core::Result<(Tensor, Tensor)> {
         use candle_core::DType;
+        // **Everything here is F32 on purpose.** The natural spelling is integer arithmetic on the ids, and it does
+        // not work: candle compiles its unary kernels per dtype, so `relu`/`mul` on an I64 tensor asks the CUDA module
+        // for a symbol that is not in it (`CUDA_ERROR_NOT_FOUND: named symbol not found`), which is how this path
+        // first failed. In F32 the ids are exact (they are < 256), the mask is a 0/1 multiply, and an out-of-range id
+        // becomes `(id - a) * 0 = 0` - a valid index with zero weight, which is exactly what a masked launch wants.
         let dev = topk_ids.device();
         let shape = topk_ids.shape().clone();
-        let ids = topk_ids.to_dtype(DType::I64)?;
-        let lo = Tensor::full(a as i64, &shape, dev)?;
-        let hi = Tensor::full((a + n) as i64, &shape, dev)?;
+        let ids = topk_ids.to_dtype(DType::F32)?;
+        let lo = Tensor::full(a as f32, &shape, dev)?;
+        let hi = Tensor::full((a + n) as f32, &shape, dev)?;
         let inside = ids
             .broadcast_ge(&lo)?
-            .mul(&ids.broadcast_lt(&hi)?)?
-            .to_dtype(DType::I64)?;
-        // Weights outside the range are exactly zero, so the masked launch contributes nothing for the other
-        // sub-ranges. Ids are rebased and clamped at 0 - `relu` before the mask, so an underflow cannot wrap.
+            .to_dtype(DType::F32)?
+            .mul(&ids.broadcast_lt(&hi)?.to_dtype(DType::F32)?)?;
         let w = topk_weights
             .to_dtype(DType::F32)?
-            .mul(&inside.to_dtype(DType::F32)?)?
+            .mul(&inside)?
             .to_dtype(topk_weights.dtype())?;
-        let rebased = ids.broadcast_sub(&lo)?.relu()?.broadcast_mul(&inside)?;
-        Ok((w, rebased.to_dtype(topk_ids.dtype())?))
+        let local = ids.broadcast_sub(&lo)?.mul(&inside)?;
+        Ok((w, local.to_dtype(topk_ids.dtype())?))
     }
 
     /// Run `layer`'s routed experts on the GPU. `None`: this chunk or layer stays on the CPU.
