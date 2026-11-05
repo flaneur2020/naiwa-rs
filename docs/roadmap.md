@@ -74,7 +74,14 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   i.e. the async path already hides nearly all of the non-copy time, so the per-layer wall clock *is* the copy and a
   finer unit has ~8% to win, not 0.4 s a chunk. The term that is wrong is the **rate**: 7.0-7.3 GB/s this session
   against 11.1 when §20.13 measured and strata's 13.1.
-- **The copy rate gap is the reallocation penalty, not the stream (§13):** the repo's `h2d_` probes give 13.4 GB/s
+- **The copies are already at the link's ceiling; the cost is a start delay (§14, correcting §13).** With a timing
+  pair on the copy stream (`NAIWA_COPY_TIME=1`) every layer copies at **13.4 GB/s** - 41.6 ms for 531 MiB, 37.7 for
+  481 - which is exactly what the `h2d_` probes reach with no compute at all and what strata's streaming reads. So
+  §13's "reallocation costs 35% of the rate" was a metric artefact: `copy=` is queue-to-consumer, and the slow layers
+  are the QSA ones (`3 mod 4`), whose attention sits in front of the MoE. What is left is **17-47 ms a layer of start
+  delay** (own 37.7 against 54-84 seen), 0.8-2 s a chunk, suspected to be the per-batch `released` fence and the
+  `after_device_work` on the 35 layers that reallocate.
+- **§13's superseded reading, kept for the record:** the repo's `h2d_` probes give 13.4 GB/s
   for one copy, for three, and on a second stream alike, but 5.5 GB/s from 4 KiB pages against 13.4 from 2 MiB pages -
   and the per-layer rates in a real chunk show 9.2-9.8 GB/s on layers whose buffer is reused against **5.8-6.8 on the
   35 of 48 that reallocate** (7 layer shapes, 2 buffers), with the second buffer's first use at 0.9 GB/s / 415 ms. The

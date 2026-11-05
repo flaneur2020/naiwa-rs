@@ -1210,6 +1210,21 @@ impl PrefillStream {
         let t_wait = std::time::Instant::now();
         buf.ready.wait_on(&self.device)?;
         let waited = t_wait.elapsed();
+        // `NAIWA_COPY_TIME=1`: the batch's own duration, measured on the copy stream, against the queue-to-consumer
+        // latency the debug line calls `copy`. They are not the same number and the difference is the layer's own
+        // work (M34 §14).
+        if let Some(us) = buf.ready.micros() {
+            crate::dbg_note(
+                "prefill_copy",
+                &format!(
+                    "layer {layer}: {} MiB in {:.1} ms, {:.1} GB/s (own), queue-to-consumer {:?}",
+                    buf.bytes >> 20,
+                    us / 1e3,
+                    buf.bytes as f64 / (us as f64 * 1e3) * 1e9,
+                    buf.queued.map(|q| q.elapsed()).unwrap_or_default()
+                ),
+            );
+        }
         // Canary (`NAIWA_BORROW_CANARY=1`): the chunk's bytes as they were after the upload; compared again right
         // before the compute. A difference proves someone wrote inside the window and names the offset.
         let take_snap = self.borrows() && std::env::var_os("NAIWA_BORROW_SNAP").is_some();

@@ -341,3 +341,45 @@ cross PCIe. With the loan's two chunks for a 3 433-token prompt that floor is ~4
 
 Which is the whole story in one line: **strata is at the byte floor and we are 28% above it, and the 28% is the
 reallocation penalty on two thirds of the layers, not the pipeline's shape.**
+
+---
+
+## 14. §13 is wrong, and the correction changes the answer: the copies are already at the link's ceiling
+
+§13 read the per-layer rates out of `NAIWA_STREAM_DBG` and concluded that reallocating on a shape change cost 35% of
+the copy rate. **That conclusion does not survive a properly measured copy.** Two things were wrong with it:
+
+1. the per-layer `copy=` in that log is **queue-to-consumer latency** (`buf.queued.elapsed()` read just before the
+   compute), not the copy's duration, so it folds in everything the layer did in between;
+2. the correlation was weak anyway: of the 15 slow layers 12 had reallocated, but so had 23 of the 33 fast ones - and
+   the slow ones are exactly the **QSA layers** (index `3 mod 4`, `full_attention_interval = 4`), i.e. the ones with
+   the expensive attention in front of the MoE. It was the metric measuring attention.
+
+So the copy stream got its own timing pair, on the **per-buffer** `CopyDone` rather than the stream (the pipeline
+queues the next layer before the consumer reads this one, so a shared pair is overwritten), behind
+`NAIWA_COPY_TIME=1`. The number it reports is `cuEventElapsedTime` between an event recorded just before the batch and
+one just after, both on the copy stream. Same prompt, same session:
+
+| layer | bytes | the copy's own duration | rate | queue-to-consumer |
+|---|---:|---:|---:|---:|
+| 0 | 531 MiB | 41.6 ms | **13.4 GB/s** | 41.6 ms |
+| 1 | 368 MiB | 28.9 ms | **13.4 GB/s** | 138.2 ms |
+| 2 | 481 MiB | 37.7 ms | **13.4 GB/s** | 64.0 ms |
+| 3 (QSA) | 481 MiB | 37.7 ms | **13.4 GB/s** | 80.1 ms |
+| 4-6 | 481 MiB | 37.7 ms | **13.4 GB/s** | 54.3-54.8 ms |
+| 7 (QSA) | 531 MiB | 41.6 ms | **13.4 GB/s** | 84.4 ms |
+
+**Every layer copies at 13.4 GB/s - the same number the `h2d_` probes reach with no compute and no pipeline, and the
+same number strata's streaming reads.** There is no copy-rate left to win: 48 x 531 MiB at 13.4 GB/s is 2.0 s a chunk
+and every layer is already there.
+
+**What is left is a start delay.** The copy's own duration is 37.7 ms, but the consumer sees 54-84 ms, i.e. **17-47 ms
+a layer of the copy stream doing nothing before the copies begin**, which is ~0.8-2 s a chunk - larger than anything
+§8 or §13 proposed to chase. Prime suspect: the ordering the pipeline inserts on the copy stream (`released` fence per
+batch, and `after_device_work` on the 35 layers that reallocate), each of which pins the copy stream behind the device
+stream's *current tail* - which by construction is the current layer's own kernels.
+
+That is the next measurement, and it is cheap with the probe that now exists: record an extra event at enqueue time and
+report `delay = (first copy starts) - (batch queued)`. If the delay is the fence, `NAIWA_STREAM_SYNC=1`'s arm should
+show it too, and removing the per-layer `after_device_work` (by not reallocating on a shape change, which §13 proposed
+for the wrong reason and is still worth doing for this one) should remove most of it.

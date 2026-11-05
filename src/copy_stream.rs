@@ -254,7 +254,9 @@ mod cuda {
             parts: &[(&SlotMemory, &[u8])],
             done: &CopyDone,
         ) -> Result<()> {
+            done.start_timing(self)?;
             self.queue_copies(fence, parts)?;
+            done.stop_timing(self)?;
             done.event.record(&self.stream).map_err(Error::wrap)
         }
 
@@ -362,6 +364,12 @@ mod cuda {
     /// Completion of an asynchronous upload, recorded on the copy stream.
     pub struct CopyDone {
         event: CudaEvent,
+        /// `NAIWA_COPY_TIME=1`: a timing pair recorded around one batch of copies, so the copy's **own** duration is
+        /// readable. It exists because the per-layer `copy=` in `NAIWA_STREAM_DBG` measures from the enqueue to the
+        /// *consumer's* start, which folds in whatever the layer did first - so the QSA layers here (every fourth)
+        /// looked 35% slower at an unchanged copy until this was measured (M34 §14). Per buffer, not per stream: the
+        /// pipeline queues the next layer before the consumer reads this one, so a shared pair would be overwritten.
+        timing: Option<Mutex<(CudaEvent, CudaEvent)>>,
     }
 
     impl CopyDone {
@@ -371,7 +379,19 @@ mod cuda {
                 .context()
                 .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
                 .map_err(Error::wrap)?;
-            Ok(Self { event })
+            let timing = if std::env::var_os("NAIWA_COPY_TIME").is_some() {
+                let ctx = cs.stream.context();
+                // `CU_EVENT_DEFAULT`, not `None`: cudarc's `new_event(None)` means DISABLE_TIMING, and an event
+                // without timing answers `cuEventElapsedTime` with CUDA_ERROR_INVALID_HANDLE.
+                let ev = || {
+                    ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(Error::wrap)
+                };
+                Some(Mutex::new((ev()?, ev()?)))
+            } else {
+                None
+            };
+            Ok(Self { event, timing })
         }
 
         /// Record this completion on the copy stream, after everything queued on it so far.
@@ -394,6 +414,36 @@ mod cuda {
                 return Ok(());
             };
             dev.cuda_stream().wait(&self.event).map_err(Error::wrap)
+        }
+
+        /// The batch's own duration in microseconds (`NAIWA_COPY_TIME=1`), or `None` when the probe is off. Only
+        /// meaningful after the completion event was waited for, which is exactly where `forward` reads it.
+        pub fn micros(&self) -> Option<f32> {
+            let t = self.timing.as_ref()?;
+            let (start, stop) = &*t.lock().unwrap();
+            match start.elapsed_ms(stop) {
+                Ok(ms) => Some(ms * 1e3),
+                Err(e) => {
+                    eprintln!("COPY_TIME: elapsed failed: {e:?}");
+                    None
+                }
+            }
+        }
+
+        fn start_timing(&self, cs: &CopyStream) -> Result<()> {
+            if let Some(t) = self.timing.as_ref() {
+                let (start, _) = &*t.lock().unwrap();
+                start.record(&cs.stream).map_err(Error::wrap)?;
+            }
+            Ok(())
+        }
+
+        fn stop_timing(&self, cs: &CopyStream) -> Result<()> {
+            if let Some(t) = self.timing.as_ref() {
+                let (_, stop) = &*t.lock().unwrap();
+                stop.record(&cs.stream).map_err(Error::wrap)?;
+            }
+            Ok(())
         }
     }
 }
