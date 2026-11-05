@@ -1357,3 +1357,50 @@ The attention kernel is now 179 ms of a ~2 s kernel budget (§20.9) and the 356 
 1. the remaining **kernel-side** lever is the quantised MoE/dense GEMM (0.866 s, 43.9% of kernel time);
 2. the remaining **end-to-end** lever is host residency - the prefill is mostly host-to-device copy, and the gap to
    strata on a long cold prompt is 2-3x, which no kernel in this file can close.
+
+### 20.12 What strata actually does about host I/O, and what of it we can use
+
+§20.11 left one number unexplained: a cold 2.9k-token prompt takes 8-11 s of wall clock while its kernels are ~2 s.
+So the host side was read in strata's source rather than guessed at. It is not "a smaller working set"; it is a
+different I/O contract, in three parts plus one habit.
+
+**1. Direct, asynchronous, aligned reads into pinned memory.** `src/core/expert_source.cpp` opens every weight file
+with `open(O_RDONLY | O_DIRECT | O_CLOEXEC)` (and says so in a note when the filesystem refuses, falling back to
+buffered), reads with the kernel's own `io_submit`/`io_getevents` at **256 requests in flight per thread**, merges
+windows less than 1 MiB apart into requests of up to **32 MiB** (`kSector 4096, kGap 1 MiB, kMerge 32 MiB`) so the
+drive sees big sequential reads, lands them in a **thread-local aligned buffer**, and scatters from there. Nothing
+goes through the page cache, so the cost is the drive's, every time, and it does not change with what else is cached.
+
+**2. The host decides what to read, ahead of the GPU asking.** The prefetch list is produced by computing the
+**router dot on the CPU** (AVX2) for `depth_` layers ahead (`STRATA_FS_DEPTH`, default 4) - "an estimate only (which
+experts to prefetch); the order of the additions differs, the output does not depend on it". Ours is driven by the
+previous step's demand (`stages/preload.rs`, `--lookahead-swaps`), which cannot see a layer the GPU has not reached.
+
+**3. The 26.8 GiB table is never resident.** `per_layer_token_embd.weight` is explicitly *not in the pack*; it is
+served by `PleReader` (`src/ngram/ple_reader.cpp`): O_DIRECT row reads into an aligned slab, an **8-way
+set-associative row cache bounded by construction**, and `issue()` / `collect()` two-phase tickets so the read is in
+flight while the host does other work, with prefetch tickets for the ngram keys of upcoming tokens.
+
+**4. It is all instrumented.** `ReaderStats` keeps per-read latencies and reports percentiles; `pread_bytes` is
+exported; the constants above are comments that name the measurements behind them (512 KiB at queue depth 48 is
+10.4 GB/s on an unmapped file and 3.4 GB/s on a mapped one - which is why windows are merged to 32 MiB).
+
+What we have instead, measured today:
+
+| | naiwa |
+|---|---|
+| expert weights | all 23.4 GiB host-resident and `cuMemHostRegister`-pinned, with huge pages - no per-request I/O at all |
+| PLE table | 26.8 GiB **mmap**, one `memcpy` per row through the page cache (`gather_host`), no prefetch, no bound |
+| PLE host cost | **354 ms total** across two 2.9k-token prompts (17 gather calls, ~5.5k rows each) - measured with the existing `PLE_DBG` probe, so **this is not the missing 6 s** |
+| wall vs kernel | 8.0-11.1 s against ~2.0 s of kernels; 5.1 s for the same prompt earlier in the session |
+
+So the honest state is that **the missing time is still unattributed**. The candidate that this reading does
+eliminate is PLE gathers; the candidates it does not are the host-side staging threads and the allocator under VRAM
+pressure (that run also had one request fail with `model_error` after 3.2 s, i.e. we are at the VRAM ceiling as well
+as the RAM one).
+
+Two things worth adopting anyway, in order: **(a)** the attribution first - a `nsys --sample=cpu` timeline of a single
+request on a freshly booted machine, since every number above moved between sessions; **(b)** the PLE reader shape
+from clause 3, because 26.8 GiB of page-cache pressure next to 23.4 GiB of pinned experts is what makes a 60 GiB host
+the binding constraint on a 54 GiB model, and because a bounded row cache makes the PLE path's cost a constant
+instead of a function of what else is cached.
