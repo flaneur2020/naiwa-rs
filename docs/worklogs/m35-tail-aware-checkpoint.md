@@ -201,3 +201,38 @@ its source**, not the plan's.
 So the state of this milestone: the cost is located (§27), the mechanism is `block alignment` and not capacity (§11,
 falsifying §10), and the remaining unknown is narrow - *which* of the three places above decides the step's 3 136 rows.
 Everything else is designed and its feasibility checked (§3-§4).
+
+## 12. S1 measured: the tail is gone and 483 ms with it - the real site was the *reusable-boundary cap*
+
+Two truncation sites existed in the same function, and §9's flag only disabled the first:
+
+| line | what it does | disabled by §9's first attempt? |
+|---|---|---|
+| `prompt_chunks.rs:280` (`aligned`) | clamps `end` down to the block boundary | yes |
+| **`prompt_chunks.rs:163/169` (`reusable_boundary` + `cap_at_reusable_boundary`)** | **caps `end` at `align_down(total_len, 32)` so the checkpoint boundary is a chunk end** | **no - and this is the one that fires** |
+
+So the flag now disables both for the **final** chunk (`cap_boundary` in `build_prompt_chunk_plan`), while non-final chunks
+keep both (their ends are chunk boundaries anyway, which is where the reusable checkpoint lives). Same prompt, same
+session, two runs an arm, `NAIWA_STEP_TIME=1`:
+
+| arm | TTFT | the MoE step sequence |
+|---|---:|---|
+| baseline | **3 751 / 4 049 ms** | `seq 1, 3136, 7, 1, 5, 5` |
+| `NAIWA_NO_TAIL_SPLIT=1` | **3 490 / 3 343 ms** | `seq 1, **3143**, 1, 5, 5` |
+
+**The 7-row step is gone, and the TTFT median falls 3 900 -> 3 417 ms (-483 ms, -12%).** The step count is the
+structural evidence: three `prompt=true` steps become two, and the prompt step carries all 3 143 rows.
+
+Two honest notes:
+
+1. **A harness artefact nearly hid this.** The first run of the "baseline" arm was accidentally *also* flagged, because
+   `env NAME=` in the measurement script **defines** the variable and `var_os` is a presence test - the same trap
+   `Slab::borrowing` documents ("a presence test made `=0` mean on"). Both arms printed `rows 3143`, which is what
+   exposed it. The script now only exports variables that are non-empty.
+2. **This flag alone trades the checkpoint away.** With the tail gone the turn has no block-aligned end, so no checkpoint
+   is stored and the next turn cannot reuse - it is M34 §28's "fix 2", worth 483 ms for a single-shot request and a loss
+   for a conversation. That is exactly what M35's tail-aware key (§3) exists to fix: keep the checkpoint, keyed on the
+   prompt's real end.
+
+Gates on the shipped defaults (flag off): `cargo test` 56 passed, `frac 0` + `--no-lookahead` byte-identical
+(the oracle arm runs `--prefix-cache-n 0`, where `block_align` is `None` and neither site is reachable).
