@@ -236,3 +236,26 @@ Two honest notes:
 
 Gates on the shipped defaults (flag off): `cargo test` 56 passed, `frac 0` + `--no-lookahead` byte-identical
 (the oracle arm runs `--prefix-cache-n 0`, where `block_align` is `None` and neither site is reachable).
+
+## 13. What is settled, and the one comparison this ad-hoc harness cannot make
+
+Settled and measured:
+
+| | |
+|---|---|
+| the truncation site | **`cap_at_reusable_boundary` + `reusable_boundary`** (`prompt_chunks.rs:163/169`), not the `aligned` clamp at `:280` - §9's first attempt disabled the wrong one |
+| disabling both for the final chunk | the `seq 7` tail step disappears and the layer-0 sequence becomes `1, 3143, 1, 5, 5` |
+| TTFT effect | **3 900 -> 3 417 ms** median (3 751/4 049 against 3 490/3 343), **-483 ms (-12%)**, two runs an arm |
+| the tail path's correctness | not the bug it looked like: the same prompt produces the same first text with and without the split (`'The text provided is a sequence of Greek letter names. To'` against `'... Greek letters. When decoded'`, i.e. a difference in wording only), and the 1 657-token prompt that produced **no** token does so in **both** arms - it is the prompt (a random-word salad), not the split |
+| the KV-block hypothesis | falsified (§11): 128 free blocks in both arms |
+
+Not settled: **the chat trade**. The flag alone drops the checkpoint, so the next turn should lose its reuse - but the two
+ad-hoc two-turn runs could not show it, because both arms re-prefilled turn 2 (5 613 ms against 5 181 ms for a 3 153-token
+turn) and the API did not report `cached_tokens`. The harness that *does* report reuse (`engines/naiwa.json` runs report
+0.90-0.97 per turn) is the instrument for this, and it currently fails on `doc` turn 1 with a pre-existing OOM (M33
+§20.11 recorded the same failure before any M35 change). So the chat comparison is blocked on that harness defect, not on
+this milestone.
+
+That is where M35 stands: the mechanism is understood and its 483 ms are reproducible, the design that keeps the
+checkpoint without the split is written and its feasibility checked, and the two remaining pieces are (a) the tail-aware
+key (§3, which removes the trade) and (b) a harness that can measure the trade in the first place.
