@@ -439,6 +439,23 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
 
 
+def substitute_doc(conv: dict, doc: str | None) -> dict:
+    """Replace the `{{DOC}}` placeholder in a conversation's turns.
+
+    It used to be sent verbatim: the `doc` class asked the model to summarise the five characters
+    `{{DOC}}`, so every `doc` number in the worklogs measured a ~20-token prompt with a nonsense
+    instruction. With a real document the class is what its name says - and it needs a document small
+    enough that seven turns of history stay inside `--pa-context-len`.
+    """
+    if doc is None:
+        return conv
+    turns = [
+        {**turn, "user": turn["user"].replace("{{DOC}}", doc)}
+        for turn in conv["turns"]
+    ]
+    return {**conv, "turns": turns}
+
+
 def conversation_messages(conv: dict, upto: int, answers: list[str]) -> list[dict]:
     """The transcript for turn `upto`: the corpus's user turns plus the answers this engine gave."""
     messages = []
@@ -505,6 +522,11 @@ def _run_round_once(cfg: dict, convs: list[dict], out_dir: Path, round_no: int, 
 
         for turn in WARMUP:
             request([{"role": "user", "content": turn["user"]}], turn["max_tokens"])
+
+        doc_text = None
+        if any("{{DOC}}" in turn["user"] for conv in convs for turn in conv["turns"]):
+            doc_text = Path(args.doc_file).read_text(encoding="utf-8")
+        convs = [substitute_doc(conv, doc_text) for conv in convs]
 
         with (out_dir / "turns.jsonl").open("a") as sink:
             for conv in convs:
@@ -593,6 +615,11 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=900.0, help="per-request HTTP timeout")
     ap.add_argument("--ready-timeout", type=float, default=900.0, help="server start → /v1/models")
     ap.add_argument("--start-retries", type=int, default=2, help="retries when the engine fails to start")
+    ap.add_argument(
+        "--doc-file",
+        default=str(HERE / "doc.md"),
+        help="text substituted for the {{DOC}} placeholder in corpus conversations",
+    )
     args = ap.parse_args()
 
     corpus_path = expand(args.corpus)

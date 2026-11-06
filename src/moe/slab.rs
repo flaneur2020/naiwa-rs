@@ -182,7 +182,11 @@ impl Slab {
 
     /// Whether the prompt path borrows its layer buffers from the pool instead of holding VRAM of its own.
     ///
-    /// **On by default** (worklog §20.13), `NAIWA_PREFILL_BORROW=0` is the arm without it.
+    /// **Off by default again since M35 §14**: with the loan on, a prompt that fits in a *single* streamed chunk
+    /// returns **no token at all** (a 300-token prompt: 3 011 ms and a real answer without the loan, zero SSE events
+    /// with it; `NAIWA_PREFILL_BORROW=1` is the arm with it). Prompts spanning two or more chunks are unaffected, which
+    /// is why §20.13's A/B - all of it on 2 896- and 3 433-token prompts - saw only the win. The 2x on long prompts is
+    /// real and is why the knob stays; the silent empty answer on the common case is why it is no longer the default.
     ///
     /// The loan is what decides the prompt step, and the prompt step is what decides the prompt's wall clock: the
     /// chunk is planned once at warmup from the VRAM that is free, and every chunk streams the whole routed expert set
@@ -202,8 +206,8 @@ impl Slab {
     pub(crate) fn borrowing() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| match std::env::var("NAIWA_PREFILL_BORROW").as_deref() {
-            Ok("0") | Ok("off") | Ok("false") | Ok("no") => false,
-            _ => true,
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes") => true,
+            _ => false,
         })
     }
 

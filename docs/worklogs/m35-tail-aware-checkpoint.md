@@ -259,3 +259,47 @@ this milestone.
 That is where M35 stands: the mechanism is understood and its 483 ms are reproducible, the design that keeps the
 checkpoint without the split is written and its feasibility checked, and the two remaining pieces are (a) the tail-aware
 key (§3, which removes the trade) and (b) a harness that can measure the trade in the first place.
+
+## 14. A silent empty answer found while building a harness for this milestone - the loan is no longer the default
+
+The `doc` class had been failing on turn 1 for milestones. §20.11 blamed CUDA OOM, and the harness did die with
+`CUDA_ERROR_DEINITIALIZED` plus one `double free or corruption (!prev)`. Both were red herrings: the engine had already
+**answered nothing at all**, and the crash was at shutdown.
+
+Reproduced without the harness (same serve command, plain streaming requests):
+
+| prompt | `NAIWA_PREFILL_BORROW=0` | default (loan **on**, since §20.13) |
+|---|---|---|
+| 33 tokens | 805 ms, real answer | 805 ms, real answer |
+| **~65 tokens** | 3 011 ms, real answer | **zero SSE events** |
+| ~250 tokens (plain lorem ipsum) | works | **zero SSE events** |
+| ~2 000 tokens (a real document) | works | **zero SSE events** |
+| 3 154 tokens (two chunks) | works | works |
+
+So: **a prompt that fits in a single streamed chunk returns no token at all when the loan is on.** No error, no NaN
+warning, no `finish_reason`, no usage - the stream just closes (the step itself runs: `step_end`, `after_prefix_block`
+and `after_reclaim` are all logged, and the prefill rate is normal). Prompts spanning two or more chunks are fine, which
+is precisely why §20.13's A/B - every measurement on 2 896- and 3 433-token prompts - saw only the 2x win.
+
+Ruled out by controlled runs, all on the same ~300-token prompt: `NAIWA_PREFILL_NOQUIESCE=1` still empty,
+`NAIWA_PREFILL_STREAM_DEPTH=1` still empty, `NAIWA_PREFILL_BORROW=0` fine, `NAIWA_PREFILL_BORROW=1` empty again.
+So it is the borrow itself, not the quiesce and not the double buffer. The mechanism is **not** identified: the last
+loaned chunk's final hidden state is presumably wrong in a way that makes the first sampled token a stop token,
+but nothing checks the hidden states on that path (`NAIWA_BORROW_CHECK` is about non-finite values and none appear).
+
+**Decision: the loan is off by default again** (`NAIWA_PREFILL_BORROW=1` turns it on). A silent empty answer on the
+most common prompt shape cannot ship, whatever it costs. The cost is real and is the number the mitigation has to beat:
+
+| 3 143-token prompt | TTFT |
+|---|---:|
+| loan on (§20.13) | 4 791 ms |
+| **loan off (default again)** | **14 083 ms** |
+
+The next concrete step is therefore: **keep the loan, but not when the chunk covers the whole prompt** (a single-chunk
+request is the only failing shape). That needs a per-call override of `Slab::borrowing()` - today it is a process-wide
+`OnceLock`, and the planner (`plan_with_lend`) is where the "does this chunk cover the whole prompt" fact is known.
+
+Also fixed while here, because it made the `doc` class meaningless: `harness/chat/corpus.jsonl`'s `doc` conversations
+contain a `{{DOC}}` placeholder that **run.py never substituted** - the class had been asking the model to summarise the
+five characters `{{DOC}}`. `run.py` now takes `--doc-file` (default `harness/chat/doc.md`, ~8 KB of real worklog, small
+enough that seven turns stay inside `--pa-context-len 4096`) and substitutes it.
