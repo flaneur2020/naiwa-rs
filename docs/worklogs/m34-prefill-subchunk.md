@@ -746,3 +746,45 @@ arm already runs with `--prefix-cache-n 0`.
 Which answers the original question about PLE completely: it is 2.4%, and the term that had been hiding as
 "unattributed overhead" - bigger than PLE - is the prefix-cache snapshot, a deliberate trade for multi-turn reuse
 rather than a cost of the prompt path itself.
+
+---
+
+## 22. The same prompt on both engines, segment by segment: the work is at parity, our snapshot is not
+
+§21's three-segment method applied to one prompt (3 143 tokens, identical text) on both engines, same session, cold
+processes. strata reports its own prefill as `3143 tokens = 0 reused + 3143 read in 3 198 ms (982.9 tok/s), ... 1
+checkpoints`, which is the number to compare against our layer loop rather than the client's TTFT.
+
+| segment | naiwa, `--prefix-cache-n 0` | naiwa, shipped (`-n 1`) | strata |
+|---|---:|---:|---:|
+| arrival -> first work | 59 ms | 95 ms | 71 ms (all of its overhead) |
+| **the prefill itself** | **3 179 ms** | 3 364 ms | **3 198 ms (983 tok/s)** |
+| prefix snapshot / checkpoint | - | **284 ms** | inside the 71 ms |
+| first decode + detokenise + stream | 112 ms | 112 ms | inside the 71 ms |
+| **client TTFT** | **3 351 ms** | **3 855 ms** | **3 269 ms** |
+| per prompt token | 1.066 ms | 1.226 ms | 1.040 ms |
+
+Three things this settles:
+
+1. **The prefill work is at parity - ours is 0.6% faster** (3 179 against 3 198 ms). The expert stream dominates both
+   (1 997 ms of our 3 179 is the copy at 13.4 GB/s), so the byte floor is the same and both engines sit on it.
+2. **strata's out-of-prefill overhead is 71 ms; ours is 171 ms** with the snapshot off. So a single-shot request is
+   **+82 ms (+2.5%)** - which is the whole gap, not the 28% §20.13 recorded (that was a squeezed chunk plan).
+3. **The shipped config's snapshot is the one real difference: 284 ms, against strata's checkpoint inside 71 ms.** Both
+   engines checkpoint (strata logs `1 checkpoints`, we write the recurrent state for `--prefix-cache-n 1`), and both do
+   it for the same reason - the next turn reuses the prompt - but strata's costs a quarter of ours. That is why our
+   shipped TTFT is +18% here while our prefill is at parity.
+
+So the ranking of what is left on the prompt path, measured rather than assumed:
+
+| | ms on a 3 143-token prompt | share of shipped TTFT |
+|---|---:|---:|
+| expert stream (byte floor, at the link's ceiling) | 1 997 | 52% |
+| other layer work (GEMM/GDN/attention, PLE 94 of it) | ~1 100 | 29% |
+| **our prefix snapshot** | **284** | **7.4%** |
+| layer 0 (outside `sum(gap)`) | 143 | 3.7% |
+| arrival + decode + stream | 171 | 4.4% |
+
+The snapshot is the only line that is both large and **not** at parity with strata, so it is the next thing worth doing
+- and unlike the ring, it does not need VRAM, only that the write happen on the copy stream (or after the response
+starts) instead of in the request's critical path.

@@ -91,6 +91,13 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
   and it is expressible without a kernel change (§11).
+- **Against strata on the same prompt, segment by segment (§22): the work is at parity and the snapshot is not.**
+  3 143 tokens, same text, same session: our prefill is **3 179 ms against strata's 3 198** (983 tok/s, 0.6% in our
+  favour), our out-of-prefill overhead is 171 ms against its 71, and the shipped config's **prefix snapshot costs 284 ms
+  against its checkpoint inside that 71**. Client TTFT 3 351 (`-n 0`) / 3 855 (shipped) / **3 269** (strata). So a
+  single-shot request is +2.5%, not the +28% §20.13 recorded, and the one line that is both large and not at parity is
+  the snapshot - the next thing worth doing, and it needs no VRAM, only that the write leave the request's critical
+  path.
 - **The overhead outside the layer loop is attributed (§21):** `NAIWA_REQ_TIME` stamps wall clock at layer 0 and at the
   last layer; with the client's own stamps the request splits into A (send -> layer 0, **95 ms**), B (the layer loop,
   3 364 ms) and C (last layer -> first token, **396 ms**), and A+B+C = TTFT exactly. C's token-scaled part is the
