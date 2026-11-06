@@ -361,3 +361,14 @@ right call while the cause was unknown.
 
 Gates on the shipped defaults: `cargo test` 56 passed, `frac 0` + `--no-lookahead` byte-identical (the oracle arm runs
 `--prefix-cache-n 0`, so no cache, no slab, no loan - `borrow_buffers` is unreachable there).
+
+Closing numbers, on the shipped defaults (loan on) after both fixes:
+
+| | |
+|---|---|
+| `doc` class, 7 turns (1 723 -> 2 264 prompt tokens) | **0 failed**; TTFT 3 528, 1 454, 1 080, 2 651, 819, 2 617, 621 ms |
+| reuse across those turns (`cached_tokens`) | 1 792, 1 920, 1 952, 2 080, 2 112, 2 240 |
+| a 3 143-token prompt, two runs | TTFT **3 961 / 3 834 ms** with the loan against **14 083 ms** without |
+
+So the loan's 3.6x on a long prompt is back, the short prompt no longer answers nothing, and the checkpoint machinery is
+exercised by a corpus for the first time.
