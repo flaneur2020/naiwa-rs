@@ -138,3 +138,33 @@ first task of S1, and it is a grep plus a print, not a redesign.
 exactly what makes it a good bisection arm), and M35's centre of gravity moves from "the chunk plan truncates" to "the
 prompt step's length is block-quantised in the scheduler's budget". The design (tail-aware key) is unaffected - it still
 removes the *need* for the boundary; what changed is where the boundary is imposed.
+
+## 10. The leading candidate now: it is KV blocks, not the checkpoint
+
+Following §9's "a second cap exists", `prefill_token_budget` is
+`min(max_num_batched_tokens, max_prefill_chunk_tokens, PROMPT_STEP_CEILING)`, none of which is 3 136 - yet two plan
+passes appear, one ending at 3 143 (with §9's flag) and one ending at 3 136. And 3 136 = 98 x 32.
+
+Which points at the one thing in this engine that is *inherently* 32-quantised: **the KV blocks a prompt step can
+allocate**. If, with `--prefix-cache-n 1`, the block retention that belongs to the checkpoint keeps blocks alive, the
+scheduler has **98** blocks to hand out instead of 99, the prompt step caps at 98 x 32 = 3 136, and the 7-token remainder
+becomes its own step - with `-n 0` the same prompt runs as one 3 143-row step, which is what we measured all along.
+
+That fits every observation in §25-§27 and needs no new mechanism:
+
+| observation | explained by "98 free blocks" |
+|---|---|
+| `-n 0` runs 3 143 rows, `-n 1` runs 3 136 | one block fewer free |
+| `--prefill-stream-min-tokens 1` changes nothing | it is not the stream threshold |
+| MTP off changes nothing | it is not the verify path |
+| the extra step costs 346 ms | a full 48-layer pass with the cache the loan emptied |
+| no GPU/API difference in a profile | it is an ordinary step |
+
+**If this is right, M35's premise is incomplete**: the tail exists because of *block capacity*, and the checkpoint's
+alignment only coincides with it. Then the fixes are different - free one block for the step (do not retain the block
+that the tail will fill), or let the step span "98 blocks + part of the next", which is exactly the partial-block
+support M35 §3 item 3 asks for anyway.
+
+The next probe is one line: print the scheduler's free-block count and the computed token budget at the prompt step for
+both arms. Until that lands, the honest statement is that this milestone has located the cost (§27) and *one* of its
+causes (§9), and that the second cause is now a specific, testable hypothesis rather than an unknown.
