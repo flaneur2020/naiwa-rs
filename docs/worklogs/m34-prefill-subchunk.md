@@ -694,3 +694,55 @@ So of this session's three "the shipped path is broken" moments - the depth-3 HT
 card free, and the oracle arm's OOM - only the first is a defect in our code. The second was the card's owner taking
 6.6 GiB, and the third was a harness default that the `--max-seqs 4` note in the chat config had already solved for the
 serving path.
+
+---
+
+## 21. The 0.3-0.9 s outside the layer loop, attributed: 60-160 ms of arrival, and a 284 ms prefix-cache snapshot
+
+It is **per request, not per layer** - `sum(gap)` is entry-to-entry over layers 1..47, so layer 0's own work, the last
+layer's, and everything before and after the loop are all outside it. `NAIWA_REQ_TIME=1` stamps absolute wall clock at
+layer 0 and at the last layer, which lines up with a client that stamps its own send and first token, so the request
+splits into three segments that add up exactly:
+
+| | 772 tokens | 3 143 tokens | slope |
+|---|---:|---:|---:|
+| **A** send -> layer 0 (HTTP, tokenise, schedule, chunk assembly) | 162 ms | 95 ms | none (fixed, noisy) |
+| **B** layer 0 -> last layer entry (the layer loop) | 2 149 ms | 3 364 ms | 0.51 ms/token |
+| **C** last layer entry -> first token | 263 ms | 396 ms | 0.056 ms/token |
+| TTFT | 2 574 ms | 3 855 ms | |
+
+A + B + C = TTFT exactly (95 + 3 364 + 396 = 3 855). Layer 0's own work is inside B but outside `sum(gap)`: 3 364 -
+3 221 = 143 ms.
+
+**The token-scaled part of C is the prefix-cache snapshot.** The chat config runs `--prefix-cache-n 1` with
+`MISTRALRS_ALIGN_CHECKPOINTS=1`, so the end of a prompt writes the recurrent state to a snapshot; with
+`--prefix-cache-n 0` the same prompt gives:
+
+| | `--prefix-cache-n 1` | `--prefix-cache-n 0` |
+|---|---:|---:|
+| A | 95 ms | 59 ms |
+| B (layer loop) | 3 364 ms | 3 179 ms |
+| **C** | **396 ms** | **112 ms** |
+| TTFT | 3 855 ms | **3 351 ms** |
+
+So the snapshot costs **284 ms on a 3 143-token prompt** (0.09 ms/token), which is the per-token term that could not be
+explained and is 7% of TTFT. It is not waste: it is what makes the next turn of a conversation cheap (prefix reuse
+0.9+ on the chat corpus), so the trade is right for chat and wrong for a single-shot request - which is why the oracle
+arm already runs with `--prefix-cache-n 0`.
+
+**The attribution in full, for a 3 143-token prompt at chunk 1 792:**
+
+| segment | ms | share |
+|---|---:|---:|
+| arrival + tokenise + schedule (A) | 95 | 2.5% |
+| expert stream, 48 layers (copy at 13.4 GB/s) | 1 997 | 52% |
+| the layer's other work, 48 layers | ~1 100 | 29% |
+| of which PLE (host gather) | 94 | 2.4% |
+| layer 0 alone (outside `sum(gap)`) | 143 | 3.7% |
+| prefix-cache snapshot (C) | 284 | 7.4% |
+| first decode step + detokenise + stream (rest of C) | 112 | 2.9% |
+| **TTFT** | **3 855** | |
+
+Which answers the original question about PLE completely: it is 2.4%, and the term that had been hiding as
+"unattributed overhead" - bigger than PLE - is the prefix-cache snapshot, a deliberate trade for multi-turn reuse
+rather than a cost of the prompt path itself.

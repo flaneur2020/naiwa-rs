@@ -91,6 +91,12 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
   and it is expressible without a kernel change (§11).
+- **The overhead outside the layer loop is attributed (§21):** `NAIWA_REQ_TIME` stamps wall clock at layer 0 and at the
+  last layer; with the client's own stamps the request splits into A (send -> layer 0, **95 ms**), B (the layer loop,
+  3 364 ms) and C (last layer -> first token, **396 ms**), and A+B+C = TTFT exactly. C's token-scaled part is the
+  **prefix-cache snapshot: 284 ms on 3 143 tokens** (`--prefix-cache-n 1` 3 855 ms against `--prefix-cache-n 0`
+  3 351), a deliberate trade for multi-turn reuse, not a cost of the prompt path. Full table: A 95 / expert stream
+  1 997 / layer work 1 100 (PLE 94) / layer 0 143 / snapshot 284 / decode+stream 112 = 3 855 ms.
 - **The stage distribution, and why PLE is not it (§19):** of a 3 048 ms chunk at chunk 2 560, **65% is the expert
   stream** (41.6 ms a layer at the link's ceiling), ~33% is the rest of the layer (quant GEMM 24%, GDN 8%, attention
   5%), and **PLE is 3%** (94 ms a step, 1.3 MB of traffic against 24 GiB). The copy is only **45% overlapped** (64.8 ms

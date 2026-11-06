@@ -1356,6 +1356,40 @@ impl PrefillStream {
             }
             return Ok(None);
         }
+        // `NAIWA_REQ_TIME=1`: absolute wall-clock stamps at the first and last layer of a chunk, so the prefill can be
+        // split against what the *client* sees. `gap` cannot do this: it is entry-to-entry over layers 1..47, so layer
+        // 0's work, the last layer's work and everything before/after the loop are all outside it (M34 §21).
+        if std::env::var_os("NAIWA_REQ_TIME").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FIRST: AtomicU64 = AtomicU64::new(0);
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            if layer == 0 {
+                FIRST.store(now_us, Ordering::Relaxed);
+            }
+            if self
+                .layers
+                .read()
+                .iter()
+                .rposition(|l| l.is_some())
+                .is_some_and(|last| last == layer)
+            {
+                LAST.store(now_us, Ordering::Relaxed);
+                crate::dbg_note(
+                    "req_time",
+                    &format!(
+                        "submit_us={} first_layer_us={} last_layer_us={} layers_us={}",
+                        FIRST.load(Ordering::Relaxed),
+                        FIRST.load(Ordering::Relaxed),
+                        now_us,
+                        now_us - FIRST.load(Ordering::Relaxed)
+                    ),
+                );
+            }
+        }
         // Entry-to-entry is a whole layer: our upload/dispatch plus the model's own dense work for it.
         let entry = std::time::Instant::now();
         let gap = {
