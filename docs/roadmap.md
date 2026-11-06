@@ -58,6 +58,31 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
+## M35 — the prefix checkpoint is keyed on the prompt's real end — 📐 proposed (2026-11-06)
+
+Worklog: [`worklogs/m35-tail-aware-checkpoint.md`](worklogs/m35-tail-aware-checkpoint.md) — the prefix checkpoint's key
+gains the prompt's **tail**, so the checkpoint is taken at the **true end of the prefill** instead of at the last 32-token
+boundary. The prompt step is then never truncated, the tail step M34 §27 found never exists, and the state stored is the
+one the next turn actually wants.
+
+- **The problem it removes:** `--prefix-cache-n 1` splits a 3 143-token prompt into 3 136 + 7 because
+  `pipeline/prompt_chunks.rs:274` aligns the chunk end to the 32-token block (the checkpoint's key is block hashes only,
+  `block_hash.rs:238`), and the 7-token step costs **346 ms** - a full 48-layer pass with the expert cache the loan
+  emptied - for a checkpoint that costs **1.2 ms**.
+- **Why it was ever done:** M10 priced it correctly at the time - an extra chunk on a CPU prefill at 11-13 tok/s is
+  ~0.6 ms, and it bought reuse (a `doc` turn 141.9 -> 5.6 s). The cost model has since inverted: one chunk is now a GPU
+  pass over 24 GiB of streamed experts.
+- **The mechanism is three edits:** a tail hash on the key, relaxing the two alignment guards
+  (`pipeline/mod.rs:1931`, `engine/mod.rs:465`), and copy-on-reuse of the tail block (7 KiB). Retention and lookup are
+  already **hash-keyed** (`block_pool.rs:175`, `:790`), so a tail hash is retained like any other - verified by reading,
+  not assumed.
+- **No CUDA kernel, no step semantics, no extra snapshot.** Smaller than M34 §28's checkpoint lane and it does not give up
+  reuse the way "don't align" would.
+- **The trade:** {multiples of 32} becomes {multiples of 32} U {the prompt's true end} - so a request sharing 3 136 tokens
+  but differing in the last 7 loses that entry. S3's hybrid rule (align only at chunk boundaries that already exist)
+  keeps both.
+- **Target:** TTFT 3.85 -> 3.51 s on a 3 143-token prompt, two prefill steps instead of three, reuse unchanged or better.
+
 ## M34 — the prompt path prefetches a fraction of a layer, at a configurable depth — ⛔ closed by measurement, both halves lose (2026-11-05)
 
 Worklog: [`worklogs/m34-prefill-subchunk.md`](worklogs/m34-prefill-subchunk.md) — the prompt path's unit of prefetch
