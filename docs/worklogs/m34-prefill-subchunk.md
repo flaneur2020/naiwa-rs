@@ -837,3 +837,43 @@ Two things this leaves behind:
 - the honest correction to §22: the 284 ms it attributed to the snapshot is the cost of `--prefix-cache-n 1`, of which
   the snapshot is 1.2 ms. The remaining ~360 ms is a per-layer effect of the cache being enabled and has no overlap to
   offer until it is understood.
+
+---
+
+## 24. The real distribution against strata: the same 41 GB, the same rate, and we are at parity
+
+§22 compared totals; this compares the *traffic*. strata's engine binary can be run and profiled on its own
+(`engine/strata --pack … --tokens-file … --max-new 1`, no Python wrapper), so both sides got an `nsys` profile of one
+cold prompt. Not the identical text - strata's `generate` takes token ids - but the same model, card, and prompt size
+class, and the byte count settles what a token or two of difference could not:
+
+| | strata (3 420 tokens) | naiwa (3 143 tokens) |
+|---|---:|---:|
+| **host-to-device traffic** | **41.4 GB** in 18 707 copies | **41.1 GB** in 19 948 copies |
+| **kernel time** | **1.97 s** in 14 933 launches | **2.28 s** in 23 275 launches |
+| its own prefill accounting | 3 275.8 ms (1 044 tok/s, 2 chunks) | 3 179-3 352 ms (layer loop) |
+| client TTFT | 3 269 ms | 3 351 ms (`-n 0`) / 3 850 (`-n 1`) |
+| effective rate over the same bytes | 41.4 / 3.28 = **12.6 GB/s** | 41.1 / 3.18 = **12.9 GB/s** |
+
+Three things follow, and they are the answer to "where does the time go" for both engines at once:
+
+1. **Both are one stream of 41 GB over PCIe.** Not approximately - to within 1%. Whatever the two engines do differently
+   in routing, caching, chunking and PLE, the prompt's traffic comes out the same, because both re-stream the experts a
+   chunk does not have resident.
+2. **Both hide the compute inside that stream, and ours hides slightly more**: 1.97 s of kernels inside 3.28 s for
+   strata against 2.28 s inside 3.18 s for us. So the layer loop is at parity (ours 0.6% faster in §22) even though our
+   kernel layer is **16% heavier in 56% more launches** - our work is more fragmented, and the pipeline absorbs it.
+3. **Anything that is not the stream is small on both sides**: PLE 94 ms (2.4%), the checkpoint 1.2 ms, the last layer
+   and the first decode ~110 ms, arrival ~60-160 ms.
+
+So the honest distribution is a two-line table, identical on both engines:
+
+| | strata | naiwa |
+|---|---:|---:|
+| expert stream, 41 GB at ~12.7 GB/s | ~3.2 s | ~3.2 s |
+| of which the kernels are overlapped | 1.97 s | 2.28 s |
+| everything else (arrival, PLE, checkpoint, first token) | ~0.07 s + PLE | ~0.27 s + PLE |
+
+Which closes the question this milestone started from: there is no stage in which we are structurally behind. The one
+measurable difference left is kernel fragmentation (23 275 launches against 14 933 for the same bytes) and the ~0.2 s of
+per-request overhead we carry outside the loop, of which the prefix cache's side effect (§23) is the larger part.

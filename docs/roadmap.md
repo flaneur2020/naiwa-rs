@@ -91,6 +91,13 @@ copy engine sees a continuous queue across layer boundaries instead of a burst w
   and 4 are **not granted** - the 1 526 MiB loan holds two ~650 MiB layer ranges - which is §4.2's prediction arriving
   as a measurement: the deeper queue needs a smaller unit, so the split has to exist first. S2 is the only half left
   and it is expressible without a kernel change (§11).
+- **The real distribution against strata (§24): the same 41 GB at the same rate.** Profiled strata's engine binary
+  directly (no Python wrapper, so nsys works) on a 3 420-token prompt against our 3 143-token one: **41.4 GB against
+  41.1 GB of host-to-device traffic**, 12.6 against 12.9 GB/s effective, kernels 1.97 s inside 3.28 s against 2.28 s
+  inside 3.18 s. Both engines are one PCIe stream with their compute hidden inside it; ours hides slightly more while
+  our kernel layer is 16% heavier in 56% more launches (23 275 against 14 933). Nothing outside the stream is larger
+  than ~0.3 s on either side. The only differences left are kernel fragmentation and our ~0.2 s of per-request
+  overhead, of which the prefix cache's per-layer side effect (§23) is the larger part.
 - **Against strata on the same prompt, segment by segment (§22): the work is at parity and the snapshot is not.**
   3 143 tokens, same text, same session: our prefill is **3 179 ms against strata's 3 198** (983 tok/s, 0.6% in our
   favour), our out-of-prefill overhead is 171 ms against its 71, and the shipped config's **prefix snapshot costs 284 ms
