@@ -918,3 +918,35 @@ costs ~275 ms on a 3 143-token prompt and returns prefix reuse of 0.9+ on every 
 why the chat config keeps it. What would find it: a timestamp inside the first decode step (engine side), splitting
 "last layer exit -> decode step start" from "decode step start -> first token". That is one probe, and it is the next
 step if this item is ever worth 275 ms.
+
+---
+
+## 26. Located: the penalty is between the prompt step returning and the first token leaving
+
+`NAIWA_STEP_TIME=1` stamps the engine's own step boundaries with absolute wall clock, which splits §25's C into the part
+inside the step and the part after it:
+
+| | `-n 1` | `-n 0` |
+|---|---:|---:|
+| last layer's entry -> the prompt step returns | **61 ms** | 112 ms |
+| **the prompt step returns -> the first token** | **331 ms** | **0.3 ms** |
+| C (last layer's entry -> first token) | 392 ms | 112 ms |
+
+Two things fall out of that, and both are new:
+
+1. **The step's own tail is *shorter* with `-n 1`** (61 ms against 112), so the penalty is not in the step at all - not
+   the layer loop (§25), not the checkpoint (1.2 ms), not the sample.
+2. **331 ms elapse between the token existing and the token being sent**, against 0.3 ms in the other arm. The engine's
+   `submission` takes the `Ready` branch on this path (the `Cuda` branch, and with it `complete_cuda_step`, never runs -
+   the probe for it prints nothing), so the wait is in the ~50 lines that follow: the guard re-lock, the sampler
+   decode, the channel push and the response writer.
+
+So the shape of the remaining question changed once more. It is not "the snapshot is slow", it is "**something between
+the prompt step and the response blocks for ~330 ms when the prefix cache is on**", and the region is small enough to
+instrument directly: three more stamps (after `submission.into_inner()`, after the guards, after the channel send)
+will name it. It is also consistent with §25's exclusions - a host-side wait, no GPU or API trace, and it disappears
+under `nsys` because profiling changes who is scheduled where.
+
+The practical reading is unchanged and worth stating for the gate: `--prefix-cache-n 1` pays ~275-330 ms on a
+single-shot 3 143-token prompt and returns prefix reuse of 0.9+ on every later turn, which is the trade the chat config
+makes; the oracle arm runs `-n 0` and is unaffected.
