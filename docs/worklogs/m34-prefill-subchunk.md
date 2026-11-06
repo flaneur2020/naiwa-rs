@@ -950,3 +950,47 @@ under `nsys` because profiling changes who is scheduled where.
 The practical reading is unchanged and worth stating for the gate: `--prefix-cache-n 1` pays ~275-330 ms on a
 single-shot 3 143-token prompt and returns prefix reuse of 0.9+ on every later turn, which is the trade the chat config
 makes; the oracle arm runs `-n 0` and is unaffected.
+
+---
+
+## 27. Found it: `--prefix-cache-n 1` leaves a 7-token tail that runs as a whole extra step
+
+§26 put the wait between the prompt step and the first token. Reading the step stamps **in order** (my first parse took
+the last stamp before the token, which is a later step's) gives the mechanism for one run:
+
+| stamp | wall clock (us) | delta |
+|---|---:|---:|
+| client send | 1793948342785722 | |
+| layer 0 entry | 1793948342984267 | +198 ms (A) |
+| last layer (47) entry | 1793948346155394 | +3 171 ms (B, the layer loop) |
+| `step_end n=1` - the prompt step returns | 1793948346200309 | +45 ms (the last layer + the step tail) |
+| **`step_end n=2` - a *second* step** | 1793948346546505 | **+346 ms** |
+| first token | 1793948346546855 | +0.35 ms |
+
+**The prompt step is not what delays the token: there is an extra step after it.** And the row counts say which one:
+with `--prefix-cache-n 1` the prompt step processes **3 136** tokens and with `-n 0` **3 143** - the difference is
+`3 143 % 32 = 7`, i.e. the prompt step stops **on the 32-token block boundary** (so the recurrent checkpoint can be keyed
+on a block, which is the `align_down(prompt, 32)` the chat config documents since M16). The remaining 7 tokens are fed by
+the next step, which is a **decode step** - and that step costs **346 ms**, because the loan emptied the cache for the
+chunk and a decode step then misses for every expert it routes to.
+
+So the whole `-n 1` penalty is: **one extra decode step of 7 rows, paying the full expert miss path, before the first
+token can be emitted.** It explains every measurement in §25-§26 without exception:
+
+- the layer loop is identical in both arms (it is the same 48-layer pass over a chunk);
+- the checkpoint itself is 1.2 ms (it is not the cost);
+- the segment after the step returns is 0.3 ms (the token is computed; it is the *extra step* that was never counted);
+- no GPU or API difference appears in a profile because it is one ordinary decode step, only an unexpected one;
+- and it is "intermittent" if you timestamp carelessly (as I first did), because which `step_end` you catch decides
+  whether you see 0.3 ms or 346 ms.
+
+**Two ways to fix it, both small**, and they are the next thing to do on this item:
+
+1. **Take the checkpoint at the aligned prefix without truncating the step** - the checkpoint key is a block-hash
+   prefix, so the snapshot can be keyed on `align_down(len, 32)` while the step still consumes all 3 143 tokens. The
+   7-token tail then never exists, and the 346 ms goes with it;
+2. if the truncation is load-bearing, **keep the chunk's layer buffer alive for the tail step** (it is 7 rows; a
+   decode step that hits the loan's buffer needs no fills at all).
+
+What this does **not** change: the trade `-n 1` makes. Prefix reuse of 0.9+ on later turns is worth far more than 275 ms
+per prompt - but not because the 275 ms is inherent. It is a tail step that should not exist.
