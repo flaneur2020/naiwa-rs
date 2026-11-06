@@ -107,3 +107,34 @@ The second row is the cost. Two ways to keep it, in order of preference:
 A 3 143-token prompt on the shipped chat config: TTFT **3.85 s -> 3.51 s** (the 275-346 ms M34 §27 measured), two prefill
 steps instead of three, the checkpoint still taken (1.2 ms), and `short`/`doc` reuse unchanged or better - with the
 oscillation that started this, `--prefix-cache-n 1`, no longer tradeable against TTFT at all.
+
+---
+
+## 9. S1, first attempt: the truncation at `prompt_chunks.rs:274` is **not** the only cap
+
+The first slice was the cheapest possible experiment: a flag (`NAIWA_NO_TAIL_SPLIT=1`) that makes
+`build_prompt_chunk_plan` leave the **final** chunk untruncated, so the plan for a 3 143-token prompt becomes
+`[0..3143]` in one chunk. Built, run, and the flag does what it says:
+
+```
+NO_TAIL_SPLIT pos=0    end=3143 total=3143     <- the plan, with the flag
+NO_TAIL_SPLIT pos=3136 end=3143 total=3143     <- and a second chunk starting at 3136
+```
+
+Two things follow, and they redirect S1:
+
+1. **The executed prompt step is still 3 136 rows** (the prefill stream logs `rows 3136`, and `NAIWA_STEP_TIME` still
+   shows three `prompt=true` steps with the third at ~346 ms). So something other than the chunk plan caps the step -
+   the plan asks for one 3 143-row step and the engine runs a 3 136-row one.
+2. **A second chunk `[3136..3143]` exists in the plan**, i.e. the planner is being invoked more than once for this
+   request (a scheduler-visible pass and then a re-plan), and one of those passes still trims at the block boundary.
+
+The most likely second site is the **prompt token budget**, which is expressed in KV blocks
+(`chunk_size = min(max_prefill_chunk_tokens, token_budget)`, and a budget derived from free blocks is inherently a
+multiple of 32) - that would make the step's length block-aligned no matter what the chunk plan says. Finding it is the
+first task of S1, and it is a grep plus a print, not a redesign.
+
+**What stands from this attempt**: the flag is in the tree and documented (it is a no-op in practice today, which is
+exactly what makes it a good bisection arm), and M35's centre of gravity moves from "the chunk plan truncates" to "the
+prompt step's length is block-quantised in the scheduler's budget". The design (tail-aware key) is unaffected - it still
+removes the *need* for the boundary; what changed is where the boundary is imposed.
