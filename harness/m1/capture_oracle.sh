@@ -15,6 +15,10 @@ MAXTOK=${MAXTOK:-16}
 # A small KV budget: the server's auto-size reserving runtime memory too squeezed the KV pool
 # out on this 12 GB card. Context length does not affect a 16-token greedy decode.
 PA_CTX=${PA_CTX:-4096}
+# Sequence slots. The default (32) reserves ~112 MiB of recurrent state each - 3.5 GiB - which no longer fits beside a
+# 2 GB expert cache on this 12 GB card: measured 2026-11-05, the arm OOM'd at load at both 4.6 and 11.2 GiB of free
+# VRAM, and 4 makes it load and stay byte-identical. The same number the chat config uses (engines/naiwa.json).
+MAX_SEQS=${MAX_SEQS:-4}
 # The frozen reference was captured from the `requant` checkpoint; `IQ1_M` was checked to produce
 # the same text at `frac 0` + `--no-lookahead`, so either can be used as MODEL.
 MODEL=${MODEL:-$HOME/Models/qwen3-coder/requant}
@@ -32,7 +36,8 @@ LOG="$OUT/serve.$TAG.log"
     -m "${MODEL:-$HOME/Models/qwen3-coder/requant}" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
     --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
-    --pa-context-len "$PA_CTX" --prefix-cache-n 0 ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
+    --pa-context-len "$PA_CTX" --prefix-cache-n 0 --max-seqs "${MAX_SEQS:-4}" \
+    ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
     --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true' EXIT

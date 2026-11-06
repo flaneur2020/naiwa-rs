@@ -681,3 +681,16 @@ The layer loop is at 950 tok/s against strata's 918; the whole TTFT is 742-777 b
 is 3%, the copy is at the ceiling and 45% overlapped, and the depth/ring route is closed both by the wipe (§15, §20.2)
 and by the split's cost (§18). What is left visible is the per-request overhead outside the layer loop, which nobody has
 instrumented yet and which is bigger than PLE.
+
+### 20.4 The oracle arm was OOMing on `--max-seqs`, not on the engine
+
+Re-running the §20 gates on the freed card turned up a third thing that had been mis-read as an engine problem: the M1
+oracle arm (`harness/m1/capture_oracle.sh`) OOM'd at load with 11.2 GiB of free VRAM, twice, and does not with
+`--max-seqs 4` - byte-identical to the reference. It was reserving the default 32 sequence slots of recurrent state
+(~112 MiB each, 3.5 GiB) beside a 2 GB expert cache on a 12 GB card. The harness now sets `MAX_SEQS=4` by default,
+which is the number the shipped chat config already uses (`engines/naiwa.json` records the measurement behind it).
+
+So of this session's three "the shipped path is broken" moments - the depth-3 HTTP 500 (§15), the OOM at 2.0 GB with the
+card free, and the oracle arm's OOM - only the first is a defect in our code. The second was the card's owner taking
+6.6 GiB, and the third was a harness default that the `--max-seqs 4` note in the chat config had already solved for the
+serving path.
