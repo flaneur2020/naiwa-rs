@@ -481,12 +481,26 @@ impl PrefillStream {
     }
 
     /// Bytes of the largest registered layer: one buffer's worth.
+    /// The largest layer's three projections, **plus the padding the layout adds on top of them**.
+    ///
+    /// `borrow_buffers` places each projection at `elem_count + MATRIX_ROW_PADDING` elements, 256-byte aligned, so a
+    /// range sized from the tensors' own `storage_size_in_bytes` is a little too small: the biggest layer then wrote
+    /// 1 664 bytes past the end of its range (measured, `NAIWA_LAYER_DBG`'s `LAYOUT` line). Those bytes are the
+    /// expert cache's - the overrun landed in the pool's next **slot**, silently, and that slot's expert became the
+    /// chunk's data. The chunk then went non-finite from the first layer that reused the slot, which is why a prompt
+    /// fitting in one chunk answered nothing at all while a two-chunk prompt was fine (M35 §15).
+    ///
+    /// The margin is deliberately generous: `MATRIX_ROW_PADDING` is a handful of elements, so 4 MiB dwarfs three of
+    /// them at any dtype, and it costs 8 MiB of the loan (two ranges) out of 1 500.
     fn layer_bytes(&self) -> usize {
+        const ROW_PADDING_MARGIN: usize = 4 << 20;
         self.layers
             .read()
             .iter()
             .flatten()
-            .map(|s| s.0.iter().map(|t| t.storage_size_in_bytes()).sum::<usize>())
+            .map(|s| {
+                s.0.iter().map(|t| t.storage_size_in_bytes()).sum::<usize>() + ROW_PADDING_MARGIN
+            })
             .max()
             .unwrap_or(0)
     }
@@ -689,8 +703,38 @@ impl PrefillStream {
             } else {
                 slab.borrow_at(offset, padded, stack.dtype(), &self.device)?
             };
-            offset += storage.allocated_bytes();
+            // **256-byte aligned, exactly as `alloc_like` places them.** A borrowed range is the pool's own bytes, and
+            // the offsets inside it come from the padded byte counts, which are not multiples of 256 for the
+            // block-quantised dtypes (IQ3_XXS: 98 bytes per 256 elements, so a padded projection ends at a multiple of
+            // 4). Those kernels load 16 bytes at a time, so a projection that starts at an unaligned address is read
+            // across the vector boundary and dequantises garbage. M35 §16: the layers whose first projection is
+            // IQ3_XXS (37 onwards) were the ones whose MoE output went non-finite, and a prompt fitting in a single
+            // chunk therefore answered nothing - while the private-buffer arm, which aligns, was fine.
+            offset = (offset + storage.allocated_bytes() + 255) & !255;
             out.push(self.copy.like_from_storage(stack, storage)?);
+        }
+        // `NAIWA_LAYER_DBG=1` (M35 §15): the layout's own numbers, because `span` is computed from *unpadded*
+        // layer sums while the placement below pads every projection by `MATRIX_ROW_PADDING` and aligns to 256
+        // bytes - so a layer's real footprint can exceed the range it was given and reach into the next buffer.
+        if std::env::var_os("NAIWA_LAYER_DBG").is_some() {
+            let used = offset - buf * span;
+            let kinds: Vec<String> = stacks
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{:?}/{}el/{}b",
+                        s.dtype(),
+                        s.shape().elem_count(),
+                        s.storage_size_in_bytes()
+                    )
+                })
+                .collect();
+            eprintln!(
+                "LAYOUT layer={layer} buf={buf} span={span} used={used} over={} pad={} {}",
+                used as i64 - span as i64,
+                candle_core::quantized::cuda::MATRIX_ROW_PADDING,
+                kinds.join(" ")
+            );
         }
         if std::env::var_os("NAIWA_PREFILL_QUIESCE").is_some() {
             // Make the non-overlap a fact rather than an assumption: no prediction job runs during a chunk, and the

@@ -542,6 +542,18 @@ impl RoutedExperts for CachedExperts {
         if layer.layer == 0 && num_tokens <= prefill_threshold() && crate::vram_peak::enabled() {
             crate::vram_peak::note_step(&layer.slot_device);
         }
+        // `NAIWA_LAYER_DBG=1`: one line per *step* (layer 0) naming the branch the MoE forward takes, the row count
+        // and whether the slab still considers its bytes loaned. Added for M35 §15, where a single-chunk prompt
+        // returned no token at all with the loan on: the two arms differ only in what happens *after* the prompt
+        // steps, so the branch and the flag are the two facts that separate them.
+        if layer.layer == 0 && std::env::var_os("NAIWA_LAYER_DBG").is_some() {
+            eprintln!(
+                "LAYER_DBG rows={num_tokens} prefill_threshold={} slab_borrowed={} prefill_engine={}",
+                prefill_threshold(),
+                crate::moe::slab::borrowed(),
+                layer.prefill.is_some(),
+            );
+        }
         if num_tokens > prefill_threshold() {
             let ids_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
             {

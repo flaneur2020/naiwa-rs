@@ -303,3 +303,61 @@ Also fixed while here, because it made the `doc` class meaningless: `harness/cha
 contain a `{{DOC}}` placeholder that **run.py never substituted** - the class had been asking the model to summarise the
 five characters `{{DOC}}`. `run.py` now takes `--doc-file` (default `harness/chat/doc.md`, ~8 KB of real worklog, small
 enough that seven turns stay inside `--pa-context-len 4096`) and substitutes it.
+
+## 16. The loan's silent empty answer: two layout defects, both in `borrow_buffers`
+
+§14 left the loan off by default because a single-chunk prompt answered nothing. The cause is found, and it is not one
+defect but two, both in how `borrow_buffers` places a layer's three projections inside its range - plus one harness
+defect that hid the symptom for a milestone.
+
+**A. The range was too small for what the layout writes into it.** `span` came from the layers' own
+`storage_size_in_bytes`, but the placement pads every projection by `MATRIX_ROW_PADDING` elements and aligns to 256
+bytes. `NAIWA_LAYER_DBG`'s new `LAYOUT` line printed the two numbers for every layer, and the biggest layer wrote
+**1 664 bytes past the end of its range** - into the expert cache's next *slot*, with no error and no invalidation.
+Fixed with a 4 MiB margin on `layer_bytes` (three paddings of a few hundred elements, so 4 MiB is generous; it costs
+8 MiB of the loan's two ranges).
+
+**B. The three projections were placed back to back, unaligned.** The private arm (`alloc_like`) ends every projection
+with `offset = (offset + bytes + 255) & !255`; `borrow_buffers` used `offset += storage.allocated_bytes()`. For the
+block-quantised dtypes the padded byte count is not a multiple of 256 - `IQ3_XXS` is 98 bytes per 256 elements, so a
+padded projection ends at a multiple of 4 - so the next projection started at an unaligned address. Those kernels load
+16 bytes at a time, so they read across the vector boundary and dequantise garbage.
+
+Defect B is the one that produced the symptom, and the evidence is a fingerprint rather than a guess: with the loan on,
+the chunk's MoE output was finite for layers 0-36 and non-finite from **layer 37 onwards** - and 37 is the first layer
+whose `gate`/`up` are `IQ3_XXS` (`NAIWA_LAYER_DBG` prints each projection's dtype):
+
+| layer | gate / up | down | chunk output |
+|---|---|---|---|
+| 36 | IQ2_S | Q2_0 | finite |
+| **37** | **IQ3_XXS** | **IQ4NL** | **non-finite** |
+| 38-47 | IQ3_XXS | IQ4NL | non-finite (upstream) |
+
+The NaN was row-count independent (300, 700, 1 800 rows all started at 37), buffer-count independent (`NAIWA_DEPTH_CAP=1`
+too), and survived `NAIWA_REFILL=0` and `NAIWA_BORROW_NOEMPTY=1`, which is what pointed away from the slot bookkeeping
+and towards the placement. `NAIWA_BORROW_PRIVATE=1` (the beside-the-cache arm) is itself broken - it ignores the buffer
+index, so both stride buffers share one allocation and it NaNs from layer 0 - which is why it could not be used as the
+control; the control was the `alloc_like` code path itself, whose alignment is what B restores.
+
+Measurements after both fixes, loan **on** (`NAIWA_PREFILL_BORROW=1`, or just the new default):
+
+| prompt | TTFT | MoE NaN |
+|---|---:|---:|
+| ~300 tokens | 3 125 ms, real answer | 0 |
+| ~700 tokens | 2 902 ms | 0 |
+| ~1 800 tokens | 3 638 ms | 0 |
+| 3 143 tokens | 5 742 ms | 0 |
+| ~300 tokens, loan **off** | 3 001 ms | 0 |
+
+(That 5 742 ms is this probe harness, not §20.13's; §20.13's own pair, same session, was 4 791 ms with the loan against
+14 083 ms without.)
+
+**The chat harness's `doc` class runs end to end for the first time**: 15 turns recorded, none failed. Turn 1 is
+1 723 prompt tokens in 3 841 ms, and reuse climbs the way it should - `cached_tokens` 96, 256, 320, 416, 544, 736, 832
+for `short`, then 1 792, 1 920, 2 048, 2 176, 2 240 for `doc`.
+
+**So the loan is the default again**, and §14's decision is superseded by this section rather than deleted: it was the
+right call while the cause was unknown.
+
+Gates on the shipped defaults: `cargo test` 56 passed, `frac 0` + `--no-lookahead` byte-identical (the oracle arm runs
+`--prefix-cache-n 0`, so no cache, no slab, no loan - `borrow_buffers` is unreachable there).
