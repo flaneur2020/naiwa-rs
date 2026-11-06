@@ -994,3 +994,42 @@ token can be emitted.** It explains every measurement in §25-§26 without excep
 
 What this does **not** change: the trade `-n 1` makes. Prefix reuse of 0.9+ on later turns is worth far more than 275 ms
 per prompt - but not because the 275 ms is inherent. It is a tail step that should not exist.
+
+---
+
+## 28. The fix: the truncation itself, and three ways to remove it
+
+The truncation is one line, `pipeline/prompt_chunks.rs:274`:
+
+```rust
+let mut end = (pos + chunk_size).min(next_feature_start).min(total_len);
+if let Some(block_size) = block_align.filter(|size| *size > 0) {
+    let aligned = end / block_size * block_size;
+    if aligned > pos && aligned < end { end = aligned; }        // 3 143 -> 3 136
+}
+```
+
+It exists because a hybrid model can only checkpoint recurrent state **between forwards** (`recurrent_checkpoint_boundary`'s
+comment says exactly that): to observe the block boundary a prefix lookup will ask for, the step has to *end* there. So
+the truncation is load-bearing, and the cost is the tail step (§27) - which is not cheap:
+
+- three `prompt=true` steps appear in one request (`NAIWA_STEP_TIME`), and the third is the 7 rows;
+- the third takes **346-348 ms**, and it does **not** go through the prefill stream: there are no `rows 7` layer lines
+  even with `--prefill-stream-min-tokens 1`, so its experts are fetched the slow way (per expert, one projection at a
+  time) with the cache the loan emptied;
+- the checkpoint it buys costs 1.2 ms and is worth a lot (reuse 0.9+ on later turns).
+
+So the question is not "make the checkpoint fast" but **"how do we get a checkpoint without paying a whole extra step"**.
+
+| # | fix | what it does | cost / risk |
+|---|---|---|---|
+| **1** | **checkpoint without truncating**: write the recurrent copy into a **checkpoint lane** at each block boundary *during* the chunk's forward | the prompt step never stops at the boundary, the tail disappears, the checkpoint stays | the pool already has `checkpoint_lanes`; what is missing is a per-boundary write inside the step. The structural fix. |
+| **2** | **don't align when the remainder is small**: skip the truncation when `end - aligned` is below a threshold (a 7-row step buys only the checkpoint) | −346 ms for prompts whose length is near a block boundary | that turn loses its checkpoint, so a *chat* loses reuse (that is why it must be a knob, not a default). Gives single-shot requests 346 ms back. |
+| **3** | **don't wipe the loan until after the tail**: defer `empty_range`/`set_borrowed` past the tail step | the tail's experts hit the layer buffer instead of streaming per expert | a stopgap: the cache stays borrowed one step longer |
+
+**Recommendation**: (1) is the real fix and belongs in its own milestone - it is the same shape as strata's "checkpoint
+at the end of every turn" and it makes the alignment free; (2) is a two-line knob worth having today, defaulted to
+today's behaviour so chat is untouched; (3) only if (1) slips.
+
+What the numbers say about priority: 346 ms of a 3.7 s single-shot prompt (9%), zero if the checkpoint is genuinely free
+after (1), and it is *not* the checkpoint (1.2 ms) but the step the alignment forces.
