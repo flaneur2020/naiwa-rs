@@ -168,3 +168,36 @@ support M35 §3 item 3 asks for anyway.
 The next probe is one line: print the scheduler's free-block count and the computed token budget at the prompt step for
 both arms. Until that lands, the honest statement is that this milestone has located the cost (§27) and *one* of its
 causes (§9), and that the second cause is now a specific, testable hypothesis rather than an unknown.
+
+## 11. The probe: it is not KV blocks (they are 128 free), and the plan/step mismatch is now the question
+
+`NAIWA_BUDGET_DBG=1` prints the scheduler's free-block count and the token budget at every prompt batch:
+
+| arm | call | free blocks | ceiling | chunk_size | block alignment |
+|---|---:|---:|---:|---:|---|
+| `-n 1` | 1 | **128** | 0 | 8 192 | **true** |
+| `-n 1` | 2 | **128** | 3 840 | 3 840 | **true** |
+| `-n 1` | 3 | 30 | 1 792 | 1 792 | **true** |
+| `-n 0` | 1 | **128** | 0 | 8 192 | **false** |
+| `-n 0` | 2 | **128** | 3 840 | 3 840 | **false** |
+
+Two conclusions, one of them a falsification:
+
+1. **§10's "one block fewer free" is wrong.** Free blocks are **128** in both arms at the moment the prompt is planned;
+   retention does not cost a block. What differs between the arms is exactly one thing: `block alignment` true against
+   false. So the tail is the *alignment*, not the capacity - which restores M35's premise from §3.
+2. **The plan and the executed step disagree, and that is now the open question.** With the 3 840 budget, `end` is
+   `min(3840, 3143) = 3143`, and §9's flag makes the planner *keep* 3 143 (the marker printed `pos=0 end=3143`), yet the
+   step that runs has **3 136** rows and a second plan `pos=3136 end=3143` appears. So the row count of the executed
+   prompt step is decided somewhere other than this plan - the candidates, in order: `materialize_prompt_chunks`
+   (which allocates KV per chunk from `chunk.end`), `seq.set_prefill_toks(..chunk.end)` /
+   `computed_updates`, or the scheduler-visible-chunk pass that re-plans from `num_computed_tokens`.
+
+Note 3 136 = `align_down(3143, 32)` exactly, which is why it kept looking like the alignment in the plan: with
+`chunk_size = 3 840` the plan's own truncation *and* whatever the step does both land on 3 136, and a flag that disables
+only the first is invisible in the result. **To separate them the probe has to print the executed step's row count and
+its source**, not the plan's.
+
+So the state of this milestone: the cost is located (§27), the mechanism is `block alignment` and not capacity (§11,
+falsifying §10), and the remaining unknown is narrow - *which* of the three places above decides the step's 3 136 rows.
+Everything else is designed and its feasibility checked (§3-§4).
