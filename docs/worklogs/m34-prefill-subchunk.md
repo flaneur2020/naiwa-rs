@@ -877,3 +877,44 @@ So the honest distribution is a two-line table, identical on both engines:
 Which closes the question this milestone started from: there is no stage in which we are structurally behind. The one
 measurable difference left is kernel fragmentation (23 275 launches against 14 933 for the same bytes) and the ~0.2 s of
 per-request overhead we carry outside the loop, of which the prefix cache's side effect (§23) is the larger part.
+
+---
+
+## 25. Chasing the `--prefix-cache-n 1` penalty: 275 ms, in one place, and not where §23 said
+
+§23 read the penalty as **+3.8 ms a layer** from a single pair of runs. Three alternating pairs say otherwise - the layer
+loop is **identical** in both arms:
+
+| pair | arm | A (arrival) | **B (layer loop)** | **C (last layer -> first token)** | TTFT |
+|---|---|---:|---:|---:|---:|
+| 1 | `-n 1` | 228 ms | **3 161** | **389** | 3 779 |
+| 1 | `-n 0` | 195 ms | **3 167** | **114** | 3 476 |
+| 2 | `-n 1` | 61 ms | **3 169** | **384** | 3 614 |
+| 2 | `-n 0` | 198 ms | **3 171** | **112** | 3 482 |
+| 3 | `-n 1` | 198 ms | **3 165** | **533** | 3 896 |
+| 3 | `-n 0` | 61 ms | **3 175** | **116** | 3 353 |
+
+B agrees to 10 ms across the arms, so **§23's per-layer reading is withdrawn** (it came from one run where the medians
+happened to differ). The whole penalty is in **C**, reproducibly: 384-533 ms against 112-116 ms, ~275 ms.
+
+C is [last layer's entry -> the client's first token], which holds the last layer's own work (~60 ms), the checkpoint,
+the first decode step and the response. Each of those was then either measured or removed:
+
+| hypothesis | how it was excluded |
+|---|---|
+| the checkpoint function | `NAIWA_SNAP_TIME`: flush 131 us + 36 gathers 1.04 ms + aux 2 us = **1.2 ms** |
+| its device copies | D2D between the arms: 511.1 MB / 668 ops against 516.8 MB / 677 ops - **+5.7 MB, +9 ops** |
+| MTP / the verify step | `--mtp` off: C 406 ms against 393 ms - unchanged |
+| a CPU-side prompt suffix (3 143 -> 3 136 rows, aligned to the 32-token block) | only **one** prefill step in the log, and `--prefill-stream-min-tokens 1` leaves C at 416 ms |
+| the lookahead machinery re-arming | `--no-lookahead`: C 426 ms against 394 ms - unchanged |
+| any CUDA API difference | `cuda_api_sum` of the two arms: 911 `cuStreamSynchronize` both, `cuMemAllocAsync` 24 116 against 24 096, `cuEventSynchronize` 66 both |
+
+Two facts are left, and they point the same way: the penalty **vanishes under `nsys`** (27 ms, §23), and it leaves **no
+GPU or API trace at all**. So it is a host-side wait of ~275 ms that profiling itself perturbs - the shape of a
+spin/backoff or a thread handoff rather than a copy.
+
+**Not chased further in this milestone**, and the practical reading is that the trade still holds: `--prefix-cache-n 1`
+costs ~275 ms on a 3 143-token prompt and returns prefix reuse of 0.9+ on every later turn of a conversation, which is
+why the chat config keeps it. What would find it: a timestamp inside the first decode step (engine side), splitting
+"last layer exit -> decode step start" from "decode step start -> first token". That is one probe, and it is the next
+step if this item is ever worth 275 ms.
