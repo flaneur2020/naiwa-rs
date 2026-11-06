@@ -788,3 +788,52 @@ So the ranking of what is left on the prompt path, measured rather than assumed:
 The snapshot is the only line that is both large and **not** at parity with strata, so it is the next thing worth doing
 - and unlike the ring, it does not need VRAM, only that the write happen on the copy stream (or after the response
 starts) instead of in the request's critical path.
+
+---
+
+## 23. The prefix checkpoint cannot be overlapped, because it is 1.2 ms - the 370 ms is the cache being on
+
+§22 attributed 284 ms to the snapshot. Asked whether it can be overlapped, it was instrumented instead of reasoned about
+(`NAIWA_SNAP_TIME`), and the answer is no: **it is not the snapshot.**
+
+**The A/B is real.** Same prompt, 3 143 tokens, four runs an arm, cold process each:
+
+| | `--prefix-cache-n 1` | `--prefix-cache-n 0` |
+|---|---:|---:|
+| TTFT | 3 937 / 3 763 / 3 843 / 4 048 ms | 3 485 / 3 489 / 3 672 / 3 479 ms |
+| median | **3 850 ms** | **3 487 ms** |
+
+**The checkpoint function itself:**
+
+```
+SNAP_TIME flush=131.006µs snapshots=1.04391ms aux_and_hashes=2.184µs total=1.178182ms
+```
+
+1.2 ms for the whole thing - the 36 per-layer gathers, the auxiliary capture, the block hashes. Its GPU footprint said
+the same: `-n 1` against `-n 0` under `nsys` adds 41 host-to-device copies, 20 allocations and 3 kernels, and a 27 ms
+TTFT difference.
+
+**So where does 200-450 ms go? Inside the layer loop.** With the same probes on both arms:
+
+| | `-n 1` | `-n 0` |
+|---|---:|---:|
+| rows | 3 136 | 3 143 |
+| layer loop | **3 352 ms** | 3 173 ms |
+| per layer | **71.3 ms** | 67.5 ms |
+| send -> layer 0 | 66 ms | 411 ms (this run's outlier) |
+
++3.8 ms **per layer**, 48 times. The checkpoint is taken once, at the end, so this is a *side effect of enabling the
+cache on the prompt path* rather than the snapshot: the most likely mechanism is the paged-attention block retention
+that comes with `--prefix-cache-n 1` (blocks are pinned for the checkpoint instead of being recycled, so each layer's
+attention sees different block bookkeeping). That is a hypothesis, not a measurement - the next step is the per-layer
+kernel counts of the two arms under `nsys`, which is a bisection this milestone did not get to.
+
+Two things this leaves behind:
+
+- the hoist that came out of the investigation is in the tree: `snapshot_recurrent_state` and
+  `snapshot_recurrent_checkpoint_state` build the 4-byte slot index tensor **once** instead of per layer, and its
+  comment records why (36 pageable H2Ds, a measured cost on the table above). It is a 1 ms item, kept because it is
+  free, not because it was the answer;
+- the honest correction to §22: the 284 ms it attributed to the snapshot is the cost of `--prefix-cache-n 1`, of which
+  the snapshot is 1.2 ms. The remaining ~360 ms is a per-layer effect of the cache being enabled and has no overlap to
+  offer until it is understood.
