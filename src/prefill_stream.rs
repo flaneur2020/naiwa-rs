@@ -282,7 +282,14 @@ pub(crate) fn plan_with_lend_depth(
         // it produced **zero decode tokens** (HTTP 500, twice out of two). The copy side is identical either way, so
         // there is nothing to gain before the wipe is made proportional to what is actually borrowed - which is what
         // splitting the unit does (a 1/g of a layer range empties 1/g of the slots).
-        stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max.min(2));
+        // `NAIWA_DEPTH_CAP` (probe): the wipe is *not* capped in the code any more, it is capped here so that a
+        // configuration which produced no decode tokens (§15) is not reachable by accident. Set it high to measure
+        // what a deeper queue does on a card that has the room.
+        let cap = std::env::var("NAIWA_DEPTH_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max.min(cap));
     } else {
         for d in (2..=depth_max).rev() {
             let owns_fits = fits(best, d)
@@ -486,6 +493,18 @@ impl PrefillStream {
 
     /// Measure now and return what fits, or `None` if nothing does.
     fn decide(&self) -> Option<(Plan, usize)> {
+        // **Give the pool's retained blocks back before measuring.** `free_bytes` is `cuMemGetInfo`, i.e. what the
+        // driver has, and the caching allocator keeps whatever it obtained during load - so the plan was sizing
+        // itself against a card that looked full when the process had simply grown into the space. Measured
+        // 2026-11-05: freeing a 6.6 GiB game from this 12 GiB card made the *plan worse* (chunk 2 560 -> 1 792) for
+        // exactly this reason, and a trim before the measurement is what separates the two.
+        // `NAIWA_PLAN_TRIM=0` is the arm without it.
+        if std::env::var("NAIWA_PLAN_TRIM").is_ok_and(|v| v != "0") {
+            match crate::copy_stream::trim_device_pool(&self.device) {
+                Ok(()) => crate::dbg_note("prefill_plan", "trimmed the pool before measuring"),
+                Err(e) => crate::dbg_note("prefill_plan", &format!("trim failed: {e}")),
+            }
+        }
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
         let (stride, chunk) = plan_with_lend_depth(
             free,

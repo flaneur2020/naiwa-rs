@@ -614,3 +614,70 @@ overlapped.
 §20.13 was the squeezed plan rather than the engine. What is left is not a rate but a *robustness* difference - strata's
 plan does not collapse when the card is busy, ours does - and the 55% of the copy that is not yet overlapped, which is
 what a ring would recover if the VRAM for it existed.
+
+---
+
+## 20. Re-measured with the card freed: the picture that survives
+
+§19.1 found a 6.6 GiB game holding the 12 GiB card. It was killed and everything VRAM-sensitive was re-measured. What
+survives, and what does not:
+
+| | with the game | card freed |
+|---|---:|---:|
+| free VRAM before load | 4 591 MiB | **11 241 MiB** |
+| free VRAM the plan sees at warmup | 2 002 MiB | **2 001 MiB** |
+| chunk the plan affords | 3 840 | 6 656 |
+| `--expert-cache-gb 4.0` | OOM | **still OOM** |
+
+So **6.6 GiB of headroom changes nothing about the chunk**, because ~9 GiB of the card is *our* own device footprint
+(2.5 GB expert cache + 0.7 MTP drafter + ~3.8 GB of non-expert weights + KV/recurrent state + ~1 GB of context and
+retained scratch). A trim of the caching allocator before the plan (`NAIWA_PLAN_TRIM`, added here) also changes nothing
+- the bytes are genuinely in use, not hoarded. 2.5 GB is the ceiling for this configuration on this card, and §19.1's
+"the game is the variance" was wrong: the game removes headroom from a card that had none to spare, but freeing it does
+not give the plan any.
+
+### 20.1 The distribution, corrected
+
+Every arm of this re-test sent the same **single step of 2 880 rows** (the plan's chunk sizes - 1 792, 4 864 - bind the
+*next* request, not the one that re-planned), so the numbers are directly comparable:
+
+| | prompt A (2 896) | prompt B (2 912) |
+|---|---:|---:|
+| TTFT | 3 914 / 3 787 / 3 733 ms | 3 425 ms |
+| layer loop (sum of the 47 `gap`s) | 3 047 / 3 052 ms | 3 133 ms |
+| **outside the layer loop** | **~740-870 ms** | **292 ms** |
+| per layer | 64.8 ms | 66.7 ms |
+| of which the copy's own duration | **41.6 ms (13.4 GB/s)** | 41.6 ms |
+| PLE (host gather, `PLE_DBG`) | 35-41 ms a call | |
+
+Two things this adds to §19: the layer loop is 3.05 s of a 3.73-3.91 s TTFT, so **0.3 s (a warm request) to 0.9 s (the
+first request after load) is outside it** - tokenisation, the plan re-check, first-call module loads - and that is larger
+than PLE's 3%. The layer loop itself is unchanged: 65 ms a layer, 41.6 of it the copy at the link's ceiling.
+
+### 20.2 Depth 3 is closed for good, and it was never VRAM
+
+§15's three-range arm produced no decode tokens (HTTP 500) on a squeezed card, which left open the possibility that it
+was simply out of memory. On the freed card it does the same thing:
+
+| ranges | granted | request | per layer | queue-to-consumer |
+|---:|---|---|---:|---:|
+| 2 | yes | ok | **64.9 ms** | 58.4 ms |
+| 3 | yes (2 048 MiB pool) | **HTTP 500** | **70.4 ms** | 125.9 ms |
+
+So it is the loan's bookkeeping, not the card - and the third buffer is not even faster when it runs: the copy is still
+41.6 ms and the queue-to-consumer latency *doubles*, because the extra range lengthens the wipe and the wait. The cap
+that §15 put in the code is now behind `NAIWA_DEPTH_CAP` (default 2) so that a configuration known to break is not
+reachable by accident, with this table beside it.
+
+### 20.3 Where the prompt stands
+
+| | tokens | TTFT | tok/s |
+|---|---:|---:|---:|
+| naiwa, single step | 2 896 | 3.73-3.91 s | **742-777** (from TTFT) |
+| naiwa, single step, layer loop only | 2 896 | 3.05 s | 950 |
+| strata (`serve`, chunk 2 816) | 3 433 | 3.74 s | 918 |
+
+The layer loop is at 950 tok/s against strata's 918; the whole TTFT is 742-777 because of the 0.3-0.9 s outside it. PLE
+is 3%, the copy is at the ceiling and 45% overlapped, and the depth/ring route is closed both by the wipe (§15, §20.2)
+and by the split's cost (§18). What is left visible is the per-request overhead outside the layer loop, which nobody has
+instrumented yet and which is bigger than PLE.
