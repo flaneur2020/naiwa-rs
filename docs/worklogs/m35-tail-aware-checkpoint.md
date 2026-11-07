@@ -779,3 +779,40 @@ and its only effect would have been to make the code say something it does not d
 
 That leaves the sequence of §22 unchanged, with one item now cheaper to justify: the tail chunk is not an artifact of a
 bad truncation site that someone can move - it is the cost of the only boundary the checkpoint format can express.
+
+## 26. The tail key, specified down to its safety argument - and two facts that shrink it
+
+§25 closed the cheap dodge. Reading the block pool for §17's step 4 turned up two facts that make the remaining work
+smaller and, more importantly, make its safety argument *checkable* rather than hopeful.
+
+**Fact 1: a retained block cannot be handed to anyone.** `retain_physical_block` (`block_pool.rs:665`) increments
+`block_retention_counts` and pulls the block out of the free queue; allocation only ever takes blocks from that queue. So
+while a tail checkpoint's lease is alive, its partial block (the one holding the last `k` tokens' KV) is not allocatable,
+and no other request can be given it. The CoW story §22 asked for is therefore **not needed for isolation** - what is
+needed is the retention itself, by id.
+
+**Fact 2: the block does not need copying to be written past the boundary.** A tail checkpoint at `n*32 + k` describes
+rows `0..k` of the partial block. The sequence that restores it then writes rows `k..` (its own new tokens), and the
+checkpoint's rows stay untouched. So "restore a partial block and keep generating" is a memcpy-free operation - as long as
+the rows before `k` are never rewritten, which nothing does.
+
+What Fact 1 does *not* cover is two sequences sharing one restored partial block: both would write rows `k..` and see each
+other's data. The pool's protection for that is `ref_cnt`-based forking, and `retain_physical_block` leaves `ref_cnt`
+alone, so it would not trigger. The cheap, honest answer is a rule rather than a mechanism: **a tail checkpoint is
+single-owner**. The entry already carries `owners: HashSet<BlockHash>`; a tail entry that already has an owner declines a
+second sequence, which falls back to the aligned checkpoint it would have used anyway. That rule costs nothing for the
+one-request-at-a-time server this is and it is one `if`.
+
+So the whole feature is:
+
+| step | where | size |
+|---|---|---|
+| 1. `tail_hash(parent, &tokens[n*32..n*32+k], extra)` | `block_hash.rs` | **done**, tested (§17) |
+| 2. `PagedRecurrentCacheEntry.tail: Option<(BlockHash, usize)>`; `add_paged_recurrent_prefix` takes it; the capture side stops declining a non-multiple boundary and computes it from `seq.get_toks()` | `prefix_cacher.rs:201/488`, `pipeline/mod.rs:1931` | ~40 lines |
+| 3. lookup takes the prompt's tokens, recomputes `tail_hash` for each candidate entry that has one, returns `tail_tokens`; `PagedPrefixCheckpoint` carries it | `prefix_cacher.rs:681`, `engine/mod.rs:476` | ~40 lines |
+| 4. retain the partial block **by id** in the same lease and release it on eviction; tail entries are single-owner | `block_pool.rs`, `prefix_cacher.rs` | ~50 lines |
+| 5. relax `engine/mod.rs:465`'s `is_multiple_of` gate; `cached_tokens = n_blocks*32 + tail_tokens` | `engine/mod.rs` | ~10 lines |
+| 6. gate: `--prefix-cache-n 1` and `--prefix-cache-n 0` on the same 7-turn conversation must produce the same tokens (§22) | harness | new |
+
+That is a half-day, not a milestone, *provided* the §20.1 anomaly is explained first - which is still the open item, and
+still one instrumented run: print `compute_block_hashes` for both requests of the failing pair.
