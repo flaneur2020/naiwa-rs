@@ -458,3 +458,30 @@ So the recommendation changes shape:
 
 `tail_hash` (§17) and the partial-block retention plan stay on the shelf: they are correct and needed only if the last
 few tokens of a prompt ever matter more than the chunk they force.
+
+### 18.1 Erratum: the loan-off row measured *no reuse*, not the loan's price
+
+The table above labels its second row "loan off", which invites reading 21 891 / 27 760 ms as what the loan costs. It is
+not. Re-running that arm with `MISTRALRS_PREFIX_DBG=1` shows the restore declining for a different reason:
+
+```
+PREFIX_DBG restore: no_replay_boundary cached=0 replay=NotRequired aux=false
+```
+
+`cached=0` is decided *before* the recurrent checkpoint is ever consulted: the KV-level block match found **no retained
+blocks at all**, so turn 2 re-prefilled from token 0 in four chunks (`range=Some((0,1024))`, `(1024,1280)`, `(1280,1536)`
+...). A checkpoint did exist in that arm ("Recurrent prefix cache full at 1 sequences, 1 checkpoints"), and `capture_gate`
+accepted, so what failed is the *retention* of the blocks, not the checkpoint.
+
+That is consistent with the loan protecting them indirectly: the loan returns ~1.3 GiB to the device, so the block pool
+sits further from pressure and its retained prefix blocks survive; without it, retained blocks are evicted under
+allocation pressure (`RETAINED_PREFIX_PRESSURE_EVICTIONS_METRIC` exists for exactly this). It also means the two arms in
+that table differ by **loan *and* reuse**, so the honest reading is:
+
+| arm | reuse | turn 1 | turn 2 |
+|---|---|---:|---:|
+| loan on | 3 136 of 3 153 tokens | 3 841 ms | 7 546 ms |
+| loan off | **none** (blocks evicted) | 21 891 ms | 27 760 ms |
+
+The loan's *own* price is therefore still unmeasured in this probe - and measuring it needs an arm where reuse happens
+either way, which is the same "don't borrow for a small step" override the next milestone needs.
