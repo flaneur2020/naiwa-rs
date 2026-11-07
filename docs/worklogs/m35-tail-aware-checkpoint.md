@@ -1115,3 +1115,40 @@ And in kernel time, which does not care about the host: **1.98 s against strata'
 So on the metric this milestone has been chasing (a cold long prompt's first token) naiwa is now ~2.6% behind, from 20.6%
 at the start of §21. The remaining visible difference is in the *whole request* (+8.1%), i.e. after the first token: the
 completion path, which §24 already flagged as ~200 ms of unexplained cost and which nothing in M35 touches.
+
+## 35. The after-first-token gap: the refill wait is not it
+
+The remaining +8.1% on the whole request is all after the first token, so it was instrumented with `NAIWA_STEP_TIME` on
+the shipped config (3 143-token prompt, 8 completion tokens):
+
+| step | duration |
+|---|---:|
+| prompt chunk (3 143 rows) | 3 265 ms |
+| decode 1 | **182 ms** |
+| decode 2 | 137 ms |
+| decode 3 | 113 ms |
+
+TTFT 3 279 ms, whole request 3 711 ms, so the 432 ms after the first token *is* those three steps (182 + 137 + 113 = 432).
+strata spends 309 ms on the same seven tokens (3 505 - 3 196), i.e. ~44 ms/token against our ~62 - and our steady state is
+~38 ms/token, so the difference is concentrated in the first decode step, which is 69 ms above our own steady state.
+
+Two candidates were tested and both are **not** it:
+
+| arm | decode 1 | decode 2 | decode 3 | whole request |
+|---|---:|---:|---:|---:|
+| shipped | 182 ms | 137 ms | 113 ms | 3 711 ms |
+| `NAIWA_REFILL=0` (no refill at all) | 88 ms | **318 ms** | 133 ms | 3 873 ms |
+| `NAIWA_REFILL_NOSYNC=1` (skip the one wait) | 181 ms | 140 ms | 119 ms | 3 839 ms |
+
+- skipping the refill moves the cost to the next step and makes the request *worse*: the readmits are worth paying for,
+  they are simply paid in the wrong place;
+- and the single `synchronize` in `refill_lent` is **not** where the 182 ms sits - removing it changes nothing, so the
+  per-slot `ReadFence` path is already doing the ordering and the wait returns as soon as the copies it queued are done.
+
+So the first decode step's 69 ms is elsewhere: the most likely remaining explanation is the speculative depth ramp (the
+first step drafts fewer tokens, so the same work buys fewer tokens) rather than per-token cost. That is measurable by
+counting tokens per step in both engines, which is the next probe - `STEP_TIME` gives durations, and `usage` gives the
+total, but neither gives the per-step token count for strata's side.
+
+`NAIWA_REFILL_NOSYNC` is kept as an env-gated probe (default off, behaviour unchanged) because it rules out an obvious
+and attractive hypothesis cheaply.
