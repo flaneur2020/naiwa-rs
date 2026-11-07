@@ -642,3 +642,49 @@ not been run yet, because the corpus's `{{DOC}}` placeholder was only substitute
 **Caveat that matters**: the host degraded during this session - the *same* naiwa arm measured 3 853 ms in the interleaved
 window and 5 825 ms twenty minutes later (the model is 54 GiB in a 60 GiB machine, and each run loads it again). Every
 number above holds *within* its window; the cross-window-comparable metric is kernel time.
+
+## 22. Risk assessment: what M35 can break, and what the current gates would not catch
+
+The prize is bounded and measured: the tail step is **~300 ms of a 3 856 ms TTFT** (§21), i.e. from +20.6% against strata
+to +11.1%. So the question is not "is it worth 300 ms" but "what does 300 ms buy in risk".
+
+**1. The gate that guards everything else is blind to this code.** The oracle arm runs `frac 0` + `--no-lookahead` **and
+`--prefix-cache-n 0`**: no prefix cache, so no checkpoint, no retention, no restore. Every byte-identical run this
+project has ever done says nothing about M35's lines. The 56 `cargo test` cases are the binary's, not the cache's.
+
+**2. The most likely failure is silent.** Three independent places can produce a *plausible* wrong answer rather than an
+error:
+- the tail's KV rows live in a partial block with no hash, so `PrefixBlockRetention::retain(&[BlockHash])` cannot name
+  it; used as-is, the block returns to LRU and another request's rows can be restored as ours (§17);
+- a prefix length that is not block-aligned has to reach the materialisation path, which allocates and *writes* the
+  sequence's own KV - into the very block the checkpoint's lease is holding, unless it is copied first (§4/S2, still
+  untenanted in code);
+- `cached_tokens` is assumed block-aligned in at least four places (`effective_recurrent_prefix_boundary`, the
+  `is_multiple_of` gate, `n_blocks * block_size`, `prompt_chunks`' boundary cap). Miss one and the restore's token count
+  and the state it restores disagree.
+This project's own history is the argument: the loan's defect (§15/§16) was *silent* too, took a milestone to find,
+survived one A/B (§20.13) and produced three wrong hypotheses here (§18, §18.1, §19.2). A KV-level variant would return
+fluent, wrong text instead of nothing, and no current gate would notice.
+
+**3. One anomaly in this exact area is still unexplained.** §20.1: a 3 143-token prompt reuses perfectly when the second
+request is identical and misses completely - `cached_tokens` 0 - when it appends anything, while lorem at 3 213 tokens
+does not. Adding partial-block entries to machinery that can already produce a total miss out of nowhere is how an
+unexplained miss becomes an unexplained *hit*.
+
+**4. Effort is moderate, and not the problem.** Steps 2/3/5 of §17 are mechanical (~200 lines, 4 files). Step 4 (retain
+the partial block by id) plus the copy-on-write above are the real work, and both need tests that do not exist yet.
+
+So: **yes, there is real risk - not to the shipped defaults (a flag keeps `--prefix-cache-n 1` byte-identical), but to
+the cache's correctness the moment the flag is on, in a way today's gates cannot see.** The order that makes it safe is
+therefore the inverse of the natural one:
+
+1. explain §20.1 (one instrumented run: print both requests' `compute_block_hashes` and the pool lookups);
+2. copy-on-write for a reused partial block, with a test that two sequences sharing a tail cannot see each other's writes;
+3. retain and release the tail block **by id**, with a test that a retained partial block is not handed to another request;
+4. then the key/metadata wiring, behind `--tail-checkpoint`, under a **new** gate: the same 7-turn conversation run twice,
+   once with `--prefix-cache-n 1` and once with `--prefix-cache-n 0`, comparing generated tokens for equality. That is the
+   "equal probe" rule this repo adopted for changes that cannot be bitwise (§20.8), and it is the only gate that would
+   catch (2).
+
+And a note on relative value: 300 ms is 8% of a turn, while the kernel-level gap against strata is 16% more kernel time in
+**56% more launches** (§24). Re-capturing that profile is cheap and may name a cheaper 8% than this one.
