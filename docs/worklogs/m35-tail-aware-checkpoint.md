@@ -869,3 +869,42 @@ attention; it depends on it being fixed first.
 The next probe is one print, in the two lookups at `block_pool.rs:800` and `:812`: for each of the first few block hashes,
 which of the two maps answered (or neither), and with which `kv_cache_group_ids`. That distinguishes "the retained entry
 was revoked" from "the group ids differ between the two requests", which is now the only fork left.
+
+### 20.4 Closed: it is not a bug, it is the chat template - and the probe was measuring the wrong thing
+
+Two more probes settled it, and the answer is a good one: the machinery is correct.
+
+`CACHE_DBG` (in `KVCacheManager::cache_blocks`) shows turn 1 registering all 98 blocks, and its **last** hash is
+`d3698418dd26dacb`. `MATCH_DBG` shows turn 2 looking for a block 97 whose hash is `fbccc26870550439` - a *different
+block*. And `HASH_DBG`'s tail dump says why:
+
+```
+turn 1 (3 143): last12 = [12102, 13053, 30183, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+turn 2 (3 153): last12 = [  799, 11316,    13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+```
+
+The two requests share the template's tail (`248046 198 248045 ...` = `<|im_end|>`, newline, `<|im_start|>`, role, ...) and
+differ exactly where the user's text ends - **inside turn 1's last block**. Appending to the *user message* moves the
+template's end-of-turn markers, so block 97 is genuinely different and a 97-block prefix match is the correct answer.
+
+That also explains every observation that looked mysterious:
+
+| observation | explanation |
+|---|---|
+| the same prompt sent twice reuses 3 136 | identical tokens, all 98 blocks match |
+| appending to the user message reuses 0 | the shared prefix is 97 blocks; the checkpoint is keyed at 98 (turn 1's own end), and a checkpoint is only usable when its key is a prefix of the matched blocks |
+| lorem at 3 213 reuses 3 200 | its suffix lands such that the last shared block survives |
+| the chat harness reuses 1 792 -> 2 240 | a real turn appends *after the assistant's answer*, so the shared prefix extends past turn 1's end and the checkpoint is a prefix of it |
+
+So §20.1/20.2/20.3 close as **not a defect**: the validator returning 0 when the matched prefix is shorter than the only
+checkpoint is pessimistic, not wrong - there is no shorter checkpoint to fall back to, and inventing one is exactly what
+§26's tail key does (it stores the checkpoint at the prompt's real end, which for a *conversation* is what the next turn
+extends).
+
+**And that unblocks M35**: the tail key was never waiting on this. What it needs is §26's five steps, with §26's safety
+argument, and its first gate is the equal-output probe over a 7-turn conversation - which today runs and reuses.
+
+Instruments added (all env-gated, all kept): `NAIWA_HASH_DBG` (block hashes + the prefix's last tokens),
+`NAIWA_MATCH_DBG` (`get_computed_blocks` block by block, the multimodal clamp, the recurrent validator, `reserve_prompt`'s
+numbers, and `cache_blocks`' registration range). Between them they answered a question that three sections of this worklog
+had guessed at.
