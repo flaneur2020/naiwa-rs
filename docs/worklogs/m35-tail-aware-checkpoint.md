@@ -1152,3 +1152,27 @@ total, but neither gives the per-step token count for strata's side.
 
 `NAIWA_REFILL_NOSYNC` is kept as an env-gated probe (default off, behaviour unchanged) because it rules out an obvious
 and attractive hypothesis cheaply.
+
+### 35.1 The decode gap, with both engines' own numbers for the same request
+
+strata's log prints the same request's split, which makes this comparable without a profiler:
+
+```
+strata serve: prompt 3143 tokens = 0 reused + 3143 read in 3125 ms (1005.7 tok/s),
+              8 generated in 368 ms (21.7 tok/s), drafts accepted 0 of 0, 1 checkpoint
+strata serve: decode expert cache hit rate: 33.8% (1020 hits / 3021 lookups)
+```
+
+| arm | prefill (3 143 tokens) | 8 tokens of decode | per token |
+|---|---:|---:|---:|
+| naiwa shipped (MTP on) | 3 265 ms (962 tok/s) | 432 ms | **62 ms** |
+| naiwa without MTP | 3 277 ms | 763 ms | 109 ms |
+| strata (**no speculation**) | 3 125 ms (1 006 tok/s) | 368 ms | **46 ms** |
+
+So prefill is at parity (962 against 1 006 tok/s, and 1.98 s of kernel time against 1.97), and the whole remaining gap is
+decode: **we are 35% slower per token than strata while drafting and they are not**. Turning MTP off confirms it is worth
+its cost on our side (1.75x: 109 -> 62 ms/token), so the strategy is right and the per-token *cost* is wrong.
+
+That makes the next target unambiguous and independent of everything in M35: profile a **decode-only** request (no prompt)
+in both engines and diff the kernel mix at one row per step. The prompt-time profile has been the instrument all along;
+decode has never been profiled on its own.
