@@ -1012,3 +1012,35 @@ a signature change on one call path, not new state.
 Gates as they stand: `cargo test` 56 passed, fork `retention:*` 5 + `block_pool:*` 22 passed, tree clean. The flag is off,
 so none of this is in the shipped path; the pieces are committed one per step (fork `20866d39`, `5191b2ca`, `79edaa85`,
 `48aa7592`).
+
+## 32. Why the tailed checkpoint never matched, and the one thing still wrong
+
+Two findings from the last two runs, and they are both the kind that only a trace gives up.
+
+**1. The gate that swallowed it published nothing.** `validate_prefix_cache_hit` refuses any boundary that is not a
+block multiple ("unaligned_boundary") and returned a reset to 0 *without a note*. A prompt's real end is exactly such a
+boundary, so every tailed checkpoint was thrown away there. The trace was: `restore_enter seq 2 cached=3143 …` and then
+`after_validator=0`, with no line to say why - three guesses earlier in this worklog were spent on machinery that was
+working. Both that branch and `checkpoint_unavailable` now print.
+
+**2. With the gate relaxed, the restore completes and the request then produces no token at all.** Not slow: wrong. That
+is precisely the failure mode §22 refused to ship, and it is the block-sharing step: the scheduler pushes the pinned block
+into `computed.block_ids`, the engine restores the recurrent state for `n*32 + tail` tokens, and the attention for those
+tail rows then reads a physical block whose rows are not where the sequence's table says they are. The pinned block *does*
+hold the tail's KV (that is what it was registered for), so the remaining bug is the mapping between "the physical block
+that holds rows 0..k" and "the sequence's block at index n".
+
+So storing and acting are separate switches now:
+
+| switch | what it does | measured |
+|---|---|---|
+| `NAIWA_TAIL_CHECKPOINT=1` | stores the tailed checkpoint, plan keeps the prompt's real end | turn 1 **3 197 ms**, one chunk of 3 143 (was 3 432-3 496 with the tail chunk) |
+| `NAIWA_TAIL_RESTORE=1` | additionally restores from it | **not safe yet** - produces no token |
+
+Both default off. The shipped path is untouched and re-verified: `SAME_TWICE` probe `cached=3136`, turn 2 158 ms,
+`cargo test` 56 passed.
+
+What is left is one mapping: when the scheduler appends the pinned block id to `computed.block_ids`, it must append the
+block whose *row layout* matches the position the tail occupies - i.e. the partial block as the sequence sees it, not as
+the pool registered it. The next probe is to print, at restore time, the sequence's `block_ids[n_blocks]` and the pointer
+the attention actually reads, and compare with the pinned block's rows.
