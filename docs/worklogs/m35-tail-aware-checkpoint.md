@@ -688,3 +688,41 @@ therefore the inverse of the natural one:
 
 And a note on relative value: 300 ms is 8% of a turn, while the kernel-level gap against strata is 16% more kernel time in
 **56% more launches** (§24). Re-capturing that profile is cheap and may name a cheaper 8% than this one.
+
+## 23. The cheapest 230 ms is a kernel we already have (and strata is no longer proﬁlable here)
+
+Re-captured naiwa's kernel timeline (nsys, 3 405-token cold prompt, shipped config):
+
+| | scalar QSA (default) | **tile QSA** (`NAIWA_QSA_MMA_KERNEL=1`) |
+|---|---:|---:|
+| kernel total | **2.30 s** / 24 034 launches | **2.07 s** / 23 8xx launches |
+| `q4_qsa_attention` | 512.7 ms / 153 | **185.5 ms / 153** |
+| `doorbell_wait_copy` (CPU-expert wait) | 129 ms / 218 | **236 ms / 454** |
+| MoE/dense quant GEMM | 845 ms / 2 973 | 845 ms / 2 973 |
+| GDN recurrence | 292 ms / 776 | 292 ms / 776 |
+| hyper-connection (`q4_hc_mix`+`q4_hc_combine`) | 90 ms / 1 411 | 90 ms / 1 411 |
+| casts (`cast_f32_bf16`, `cast_bf16_f32`, `quantize_q8_1`, `quantize_mmq_q8_1`) | ~60 ms / ~3 500 | same |
+
+So the tile kernel - measured 2.99x in M33 §20.9, still default-off because it changes the arithmetic order - buys **327 ms
+of attention and 230 ms net** (the doorbell wait grows by 107 ms as the GPU stops waiting on attention and starts waiting on
+the CPU experts). Against strata's *last* capture (1.97 s / 14 933) that moves us from +17% to **+5%**, and it needs no
+cache work at all.
+
+The launch-count gap (24 034 against 14 933) is not one thing: ~3 500 cast/quantize launches, 1 411 hyper-connection
+launches, 2 973 `mul_mat_q` launches. Strata's CLI advertises exactly the fusion we lack - `--no-fused-gr` describes "the
+six-kernel hyper-connection read and a separate write (native)", i.e. theirs is fused by default and ours is two kernels
+plus five fusion components per layer.
+
+**Strata can no longer be profiled on this host**, so 1.97 s stays a historical number: its engine binary now refuses to
+start ("this CPU cannot run the expert kernel: missing AVX512F AVX512BW AVX512VL AVX512-VNNI AVX512-VBMI"), and the server
+path spawns the engine over stdio in a way `nsys --trace-fork-before-exec=true` does not follow (the report contains no
+CUDA data). Its *wall clock* still works - 3 362 ms TTFT for the same 3 405-token prompt, in the same session as naiwa's
+5 917-6 010 ms under nsys - so comparisons are: wall clock through the server, kernels from the last capture.
+
+Next, in order of measured value per unit of risk:
+
+1. **enable the tile attention kernel** (-230 ms of kernel time, verified here) and re-baseline the oracle arm for it, per
+   the rule this repo already has for changes that cannot be bitwise (§20.8);
+2. **the doorbell wait** (236 ms with the tile kernel, and growing as other things get faster): that is GPU idle time
+   waiting for CPU experts, and it does not touch the prefix cache;
+3. only then M35's tail checkpoint (~300 ms of TTFT, with §22's risk profile).
