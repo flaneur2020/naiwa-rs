@@ -943,3 +943,37 @@ So M35 stands at: the mechanism is understood and its 300 ms are real; the reten
 unallocatable, a tail entry is single-owner, writes past the boundary are harmless); the last piece is getting one integer
 - the partial block's id - to the place that can hold it. That is the piece to do next, and it is a design decision about
 layering rather than another experiment.
+
+## 28. The last unknown is now code with a test: retaining a partial block by id
+
+§27 ended on "one integer has to travel": a partial block cannot be named by a full-block hash, so the checkpoint's lease
+needs an id half. That half is written and tested (fork `8bda6ac5`):
+
+- `PrefixBlockRetention::retain_with_tail(hashes, Some(block_id))` - the existing hash half plus a refcounted id in
+  `PrefixBlockRetentionState::id_ref_counts`, released by the same `Drop`;
+- `BlockPool::sync_retention_locked` reconciles the id set like it already reconciles the hash set, calling
+  `retain_physical_block` / `release_physical_block`;
+- and the invariant is pinned by a test: while the lease lives the block is **not handed out** by `get_new_blocks` (it is
+  out of the free queue), and after the lease drops all four usable blocks come back. `retention:*` 5 passed, 2 ignored;
+  `block_pool:*` 22 passed.
+
+So the safety argument of §26 is no longer an argument: pinning works, and a pinned block is unallocatable by
+construction.
+
+What is left is wiring the four call sites, in this order (nothing here is unknown any more):
+
+1. **the block id must reach the snapshot.** The scheduler knows a sequence's blocks (`req_to_blocks`) and the pipeline does
+   not, so the smallest route is to pass the tail block's id alongside the step's other per-sequence data - or, per §27
+   option 3, have the scheduler register the partial block under the tail hash it can compute from `seq_block_hashes` +
+   tokens, which needs no signature change at all and is the route to try first;
+2. `PagedRecurrentCacheEntry.tail: Option<(BlockHash, usize)>` + `retain_with_tail` in
+   `add_paged_recurrent_prefix` (`prefix_cacher.rs:488/537`);
+3. the capture side stops declining a non-multiple boundary (`pipeline/mod.rs:1931`) and computes the tail hash from
+   `seq.get_toks()`, declining when the sequence has multimodal features (the tail hash's extra keys then need the mm span);
+4. the lookup verifies the tail (`prefix_cacher.rs:681`, needs `tokens` + `block_size`) and carries `tail_tokens` in
+   `PagedPrefixCheckpoint`;
+5. `engine/mod.rs:465` stops requiring a block-aligned boundary for this case and uses
+   `cached_tokens = n_blocks*block_size + tail_tokens`;
+6. the gate: the same 7-turn conversation with `--prefix-cache-n 1` and `0` must produce identical tokens (§22), plus the
+   two-turn probes: a 3 143-token prompt should now run as **one** chunk, check at 3 143, and the next turn should reuse
+   3 143 (better than today's 3 136) with no tail chunk at all - which is §24's +12.6% turning into roughly +4%.
