@@ -414,3 +414,47 @@ So M35's remaining work, in the order that keeps it correct:
 Steps 2, 3 and 5 are mechanical. Step 4 is the one to do first, because it is what makes the rest safe - and because the
 thing it protects (a block with no hash) is the same shape as the failure that made the whole loan look like an OOM in
 §14.
+
+## 18. Reuse proven, and it reframes the milestone: the cost is the chunk, not the alignment
+
+A two-turn probe (one process, turn 1 = the 3 143-token prompt, turn 2 = the same prompt plus ten tokens, so the shared
+prefix is 3 143) turned up three facts that matter more than the tail key.
+
+**1. The checkpoint is actually used.** `MISTRALRS_PREFIX_DBG=1` shows turn 2 prefilling
+`range=Some((3136, 3153))`, i.e. **17 rows** starting at the checkpoint's boundary. This is the first direct evidence in
+this repo that the recurrent prefix path works end to end - the chat harness showed it indirectly, through
+`cached_tokens` climbing across turns (§16).
+
+**2. But 17 rows cost what 3 143 rows cost.** `NAIWA_STEP_TIME` and `NAIWA_STREAM_DBG`'s `req_time` give the layer loops:
+turn 1 (3 143 rows) 3 378 ms, turn 2 (17 rows) **2 386 + 2 599 ms** - and turn 2's TTFT is **7 546 ms** against turn 1's
+3 841 ms. The reason is the property M33 §20.13 measured and this milestone kept forgetting: a chunk streams the whole
+48-layer expert set regardless of how many rows it has (~45 ms/layer). So "reuse 3 136 of 3 153 tokens" saves rows,
+which were never the expensive part.
+
+| arm | turn 1 TTFT | turn 2 TTFT |
+|---|---:|---:|
+| loan on (default) | 3 841 ms | **7 546 ms** |
+| loan off | 21 891 ms | 27 760 ms |
+| loan on, `NAIWA_PREFILL_THRESHOLD=1` (17 rows on the GPU stream) | 4 247 ms | 8 827 ms |
+| loan on, `NAIWA_NO_TAIL_SPLIT=1` (no tail step, no new checkpoint) | 3 697 ms | 7 092 ms |
+
+The loan is not the problem (turning it off makes both turns 4-5x worse, because the plan chunk drops to 768 and the
+prompt needs five chunks instead of two), and neither the CPU path for 17 rows nor forcing that step onto the GPU stream
+fixes it (8 827 ms). What costs 7.5 s is **the number of chunks**, each of which re-streams every layer's experts.
+
+**3. That is where M35's value actually is, and it is smaller than §3 assumed.** §12's 483 ms is real, but it is a
+*single-shot* saving: it comes from removing one extra chunk that says 7 tokens. For a conversation, the same chunk
+boundary already exists (the plan's own chunk end), and the tail key would only save the *last* chunk's alignment - while
+the thing that actually decides a follow-up turn's TTFT is that a 17-row continuation is still a whole chunk.
+
+So the recommendation changes shape:
+
+- keep `NAIWA_NO_TAIL_SPLIT` as the knob it is (single-shot prompts: -483 ms, §12) and keep the default truncation for
+  chat, where reuse matters;
+- **the next milestone-worthy question is not the tail key but "why does a mostly-cache-hit continuation cost a full
+  chunk"** - i.e. a 17-row step should be served from the resident experts (the decode path) rather than by streaming
+  48 layers. §16's loan is what makes that hard today: the chunk empties the cache it borrows from, so the cheap path
+  has nothing resident to serve from.
+
+`tail_hash` (§17) and the partial-block retention plan stay on the shelf: they are correct and needed only if the last
+few tokens of a prompt ever matter more than the chunk they force.
