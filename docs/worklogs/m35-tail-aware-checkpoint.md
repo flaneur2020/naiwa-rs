@@ -609,3 +609,36 @@ What is left is something about *that request pair* - a 3 143-token prompt whose
 (`compute_block_hashes` is pure, so this is a print, not a debugger) and their pool lookups: if block 0's hash differs,
 the pipeline is feeding different tokens; if it is equal, the retained entry was dropped and the metric
 `RETAINED_PREFIX_PRESSURE_EVICTIONS_METRIC` will say so. Both are one run each, and neither needs the rest of M35.
+
+## 21. Where naiwa stands against strata, measured now
+
+Same session, same 3 143-token cold prompt, arms interleaved (naiwa, strata, naiwa, strata) so host drift hits both:
+
+| arm | TTFT | whole request |
+|---|---:|---:|
+| naiwa, shipped defaults | 3 853 / 3 859 ms (median **3 856**) | 4 294 / 4 298 ms |
+| naiwa + `NAIWA_NO_TAIL_SPLIT=1` | 3 559 / 3 547 ms (median **3 553**) | 4 139 / 4 105 ms |
+| **strata** | 3 205 / 3 192 ms (median **3 198**) | 3 499 / 3 515 ms |
+
+So naiwa is **+20.6%** on TTFT as shipped, **+11.1%** with the truncation knob, and +22.0% / +17.7% on the whole request.
+
+Where the gap is, from the parts already measured:
+
+| part | naiwa | strata | note |
+|---|---:|---:|---|
+| inside the layer loop (prefill proper) | ~3 179 ms | ~3 198 ms | M33 §22, same prompt: **parity** |
+| the 7-token tail chunk | ~300 ms | none | this is M35's premise: strata checkpoints at the prompt's real end, so it never needs the tail step |
+| layer-external overhead (A + C segments) | 171 ms (of which C 396 ms with `-n 1`, 112 ms with `-n 0`) | 71 ms | M33 §21/§22 |
+
+The two engine-side numbers that do not depend on the host's memory pressure (nsys, same session, M33 §24) say the same
+thing in another currency: **H2D 41.1 GB in 19 948 copies against strata's 41.4 GB in 18 707** - we move slightly fewer
+bytes - while kernels are **2.28 s in 23 275 launches against 1.97 s in 14 933**, i.e. 16% more kernel time in 56% more
+launches. That capture predates §16's loan fixes, so it is the number to re-take next.
+
+Multi-turn (chat harness, `doc` class, 7 turns, now working for the first time - §16): 0 failures, turn 1 3 528 ms for
+1 723 prompt tokens, later turns 621-2 651 ms with 1 792-2 240 cached tokens, TPOT 36-44 ms. Strata's arm of that class has
+not been run yet, because the corpus's `{{DOC}}` placeholder was only substituted in §16.
+
+**Caveat that matters**: the host degraded during this session - the *same* naiwa arm measured 3 853 ms in the interleaved
+window and 5 825 ms twenty minutes later (the model is 54 GiB in a 60 GiB machine, and each run loads it again). Every
+number above holds *within* its window; the cross-window-comparable metric is kernel time.
