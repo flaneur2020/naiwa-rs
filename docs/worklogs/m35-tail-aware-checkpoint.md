@@ -842,3 +842,30 @@ block_size, replay, mm)` is consulted *before* the recurrent cache, and `replay`
 speculative policy - not on the prefix. So the next print belongs there: log `cached_tokens` as the KV match computes it,
 before any policy touches it. If it is already 0 there, the loss is upstream in the paged KV match; if it is 3 136, the
 policy is dropping it.
+
+### 20.3 Capacity is not it either - and this blocks the tail key, not just a nicety
+
+Ruled out by experiment (two-turn probe, second request appends ten tokens, `cached_tokens` still 0 in every arm):
+
+| arm | `cached_tokens` in turn 2 |
+|---|---:|
+| shipped (`--pa-context-len 4096`, `--max-seqs 4`) | 0 |
+| `--pa-context-len 8192` | 0 |
+| `--max-seqs 2` | 0 |
+
+So it is neither the block count nor the per-sequence slot reservation. Combined with §20.2 (identical hashes), the miss
+is inside the *match* itself: `BlockPool::get_common_cached_block` (`block_pool.rs:790`) consults `retained_hash_to_block`
+first - gated on `has_all_groups`, i.e. on the block carrying every `kv_cache_group_ids` entry - and falls back to
+`cached_block_hash_to_block.get_common(hash, group_ids)` (`kv_cache_manager.rs:207`). The identical-request arm proves all
+of that machinery works for the same first request; only the appending request sees nothing, and its first-block hash is
+the same.
+
+**The conclusion that matters for this milestone**: a tail checkpoint is consulted *after* the KV match, from
+`effective_recurrent_prefix_boundary(cached_tokens, ...)`. If an appending request's `cached_tokens` is 0 at that point,
+the recurrent checkpoint is never looked at - so **M35's tail key cannot pay off on the workloads it targets (a
+conversation continuing its own prefix) until this is explained**. The tail key does not merely compete with this bug for
+attention; it depends on it being fixed first.
+
+The next probe is one print, in the two lookups at `block_pool.rs:800` and `:812`: for each of the first few block hashes,
+which of the two maps answered (or neither), and with which `kv_cache_group_ids`. That distinguishes "the retained entry
+was revoked" from "the group ids differ between the two requests", which is now the only fork left.
