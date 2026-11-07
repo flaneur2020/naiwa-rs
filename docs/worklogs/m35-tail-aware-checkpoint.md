@@ -582,3 +582,30 @@ follows the prompt - or the retained entry is dropped for a reason that has noth
 Until that is understood, the milestone's own conclusion stands unchanged: the truncation knob is a single-shot
 optimisation (§12), `tail_hash` stays parked (§17), and the reuse path is in better shape than the last two sections
 claimed.
+
+### 20.1 The miss is one prompt's, and bisection narrows it to its full length only
+
+Same serve command, same probe, second request = first plus ten tokens, unless stated:
+
+| prefix | prompt tokens | turn 1's chunks | `cached_tokens` in turn 2 | turn 2 |
+|---|---:|---|---:|---:|
+| lorem | 3 213 | `(0,3200) (3200,3213)` | **3 200** | 541 ms |
+| lorem (tail 11) | 3 211 | - | 3 200 | 469 ms |
+| lorem (tail 7) | 3 215 | - | 3 200 | 533 ms |
+| pf2900 / 4 | 790 | - | 768 | 703 ms |
+| pf2900 / 2 | 1 579 | - | 1 568 | 466 ms |
+| **pf2900** | **3 143** | `(0,3136) (3136,3143)` | **0** | 7 513 ms |
+| pf2900, second request **identical** | 3 143 | same | **3 136** | **160 ms** |
+| pf2900 + `" "` before the suffix | 3 153 | same | 0 | 7 500 ms |
+
+So the two structurally identical cases - lorem's `(0,3200)+(3200,3213)` and pf2900's `(0,3136)+(3136,3143)` - behave
+oppositely, and the same prompt that misses on an appended request hits perfectly on an identical one. Ruled out by the
+matrix: prompt length (3 213 works), its tail's length (7, 11, 13 all work), the chunk structure (identical), the block
+count (100 works), the loan (all of these run the shipped default), boundary tokenisation (inserting a space changes
+nothing), and the prefix's own content in general (the same file at half and quarter length reuses).
+
+What is left is something about *that request pair* - a 3 143-token prompt whose first chunk is the whole prompt minus a
+7-token tail, followed by a request that extends it. The next step is to dump the block hashes of both requests
+(`compute_block_hashes` is pure, so this is a print, not a debugger) and their pool lookups: if block 0's hash differs,
+the pipeline is feeding different tokens; if it is equal, the retained entry was dropped and the metric
+`RETAINED_PREFIX_PRESSURE_EVICTIONS_METRIC` will say so. Both are one run each, and neither needs the rest of M35.
