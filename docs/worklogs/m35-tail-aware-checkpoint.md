@@ -816,3 +816,29 @@ So the whole feature is:
 
 That is a half-day, not a milestone, *provided* the §20.1 anomaly is explained first - which is still the open item, and
 still one instrumented run: print `compute_block_hashes` for both requests of the failing pair.
+
+### 20.2 The hashes are equal - so the miss is in the match, not in the hashing
+
+`NAIWA_HASH_DBG=1` prints, for every `compute_block_hashes` call, the token count, the block count and the first three
+hashes. The failing pair (turn 1 = 3 143 tokens, turn 2 = the same plus ten):
+
+```
+HASH_DBG tokens=3143 blocks=98 first_tokens=[248045, 846, 198, 30724] head=3f9d245155943346 6d0ecbb2789983c4 9434afca819...
+HASH_DBG tokens=3153 blocks=98 first_tokens=[248045, 846, 198, 30724] head=3f9d245155943346 6d0ecbb2789983c4 9434afca819...
+```
+
+**Identical, block for block.** So the pipeline is not feeding a different prefix, no template or tokenizer subtlety is
+involved, and the total miss is not the hashing.
+
+That narrows §20.1 to a question about the *match*: given equal first-block hashes, why does a second request that appends
+ten tokens match **zero** blocks while the same request sent twice matches **98**? Same first request, same pool, same
+retention. The remaining candidates are the match/admission path (`get_common_cached_block`, the scheduler's
+`cached_tokens` computation, the `prefix_policy`/replay decision that runs *before* the recurrent lookup and can already
+return `cached=0` - `PREFIX_DBG restore: no_replay_boundary cached=0`), and the retention lease's revocation, which
+`prune_revoked_paged_recurrent_entries` turns into a silent entry removal.
+
+One observation that fits the append case and not the identical one: `effective_recurrent_prefix_boundary(cached_tokens, 0,
+block_size, replay, mm)` is consulted *before* the recurrent cache, and `replay` depends on the request's modality and
+speculative policy - not on the prefix. So the next print belongs there: log `cached_tokens` as the KV match computes it,
+before any policy touches it. If it is already 0 there, the loss is upstream in the paged KV match; if it is 3 136, the
+policy is dropping it.
