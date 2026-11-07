@@ -1462,3 +1462,39 @@ there is nothing to lend.
 per-chunk efficiency: 4 791 against 3 741 ms is 2.05 s against 1.87 s per chunk, and strata gets there with a 199-slot
 ring where we have two layer buffers. That is the overlap-depth question §20.9 ended on, not a residency question -
 and the PLE measurement in §20.12 (354 ms for two long prompts) rules the host table out as well.
+
+## 20.15 The tile attention kernel is the default now, and the oracle still matches
+
+§20.9 built `q4_qsa_attention_tile_kernel` (2.99x on attention) and left it off, because it changes the arithmetic order
+and the byte-exact oracle can only pin one order. §20.8's rule was then applied the other way round: measure what the
+reordering actually does to the gate.
+
+It does nothing. With the tile kernel as the default (`NAIWA_QSA_MMA_KERNEL=0` is now the scalar arm), the oracle arm
+(`frac 0` + `--no-lookahead`) is still **byte-identical** to `harness/m1/reference.oracle.txt`. That is consistent with the
+port's own check - `worst |mma-ref| = 0`, i.e. the mma path reproduces the scalar dot products exactly on this model - so no
+re-baseline was needed and the project keeps its strongest anchor unchanged.
+
+Measured, this session, 3 405-token cold prompt under nsys:
+
+| | scalar | **tile (default)** |
+|---|---:|---:|
+| kernel total | 2.30 s / 24 034 launches | **2.07 s** / 23 8xx |
+| `q4_qsa_attention` | 512.7 ms | **185.5 ms** |
+| `doorbell_wait_copy` | 129 ms | 236 ms |
+
+and on wall clock, interleaved, two runs an arm, 3 143-token prompt:
+
+| | TTFT | whole request |
+|---|---:|---:|
+| scalar (`=0`) | 3 574 / 3 585 ms | 3 998 / 4 004 ms |
+| **tile (default)** | **3 608 / 3 329 ms** | **3 908 / 3 626 ms** |
+
+Median TTFT 3 580 -> **3 469 ms** (-111 ms) and whole request 4 001 -> **3 767 ms** (-234 ms), which is the kernel-level
+-230 ms showing up in the clock, as it should.
+
+Correctness on the chat path: the `short` + `doc` classes run 15 turns with **0 failures** and reuse intact
+(`cached_tokens` 128, 256, 288 ... 2 048, 2 144, 2 176), `doc` turns at 644-1 542 ms.
+
+What this does *not* fix: the doorbell wait grew by 107 ms as attention stopped being the bottleneck. That is GPU idle time
+waiting for CPU-computed experts, and it is now the largest single avoidable block in the timeline (§23 of the M35
+worklog) - 236 ms, and it will grow as everything else gets faster.
