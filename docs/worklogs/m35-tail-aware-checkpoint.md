@@ -726,3 +726,25 @@ Next, in order of measured value per unit of risk:
 2. **the doorbell wait** (236 ms with the tile kernel, and growing as other things get faster): that is GPU idle time
    waiting for CPU experts, and it does not touch the prefix cache;
 3. only then M35's tail checkpoint (~300 ms of TTFT, with §22's risk profile).
+
+## 24. The gap now, with the tile kernel shipped
+
+Same session, arms interleaved, 3 143-token cold prompt, four runs an arm (§21's method, after §20.15):
+
+| arm | TTFT median | whole request median | against strata |
+|---|---:|---:|---:|
+| **naiwa, shipped** (tile kernel default) | **3 560 ms** | **3 940 ms** | **+397 ms / +12.6%** |
+| naiwa + `NAIWA_NO_TAIL_SPLIT=1` | 3 314 ms | 3 811 ms | **+162 ms / +5.1%** |
+| strata | 3 162 ms | 3 475 ms | - |
+
+Raw, so the spread is visible: naiwa 3 434 / 3 598 / 3 647 / 3 521; strata 3 278 / 3 144 / 3 180 / 3 145; naiwa without the
+tail step 3 402 / 3 227 against strata 3 160 / 3 146.
+
+So the tile kernel took the gap from **+658 ms (+20.6%, §21)** to **+397 ms (+12.6%)**, and the remaining gap is almost
+entirely the two things already named: the **tail chunk (~300 ms**, since removing it lands at +162 ms) and the
+**layer-external overhead (~100 ms)**. Kernel time, which is the number that ignores the host, is 2.07 s against strata's
+last capture of 1.97 s, i.e. **+5%**.
+
+Note what the whole-request column says: without the tail step the TTFT gap is 5.1% but the request still costs 10.4% more.
+So there is a second, smaller block *after* the first token (the completion path: 8 tokens of decode, the checkpoint
+snapshot, the prefix bookkeeping) worth ~200 ms that no previous section has isolated.
