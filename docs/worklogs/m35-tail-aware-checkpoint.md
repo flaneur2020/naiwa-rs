@@ -1080,3 +1080,38 @@ failures** and reuse unchanged; `cargo test` 56 passed.
 `NAIWA_TAIL_RESTORE` stays off and is documented as unsafe: with the floor fixed it would now be worth re-testing on a
 conversation that really continues past the prompt (not `SAME_TWICE`, which cannot exercise it by construction), and that
 is the first item for whoever picks this up.
+
+## 34. The doorbell wait is not a prefill cost, and where that leaves the comparison
+
+Asked whether the prefill stage could drop the CPU-expert doorbell. It can - because prefill never queues one:
+
+| call site | condition | path |
+|---|---|---|
+| `moe/expert.rs:110` | `seq == 1` | decode |
+| `moe/decode.rs:282` | `num_tokens <= prefill_threshold()` | decode |
+
+`cached_layer::forward` sends anything above the threshold down the prefill path, and that path runs the experts on the
+device out of the streamed buffers - `Pending::upload` (which is what launches `doorbell_wait_copy_f32`) is unreachable
+there. A switch to "turn the doorbell off during prefill" would be a no-op with a name.
+
+The measurement agrees: removing the 7-row tail chunk (§33) took the doorbell from **236 ms to 111 ms** and the kernel
+total from 2.07 s to **1.98 s**. What is left belongs to the small steps - the 1-row step every request starts with and
+the speculative verify steps - where `--cpu-moe` deliberately computes the experts on the host. Those waits are the CPU
+experts' latency, not an avoidable prefill overhead; the lever there is expert residency (or running decode MoE on the
+device when VRAM allows), not a phase switch.
+
+Final comparison, same session, arms interleaved, 3 143-token cold prompt, two runs an arm:
+
+| arm | TTFT | whole request |
+|---|---:|---:|
+| naiwa defaults (tile kernel) | 3 572 ms | 3 948 ms |
+| **naiwa shipped (tile + tail checkpoint)** | **3 278 ms** | **3 787 ms** |
+| strata | **3 196 ms** | **3 505 ms** |
+| gap, defaults | +377 ms / +11.8% | +443 ms / +12.6% |
+| **gap, shipped** | **+83 ms / +2.6%** | **+282 ms / +8.1%** |
+
+And in kernel time, which does not care about the host: **1.98 s against strata's 1.97 s** - parity.
+
+So on the metric this milestone has been chasing (a cold long prompt's first token) naiwa is now ~2.6% behind, from 20.6%
+at the start of §21. The remaining visible difference is in the *whole request* (+8.1%), i.e. after the first token: the
+completion path, which §24 already flagged as ~200 ms of unexplained cost and which nothing in M35 touches.
