@@ -372,3 +372,45 @@ Closing numbers, on the shipped defaults (loan on) after both fixes:
 
 So the loan's 3.6x on a long prompt is back, the short prompt no longer answers nothing, and the checkpoint machinery is
 exercised by a corpus for the first time.
+
+## 17. The key does not need to change - and what does need to change is the tail block's retention
+
+Reading the four places the checkpoint touches settles the design, and it is smaller than §3 assumed:
+
+| place | what it does with the key |
+|---|---|
+| `prefix_cacher.rs:681` `peek_longest_paged_recurrent_prefix` | `filter(key.len() <= max_blocks && block_hashes.starts_with(key))` then `max_by_key(key.len())` |
+| `:669` `get_longest_...` | `promote_paged_recurrent_prefix(&block_hashes[..n_blocks], ...)` - a lease over the key's blocks |
+| `:488` `add_paged_recurrent_prefix` | `retention.retain(&key)`, `paged_recurrent_sequence_keys[owner] = key` |
+| `engine/mod.rs:476` | `max_blocks = cached_tokens / block_size`, restore `n_blocks * block_size` |
+
+Putting the tail hash **inside** the key would make `key.len()` mean "blocks" in three of those and "blocks + 1" in the
+fourth, and would feed a non-block hash into `retain`. Keeping the key as block hashes only and storing the tail **beside**
+it - `tail: Option<(BlockHash, usize)>`, the hash from the new
+`paged_attention::block_hash::tail_hash` and the token count - leaves all four untouched. `tail_hash` is written and its
+invariant tested (`cargo test -p mistralrs-core --lib --features cuda tail_hash`; the fork's test suite needs
+`PATH=/usr/local/cuda/bin:$PATH`, without it `mistralrs-quant`'s build script fails): it chains like a block hash but
+refuses to alias the full block at the same place.
+
+**The blocker, and it is not the key.** The tail's KV rows live in *one partial physical block*, which has no hash - so
+`PrefixBlockRetention::retain(&[BlockHash])` (`block_pool.rs:175`, refcounted in `hash_ref_counts`) cannot name it. Once
+the sequence that produced the checkpoint releases its blocks, that partial block is ordinary LRU material and another
+request can be given it. A restore of `n_blocks * 32 + k` tokens would then read **someone else's KV rows** for the last
+`k` tokens: not a miss, silent corruption. So steps 1-3 and 5 below would be *worse* than doing nothing if done without
+step 4.
+
+The mechanism for 4 exists: `retain_physical_block(block_id)` (`block_pool.rs:665`) already keeps a block alive by id
+(`block_retention_counts`, `num_retained_physical_blocks`), which is how the pool protects blocks that have no hash. The
+work is to carry the tail block's id into the checkpoint's lease and to release it where the lease is dropped.
+
+So M35's remaining work, in the order that keeps it correct:
+
+1. ~~`tail_hash`~~ done, with its test.
+2. `PagedRecurrentCacheEntry.tail: Option<(BlockHash, usize)>`; `add_paged_recurrent_prefix` takes it; `snapshot_paged_recurrent_prefix` (`pipeline/mod.rs:1931`) stops declining a non-multiple boundary and computes it from `seq.get_toks()`.
+3. `peek_longest_paged_recurrent_prefix` takes the prompt's tokens (the caller has them) and, for each candidate entry with a tail, recomputes `tail_hash(block_hashes[n-1], &tokens[n*32 .. n*32+k], extra)` to confirm it; `PagedPrefixCheckpoint` carries the hit's `tail_tokens`.
+4. **Retain the tail block by id** in the same lease as the block-hash retention, and release it on eviction. This is the step that decides whether the feature is correct.
+5. Relax `engine/mod.rs:465`'s `is_multiple_of(block_size)` gate and make `stage_recurrent_restore`'s `cached_tokens` the hit's `n_blocks * block_size + tail_tokens`; `pipeline/mod.rs:1923`'s `cached_tokens.is_multiple_of` gate on the capture side goes away with step 2.
+
+Steps 2, 3 and 5 are mechanical. Step 4 is the one to do first, because it is what makes the rest safe - and because the
+thing it protects (a block with no hash) is the same shape as the failure that made the whole loan look like an OOM in
+§14.
