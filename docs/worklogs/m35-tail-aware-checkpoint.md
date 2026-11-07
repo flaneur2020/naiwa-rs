@@ -1176,3 +1176,27 @@ its cost on our side (1.75x: 109 -> 62 ms/token), so the strategy is right and t
 That makes the next target unambiguous and independent of everything in M35: profile a **decode-only** request (no prompt)
 in both engines and diff the kernel mix at one row per step. The prompt-time profile has been the instrument all along;
 decode has never been profiled on its own.
+
+## 36. Prefill on its own: within 3% of strata, and inside the noise band
+
+Same prompt (3 143 tokens), same session, one request per run, both engines' **own** prompt-step timings - naiwa's
+`NAIWA_STEP_TIME` prompt step, strata's `prompt N tokens ... in X ms` line:
+
+| run | naiwa prefill step | strata prefill |
+|---|---:|---:|
+| 1 | 3 227 ms (974 tok/s) | 3 136 ms (1 002 tok/s) |
+| 2 | 3 047 ms (1 032 tok/s) | 3 129 ms (1 005 tok/s) |
+| median | **3 137 ms / 1 003 tok/s** | **3 133 ms / 1 003 tok/s** |
+
+So prefill is **at parity** - the two medians agree to 4 ms, and the run-to-run spread on our side (180 ms) is larger than
+the difference. In kernel time, which is the host-independent number: **1.98 s against 1.97 s**.
+
+Two caveats worth recording, because they are visible in the same logs:
+
+- the *first* prompt step of a server's life is a 1-row step that costs 470-640 ms and belongs to no request. It is
+  startup, not prefill, and mixing it in is what made an earlier parse of mine read 813 tok/s;
+- strata's log also reports `decode expert cache hit rate: 33.8%` and `0 of 0` drafts. Its prefill number is unaffected by
+  either, but the decode comparison in §35.1 is: it reaches 46 ms/token with no speculation at all.
+
+Which leaves the shape of the whole comparison: **prefill parity, decode 35% behind** (62 ms/token against 46). Everything
+M35 did moved prefill; nothing it did touched decode, and decode is now the only place a gap remains.
