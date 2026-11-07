@@ -542,3 +542,43 @@ made a 3 143-token prompt cost 9 954 ms instead of 3 841. That lesson is worth k
 
 So M35 ends with: `tail_hash` parked (§17), the truncation knob from §12 shipped as a knob, and the real constraint named -
 on this card a conversation can reuse a ~40-block prefix but not a ~98-block one.
+
+## 20. The reuse curve is flat to 3 213 tokens, and one prompt reproduces a total miss
+
+§19.2 read a capacity limit out of one failing probe. Sweeping the prompt length with everything else fixed
+(`harness`-identical serve command, two turns, turn 2 = turn 1 plus ten tokens) shows **no cliff**:
+
+| prompt | `cached_tokens` in turn 2 | turn 1 | turn 2 |
+|---:|---:|---:|---:|
+| 973 | 960 | 2 634 ms | 512 ms |
+| 1 453 | 1 440 | 2 909 ms | 439 ms |
+| 2 093 | 2 080 | 3 182 ms | 547 ms |
+| 2 733 | 2 720 | 3 680 ms | 551 ms |
+| **3 213** | **3 200** | 3 926 ms | **541 ms** |
+| 3 211 (tail 11) | 3 200 | - | 469 ms |
+| 3 215 (tail 7) | 3 200 | - | 533 ms |
+
+So a 100-block prefix reuses as happily as a 40-block one, the tail's length is irrelevant, and **§19.2's "98 blocks do
+not survive to the next turn" is retracted** - it was inferred from the one probe that fails, not from a sweep.
+
+What *is* real is narrower and reproducible. `/tmp/pf2900.txt` (a 3 143-token Greek-letter word salad):
+
+| second request | `cached_tokens` | turn 2 |
+|---|---:|---:|
+| **identical** to the first | **3 136** | **160 ms** |
+| first + `"\n\nSay hi."` | **0** | 7 354 ms |
+| first + `"\n\nNow summarise the above in one sentence."` | **0** | 7 513 ms |
+
+while the lorem prompts at the same length reuse in both cases (3 200 of 3 213). So appending *anything* to that
+particular prefix invalidates it end to end - a total miss, not a partial one - and the identical request reuses it
+perfectly. Content-dependent, size-independent, tail-independent, loan-independent (the sweep runs the shipped default).
+
+That is a specific, falsifiable lead rather than a theory: **the next probe is to bisect `pf2900.txt`** (half, quarter,
+...) until the property appears or disappears, and to print `PREFIX_DBG`'s block match for both halves. A total miss on an
+appended request whose first block is byte-identical to a cached one is not something the block model explains, so either
+the hashing of that request's tokens differs from its own earlier hashing - a tokenizer/template path that depends on what
+follows the prompt - or the retained entry is dropped for a reason that has nothing to do with the blocks.
+
+Until that is understood, the milestone's own conclusion stands unchanged: the truncation knob is a single-shot
+optimisation (§12), `tail_hash` stays parked (§17), and the reuse path is in better shape than the last two sections
+claimed.
