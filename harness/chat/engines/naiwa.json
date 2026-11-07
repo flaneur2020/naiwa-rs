@@ -60,12 +60,14 @@
     "promotion": "on by default since M20 §25: promote up to 1 staged expert per layer per step, only if it has been demanded >= 4 times (dynamic residency that follows decode). Measured neutral (-1.1 ms median, inside the baseline's 6 ms spread).",
     "cold_start": "--expert-profile strata/data/expert-profile-coder.bin: the cache starts with the profile's hot experts (strata's ranking), 0.14 s, no extra VRAM. Cold turn-1 TPOT 45.6 vs 48.1 and cold turn-2 34.0 vs 39.6 (M20 §29).",
     "loan": "on by default (M33 §20.13), and correct since M35 §16. The loan briefly stopped being the default because a prompt fitting in a single streamed chunk answered nothing at all: borrow_buffers placed the layer's three projections back to back, while the private arm aligns each to 256 bytes, so IQ3_XXS (98 bytes per 256 elements) left the following IQ4NL projection unaligned, and every layer from the first IQ3_XXS one (37) produced a non-finite MoE output. The range was also 1 664 bytes too small for the layout's padding. Both fixed; NAIWA_PREFILL_BORROW=0 is the arm without the loan (a 3 143-token prompt: 4 791 ms with, 14 083 without).",
-    "attention": "the tile mma kernel is the default since M35 §23 / M33 §20.15: on a 3405-token prompt it takes q4_qsa_attention from 512.7 to 185.5 ms (kernel total 2.30 -> 2.07 s), wall clock -111 ms TTFT and -234 ms per request, and the frac 0 + --no-lookahead oracle stays byte-identical (the mma path reproduces the scalar dot products exactly: worst |mma-ref| = 0). NAIWA_QSA_MMA_KERNEL=0 is the scalar arm."
+    "attention": "the tile mma kernel is the default since M35 §23 / M33 §20.15: on a 3405-token prompt it takes q4_qsa_attention from 512.7 to 185.5 ms (kernel total 2.30 -> 2.07 s), wall clock -111 ms TTFT and -234 ms per request, and the frac 0 + --no-lookahead oracle stays byte-identical (the mma path reproduces the scalar dot products exactly: worst |mma-ref| = 0). NAIWA_QSA_MMA_KERNEL=0 is the scalar arm.",
+    "tail_checkpoint": "on (M35 §33): the prompt's last chunk keeps its real end instead of being truncated to a block boundary, so a 3143-token prompt runs as one chunk instead of 3136+7. Measured on the same session, interleaved against strata: TTFT 3548 -> 3220 ms (gap +12.5% -> +2.3%), whole request 3980 -> 3690 ms (+15.2% -> +7.0%). A checkpoint at that unaligned end is stored with the tail's content hash but NOT yet restored (NAIWA_TAIL_RESTORE, off): the doc class still reuses through the aligned checkpoints MISTRALRS_ALIGN_CHECKPOINTS takes during decode (cached 1792..2176, unchanged, 0 failures over 7 turns)."
   },
   "env": {
     "MISTRALRS_MTP_PREFIX_REPLAY": "none",
     "MISTRALRS_ALIGN_CHECKPOINTS": "1",
     "NAIWA_PROMOTE_MAX": "1",
-    "NAIWA_PROMOTE_MIN_HITS": "4"
+    "NAIWA_PROMOTE_MIN_HITS": "4",
+    "NAIWA_TAIL_CHECKPOINT": "1"
   }
 }

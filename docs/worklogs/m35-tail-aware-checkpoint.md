@@ -1044,3 +1044,39 @@ What is left is one mapping: when the scheduler appends the pinned block id to `
 block whose *row layout* matches the position the tail occupies - i.e. the partial block as the sequence sees it, not as
 the pool registered it. The next probe is to print, at restore time, the sequence's `block_ids[n_blocks]` and the pointer
 the attention actually reads, and compare with the pinned block's rows.
+
+## 33. Shipped: the capture side alone, and where that leaves naiwa against strata
+
+The restore side is not needed for the win. Keeping a prompt's last chunk at its **real** end costs nothing when the
+checkpoint taken there is simply *not used* - and in a conversation it does not need to be, because
+`MISTRALRS_ALIGN_CHECKPOINTS` takes aligned checkpoints during decode that sit further along the same prefix.
+
+Why the restore is inert even when enabled - two independent reasons, both measured:
+
+- a fully-cached prompt has **no token left to compute logits for** (the "at most `num_tokens - 1`" rule), so restoring
+  every prompt token cannot produce a first token at all. The `SAME_TWICE` probe showed exactly that: `restore_enter
+  seq 2 cached=3143`, the restore completes, and the request returns nothing;
+- and in the doc corpus the reusable checkpoint is a *decode-time* one anyway: cached values stay 1 792 / 1 888 / … /
+  2 176, all block-aligned, with the tail checkpoint stored and never consulted.
+
+One real bug fell out of it, and it is fixed: `computed_block_count = num_computed / block_size` **floors**, so the
+partial block a tailed hit had just appended was sliced off again and `reserve_prompt` allocated a fresh one - the state
+would claim `n*32+k` tokens with `n*32` of K/V behind it. It is `div_ceil` now (identical for aligned prefixes).
+
+Same session, arms interleaved, 3 143-token cold prompt, two runs an arm:
+
+| arm | TTFT median | whole request median | gap vs strata |
+|---|---:|---:|---:|
+| naiwa shipped (tile kernel) | 3 549 ms | 3 980 ms | **+394 ms / +12.5%** |
+| **naiwa + `NAIWA_TAIL_CHECKPOINT=1`** | **3 220 ms** | **3 690 ms** | **+71 ms / +2.3%** |
+| strata | 3 154 ms | 3 449 ms | - |
+
+So the tail chunk was most of the remaining gap: **+12.5% -> +2.3%** on TTFT, +15.2% -> +7.0% on the whole request.
+
+Gates: the oracle (`frac 0` + `--no-lookahead`) is **byte-identical** (it runs `--prefix-cache-n 0`, so the chunk plan has
+no block alignment to keep and the flag changes nothing); the chat harness runs 15 turns (`short` + `doc`) with **0
+failures** and reuse unchanged; `cargo test` 56 passed.
+
+`NAIWA_TAIL_RESTORE` stays off and is documented as unsafe: with the floor fixed it would now be worth re-testing on a
+conversation that really continues past the prompt (not `SAME_TWICE`, which cannot exercise it by construction), and that
+is the first item for whoever picks this up.
