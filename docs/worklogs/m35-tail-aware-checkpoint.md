@@ -977,3 +977,38 @@ What is left is wiring the four call sites, in this order (nothing here is unkno
 6. the gate: the same 7-turn conversation with `--prefix-cache-n 1` and `0` must produce identical tokens (§22), plus the
    two-turn probes: a 3 143-token prompt should now run as **one** chunk, check at 3 143, and the next turn should reuse
    3 143 (better than today's 3 136) with no tail chunk at all - which is §24's +12.6% turning into roughly +4%.
+
+## 30. The tail chunk is gone; reuse is one scheduler change away
+
+What `NAIWA_TAIL_CHECKPOINT=1` does today, measured on the 3 143-token two-turn probe (this session):
+
+| | chunk plan of turn 1 | turn 1 TTFT | turn 2 |
+|---|---|---:|---:|
+| default (flag off) | `(0,3136) (3136,3143)` | 3 496 ms | 7 235 ms |
+| `NAIWA_TAIL_CHECKPOINT=1` | **`(0,3143)`** | **3 203 ms** | 6 842 ms |
+
+So the mechanism works end to end on the capture side: one chunk, a checkpoint at the prompt's real end
+(`snapshot: seq 1 tokens=3143 blocks=98`), and the ~300 ms the tail step cost is gone. The flag stays **off**, because
+reuse needs the last step and without it turn 2 re-prefills in both arms (7 235 against 6 842 is noise, not a win).
+
+The last step, precisely (and it is a scheduler change, not an engine one):
+
+1. the attention KV for the tail rows lives in the **pinned partial block**, so a restore of `n*32 + tail` tokens has to
+   put that block into the sequence's block table - the engine cannot (`EitherCache::Hybrid` has no `BlockPool`), and
+   `PagedPrefixCacheValidation` can only *shrink* the scheduler's prefix today;
+2. so the scheduler must ask: after `get_computed_blocks`, call
+   `peek_longest_paged_recurrent_prefix_tailed(block_hashes, max_blocks, tokens, block_size)`; on a hit with
+   `tail_tokens > 0`, derive `partial_block_key(block_hashes[n-1], tail_tokens)`, ask the pool for its id (a new
+   `partial_block_for(key) -> Option<usize>`, one lookup in `partial_hash_to_block`), append that id to
+   `computed.block_ids` and add `tail_tokens` to `num_computed_tokens` (giving 99 blocks / 3 143 tokens);
+3. `reserve_prompt` then reserves 0 extra blocks and `touch`es all 99, so the pinned block is shared with a refcount and
+   the model reads the tail's KV from it;
+4. the engine's restore only has to use `checkpoint.tail_tokens` - which `PagedPrefixCheckpoint` already carries.
+
+Blocker for that step, found at the end of this session: **the scheduler has no handle on the prefix cacher**
+(`grep prefix_cacher paged_attention/scheduler.rs` is empty), so it has to be passed in at the scheduler's entry point -
+a signature change on one call path, not new state.
+
+Gates as they stand: `cargo test` 56 passed, fork `retention:*` 5 + `block_pool:*` 22 passed, tree clean. The flag is off,
+so none of this is in the shipped path; the pieces are committed one per step (fork `20866d39`, `5191b2ca`, `79edaa85`,
+`48aa7592`).
