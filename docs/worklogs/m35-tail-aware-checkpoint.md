@@ -1200,3 +1200,40 @@ Two caveats worth recording, because they are visible in the same logs:
 
 Which leaves the shape of the whole comparison: **prefill parity, decode 35% behind** (62 ms/token against 46). Everything
 M35 did moved prefill; nothing it did touched decode, and decode is now the only place a gap remains.
+
+## 37. Decode on its own: +11.5% per token, not 35%
+
+§35.1's 62 against 46 ms/token came from an eight-token window, where the first decode step (182 ms, 69 ms above our own
+steady state) dominates the average. Measuring decode as its own thing - a 23-token prompt and 128 generated tokens, so
+prefill is 0.6 s of a 6 s request - gives a different and more honest number. Same harness against both engines' OpenAI
+endpoints, one request per run:
+
+| arm | ttft | 128 tokens | per token |
+|---|---:|---:|---:|
+| naiwa, shipped (MTP on) | 644 / 565 ms | 6 263 / 6 058 ms | **44.2 / 43.2 ms** |
+| naiwa, MTP off | 507 ms | 6 847 ms | 49.9 ms |
+| strata | 690 / 616 ms | 5 644 / 5 036 ms | **39.0 / 39.3 ms** |
+
+(strata's second number is its own line: `128 generated in 5036 ms (25.4 tok/s)`; its prompt line was 23 tokens in 616 ms.)
+
+So steady-state decode is **43.7 ms/token against 39.2, +11.5%** - and that is with our MTP drafting while strata drafts
+nothing (`drafts accepted 0 of 0` in its own log). Two things follow:
+
+- the earlier "35%" was a first-step artefact, and the honest decode gap is about **+4.5 ms/token**;
+- MTP is worth only **13%** at this length (49.9 -> 43.7), not the 1.75x the eight-token window suggested: its value is in
+  the *first* steps and in short generations, where the draft acceptance is high per verify step, and it flattens as the
+  context and the generated text grow.
+
+So the shape of the whole comparison, all four parts measured the same way:
+
+| | naiwa | strata | gap |
+|---|---:|---:|---:|
+| prefill (3 143 tokens) | 3 137 ms (1 003 tok/s) | 3 133 ms (1 003 tok/s) | **parity** |
+| kernel time (prompt request) | 1.98 s | 1.97 s | +0.5% |
+| decode, steady state | 43.7 ms/token | 39.2 ms/token | **+11.5%** |
+| decode, first steps (8-token window) | 62 ms/token | 46 ms/token | +35% |
+| TTFT, 3 143-token cold prompt | 3 278 ms | 3 196 ms | +2.6% |
+| whole request (8 tokens) | 3 787 ms | 3 505 ms | +8.1% |
+
+The decode gap is now the only one worth chasing, and it is 4.5 ms/token: a profile of a decode-only request in both
+engines, comparing the kernel mix at one row per step, is the way in - that profile has never been taken on either side.
