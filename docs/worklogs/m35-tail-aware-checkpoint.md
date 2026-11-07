@@ -748,3 +748,34 @@ last capture of 1.97 s, i.e. **+5%**.
 Note what the whole-request column says: without the tail step the TTFT gap is 5.1% but the request still costs 10.4% more.
 So there is a second, smaller block *after* the first token (the completion path: 8 tokens of decode, the checkpoint
 snapshot, the prefix bookkeeping) worth ~200 ms that no previous section has isolated.
+
+## 25. There is no cheap way out: the tail chunk is structural, and the "mixed rule" is a no-op
+
+The obvious dodge was to keep the checkpoint but stop paying for the extra chunk: truncate only when the plan has no
+earlier boundary, i.e. "skip the truncation at the prompt's end if a chunk was already emitted". That was implemented
+(`skip_at_end(end, !chunks.is_empty())`, applied to all four places that end a chunk) and measured against
+`NAIWA_NO_TAIL_SPLIT=0` (the old always-truncate arm) with `NAIWA_CHUNK_DBG=1`:
+
+| configuration | chunk plans, both arms |
+|---|---|
+| shipped ceiling | `(0,3136) (3136,3143)` - **identical in both arms** |
+| `--max-prefill-chunk-tokens 1024` | `(0,3136) (3136,3143)` - **identical in both arms** |
+| 3 405-token prompt | `(0,3392) (3392,3405)` - identical |
+
+The reason is structural, and it is worth writing down because it closes the question: the tail chunk is created **by the
+truncation itself**, at a moment when `chunks` is still empty. When the plan *does* split earlier (the nsys sessions,
+whose ceiling was 2 816: `(0,2816) (2816,3136) (3136,3143)`), the truncation does not add a chunk - it only moves the last
+boundary - so skipping it changes nothing about the count. In other words:
+
+- truncate at the end -> the last chunk ends at `align_down(total, 32)` and the remainder becomes its own chunk: a
+  checkpoint exists, and it costs one small chunk (measured 275-346 ms, and ~300 ms again in §24);
+- do not truncate -> there is no aligned boundary anywhere, so there is no checkpoint at all, and the next turn
+  re-prefills (7 317 ms against 550 ms on a two-turn probe);
+- and there is no third option in the current code, because a checkpoint can only be taken at a *chunk* boundary.
+
+So the choice is exactly the trade §22 priced, and M35's body (a key that can name the prompt's real end) is the only way
+to have both. The "mixed rule" was reverted rather than kept: it is dead code in every configuration this card reaches,
+and its only effect would have been to make the code say something it does not do.
+
+That leaves the sequence of §22 unchanged, with one item now cheaper to justify: the tail chunk is not an artifact of a
+bad truncation site that someone can move - it is the cost of the only boundary the checkpoint format can express.
