@@ -908,3 +908,38 @@ Instruments added (all env-gated, all kept): `NAIWA_HASH_DBG` (block hashes + th
 `NAIWA_MATCH_DBG` (`get_computed_blocks` block by block, the multimodal clamp, the recurrent validator, `reserve_prompt`'s
 numbers, and `cache_blocks`' registration range). Between them they answered a question that three sections of this worklog
 had guessed at.
+
+## 27. The last unknown in the plan: who can name the partial block
+
+§26 assumed step 4 could reuse the existing hash-based retention by registering the partial block under the tail hash. Two
+looks at the layers say no, and the reason is worth writing down because it is the only thing left that is not mechanical:
+
+- the **pipeline** (`snapshot_paged_recurrent_prefix`) has the prefix cacher and the sequence, but the pool is not reachable
+  from it: `EitherCache::Hybrid(HybridCache)` carries the hybrid KV cache, while the `BlockPool` lives in the scheduler's
+  `KVCacheManager`. So the pipeline cannot register a hash for a block;
+- the **sequence** does not carry its block ids; the scheduler's `req_to_blocks` does. So the pipeline cannot even name the
+  physical block that holds the tail, which is what `retain_physical_block(id)` needs;
+- `PrefixBlockRetention` (which *is* shared: the cacher holds it, and the pool reconciles from it in
+  `sync_retention_locked`) knows only hashes. It is the one place both sides can see, so the tail id must be carried
+  *through it* - `RetainedPrefixEntry { hashes, tail_block: Option<usize>, .. }` - with the pool's reconciler calling
+  `retain_physical_block`/`release_physical_block` for that id.
+
+Which means the remaining change is a **plumbing** one, of a shape this codebase does not have yet: the tail block's id has
+to travel from the scheduler (where a sequence's blocks are known) to the checkpoint entry (where it was not). Three
+options, in increasing size:
+
+1. let the scheduler pass the sequence's block table into `snapshot_paged_recurrent_prefix` (it already calls into the
+   pipeline, so this is a parameter, not a new channel) - smallest;
+2. have `Sequence` carry its block ids (the scheduler already keeps them in `req_to_blocks`; a copy on the sequence is
+   redundant state, and this codebase has been bitten by redundant state before);
+3. register the partial block in the pool from the *scheduler* when it caches full blocks (it is right there, in
+   `cache_blocks`) under the same tail hash the checkpoint will use - but then the hash must be computed in two places, or
+   passed down.
+
+Option 1 is the one to try first: it adds no state, and the scheduler is where both facts (the block table and the moment
+of the snapshot) already meet.
+
+So M35 stands at: the mechanism is understood and its 300 ms are real; the retention plan is sound (a retained block is
+unallocatable, a tail entry is single-owner, writes past the boundary are harmless); the last piece is getting one integer
+- the partial block's id - to the place that can hold it. That is the piece to do next, and it is a design decision about
+layering rather than another experiment.
