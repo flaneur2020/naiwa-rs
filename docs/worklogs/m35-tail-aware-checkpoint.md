@@ -485,3 +485,60 @@ that table differ by **loan *and* reuse**, so the honest reading is:
 
 The loan's *own* price is therefore still unmeasured in this probe - and measuring it needs an arm where reuse happens
 either way, which is the same "don't borrow for a small step" override the next milestone needs.
+
+## 19. Two corrections, one neutral experiment, and where the real reuse limit is
+
+### 19.1 §18 was wrong about the reuse: that probe never reused
+
+`NAIWA_CHUNK_DBG=1` prints **every** chunk of every prompt step, and turn 2 of the 3 143-token probe is:
+
+```
+start=0    end=1536   final=false
+start=1536 end=3072   final=false
+start=3072 end=3136   final=false
+start=3136 end=3153   final=true
+```
+
+Four chunks from token 0. The `range=(3136, 3153)` line §18 read as "reuse proven, 17 rows" was the *last* of those
+chunks, i.e. the tail of a full re-prefill. So §18's "reuse proven" and §18.1's "retention failed under loan pressure"
+are both wrong: **the KV prefix match returned nothing**, which is why the plan started at 0.
+
+### 19.2 The real limit is the retained-block budget
+
+The same probe with a **1 293-token** prompt reuses perfectly:
+
+```
+start=1280 end=1303   final=true      # one chunk, 23 rows, from the checkpoint's boundary
+```
+
+turn 1 3 123 ms, **turn 2 534 ms**. So the mechanism works, and it works best where it is cheap. What separates the two
+probes is the size of the retained prefix: 3 136 tokens is 98 blocks, 1 280 is 40. On this card (`--pa-context-len 4096`,
+`--max-seqs 4`, a 2.5 GB expert cache) 98 retained blocks do not survive until the next turn; 40 do. That is a capacity
+fact about the block pool, not about the loan, the checkpoint or the alignment - and it is the number a "long-context chat"
+feature would have to raise.
+
+### 19.3 "The only chunk does not borrow" is a true statement with no measurable effect
+
+Acting on §18, the prompt path was taught to skip the loan when a step is a sequence's **only** chunk (it starts where the
+sequence entered the step and ends at its prompt's end), on the grounds that the loan exists to lower the *number* of
+chunks and such a step has no chunk to buy. Implemented and measured, three runs an arm, on the 1 293-token probe
+(turn 2 = the 23-row continuation, i.e. exactly the step in question):
+
+| arm | turn 2 TTFT |
+|---|---:|
+| skip the loan on an only-chunk step | 476 / 520 / 534 ms |
+| borrow as before | 563 / 463 / 497 ms |
+
+**Neutral, and the mechanism says why**: `refill_lent` already puts back everything the loan displaced (723 experts, one
+queued copy each, then one wait), so the loan's cost to a conversation is that single refill - not the cold cache §18
+assumed. What made the 3 143-token probe slow was 19.2's re-prefill, which no borrow policy touches.
+
+The change was therefore **reverted** rather than kept as a knob: it needed a per-step global in mistralrs-core, a
+buffer-provenance check (`LayerBuf.borrowed`) so a step cannot reuse the other mode's buffers, and a callback split in
+`PrefillStream::decide` between "can borrow" (the plan) and "borrows this step" (the allocation) - and one instructive
+failure along the way: sizing the *plan* from the per-step decision dropped the chunk from 3 072 to 1 024 at warmup and
+made a 3 143-token prompt cost 9 954 ms instead of 3 841. That lesson is worth keeping even though the code is not:
+**a once-per-session decision must not be taken from a per-step fact.**
+
+So M35 ends with: `tail_hash` parked (§17), the truncation knob from §12 shipped as a knob, and the real constraint named -
+on this card a conversation can reuse a ~40-block prefix but not a ~98-block one.
