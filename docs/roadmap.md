@@ -8,6 +8,9 @@ Design and current-state detail live in [`design.md`](design.md); per-milestone 
 Recorded 2026-10-16; last updated 2026-11-02 after the CUDA-graph line was withdrawn (M29-M32) and M33 opened
 (the prompt path borrows the expert cache).
 
+**M38** (launch count on the decode critical path) is open: 107 launches and 236 µs of inter-kernel gap per layer call,
+a 0.7 ms/token ceiling for the whole launch bill. See [`worklogs/m38-launch-count.md`](worklogs/m38-launch-count.md).
+
 ---
 
 ## Judging principles
