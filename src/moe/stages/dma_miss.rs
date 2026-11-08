@@ -16,8 +16,10 @@ use super::Hit;
 /// first half's kernels.
 fn staging_waves() -> usize {
     // M26 measured waves = 2 against waves = 1 and found no difference (TPOT 38.1 against 38.5 ms, inside
-    // the +-8% noise) while `staging_wait` grew by 1.6 ms, so the shipped default is the old single batch.
-    // The wave path stays for the record and for anyone who wants to re-measure it.
+    // the +-8% noise) while `staging_wait` grew by 1.6 ms, so the default stays at one batch. M36 §13
+    // re-measured: 4 waves win on the decode-only arm (42.8 / 44.2 / 42.3 against 44.3 / 45.5 / 44.2 ms per
+    // token) but lose in the chat harness (TPOT median 41.6 against 40.2 over 154 turns) - the waves
+    // interleave with prefill and with reuse, so the single-batch default is the one that ships.
     std::env::var("NAIWA_STAGING_WAVES")
         .ok()
         .and_then(|v| v.parse().ok())

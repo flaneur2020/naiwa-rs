@@ -496,3 +496,72 @@ already measured what each would cost (AVX-512 or more VRAM).
 
 The kernels stay, default on, because they are free: three unit tests, no numeric change to anything the oracle covers
 (single-row decode never takes the two-row path), and a strictly lower host cost.
+
+## 13. The overlap question: 18.6 ms/token is exposed, and the window is one layer wide
+
+Asked whether the overlap between host and GPU has room. It does, on paper, and the size is easy to state from §12's
+numbers:
+
+| term | per token |
+|---|---:|
+| host expert compute | ~20-24.6 ms |
+| GPU path (perfect-cache measurement) | 26.4 ms |
+| wall clock | 45 ms |
+| **hidden by overlap** | **~1.7-6 ms** |
+| **exposed** | **18.6 ms** (0.39 ms per layer) |
+
+If the host work were fully hidden the decode would cost ~26.4 ms/token, i.e. **18.6 ms/token is the prize**. The question
+is whether the window can be widened.
+
+### Why the window is one layer wide
+
+Inside a step the chain is `attn_L -> route_L -> MoE_L -> x_{L+1}`. The misses of layer L can only be submitted after
+`route_L`, and their result is needed by `MoE_L`, so the GPU work available to hide them is exactly *layer L's own cached
+experts* - the `Hit` GEMVs, ~1.4 ms per layer, which is the 1 272-1 405 µs `gap` column in `FUSED_DBG`. The host batch is
+~1.3-1.9 ms for the same layer. **That is why the two are neck and neck, and why a 9.2% host improvement (§12) disappears
+into the overlap instead of showing up.**
+
+Widening the window therefore needs one of:
+
+1. **more GPU work between submit and join** for the same layer - not available: everything else in the layer depends on
+   the MoE result;
+2. **cross-step prefetch** of the next step's predicted misses - the lookahead thread, which is empirically idle (470
+   loads against 15 640 swaps);
+3. **fewer misses** so the host batch fits inside the window (cache capacity; VRAM-bound, §11).
+
+### What was tried: staging waves and the DMA share
+
+The staging ring is the one mechanism that turns host work into *overlappable* GPU work: a share of the misses is DMA'd
+into the ring and computed on the GPU alongside the residents. `NAIWA_STAGING_WAVES` splits a step's staged experts into
+waves, each with its own event, so the GPU starts on wave 1 while the later waves' DMA is still landing (events, not
+slots - no extra VRAM).
+
+| config | decode-only, 128 tokens |
+|---|---:|
+| `--pcie-frac 0.4`, waves 1 (default) | 44.3 / 45.5 / 44.2 ms per token |
+| `--pcie-frac 0.4`, waves 4 | **42.8 / 44.2 / 42.3** |
+| `--pcie-frac 0.7`, waves 4 | 49.6 |
+| `--pcie-frac 1.0`, waves 4 | 59.0 |
+
+So the overlap axis *is* real, and 4 waves buy 1.5 ms/token on an isolated decode. But the shipped workload is the chat
+harness, and there the same change **loses**:
+
+| arm | chat harness, 154 turns |
+|---|---:|
+| waves 1 (default) | **TPOT median 40.2 ms** |
+| waves 4 | 41.6 ms |
+
+The waves interleave with prefill chunks and with prefix reuse, and `staging_wait` grows (the effect M26 recorded). So the
+default stays at one batch, `NAIWA_STAGING_WAVES` stays as the documented knob, and the win is recorded for the
+decode-only case rather than shipped.
+
+Raising `--pcie-frac` past 0.4 remains strictly worse: at 0.7 and 1.0 the link time of ~131 experts per token (262 MB
+against 13.4 GB/s) exceeds what the window can hide, and the ring is 16 slots shared by all layers.
+
+### Net answer
+
+- The overlap space is **18.6 ms/token**, but it is not reachable by scheduling alone: the window is structurally one
+  layer's cached-expert work (~1.4 ms) against a host batch of ~1.3-1.9 ms.
+- The measured overlap knobs move 1.5 ms/token in the lab and lose it back in the chat harness.
+- Getting the 18.6 ms needs the host batch to shrink *below* the window everywhere (fewer misses via VRAM, or a faster
+  host via AVX-512) or a working cross-step predictor - the two things §11 already identified, in that order.
