@@ -1,7 +1,8 @@
 # M35 — the prefix checkpoint is keyed on the prompt's real end, not on a block boundary
 
-**Status:** proposed; feasibility checked against the code, nothing built (2026-11-06). This file is the design and the
-plan; sections are added as the steps land, the way M33/M34 were.
+**Status:** ✅ closed (2026-11-07) — the *fix* shipped and stayed, the *mechanism* was deleted by
+[M36](m36-cleanup-and-final-comparison.md) after its own §33/§38 measurement showed the tail checkpoint bought nothing
+over simply not truncating. What survived into the tree is one rule: the prompt's last chunk keeps its real end.
 **Parent:** M34 §27-§28 (the `--prefix-cache-n 1` penalty is a whole extra step for a 7-token tail: 346 ms of a 3.7 s
 single-shot prompt), M10 ("a checkpoint needs a block-aligned prompt step" - the decision M35 replaces), M16 item 1
 (`align_down(prompt, 32)`).
