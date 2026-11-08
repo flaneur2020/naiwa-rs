@@ -276,3 +276,45 @@ one codebook lookup serves every row that shares the expert, instead of re-deriv
 look at are `mistralrs-quant/src/gguf/fused_cpu.rs` (the rayon pool and its per-pair loop) and the per-type row kernels it
 calls. No change to numerics is required or wanted: the arithmetic order stays as it is, only the loop structure moves -
 which keeps the §"arithmetic order" constraint intact.
+
+## 9. How fast the host path can realistically get: 1.4x, not 2-3x
+
+§8 claimed a 2-3x target. That is too much, and the arithmetic says so: what is needed is not a fast host but a host that
+is *faster than the GPU per layer*.
+
+| | per layer | per token |
+|---|---:|---:|
+| host batch (today) | 1 922-2 017 µs | ~40 ms |
+| GPU work available between batches (`gap`) | 1 272-1 405 µs | 26.4 ms (the perfect-cache ceiling) |
+
+The GPU already runs at 26.4 ms/token; the host needs 40 ms. Making the host match the GPU is a **1.37x** improvement, and
+that alone would put decode at ~30-34 ms/token - ahead of strata's 39-41. Anything beyond that buys little, because the
+GPU becomes the limit. So the honest target is **1.3-1.4x**, not 2-3x.
+
+### What the existing code already does, and what it is worth
+
+The fork is not starting from zero: `mistralrs-quant/src/gguf/fused_cpu.rs` already has multi-row kernels for **Q2_0** and
+**IQ4NL** (`NAIWA_NO_Q2ROWS`, `NAIWA_NO_I4NLROWS` switch them off). Disabling them on a 24-token decode:
+
+| arm | µs/call | µs/pair | µs/expert | gap | per token |
+|---|---:|---:|---:|---:|---:|
+| control | 1 922 | 171.4 | 213.9 | 1 405 | 46.7 ms |
+| without Q2_0/IQ4NL multi-row | 2 120 | 204.8 | 258.7 | 1 272 | 54.1 ms |
+
+So the technique that §8 proposed as the milestone is **already applied to two of the six quant types and is worth ~19%**
+of host time (7.4 ms/token). Extending it to the i-quant gate/up rows (IQ2_S, IQ3_XXS, IQ3_S - which have no multi-row
+path) should be worth the same order: **10-20%, not 2-3x**. That is still most of what the 1.37x target asks for, but it
+must be stated as 1.2-1.4x.
+
+### And a caution about the measurement itself
+
+The same `--mtp-n-predict` arms measured 49.8 / 46.4 / 35.5 ms/token on three separate 24-token runs - a ±10% spread that
+is as large as some of the effects §7 and §8 quote. Decode arms from here on should be 128-token runs, several per arm,
+with medians; the FUSED_DBG columns (µs/pair, µs/expert) are far less noisy than the wall clock and should be the primary
+metric, since they measure the thing being changed.
+
+### Revised M37
+
+1. Instrument `fused_cpu` per quant type (µs/expert by type) - measure before writing code.
+2. Extend the existing Q2_0/IQ4NL row-batching to the i-quant gate/up rows.
+3. Target: host ≤ 1.4 ms/layer (1.37x from today), decode 44 -> 34 ms/token, arithmetic untouched.

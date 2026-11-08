@@ -86,9 +86,11 @@ profile found the whole remaining gap in one kernel.
   L's own output; the lookahead does 470 loads against 15 640 swaps), deeper speculation (depth 3: 49.8 against depth
   1's 44.1 ms/token), moving misses to PCIe (`--pcie-frac` 0.7/1.0: 51.9/54.1 ms/token), promotion policy (hit rate
   80.3% -> 80.5%).
-- **Target:** 228 -> under 100 µs per expert (2.02 -> under 0.9 ms per layer), the doorbell spin to vanish as a
-  consequence, decode from 44 to under 35 ms/token (the perfect-cache ceiling is 26.4), and the output byte-identical -
-  the arithmetic does not change, only the loop structure.
+- **Target: 1.37x, not 2-3x** (M36 §9). The GPU already runs at 26.4 ms/token; the host needs 40. Matching the GPU is
+  1.37x, which puts decode at ~30-34 ms/token - ahead of strata - and beyond that the GPU is the limit. The technique is
+  already in the tree for **Q2_0 and IQ4NL** (`NAIWA_NO_Q2ROWS` / `NAIWA_NO_I4NLROWS`): disabling those multi-row kernels
+  costs +19% host time (213.9 -> 258.7 µs/expert), so extending them to the i-quant gate/up rows is worth 10-20%, not 3x.
+  Arithmetic untouched; measure µs/expert per quant type first, wall clock second (the 24-token arms carry ±10%).
 
 ## M36 — the tree after the cleanup, and the comparison that says where the gap is — ✅ done (2026-11-07)
 
