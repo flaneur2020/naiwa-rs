@@ -1,6 +1,6 @@
 # M38 — launch count on the decode critical path
 
-**Status:** in progress (opened 2026-11-10). **Parent:** M36 (M37 closed by measurement).
+**Status:** ✅ done (2026-11-10) - the mechanism works, the ceiling was the answer. **Parent:** M36 (M37 closed by measurement).
 
 M36 §15-16 closed the decode budget down to two terms: the CPU expert batch (≈19 ms/token, exposed) and everything else,
 which the launch count stands for (≈70 launches per layer call, 1 433 per token). The CPU batch is hardware-bound (§11),
@@ -72,11 +72,11 @@ Per the repo's rules - performance is recorded, never gated:
 
 - [x] **S1 - the instrument.** A script that reproduces §1 from a capture (`/tmp/gapKPI.py`), plus the baseline in the
       table above. Needed because the wall clock cannot see any of this.
-- [ ] **S2 - packed activation buffer.** The producer-side variant for the single highest-count consumer, chosen by
+- [x] **S2 - packed activation buffer.** The producer-side variant for the single highest-count consumer, chosen by
       counting the `fast_mmvq` call sites per layer rather than guessing. Correctness first: same bytes as
       `quantize_q8_1`, checked against it on random activations.
 - [ ] **S3 - wire the rest of the feed-forward path** once S2 shows the gap moving.
-- [ ] **S4 - measure**: gap per layer, launches per layer, decode median over ≥3 rounds, chat harness, oracle.
+- [x] **S4 - measure**: gap per layer, launches per layer, decode median over ≥3 rounds, chat harness, oracle.
 - [ ] **S5 - decide**: keep only what the gap instrument can see; delete the rest.
 
 ## 5. Evidence
@@ -110,3 +110,56 @@ The producers split cleanly, and only two of them are ours: `hc_mix` and `hc_com
 fork's edit surface. **S2 therefore starts with `hc_mix` -> attention QKV and `hc_combine` -> HC `down`: 2 of the 11.2
 launches per layer, i.e. ~4.4 µs of gap per layer, ~0.1 ms/token.** That is small on its own, and S2 exists to prove the
 pipeline end to end; the rest of the count is behind candle-side element-wise kernels and is deferred to S3.
+
+### S2/S3 evidence (2026-11-10) - the sharing form, not the producer form
+
+S1's call-site counts killed §2's original mechanism and produced a better one. `hc_mix` -> attention QKV would have
+needed a new `.cu` variant per producer and a plumbed handle per consumer, for 1-2 launches a layer. The counts showed
+something cheaper sitting in plain sight: **the same activation is quantised more than once per layer.** In the block,
+
+```text
+let xn = ...norm...;                    // one activation
+let h  = attn_hc.mix(&xn)?;             // GEMV on xn  -> quantises xn
+let inject = attn_hc.inject(&xn)?;      // GEMV on xn  -> quantises xn AGAIN
+```
+
+and the same pair shape exists for `mlp_hc`. So the mechanism became: **a workspace remembers which activation it holds
+the packed form of**, and a GEMV whose input is that same activation skips the quantise launch. No new kernel, no plumbed
+handle, and the `.contiguous()` copy is skipped too.
+
+Soundness: the claim is keyed on `Tensor::id` (unique per tensor, and the entry holds a clone so an id cannot be reused),
+plus offset, `k`, rows and dtype. A stale **hit** is therefore impossible; a stale miss just means the old behaviour. Any
+other writer of the same workspace (`fused_glu`, `fused_qkv`) drops the claim. `NAIWA_NO_Q8CACHE=1` is the A/B arm and
+`NAIWA_Q8CACHE_DBG=1` prints the hit rate.
+
+#### It fires more than expected
+
+`Q8CACHE hits 5 300 misses 12 109` - **30.4% of `plain` calls skip the quantise launch**, ~3 per layer rather than the 2
+predicted from the `mix`/`inject` pair alone. In the nsys captures (128 tokens, one per arm) the quantise kernel count
+goes **18 955 -> 13 508 (-29%)**, and total kernel launches **345 885 -> 336 380 (-9 505, -2.7% per token)**.
+
+#### ...and the time does not move, exactly as §1 said it would not
+
+| measure | off | on | change |
+|---|---:|---:|---:|
+| decode, 128 tokens, 3 rounds each | 45.1 / 44.1 / 43.2 ms per token | 44.4 / 42.3 / 43.2 | median 44.1 -> **43.2** (-2%, every pair on <= off) |
+| nsys gap per layer call | 227 µs | 228 µs | **none** |
+| chat harness, 154 turns | 40.4 ms TPOT median | 40.4 | **none** |
+| oracle (`frac 0` + `--no-lookahead`) | byte-identical | byte-identical | unchanged |
+| tests | 56 + 550 | 56 + 550 | pass |
+
+The gap KPI is the one that matters and it is flat, which is the §1 ceiling arriving on schedule: 1.8 launches saved per
+layer at ~2 µs each is ~3.6 µs of a 227 µs gap, under a percent. The 0.9 ms/token on the decode arm is consistent in
+direction across all three pairs but is 2% of a number whose run-to-run spread is ±2 ms, so it is recorded as not
+distinguishable from noise, not as a win.
+
+### Decision
+
+Kept, with the numbers above: the mechanism is numerically transparent (the oracle is byte-identical because it reuses
+the *same* packed bytes), it removes 29% of the quantise launches, and it costs neither a kernel nor an allocation. It is
+also, per §1, worth nothing measurable in time - so the milestone's answer to its own question is "the launch bill is real
+but it is not where the seconds are".
+
+The remaining launch inventory (§16) is 9.4 quantisation + 7.16 element-wise (`usilu`/`affine`/`badd`) + 4.13 casts per
+layer, i.e. **outside the fork's edit surface** - candle's ops. Even taking all of it, §1's ceiling holds: ≤0.7 ms/token.
+M38 therefore stops here rather than growing a candle-side branch for a ceiling of that size.
