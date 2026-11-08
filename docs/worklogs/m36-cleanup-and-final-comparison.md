@@ -675,6 +675,45 @@ Every remaining lever is therefore about the batch's *size* or *speed*, both alr
 | deeper MTP | amortises the batch over more tokens; swept in §7 (depth 1: 44.1, 2: 42-45, 3: 49.8) |
 
 The one number that is *not* explained by the batch: `total - expert_dev` is 25.7-33.7 ms per step, while nsys puts all GPU
-kernels at 26.9 ms/token including the spins. The gap is stream-side launch latency across ~1 433 launches per token
-(15 909 `gemv_kernel_batched`, 12 234 hyper-connection, 20 783 cast/copy). Fusing those is the only remaining software
-lever that does not need different hardware - and it is launch count, not arithmetic.
+kernels at 26.9 ms/token including the spins. The gap is stream-side launch latency, so the launch count matters. Counted
+per **layer call** (`nsysdec-dec`, 2 627 layer calls, 69.8 launches each, see §16), not per token as an earlier draft of
+this section said.
+
+## 16. Where the launches go: 70 per layer call, and hyper-connection is 4.6 of them
+
+The decode profile (`nsysdec-dec.nsys-rep`) has 2 627 `doorbell_wait_copy_f32_kernel` instances, one per layer call, and
+183 412 kernel launches in total - **69.8 launches per layer call**, ~1 433 per token at ~20.5 layer calls per token.
+Grouped by kernel family:
+
+| kernel | launches / layer call | total launches | time |
+|---|---:|---:|---:|
+| `mmvq_gguf_quantize_q8_1_bf16` | **6.83** | 17 944 | 18.9 ms |
+| `gemv_kernel_batched` (bf16) | 6.06 | 15 909 | 148.0 ms |
+| `cutlass` bf16 GEMM (all variants) | 3.37 | 8 855 | 134.1 ms |
+| `quantize_q8_1` + `quantize_q8_1_bf16` | 4.32 | 11 338 | 12.7 ms |
+| `q4_hc_mix` / `q4_hc_combine` | 2.32 / 2.24 | 11 964 | 32.1 ms |
+| `mmvq_gguf_q6_k_bf16_plain` | 2.27 | 5 967 | **413.6 ms** |
+| `badd_f32` / `affine_bf16` / `usilu_bf16` | 2.50 / 2.34 / 2.32 | 18 805 | 24.3 ms |
+| `cast_bf16_f32` / `cast_f32_bf16` | 2.21 / 1.92 | 10 858 | 23.9 ms |
+
+### Why hyper-connection lands at 4.6 per layer
+
+Not because it is chunky: because this architecture uses a gated residual mixer **in place of every layernorm**
+(`qwen4_exp/hyper.rs`: "it stands in for every layernorm"), and each transformer block has two of them -
+`attn_hc` and `mlp_hc` (`qwen4_exp/text.rs:272`) - plus one `final_mixer` per model. Each mixer runs one `hc_mix` and one
+`hc_combine`, so **2 mixers x 2 kernels = 4 per layer**, matching the measured 2.32 + 2.24 (+0.10 `hc_norm` where the
+combine could not fuse the next norm).
+
+They are already fused kernels, not a chain of element-wise ops: `q4_hc_mix_kernel` averages 1.3 µs and
+`q4_hc_combine_kernel` 4.1 µs, and together they are 32.1 ms of 3.44 s of kernel time (0.9%). The sum is one kernel per
+mixer pass, and the two passes are separated by the attention/MoE computation whose input one produces and whose output
+the other consumes, so they cannot be merged with each other.
+
+### The launches worth attacking are next to it, not in it
+
+- **11.2 quantisation launches per layer** (`quantize_q8_1` and its bf16 variants): every quantised GEMV quantises its
+  own activation, and the mixers' `down`/`up` weights are quantised too, so hyper-connection alone accounts for about four
+  of them. Quantising the activation inside the GEMV would remove most of the 11.
+- `gemv_kernel_batched` at 6.06 per layer is the bf16 tail of the same projections.
+- `mmvq_gguf_q6_k_bf16_plain` is only 2.27 launches per layer but 413 ms - the q6_k path is 12% of all kernel time for 3%
+  of the launches, i.e. it is bandwidth, not launch overhead.
