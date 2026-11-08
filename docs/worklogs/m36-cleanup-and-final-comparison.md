@@ -551,9 +551,19 @@ harness, and there the same change **loses**:
 | waves 1 (default) | **TPOT median 40.2 ms** |
 | waves 4 | 41.6 ms |
 
-The waves interleave with prefill chunks and with prefix reuse, and `staging_wait` grows (the effect M26 recorded). So the
-default stays at one batch, `NAIWA_STAGING_WAVES` stays as the documented knob, and the win is recorded for the
-decode-only case rather than shipped.
+That explanation was wrong on the first pass, and the correction is worth keeping: `DmaMiss::submit` is called from
+exactly one place, `decode.rs:96`, so waves cannot touch prefill or reuse at all. `NAIWA_STEP_BUDGET=1` shows what they do
+touch, on the decode step itself:
+
+| arm | total | `expert_dev` (CPU batch) | `staging_wait` | layers waiting >200 µs |
+|---|---:|---:|---:|---:|
+| waves 1 | 58.0 / 53.4 / 73.0 ms | 30.6 / 27.6 / 39.3 | **2.9-3.6 ms** | 0-1 / 48 |
+| waves 4 | 56.3 / 55.9 / 50.8 ms | 26.0 / 29.2 / 25.1 | **5.5-6.0 ms** | 1-4 / 48 |
+
+Per-wave events make the consumer wait on DMA that is *less* complete, so the wait stops being hidden: `staging_wait`
+doubles and a few layers per step cross 200 µs. A single batch's copies land under the CPU batch instead, which is why
+one batch wins. The lab "win" for 4 waves was noise in `expert_dev`, which swings 25-39 ms between runs - fifteen times
+the effect being measured. The default stays at one batch, and `NAIWA_STAGING_WAVES` stays documented with both numbers.
 
 Raising `--pcie-frac` past 0.4 remains strictly worse: at 0.7 and 1.0 the link time of ~131 experts per token (262 MB
 against 13.4 GB/s) exceeds what the window can hide, and the ring is 16 slots shared by all layers.
@@ -565,3 +575,38 @@ against 13.4 GB/s) exceeds what the window can hide, and the ring is 16 slots sh
 - The measured overlap knobs move 1.5 ms/token in the lab and lose it back in the chat harness.
 - Getting the 18.6 ms needs the host batch to shrink *below* the window everywhere (fewer misses via VRAM, or a faster
   host via AVX-512) or a working cross-step predictor - the two things §11 already identified, in that order.
+
+## 14. `STEP_BUDGET` corrects the exposed/hidden split from §13
+
+`NAIWA_STEP_BUDGET=1` (already in the tree) splits a decode step into the phases the mechanisms can change. Run on the
+128-token decode arm it says something §12 and §13 got wrong:
+
+| phase | per step (48 layers) |
+|---|---:|
+| `total` | 51-73 ms |
+| `expert_dev` (the CPU expert batch's own wall) | 25-39 ms |
+| `total - expert_dev` (GPU work + handshakes) | **25.7-33.7 ms** |
+| `plan` (route/doorbell read + staging publish) | 41-65 ms |
+| `gpu` (resident + staged expert kernels, queued) | 2.4-2.9 ms |
+| **`cpu_join`** (waiting for the CPU result ring) | **0.2-0.3 ms** |
+| `staging_wait` | 2.9-6.0 ms |
+| `spawn` / `preload_wait` / `fence` / `other` | 0.0-1.0 ms each |
+
+Two things follow.
+
+1. **`cpu_join` is 0.2 ms.** The token thread does not wait for the CPU experts at the join - they are already done. So the
+   CPU batch is *not* the exposed phase. It runs inside `plan`: the step total tracks `expert_dev` almost exactly
+   (73.0 with 39.3, 50.8 with 25.1), and `plan` is the phase that contains the doorbell roundtrip the batch hides behind.
+2. **The exposed cost is the handshake, ~1 ms per layer.** `plan` is 41-65 ms per step over 48 layers, i.e. 0.86-1.36 ms
+   per layer, which is exactly the 1 272-1 405 µs `gap` `FUSED_DBG` reports and the 644 µs `doorbell_wait_copy` spin from
+   §6 seen from the token thread's side.
+
+So §12's result is not surprising after all, it was predicted by the wrong model: a 9.2% faster CPU batch cannot move a
+wall clock whose exposed term is a per-layer GPU-to-host roundtrip and whose hidden term is the batch itself. And the
+lever that matters for decode is **the cost of one layer's routing handshake**, not the expert arithmetic - which is why
+every host-side optimisation since M36 (§9 x2 kernels, §11 grouping/threads, §13 waves) landed inside a phase that was
+already hidden.
+
+This is the number to attack if decode is revisited: `plan` 0.86-1.36 ms per layer, 48 times per step, against `gpu` 2.4-2.9 ms
+for the whole step. Whether it can be made cheaper is a question about the doorbell's implementation (pinned host buffer
+and a flag spin, against an event plus stream synchronise), not about FLOPs.
