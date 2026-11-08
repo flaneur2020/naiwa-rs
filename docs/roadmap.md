@@ -58,6 +58,23 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
+## M36 — the tree after the cleanup, and the comparison that says where the gap is — ✅ done (2026-11-07)
+
+Worklog: [`worklogs/m36-cleanup-and-final-comparison.md`](worklogs/m36-cleanup-and-final-comparison.md) — M35's fix
+(the prompt's last chunk keeps its natural end) was worth 300-480 ms; M35's *mechanism* (a tail-keyed prefix checkpoint)
+was worth nothing, because the restore side that would read it is default-off for producing no tokens, and reuse comes
+from the aligned checkpoints taken during decode. This milestone deletes the mechanism, keeps the fix, and re-measures.
+
+- **Deleted:** `tail_hash`, `partial_block_key`, the partial-block retention path, `PagedTail`, the `_tailed` peek, the
+  scheduler's tail admission, the engine's tailed gate and diagnostics, and the `NAIWA_TAIL_CHECKPOINT` /
+  `NAIWA_NO_TAIL_SPLIT` / `NAIWA_TAIL_RESTORE` knobs. Measured: `NO_TAIL_SPLIT` and `TAIL_CHECKPOINT` are identical
+  (TTFT 3 182/3 177 against 3 045/3 186 ms), while the default still pays a 335 ms remainder step.
+- **Kept:** the no-truncation rule (now unconditional), `div_ceil`, the tile mma kernel default.
+- **After the cleanup:** kernel total **1.86 s** (was 1.98 s — the deleted path did work on every prompt that nothing
+  read), TTFT **+2.7%** against strata (3 313 vs 3 227 ms), prefill parity (999-1 003 tok/s both), decode **+8.2%** per
+  token (44.8 vs 41.4 ms, ours with MTP drafting, theirs with none).
+- **The gap is entirely decode**, and decode has never been profiled on either side. That is the next milestone.
+
 ## M35 — the prefix checkpoint is keyed on the prompt's real end — 📐 proposed (2026-11-06)
 
 Worklog: [`worklogs/m35-tail-aware-checkpoint.md`](worklogs/m35-tail-aware-checkpoint.md) — the prefix checkpoint's key

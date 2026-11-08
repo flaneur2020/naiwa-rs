@@ -200,11 +200,7 @@ impl Layers {
             // wait existed: `invalid CUDA top-1 output: max_logit=NaN argmax=NaN`, one request in 24-72, always on
             // a turn after a chunk. One `synchronize` on the copy stream is strata's `sync_queued` and costs the
             // loan's transfer once (~1.4 GB, ~110 ms) at the end of a prompt, which is where it belongs.
-            // `NAIWA_REFILL_NOSYNC=1` (probe, M35 §35): skip the one wait and rely on the per-slot `ReadFence`, which
-            // is what orders a read of a slot after the copy into it. This wait is serial: it blocks the first decode
-            // step for the whole refill (~723 copies, measured 93 ms of a 182 ms step) while the decode's own GPU work
-            // could be running.
-            if asked > 0 && std::env::var_os("NAIWA_REFILL_NOSYNC").is_none() {
+            if asked > 0 {
                 if let Some(cs) = self
                     .all()
                     .iter()
