@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum Phase {
-    /// Routing the step's experts: the doorbell read and the plan (hits / staged / CPU).
+    /// Routing the step's experts: the top-k doorbell read and the hit/miss split.
     Plan = 0,
+    /// `--pcie-frac`: turning misses into staged hits (slot reservation, copies, publication).
+    Stage = 8,
     /// Building and submitting the CPU expert job.
     Spawn = 1,
     /// Waiting for the lookahead's preload claim (a prediction's copy).
@@ -36,9 +38,10 @@ pub(crate) enum Phase {
     Other = 7,
 }
 
-const PHASES: usize = 8;
+const PHASES: usize = 9;
 
 static NS: [AtomicU64; PHASES] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -127,12 +130,13 @@ pub(crate) fn step_boundary(layers: usize) {
     #[cfg(not(feature = "cuda"))]
     let (expert_ms, expert_n) = (0.0, 0usize);
     eprintln!(
-        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers) | plan {:.1} spawn {:.1} \
-         preload_wait {:.1} gpu {:.1} staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | \
+        "STEP_BUDGET layers {layers} total {:.1} ms expert_dev {:.1} ms ({expert_n} layers) | plan {:.1} stage {:.1} \
+         spawn {:.1} preload_wait {:.1} gpu {:.1} staging_wait {:.1} cpu_join {:.1} fence {:.1} other {:.1} | \
          pairs {} distinct {} ({:.0}% grouping headroom) | waits>200us preload {}/{} staging {}/{} cpu {}/{}",
         total as f64 / 1e6,
         expert_ms,
         ms(Phase::Plan as usize),
+        ms(Phase::Stage as usize),
         ms(Phase::Spawn as usize),
         ms(Phase::PreloadWait as usize),
         ms(Phase::Gpu as usize),

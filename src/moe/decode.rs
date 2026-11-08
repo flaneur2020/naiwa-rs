@@ -90,13 +90,14 @@ pub(crate) fn forward(
     // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
     // GPU with the hits, leaving the rest on the CPU. `stage_misses` only *appends* to
     // `plan.hits`, so the resident prefix is exactly what was there before the call.
+    mark!(stats::BudgetPhase::Plan);
     #[cfg(feature = "cuda")]
     let resident_prefix: Vec<usize> = plan.hits.iter().map(Vec::len).collect();
     if layer.staging_enabled() {
         DmaMiss::submit(layer, &mut plan)?;
     }
 
-    mark!(stats::BudgetPhase::Plan);
+    mark!(stats::BudgetPhase::Stage);
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
     stats::record_cache_misses(n_cpu);
     // M22.3: how much of the step's expert demand is distinct experts, i.e. the headroom a per-expert row batch

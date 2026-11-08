@@ -610,3 +610,71 @@ already hidden.
 This is the number to attack if decode is revisited: `plan` 0.86-1.36 ms per layer, 48 times per step, against `gpu` 2.4-2.9 ms
 for the whole step. Whether it can be made cheaper is a question about the doorbell's implementation (pinned host buffer
 and a flag spin, against an event plus stream synchronise), not about FLOPs.
+
+## 15. The serial chain, measured per phase: the CPU batch is ~56% of one layer
+
+`Phase::Plan` covered both routing and the staging publication, so §14's "1 ms of handshake" was two things. Split with a
+new `Phase::Stage` (one `mark!`, no behaviour change) and a 128-token decode:
+
+| phase | per layer |
+|---|---:|
+| **`plan`** - `Route::submit`, i.e. the top-k doorbell read | **1 404 µs** |
+| `stage` - turning misses into staged hits (slot reservation, copies, publication) | 48 µs |
+| `spawn` - building and submitting the CPU job | 23 µs |
+| `gpu` - the resident expert kernels, queued (not waited) | 58 µs |
+| `staging_wait` - the staging DMA's completion event | 65 µs |
+| `cpu_join` - the CPU result ring | 6 µs |
+| `other` / `preload_wait` / `fence` | 12 / 0 / 0 µs |
+
+So the wait is the top-k read, and the phases sum to the step total (77.2 ms, `expert_dev` 37.8 ms inside it). `expert_dev`
+is a pair of CUDA events around a layer's expert region, so it measures the **GPU's** span there - which contains the
+`doorbell_wait_copy_f32_kernel` spin (waiting for the CPU batch) plus the staged DMA and the expert GEMVs. At ~1.6 tokens
+per step, 37.8 ms/step is ~23 ms/token, and the perfect-cache probe (no CPU experts at all) measured 26.4 ms/token against
+a 45 ms wall - the two agree to within the step/token conversion. **The CPU batch is roughly 56% of one layer's serial
+chain, and hiding it saves the 18.6 ms/token of §13.**
+
+### Is the chain really serial? Slowing the batch down says yes
+
+If the batch were hidden, changing its speed would not move the wall. It does:
+
+| `NAIWA_CPU_MOE_THREADS` | per token | `total`/step | `expert_dev`/step |
+|---|---:|---:|---:|
+| 8 (default) | 42.5 ms | 63.5 ms | 30.8 ms |
+| 4 | 47.9 ms | 76.5 ms | 35.8 ms |
+
++5.0 ms of batch per step buys +5.4 ms per token - slope > 1, so the batch is not just exposed, it drags the staging and
+promotion pipeline with it. And halving the threads only costs the batch 16%, which is §11's measurement again: it is
+memory- and codebook-bound, not thread-bound.
+
+### Why more `--pcie-frac` does not move misses off the chain
+
+| `--pcie-frac` | per token | `total`/step | `expert_dev`/step | `plan`/layer | `stage` | `staging_wait` |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.4 (shipped) | 46.8 ms | 64.0 ms | 30.4 ms | 1 127 µs | 1.9 ms | 3.1 ms |
+| 0.7 | 48.8 ms | 77.0 ms | 49.6 ms | 1 419 µs | 2.6 ms | 2.8 ms |
+| 1.0 | 50.9 ms | 90.2 ms | 61.5 ms | 1 713 µs | 2.8 ms | 2.4 ms |
+
+`expert_dev` *grows* with the staged share - the opposite of taking work off the critical path. The staged copies are
+consumed by the same layer, so their DMA sits inside the layer's expert region next to the compute it feeds, and the next
+layer's routing waits behind it: the DMA cost lands in the *next* layer's `plan` spin (1 127 -> 1 713 µs per layer). At
+frac 1.0 that is ~2.7 experts x 1.2 MB = 3.3 MB per layer, which would be 0.24 ms at 13.4 GB/s but measures ~0.59 ms, i.e.
+an effective ~5.6 GB/s for scattered slot copies. **Staging only pays when the copy replaces something slower - which is
+residency, §10's conclusion, not bandwidth.**
+
+### What this leaves
+
+The per-layer chain is `route -> {CPU batch | staged DMA} -> GEMV -> x_{L+1}` with no slack, and the batch is 56% of it.
+Every remaining lever is therefore about the batch's *size* or *speed*, both already measured as hardware-bound:
+
+| lever | status |
+|---|---|
+| fewer misses (more VRAM) | 3-4% hit rate per GiB; 3.5 GiB fails the chat harness on a 12 GiB card (§11) |
+| faster host kernels | at the ~50 GFLOP/s AVX-2 floor; the x2 kernels took 9.2% of gate/up and 1.2 ms/token, inside the noise |
+| prefetch next layer's misses | needs next layer's routing, which needs this layer's MoE output |
+| stage instead of compute | measured above: same-layer dependency, so no overlap |
+| deeper MTP | amortises the batch over more tokens; swept in §7 (depth 1: 44.1, 2: 42-45, 3: 49.8) |
+
+The one number that is *not* explained by the batch: `total - expert_dev` is 25.7-33.7 ms per step, while nsys puts all GPU
+kernels at 26.9 ms/token including the spins. The gap is stream-side launch latency across ~1 433 launches per token
+(15 909 `gemv_kernel_batched`, 12 234 hyper-connection, 20 783 cast/copy). Fusing those is the only remaining software
+lever that does not need different hardware - and it is launch count, not arithmetic.
