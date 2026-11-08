@@ -58,7 +58,7 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
-## M37 — decode stops waiting for the CPU experts — 📐 proposed (2026-11-07)
+## M37 — decode stops waiting for the CPU experts — ⛔ closed by measurement: the host path is at its floor (2026-11-07)
 
 Worklog: [`worklogs/m36-cleanup-and-final-comparison.md`](worklogs/m36-cleanup-and-final-comparison.md) §6 — M36's decode
 profile found the whole remaining gap in one kernel.
@@ -86,7 +86,13 @@ profile found the whole remaining gap in one kernel.
   L's own output; the lookahead does 470 loads against 15 640 swaps), deeper speculation (depth 3: 49.8 against depth
   1's 44.1 ms/token), moving misses to PCIe (`--pcie-frac` 0.7/1.0: 51.9/54.1 ms/token), promotion policy (hit rate
   80.3% -> 80.5%).
-- **Target: 1.37x, not 2-3x** (M36 §9). The GPU already runs at 26.4 ms/token; the host needs 40. Matching the GPU is
+- **Outcome (M36 §11):** every axis measured to its floor. Expert grouping in `gate_up` is neutral (130 vs 129 µs/expert -
+  the kernels are codebook-bound, not DRAM-bound); 8 threads is already the optimum (6: 145, 8: 130, 12: 128 µs but slower
+  wall clock); a 3.5 GiB cache measures 41.2 ms/token alone but **fails the chat harness** on 12 GB of VRAM. The remaining
+  technique (dequantise once, dot many rows) has a **~20%** ceiling on gate/up because an expert serves only 1.25 rows,
+  i.e. ~3 ms/token - below this host's noise. Floor: **~130 µs/expert gate-up, ~71 down, 42-44 ms/token decode**, and
+  going below it needs AVX-512, more VRAM, or a bigger link, not code.
+- **Target was 1.37x, not 2-3x** (M36 §9). The GPU already runs at 26.4 ms/token; the host needs 40. Matching the GPU is
   1.37x, which puts decode at ~30-34 ms/token - ahead of strata - and beyond that the GPU is the limit. The technique is
   already in the tree for **Q2_0 and IQ4NL** (`NAIWA_NO_Q2ROWS` / `NAIWA_NO_I4NLROWS`): disabling those multi-row kernels
   costs +19% host time (213.9 -> 258.7 µs/expert), so extending them to the i-quant gate/up rows is worth 10-20%, not 3x.

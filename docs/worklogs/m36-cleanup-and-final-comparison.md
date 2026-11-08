@@ -373,3 +373,68 @@ The measured levers, in order of size, are now all small and all known:
 
 That is the honest position: decode's remaining gap is a host-side efficiency problem of order 1.2-1.4x, not a structural
 one, and the largest single piece (gate/up) has a hard 20% ceiling from row sharing.
+
+## 11. M37 step 2: the host path taken to its floor, and what that floor is
+
+Three optimisations were implemented and measured; only the instrumentation survives, because the other two do not pay.
+
+### 11.1 Expert grouping in `gate_up`: neutral
+
+Pairs are sorted by expert, so one task can own a whole expert's run of pairs and keep the weight row in L1 instead of
+pulling it once per pair. Implemented (`NAIWA_NO_EXPERT_GROUPING=1` as the A/B arm):
+
+| arm | gate/up | down | per token |
+|---|---:|---:|---:|
+| per-pair scheduling (before) | 129 µs/expert | 72 | 44.1 ms |
+| one task per expert's run (after) | 130 µs/expert | 71 | 42.8 ms |
+
+**Neutral.** The weight read is not the cost - these kernels are bound by the codebook unpacking (ALU), not by DRAM. So
+the change was reverted rather than shipped as dead complexity.
+
+### 11.2 Thread count: the default is already the optimum
+
+| `NAIWA_CPU_MOE_THREADS` | gate/up | per token |
+|---|---:|---:|
+| 6 | 145 µs/expert | 46.5 ms |
+| **8 (the default, `available - 2` capped at 8)** | **130** | **42.8-44.1 ms** |
+| 12 | 128 | 45.9 ms |
+
+8 threads is what the fork already picks, and the per-expert time at 12 is no better while the wall clock is worse.
+
+### 11.3 A bigger cache: better in isolation, not shippable
+
+`--expert-cache-gb 3.5` measured **41.2 ms/token** on a decode-only request (hit rate 84.3% against 80.3%). In the chat
+harness it **fails**: `naiwa round 2 short turn 6 failed: model_error` - 12 GB of VRAM cannot hold the cache, the KV pool
+and the prefill scratch once the conversation grows. Reverted to 2.5 GiB, and the harness is green again (154 turns, 0
+empty outputs, TPOT median 40.4 ms).
+
+### 11.4 Why the remaining ~1.2x is not reachable here
+
+The only real technique left is **dequantise once, dot many rows** for the i-quant gate/up stacks (what strata's
+`multi-token` i-quant kernels do). Its ceiling follows from two numbers already measured:
+
+- each expert serves **1.25 rows** in a decode batch (5.86 rows, 8.99 distinct experts), so at most ~20% of the pairs can
+  reuse an unpacking;
+- gate/up is 64% of the host's expert time, so 20% of that is **~13% of host time, ~3 ms/token** - under this host's
+  ±10% noise, and less than the 2.5 -> 3.5 GiB cache gave before it ran out of VRAM.
+
+So the measured floor for the host expert path on this machine is **~130 µs per expert for gate/up and ~71 for down, at
+~50 GFLOP/s aggregate**, and decode's floor with the shipped configuration is **42-44 ms/token** (26.4 ms of GPU work
+plus the exposed host work that cannot be hidden on a strict layer chain).
+
+Getting below that needs a change of hardware or of strategy, not of code:
+
+| would need | why |
+|---|---|
+| AVX-512 (this host has none; strata's own engine refuses to run its i-quant kernel for the same reason) | the kernels are codebook-bound, and AVX-512 VBMI does the lookups 2-4x faster |
+| more VRAM than 12 GB | residency is the only lever that removes work rather than speeding it up: every GiB is worth 3-4% hit rate |
+| the GPU computing the misses | measured worse here: 262 MB/token of misses against a 13.4 GB/s link (`--pcie-frac` 0.7/1.0 = 51.9/54.1 ms) |
+
+### 11.5 What ships from M37
+
+| change | state |
+|---|---|
+| `NAIWA_FUSED_PHASE_DBG` (fork `fused_cpu.rs`) | **kept** - the instrument that attributed 64/36 to gate/up/down and produced every number in §10-§11 |
+| expert grouping | reverted (neutral) |
+| `--expert-cache-gb 3.5` | reverted (does not fit) |
+| thread count | unchanged (already optimal) |
