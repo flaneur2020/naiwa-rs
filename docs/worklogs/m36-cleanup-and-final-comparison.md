@@ -318,3 +318,58 @@ metric, since they measure the thing being changed.
 1. Instrument `fused_cpu` per quant type (µs/expert by type) - measure before writing code.
 2. Extend the existing Q2_0/IQ4NL row-batching to the i-quant gate/up rows.
 3. Target: host ≤ 1.4 ms/layer (1.37x from today), decode 44 -> 34 ms/token, arithmetic untouched.
+
+## 10. M37 step 1 done: the host cost by quant type, and no villain
+
+`NAIWA_FUSED_PHASE_DBG=1` (new, fork `fused_cpu.rs`) prints one line per CPU batch with the two passes split. Aggregated
+over the 2 473 batches of a 128-token decode:
+
+| gate/up | down | calls | experts | gate/up total | down total | µs per expert (gate/up) | µs per expert (down) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| IQ3_XXS | IQ4NL | 738 | 5 830 | 0.771 s | 0.437 s | 132 | 75 |
+| IQ2_S | IQ4NL | 769 | 4 555 | 0.564 s | 0.353 s | 124 | 78 |
+| IQ3_S | IQ4NL | 451 | 2 479 | 0.370 s | 0.196 s | 149 | 79 |
+| IQ2_S | Q2_0 | 252 | 1 383 | 0.172 s | 0.077 s | 125 | 55 |
+| IQ3_XXS | Q2_0 | 155 | 851 | 0.115 s | 0.046 s | 135 | 55 |
+| IQ4XS | IQ4NL | 54 | 416 | 0.047 s | 0.030 s | 113 | 72 |
+| IQ3_S | Q2_0 | 54 | 395 | 0.057 s | 0.020 s | 145 | 50 |
+
+**gate/up is 64% of the host's expert time, down is 36%**, and no type is pathological: every gate/up stack lands in
+113-149 µs per expert, every down stack in 50-79. The effective throughput is **~45-50 GFLOP/s** (gate/up: 6.55 MFLOP in
+132 µs; down: 3.28 MFLOP in 72 µs) - not great for six AVX-2 cores on a memory-bound GEMV, but nowhere near the 3-5x
+deficit §8 implied. §9's 1.37x is the right order, and even that is at the optimistic end.
+
+### Why row-batching cannot give more than ~20%
+
+The same batches hold **5.86 rows but 8.99 distinct experts**: each expert serves **1.25 rows** on average. Batching rows
+can therefore only save the weight traffic of the *shared* fraction, i.e. ~20% - which is exactly what the existing
+Q2_0/IQ4NL row kernels are worth (§9: disabling them costs +19%). Extending them to the i-quant gate/up rows is worth
+about the same, not more.
+
+### `--pcie-frac` is already at its optimum, and for a reason worth knowing
+
+| `--pcie-frac` | per token | hit rate |
+|---|---:|---:|
+| 0.0 | 57.0 ms | **59.5%** (41 847 misses, 0 staged, 0 promotions) |
+| 0.2 | 45.9 ms | 70.9% |
+| **0.4 (shipped)** | **44 ms** | 80.3% |
+| 0.7 | 51.9 ms | - |
+| 1.0 | 54.1 ms | - |
+
+At 0.0 the hit rate *collapses*, because the staging path is also what feeds promotions into the cache (`staged ->
+promoted`). So the DMA is not paying for itself with link time, it is paying for itself with residency. That closes the
+last "just turn the knob" idea: 0.4 is the measured optimum of the two effects.
+
+### Where this leaves M37
+
+The measured levers, in order of size, are now all small and all known:
+
+| lever | expected | status |
+|---|---|---|
+| i-quant gate/up row batching (extend Q2_0/IQ4NL's technique) | ~1.1-1.2x on 64% of host time | not built; ~20% ceiling by the 1.25 rows/expert measurement |
+| thread-count / SIMD balance in `fused_cpu` | unknown, bounded by 45-50 GFLOP/s today | needs its own measurement |
+| cache capacity | 3-4% hit per GiB, 2.5 -> 3.5 GiB bought 44 -> 41.2 ms | VRAM-bound |
+| everything else | - | ruled out with numbers in §7-§9 |
+
+That is the honest position: decode's remaining gap is a host-side efficiency problem of order 1.2-1.4x, not a structural
+one, and the largest single piece (gate/up) has a hard 20% ceiling from row sharing.
