@@ -58,6 +58,25 @@ Why: the graph never reached a replayable whole step, and the default path paid 
 reached by M16/M25; the graph tree measured **45.9 ms** unregistered (M31 §167). The oracle is byte-identical again:
 `frac 0` + `--no-lookahead` == `harness/m1/reference.oracle.txt`.
 
+## M37 — decode stops waiting for the CPU experts — 📐 proposed (2026-11-07)
+
+Worklog: [`worklogs/m36-cleanup-and-final-comparison.md`](worklogs/m36-cleanup-and-final-comparison.md) §6 — M36's decode
+profile found the whole remaining gap in one kernel.
+
+- **The measurement:** in a 128-token decode, kernel total is 3.44 s and **1.69 s of it (49%) is
+  `doorbell_wait_copy_f32_kernel`** — the GPU spinning for the host's expert result, 644 µs per wait, one wait per layer.
+  The real expert arithmetic on the GPU is 0.75 s; attention is 0.034 s.
+- **The ceiling:** with `NAIWA_GPU_ONLY_EXPERTS=1` (a lossy probe that drops every non-resident expert) a decode costs
+  **26.4 ms/token** against today's 45.1 and strata's 39-41. So the CPU round trip costs ~19 ms/token and the compute
+  path is already a third faster than strata's.
+- **The mechanism:** a layer's misses are submitted and then joined at `BudgetPhase::CpuJoin` before that layer's MoE
+  runs, so the wait is serial. strata runs `CPU pool tasks/phase: 18` over 6 threads and keeps the host ahead of the GPU.
+- **One mechanism for this milestone:** make the CPU expert batch leave the critical path - submit layer L's misses,
+  start the GPU work that does not depend on them, and join as late as the dependency allows (the same shape the
+  sequential (`seq == 1`) path already uses via `deferred`, extended to the multi-row verify path).
+- **Target:** doorbell wait from 13.2 to under 4 ms/token, decode from 45 to under 35 ms/token, output unchanged
+  (checked by the oracle plus a decode-parity probe, since the CPU and GPU expert paths round differently).
+
 ## M36 — the tree after the cleanup, and the comparison that says where the gap is — ✅ done (2026-11-07)
 
 Worklog: [`worklogs/m36-cleanup-and-final-comparison.md`](worklogs/m36-cleanup-and-final-comparison.md) — M35's fix

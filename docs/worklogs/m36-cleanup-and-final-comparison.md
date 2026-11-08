@@ -114,3 +114,60 @@ both engines and diff the kernel mix at one row per step. Neither side has ever 
 Note for the oracle: `capture_oracle.sh` now also prints `captured -> …` on its second line, so compare the text line
 (`head -1`), not the whole file. The invocation that reproduces the reference is
 `MODEL=~/Models/qwen3-coder/IQ1_M BIN=$PWD/target/release/naiwa-rs FRAC=0 NO_LOOKAHEAD=1`.
+
+## 6. Where the decode gap comes from: the GPU is waiting on the CPU, and it is half the time
+
+A decode-only request profiled with `nsys` (23-token prompt, 128 generated tokens, shipped config). Kernel total
+**3.44 s** over 128 tokens = 26.9 ms of kernel per token, 183 412 launches = **1 433 launches per token**.
+
+| kernel | total | share | launches | per launch |
+|---|---:|---:|---:|---:|
+| **`doorbell_wait_copy_f32_kernel`** | **1.692 s** | **49.1%** | 2 627 | **644 µs** |
+| `mmvq_gguf_q6_k_bf16_plain_cuda1` | 0.178 s | 5.2% | 357 | 498 µs |
+| `gemv_kernel_batched<bf16>` | 0.148 s | 4.3% | 15 909 | 9.3 µs |
+| `moe_gemv_down_aggregate_iq4nl_q8_1` | 0.146 s | 4.3% | 4 485 | 32.7 µs |
+| cutlass wmma bf16 | 0.134 s | 3.9% | 8 829 | 15.2 µs |
+| `moe_gemv_fused_gate_up_iq2s_q8_1` | 0.117 s | 3.4% | 2 292 | 50.9 µs |
+| `mmvq_gguf_q6_k_bf16_plain_cuda3` | 0.115 s | 3.3% | 2 856 | 40.1 µs |
+| `moe_gemv_fused_gate_up_iq3xxs` | 0.104 s | 3.0% | 1 959 | 53.1 µs |
+| `doorbell_copy_f32_kernel` | 0.048 s | 1.4% | 2 679 | 17.8 µs |
+| `gdn_speculative_recurrence_*` | 0.042 s | 1.2% | 1 980 | 21.5 µs |
+| `q4_qsa_attention_kernel` | 0.034 s | 1.0% | 824 | 41.7 µs |
+
+The whole MoE GEMM family — the actual expert arithmetic, `moe_gemv_fused_gate_up_*` + `moe_gemv_down_aggregate_*` —
+sums to **0.75 s, 5.9 ms/token**. The GPU spends **13.2 ms/token doing nothing** while it waits for the CPU experts: that
+is 30% of the 45 ms wall clock, and it is 30x the cost of all attention kernels in the same window.
+
+2 627 waits over ~51 steps of 48 layers is one wait per layer: at a 2.5 GiB cache almost **every layer misses** at least
+one of its ten experts, so the CPU path runs on essentially every layer.
+
+### The perfect-cache ceiling says the compute path is not the problem
+
+`NAIWA_GPU_ONLY_EXPERTS=1` drops every non-resident expert once the cache is full - lossy, output is garbage, but it
+bounds what decode would cost with a cache that never misses:
+
+| arm | per token |
+|---|---:|
+| shipped (CPU experts for the misses) | 45.1 ms |
+| **`NAIWA_GPU_ONLY_EXPERTS=1` (perfect cache, lossy)** | **26.4 ms** |
+| strata | 39-41 ms |
+
+So the CPU round trip costs **~19 ms/token**, and with it removed decode would be **faster than strata by a third**. The
+deficit is not in our GEMMs, our attention or our MTP — it is that we do not hide the host's expert latency, while strata
+does (its log: `CPU pool tasks/phase: 18`, `participating threads: 6`, and a 33.8% hit rate on a *smaller* 1.98 GiB
+cache).
+
+### 6.1 What that means for the next milestone
+
+Three levers, in order of measured size:
+
+1. **Overlap the CPU batch with GPU work** (~13 ms/token available). Today the token thread submits a layer's misses,
+   then joins them at `BudgetPhase::CpuJoin` before that layer's MoE can run, so the GPU idles inside
+   `doorbell_wait_copy_f32`. strata's equivalent batching runs 18 tasks over 6 threads and keeps the host ahead.
+2. **Raise the hit rate** (the same 13 ms is what a bigger or better-profiled cache buys): 2.5 GiB of 23.4 GiB today.
+3. **Cut launches** - 1 433 per token, of which 15 909 `gemv_kernel_batched` (124/token) and 12 234 hyper-connection
+   launches are candidates for fusion, and 20 783 cast/copy for elimination.
+
+Note the trap this rules out: it is tempting to read the doorbell's 644 µs as "the CPU is slow". It is not - the CPU
+computes a layer's seven-ish experts in that time on AVX-2 with a 10-thread rayon pool, which is the same work and the
+same ISA strata uses. The difference is *when* it is asked: strata asks earlier and in batches, we ask and then spin.
