@@ -171,3 +171,53 @@ Three levers, in order of measured size:
 Note the trap this rules out: it is tempting to read the doorbell's 644 µs as "the CPU is slow". It is not - the CPU
 computes a layer's seven-ish experts in that time on AVX-2 with a 10-thread rayon pool, which is the same work and the
 same ISA strata uses. The difference is *when* it is asked: strata asks earlier and in batches, we ask and then spin.
+
+## 7. Correcting §6: the hit rate is 80%, and deeper MTP does not amortise the wait
+
+Two measurements that sharpen §6, taken while explaining it.
+
+**The cache is not cold.** `NAIWA_STATS=1` on the same 128-token decode: **80.3% hit rate** (68 322 hits, 16 726 misses,
+18 632 staged, 2 277 promotions), lookahead `470 loaded / 15 640 swaps`. So a layer receives ~10 lookups and misses ~2-3
+of them; with one lookup in ten missing, 1 - 0.8^10 = 89% of layers take the host path - which is what "2 627 waits over
+~51 steps of 48 layers" measures. §6's "almost every layer misses" holds; "the cache contributes almost nothing" does not.
+
+**Deeper speculation makes it worse, not better.** The hope was that a verify step's rows share the same 48-layer chain,
+so the host batch would amortise over more tokens:
+
+| `--mtp-n-predict` | per token |
+|---|---:|
+| 1 | 44.1 ms |
+| 2 (default arm) | 42.3-45.1 ms |
+| 3 | 49.8 ms |
+
+It does not amortise, because the miss set per layer is the **union over the rows**: three draft rows route to three sets
+of experts, so the host batch for one layer grows with the row count while the chain length does not shrink. Amortisation
+would need the same experts across rows, which is precisely what drafting destroys.
+
+### What 644 µs actually is
+
+The work behind one wait is ~2.7 missed experts x 3 projections of 640x2560 = 12.4 M MAC = ~25 MFLOP, which at a
+realistic 40 GFLOP/s for AVX-2 quantised GEMV over 10 threads is **0.5-0.6 ms** - the wait *is* mostly the compute, not
+handshake overhead. So the honest statement is not "the CPU is slow" but "the CPU is busy doing real work while the GPU
+has nothing else to do", which is a **scheduling** problem: the same work is done on the critical path, once per layer,
+48 times per token.
+
+strata does *more* host work than we do - its long-prompt decode reports a **33.8%** hit rate against our 80.3% - and is
+still 12% faster per token. That is the whole argument: the work is unavoidable, the exposure is not.
+
+### Why "submit, do unrelated GPU work, join late" is not available inside a step
+
+The chain inside a decode step is strict: `attn_L -> route_L -> MoE_L -> x_{L+1}`. Layer L's routing is what names the
+experts, and layer L's output is what layer L+1 needs, so between the submit and the join of one layer's misses there is
+**no GPU work that does not depend on them**. M37's original wording implied otherwise; it was wrong.
+
+The only axes that expose the host work to overlap are therefore:
+
+1. **Cross-step prediction** - compute step n+1's *predicted* misses while the GPU finishes step n. The machinery exists
+   (the lookahead thread) and is empirically idle: 470 loads against 15 640 swaps. This is the axis to fix, and its
+   quality metric is prediction accuracy, not draft acceptance.
+2. **A smaller tail** - a bigger or better-ranked cache so fewer layers miss at all (2.5 GiB of 23.4 GiB today; the
+   profile provides the ranking, but the drop rate at 2 500 of 12 288 experts is what leaves 2-3 misses per layer).
+3. **Fewer, larger waits** - batch the misses of several layers per handoff where the dependency allows (a layer's
+   *attention* path does not need the previous layer's MoE when the model allows overlap of the residual stream, which
+   this architecture does not).

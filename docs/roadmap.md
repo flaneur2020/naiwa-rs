@@ -71,11 +71,15 @@ profile found the whole remaining gap in one kernel.
   path is already a third faster than strata's.
 - **The mechanism:** a layer's misses are submitted and then joined at `BudgetPhase::CpuJoin` before that layer's MoE
   runs, so the wait is serial. strata runs `CPU pool tasks/phase: 18` over 6 threads and keeps the host ahead of the GPU.
-- **One mechanism for this milestone:** make the CPU expert batch leave the critical path - submit layer L's misses,
-  start the GPU work that does not depend on them, and join as late as the dependency allows (the same shape the
-  sequential (`seq == 1`) path already uses via `deferred`, extended to the multi-row verify path).
-- **Target:** doorbell wait from 13.2 to under 4 ms/token, decode from 45 to under 35 ms/token, output unchanged
-  (checked by the oracle plus a decode-parity probe, since the CPU and GPU expert paths round differently).
+- **What will not work (measured, M36 §7):** joining later *within* a step - the chain `attn_L -> route_L -> MoE_L` is
+  strict, so there is no independent GPU work to hide behind - and deeper speculation (depth 3 measures 49.8 ms/token
+  against depth 1's 44.1), because a layer's miss set is the union over the draft rows.
+- **One mechanism for this milestone:** **cross-step prediction**. Compute step n+1's predicted misses on the host while
+  the GPU finishes step n, so the join finds them already in a slot. The lookahead thread exists for this and is idle
+  (470 loads against 15 640 swaps over a 128-token decode), so the first job is to make its accuracy measurable and then
+  make it pay.
+- **Target:** doorbell wait from 13.2 to under 4 ms/token, decode from 45 to under 35 ms/token (the perfect-cache ceiling
+  is 26.4), output unchanged (oracle plus a decode-parity probe, since the CPU and GPU expert paths round differently).
 
 ## M36 — the tree after the cleanup, and the comparison that says where the gap is — ✅ done (2026-11-07)
 
