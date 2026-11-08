@@ -74,12 +74,21 @@ profile found the whole remaining gap in one kernel.
 - **What will not work (measured, M36 §7):** joining later *within* a step - the chain `attn_L -> route_L -> MoE_L` is
   strict, so there is no independent GPU work to hide behind - and deeper speculation (depth 3 measures 49.8 ms/token
   against depth 1's 44.1), because a layer's miss set is the union over the draft rows.
-- **One mechanism for this milestone:** **cross-step prediction**. Compute step n+1's predicted misses on the host while
-  the GPU finishes step n, so the join finds them already in a slot. The lookahead thread exists for this and is idle
-  (470 loads against 15 640 swaps over a 128-token decode), so the first job is to make its accuracy measurable and then
-  make it pay.
-- **Target:** doorbell wait from 13.2 to under 4 ms/token, decode from 45 to under 35 ms/token (the perfect-cache ceiling
-  is 26.4), output unchanged (oracle plus a decode-parity probe, since the CPU and GPU expert paths round differently).
+- **What actually keeps them waiting (M36 §8):** the host batch itself. `FUSED_DBG` reads **2 017 µs per layer batch**
+  (228 µs per expert) while the GPU has only **1 400 µs** of work before it needs the result - the 0.6 ms difference is
+  exactly the measured spin. 228 µs per expert is 21 GFLOP/s effective, 3-5x below what this AVX-2 host should do; the
+  cost is per-weight dequantisation, and strata's answer to it is in its own log: *"multi-token for the i-quant gate/up
+  rows"* - amortise one codebook lookup over every row that shares the expert.
+- **One mechanism for this milestone:** specialise the i-quant gate/up/down row kernels for multi-row batches
+  (`mistralrs-quant/src/gguf/fused_cpu.rs`), taking the host below the GPU's 1.4 ms per layer so the spin disappears by
+  construction. Arithmetic order is untouched - only the loop structure moves.
+- **Ruled out by measurement (do not retry):** cross-step prediction (a guess - layer L+1's experts are named by layer
+  L's own output; the lookahead does 470 loads against 15 640 swaps), deeper speculation (depth 3: 49.8 against depth
+  1's 44.1 ms/token), moving misses to PCIe (`--pcie-frac` 0.7/1.0: 51.9/54.1 ms/token), promotion policy (hit rate
+  80.3% -> 80.5%).
+- **Target:** 228 -> under 100 µs per expert (2.02 -> under 0.9 ms per layer), the doorbell spin to vanish as a
+  consequence, decode from 44 to under 35 ms/token (the perfect-cache ceiling is 26.4), and the output byte-identical -
+  the arithmetic does not change, only the loop structure.
 
 ## M36 — the tree after the cleanup, and the comparison that says where the gap is — ✅ done (2026-11-07)
 

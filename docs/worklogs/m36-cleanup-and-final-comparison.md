@@ -221,3 +221,58 @@ The only axes that expose the host work to overlap are therefore:
 3. **Fewer, larger waits** - batch the misses of several layers per handoff where the dependency allows (a layer's
    *attention* path does not need the previous layer's MoE when the model allows overlap of the residual stream, which
    this architecture does not).
+
+## 8. The host path itself is slow: 228 µs per expert, and that is 40 ms/token
+
+The user's objection to §7 is correct and it re-orders the whole plan: you cannot precompute the next layer, because
+layer L+1's experts are named by layer L's own attention output. So any "overlap" scheme is a guess. That sent me back to
+the numbers, and the CPU path turns out to be the thing that is actually wrong.
+
+`FUSED_DBG` (already in the tree, one line per 480 CPU batches) on a 24-token decode:
+
+```
+FUSED_DBG calls rows/call pairs/call experts/call us/call us/pair us/expert gap_us/call
+FUSED_DBG 480   5.94       11.14       8.85         2016.9   181.1    227.8     1399.6
+```
+
+| reading | value |
+|---|---:|
+| CPU time per layer (one batch of ~9 experts) | **2 017 µs** |
+| per (expert, row) pair | 181 µs |
+| **per expert** (gate+up+down) | **228 µs** |
+| GPU time between two CPU batches (the gap) | 1 400 µs |
+
+Two conclusions, both measured:
+
+1. **The host is the bottleneck, not the GPU.** A batch costs 2.02 ms and the GPU only has 1.40 ms of work before it needs
+   the result - the 0.6 ms difference is exactly the 644 µs average
+   `doorbell_wait_copy_f32` spin from §6. 480 batches x 2.02 ms = **0.97 s per 24 tokens = 40 ms/token of host compute**,
+   against a 43.9 ms/token wall clock: decode is a host-bound workload with a GPU attached.
+2. **228 µs per expert is 3-5x what this CPU should need.** An expert is 3 projections of 640x2560 = 4.9 M MAC ≈ 9.8
+   MFLOP, and this host's AVX-2 path measures ~21 GFLOP/s effective - a good AVX-2 quantised GEMV on 6 cores is 60-100+.
+   The gap is per-weight dequantisation: these experts are IQ2_S/IQ3_XXS/IQ4NL/Q2_0, where every weight is a codebook
+   lookup, and strata's own log says what it does about that: *"the expert kernels run on AVX-2 (`multi-token` for the
+   i-quant gate/up rows)"* - it processes several rows at once to amortise the lookups. We do have rows to amortise
+   (5.94 rows/call) and evidently do not use them that way.
+
+### The levers that are now ruled out, with their numbers
+
+| lever | measurement | verdict |
+|---|---|---|
+| deeper speculation (more rows to amortise) | depth 1 44.1, depth 2 42-45, depth 3 49.8 ms/token | worse |
+| move misses to PCIe and compute on the GPU (`--pcie-frac`) | 0.4: 44, 0.7: 51.9, 1.0: 54.1 ms/token | worse - 131 experts/token is 262 MB/token against a 13.4 GB/s link |
+| more promotions (policy) | 2 277 -> 6 461 promotions, hit rate 80.3% -> 80.5% | no effect; it is capacity, not policy |
+| bigger cache (capacity) | 2.5 -> 3.5 GiB: hit 80.3% -> 84.3%, 44 -> 41.2 ms/token | real but shallow, and VRAM-bound |
+| cross-step prediction | lookahead does 470 loads against 15 640 swaps | not a plan: it is a guess about the next token's routing |
+
+### So M37 becomes: make the host expert kernel 2-3x faster
+
+Target: **228 -> under 100 µs per expert**, i.e. 2.02 -> under 0.9 ms per layer. That puts the host below the GPU's 1.40 ms
+per layer, at which point the doorbell spin disappears on its own (the GPU becomes the bottleneck again) and decode moves
+from 44 towards the 26-30 ms/token the compute path already supports.
+
+The work is the same thing strata did and documented: specialise the i-quant gate/up/down rows for multi-row batches, so
+one codebook lookup serves every row that shares the expert, instead of re-deriving the weights per row. The pieces to
+look at are `mistralrs-quant/src/gguf/fused_cpu.rs` (the rayon pool and its per-pair loop) and the per-type row kernels it
+calls. No change to numerics is required or wanted: the arithmetic order stays as it is, only the loop structure moves -
+which keeps the §"arithmetic order" constraint intact.

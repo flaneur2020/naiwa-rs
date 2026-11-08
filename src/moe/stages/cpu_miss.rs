@@ -30,13 +30,25 @@ pub(crate) fn fused_decode(
     // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
     let _ = &GENERIC;
     if !matches!(act, Activation::Silu | Activation::Swish) {
+        if std::env::var_os("NAIWA_FUSED_DBG").is_some() {
+            eprintln!("FUSED_MISS act={act:?}");
+        }
         return Ok(None);
     }
     let Some((gate, up, down)) = experts.expert_qtensors() else {
+        if std::env::var_os("NAIWA_FUSED_DBG").is_some() {
+            eprintln!("FUSED_MISS no expert_qtensors");
+        }
         return Ok(None);
     };
     let t0 = std::time::Instant::now();
     let ys = mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk);
+    if matches!(&ys, Ok(None)) && std::env::var_os("NAIWA_FUSED_DBG").is_some() {
+        eprintln!(
+            "FUSED_MISS fused_moe_decode None: gate={:?} up={:?} down={:?} xs={} ids={} topk={topk}",
+            gate.dtype(), up.dtype(), down.dtype(), xs.len(), ids.len()
+        );
+    }
     crate::stats::record_fused_decode(t0, ids, weights, topk);
     ys
 }
