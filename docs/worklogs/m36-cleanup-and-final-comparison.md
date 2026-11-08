@@ -438,3 +438,61 @@ Getting below that needs a change of hardware or of strategy, not of code:
 | expert grouping | reverted (neutral) |
 | `--expert-cache-gb 3.5` | reverted (does not fit) |
 | thread count | unchanged (already optimal) |
+
+## 12. M37 step 3: dequantise-once is real on the host (-9.2%) and neutral on the wall clock
+
+Built the multi-row i-quant kernels after all: `vec_dot_q8_k_x2` for **IQ2_S**, **IQ3_XXS** and **IQ3_S**, which unpack
+one weight row once and dot **two activations** against it (the grid lookups, sign masks and scale vectors are weight-only,
+so the second row costs two loads and two `maddubs`). `gate_up` uses them whenever one expert serves two or more rows;
+`NAIWA_NO_X2=1` is the A/B arm and `NAIWA_NO_EXPERT_GROUPING=1` restores per-pair tasks.
+
+Each kernel is checked against the two single-row dots it replaces (`vec_dot_x2_matches_two_single_dots`, one per type):
+identical to 1e-4 relative, and the AVX2 path agrees with the scalar fallback.
+
+### Host time: -9.2% on the gate/up pass
+
+Aggregated from `NAIWA_FUSED_PHASE_DBG`, two 128-token runs per arm:
+
+| gate/up stack | x2 off | x2 on | change |
+|---|---:|---:|---:|
+| IQ3_XXS | 147 µs/expert | 125 | **-14.7%** |
+| IQ3_S | 151 | 140 | **-6.9%** |
+| IQ2_S | 125 | 121 | -3.3% |
+| IQ4XS (no x2 kernel) | 118 | 123 | +4.4% (noise) |
+| **gate/up total** | **4.464 s** | **4.053 s** | **-9.2%** |
+
+-1.6 ms/token of host compute. That is the size §9/§11 predicted (~2-3 ms/token) and it is real, not noise: the per-type
+per-expert columns carry a fraction of the wall clock's spread.
+
+### Wall clock: unchanged, and that is the finding
+
+| arm | 128-token decode, four runs | median |
+|---|---|---:|
+| x2 off | 46.9 / 45.7 / 45.5 / 44.6 ms per token | **45.6** |
+| x2 on | 45.6 / 45.1 / 46.4 / 46.4 ms per token | **46.0** |
+
+Neutral to slightly worse, i.e. inside the ±2 ms/token spread this host has. With the phases measured in the same runs the
+reason is arithmetic: host compute is ~24.6 ms/token (gate/up 2.0 s + down 1.15 s over 128 tokens), the GPU path is
+26.4 ms/token, and the wall is 45 - so **the host and the GPU overlap by roughly 6 ms and the GPU is now the larger of the
+two terms**. Removing 1.6 ms from the smaller term cannot move the sum by more than that, and it does not: it disappears
+into the overlap.
+
+So the earlier "40 ms/token of host compute" in §8 double-counted (it took `us/call` from `FUSED_DBG`, which includes
+the activation quantisation and slot bookkeeping the phase split shows separately). The corrected decomposition is:
+
+| term | per token |
+|---|---:|
+| host expert compute | 24.6 ms |
+| GPU work (perfect-cache measurement) | 26.4 ms |
+| overlapped | ~6 ms |
+| wall clock | 45 ms |
+
+### What that closes
+
+M37's premise was that the host is the critical path and can be made faster than the GPU per layer. Half right: the host
+*is* on the critical path layer by layer (that is the 644 µs spin), but at the token level the GPU and host overlap enough
+that a 9.2% host improvement is invisible. Both terms now need to shrink for the decode number to move, and §11 has
+already measured what each would cost (AVX-512 or more VRAM).
+
+The kernels stay, default on, because they are free: three unit tests, no numeric change to anything the oracle covers
+(single-row decode never takes the two-row path), and a strictly lower host cost.
