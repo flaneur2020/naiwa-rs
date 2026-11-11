@@ -5,11 +5,19 @@ Goal: a Rust implementation of Strata that runs Qwen3.8-Next-Flash on commodity 
 Design and current-state detail live in [`design.md`](design.md); per-milestone evidence lives in
 [`worklogs/`](worklogs/).
 
-Recorded 2026-10-16; last updated 2026-11-02 after the CUDA-graph line was withdrawn (M29-M32) and M33 opened
-(the prompt path borrows the expert cache).
+Recorded 2026-10-16. Current milestone status and measurement decisions are linked below;
+historical closure/upper-bound claims must be read with their subsequent corrections.
 
-**M38** (launch count on the decode critical path) is open: 107 launches and 236 µs of inter-kernel gap per layer call,
-a 0.7 ms/token ceiling for the whole launch bill. See [`worklogs/m38-launch-count.md`](worklogs/m38-launch-count.md).
+**M42** is in progress: CPU-before-DMA, replacement budget, single-sequence GPU sampling and CPU-pool tuning have measured opt-in results. Recent decisions, five-restart Strata comparison, configuration and remaining adoption gates: [optimization summary](worklogs/m42-optimization-summary.md). Detailed attribution: [M42 worklog](worklogs/m42-token-thread-sync-reads.md). Defaults remain unchanged; the comparison uses neural MTP on naiwa versus suffix lookup on Strata, not matching neural drafters.
+
+**M41** is background for CPU submission and resident dispatch. M40's prior CPU-direction closure and exposure ceiling are withdrawn; prediction statistics require the corrected window accounting. See [M41](worklogs/m41-cpu-submit-and-resident-dispatch.md).
+
+**M39** (the same request produces the same tokens) is open: repeated runs of one greedy request were doing
+different work, which is what made every decode A/B noisy. Two of three sources are fixed and gated; the
+drafter's grouped combine is still atomic. See [`worklogs/m39-deterministic-decode.md`](worklogs/m39-deterministic-decode.md).
+
+**M38** (launch count on the decode critical path) is done: 107 launches and 236 µs of inter-kernel gap per layer call,
+a 0.7 ms/token ceiling for the whole launch bill, no wall-clock gain. See [`worklogs/m38-launch-count.md`](worklogs/m38-launch-count.md).
 
 ---
 
@@ -413,6 +421,8 @@ the tree and measured; the loan itself stays behind `NAIWA_PREFILL_BORROW=1`.
 
 | milestone | mechanism | status | decisive result |
 |---|---|---|---|
+| **M40 / M41** | CPU submission and resident dispatch | in progress | M40 closure withdrawn; single-mechanism experiment and validation in [M41](worklogs/m41-cpu-submit-and-resident-dispatch.md) |
+| **M39** | one request, one token path (reproducible decode) | 🔶 in progress | Three runs of one greedy request produced **three different texts** while Strata repeated bit-identically. Two causes found and fixed: the GPU expert combine used `atomicAdd` across top-k (fork: per-slot partials + fixed-order weighted sum, `MISTRALRS_MOE_DET_COMBINE`), and promotion picked its candidate out of a `HashMap` (now sorted by expert id). With both, `frac 0.4` is byte-identical 3/3 and `NAIWA_XSUM` shows no divergence through 48 layers. The drafter's `moe_grouped` combine is still atomic, so MTP=2 still differs; oracle byte-exact, cost neutral (41.7 against 41.4 ms median) |
 | **M33** | the prompt path borrows the expert cache | 🔶 built, loan repaired, off by default | The cache's banks come from one 1.5 GiB lending window, a prompt borrows **two ranges of it**, and a ledger refills what it displaced. The chunk's cost is measured (0.35 MiB a row: 386 MiB for 1 216 tokens against 1 730 when the buffers sit beside the cache), the cache's nominal size is now the resident one (per-layer slot pricing, +318 MiB free at load), oracle byte-exact, 56 tests. The loan's NaN is fixed (its once-per-chunk emptying ran only on reallocation); after the fix 0 failures in 40 turns and 3.2 GB runs a long prompt. Left **off by default** because the ladder is flat (2.2 / 2.9 / 3.2 GB = 33.5 / 33.7 / 32.4 ms TPOT, inside the spread), so a bigger cache is not worth the loan's wipe |
 | **M0** | zero-argument doorbell primitives | ✅ 2026-10-16 | 1000/1000 visible, 200/200 replays, baked-target control fails |
 | **M1** | static layout + descriptor-driven kernel | ✅ 2026-10-16 | bitwise kernel, byte-exact engine at `frac 0`; rings frozen |
