@@ -76,14 +76,56 @@ pub(crate) fn forward(
         };
     }
     Preload::submit(layer, &x2d, rows, hidden)?;
+    // M42: hand the same activation to the CPU experts through mapped memory, queued here (before
+    // the routing read) so the token thread never has to sync for it.
+    let cpu_act = match layer.cpu_chan() {
+        Some(chan) if rows * hidden <= chan.max_n() => chan.publish(&x2d, rows * hidden)?,
+        _ => None,
+    };
+
+    // NAIWA_XSUM: checksum of this layer's MoE input, for the first few ticks only. Repeated runs
+    // of one greedy request that end up with different tokens diverge somewhere; the first layer
+    // whose input checksum differs is that point, which no earlier probe could localize. Costs a
+    // D2H per layer, so it is diagnostic only.
+    static XSUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *XSUM.get_or_init(|| std::env::var_os("NAIWA_XSUM").is_some()) {
+        let tick = layer.state().lock().unwrap().tick + 1;
+        if tick <= 3 {
+            if let Ok(v) = x2d.to_dtype(candle_core::DType::F32).and_then(|t| t.flatten_all()?.to_vec1::<f32>()) {
+                let sum: f64 = v.iter().map(|&x| x as f64).sum();
+                let l1: f64 = v.iter().map(|&x| (x as f64).abs()).sum();
+                eprintln!("XSUM tick={tick} layer={} rows={rows} sum={sum:.9} l1={l1:.9} first={:.9}", layer.layer(), v[0]);
+            }
+        }
+    }
 
     // M27: the raw routing demand, before any cache decision, for the allocation study.
-    if let Ok(ids) = topk_ids.flatten_all() {
-        if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
-            stats::record_expert_demand(layer.layer(), &ids);
+    // Do not synchronize/copy routing ids for a disabled histogram. The debug
+    // override preserves the previous behaviour for an A/B measurement.
+    if std::env::var_os("NAIWA_EXPERT_HIST").is_some()
+        || std::env::var_os("NAIWA_FORCE_HIST_READ").is_some()
+    {
+        if let Ok(ids) = topk_ids.flatten_all() {
+            if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
+                stats::record_expert_demand(layer.layer(), &ids);
+            }
         }
     }
     let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
+    let schedule_tick = if stats::schedule::enabled() {
+        layer.state().lock().unwrap().tick
+    } else { 0 };
+    #[cfg(feature = "cuda")]
+    let partition_stream = if stats::gpu_partition::enabled() && layer.slot_device().is_cuda() {
+        Some(layer.slot_device().as_cuda_device()?.cuda_stream())
+    } else { None };
+    macro_rules! gpu_mark { ($phase:expr) => { #[cfg(feature = "cuda")] if let Some(stream) = &partition_stream { stats::gpu_partition::mark(stream, layer.layer(), rows, $phase); } }; }
+    gpu_mark!("route");
+    stats::schedule::event(layer.layer(), schedule_tick, "route_ready");
+    // M41: this boundary follows host routing/classification, not GPU top-k completion.
+    static CPU_TIMELINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let route_ready = (*CPU_TIMELINE.get_or_init(|| std::env::var_os("NAIWA_CPU_TIMELINE").is_some()))
+        .then(std::time::Instant::now);
     let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
     stats::record_cache_hits(n_hits);
 
@@ -93,10 +135,45 @@ pub(crate) fn forward(
     mark!(stats::BudgetPhase::Plan);
     #[cfg(feature = "cuda")]
     let resident_prefix: Vec<usize> = plan.hits.iter().map(Vec::len).collect();
+    let mut early_cpu = None;
+    let mut cpu_submitted = false;
     if layer.staging_enabled() {
-        DmaMiss::submit(layer, &mut plan)?;
+        if std::env::var("NAIWA_CPU_BEFORE_DMA").as_deref() == Ok("1") {
+            DmaMiss::submit_cpu_first(layer, &mut plan, &mut |misses, chosen| {
+                let cpu_misses: Vec<Vec<(u32, f32)>> = misses.iter().map(|row| {
+                    row.iter().copied().filter(|(id, _)| !chosen.contains(id)).collect()
+                }).collect();
+                early_cpu = CpuMiss::submit(layer, &cpu_misses, &x2d, rows,
+                    route_ready, cpu_act.clone())?;
+                cpu_submitted = true;
+                Ok(())
+            })?;
+        } else {
+            DmaMiss::submit(layer, &mut plan)?;
+        }
     }
 
+    stats::schedule::event(layer.layer(), schedule_tick, "dma_enqueued");
+    if let Some(mut trace) = plan.work_trace.take() {
+        trace["gpu_slots_weight_bits"] = serde_json::json!(plan.hits.iter()
+            .map(|row| row.iter().map(|(_, slot, w)| (*slot, w.to_bits())).collect::<Vec<_>>())
+            .collect::<Vec<_>>());
+        trace["cpu_ids_weight_bits"] = serde_json::json!(plan.misses.iter()
+            .map(|row| row.iter().map(|(id, w)| (*id, w.to_bits())).collect::<Vec<_>>())
+            .collect::<Vec<_>>());
+        // Separate sink prevents tracing's stdout logger from interleaving JSON bytes.
+        static WORK_FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+        let file = WORK_FILE.get_or_init(|| std::env::var_os("NAIWA_WORK_TRACE_FILE")
+            .map(|path| std::sync::Mutex::new(std::fs::File::create(path)
+                .expect("create NAIWA_WORK_TRACE_FILE"))));
+        if let Some(file) = file {
+            use std::io::Write;
+            writeln!(file.lock().unwrap(), "MOE_WORK {trace}")
+                .map_err(|e| candle_core::Error::Msg(format!("write work trace: {e}")))?;
+        } else {
+            eprintln!("MOE_WORK {trace}");
+        }
+    }
     mark!(stats::BudgetPhase::Stage);
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
     stats::record_cache_misses(n_cpu);
@@ -126,9 +203,15 @@ pub(crate) fn forward(
     if candle_core::cuda_backend::alloc_trace::enabled() {
         // Handled at the step boundary: the window accumulates across the step.
     }
-    let cpu = CpuMiss::submit(layer, &plan.misses, &x2d, rows)?;
+    let cpu = if cpu_submitted {
+        early_cpu
+    } else {
+        CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready, cpu_act)?
+    };
+    stats::schedule::event(layer.layer(), schedule_tick, "cpu_submit_return");
     mark!(stats::BudgetPhase::Spawn);
 
+    gpu_mark!("plan_submit");
     // Wait for the latest preload claim on candle's stream. The claim carries its own completion
     // event, so this also drains a copy the lookahead queued late; a layer that never gets
     // predicted has no claim and costs no CUDA call at all.
@@ -136,6 +219,7 @@ pub(crate) fn forward(
     {
         layer.wait_preload()?;
     }
+    gpu_mark!("preload_ready");
     mark!(stats::BudgetPhase::PreloadWait);
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
     // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
@@ -177,9 +261,11 @@ pub(crate) fn forward(
         None
     };
 
+    gpu_mark!("resident_end");
     // ... and the staging DMA's completion event, on candle's stream.
     #[cfg(feature = "cuda")]
     layer.wait_staging()?;
+    gpu_mark!("staging_ready");
     mark!(stats::BudgetPhase::Gpu);
 
     #[cfg(feature = "cuda")]
@@ -246,6 +332,7 @@ pub(crate) fn forward(
     if let Some(stream) = &cuda_stream {
         stats::budget_dev::end(stream, expert_ev);
     }
+    gpu_mark!("staged_end");
     // Kernels reading these slots may be queued even if a later step failed: fence every
     // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
     // cannot be recorded, wait for the device instead.
@@ -280,13 +367,16 @@ pub(crate) fn forward(
     mark!(stats::BudgetPhase::Fence);
 
     // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
+    gpu_mark!("promotion_end");
     let cpu_out = cpu.map(|p| p.upload()).transpose();
+    gpu_mark!("cpu_ready");
     mark!(stats::BudgetPhase::CpuJoin);
     let sum = match cpu_out? {
         None => gpu_out,
         Some(c) => (gpu_out + c)?,
     };
     let out = sum.to_dtype(xs.dtype())?.reshape((batch, seq, hidden))?;
+    gpu_mark!("combine_end");
     mark!(stats::BudgetPhase::Other);
     Ok(out)
 }

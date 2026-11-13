@@ -1,0 +1,39 @@
+{
+  "medians": {
+    "base": 48.484606811023625,
+    "cpu_first": 47.79230925984252,
+    "strata": 37.13565068503937
+  },
+  "pairs": [
+    {
+      "round": 1,
+      "base": 48.484606811023625,
+      "cpu_first": 47.407231574803156,
+      "strata": 37.13565068503937,
+      "cpu_first_minus_base": -1.077375236220469,
+      "cpu_first_minus_strata": 10.271580889763783,
+      "cpu_first_slower_pct": 27.659622762182636
+    },
+    {
+      "round": 2,
+      "cpu_first": 47.79230925984252,
+      "strata": 37.15195982677165,
+      "base": 48.320197976377955,
+      "cpu_first_minus_base": -0.5278887165354362,
+      "cpu_first_minus_strata": 10.640349433070867,
+      "cpu_first_slower_pct": 28.6400757394323
+    },
+    {
+      "round": 3,
+      "strata": 37.127402692913385,
+      "base": 48.68331992913386,
+      "cpu_first": 48.152952157480314,
+      "cpu_first_minus_base": -0.5303677716535447,
+      "cpu_first_minus_strata": 11.025549464566929,
+      "cpu_first_slower_pct": 29.696527806593398
+    }
+  ],
+  "median_paired_cpu_improvement_ms": 0.5303677716535447,
+  "median_paired_gap_ms": 10.640349433070867,
+  "ratio_of_medians_slower_pct": 28.696571564575635
+}

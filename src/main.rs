@@ -8,6 +8,7 @@ mod copy_stream;
 mod doorbell;
 mod vram_peak;
 mod executor;
+mod spin_pool;
 mod host_memory;
 mod load;
 mod moe;
@@ -42,6 +43,11 @@ async fn main() -> Result<()> {
     // Every artifact must already be local; this keeps the mistral.rs loaders off the network.
     std::env::set_var(HF_HUB_OFFLINE_ENV, "1");
     candle_core::utils::init_global_threadpool();
+    #[cfg(feature = "cuda")]
+    stats::model_partition::install();
+    if std::env::var_os("NAIWA_CPU_SPIN_US").is_some() {
+        mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(spin_pool::dispatch));
+    }
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);
 

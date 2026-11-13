@@ -1,0 +1,74 @@
+[
+  {
+    "engine": "naiwa",
+    "round": 1,
+    "tpot_ms": 41.845123692393656,
+    "ttft_ms": 474.620568100363,
+    "total_ms": 5807.895878795534,
+    "hashes": [
+      "320a88610fafce62811cf53e1f66cfa70b4da8fa04732fc6b3fab463eee70f80",
+      "142013e365b7e2b358ce0455e18eda24cf10c138bed9277a1baccdd7bd44ada3",
+      "9f6515deee29849aefa26c8123132ae7e543318967ee6ccf54578673e97103f7"
+    ]
+  },
+  {
+    "engine": "naiwa",
+    "round": 2,
+    "tpot_ms": 42.48290423003179,
+    "ttft_ms": 499.21818799339235,
+    "total_ms": 5874.664761126041,
+    "hashes": [
+      "3f82500a0835f6b16127ff03edc4232000d6fb423fa1ac9645eaf0ce5bf4bfe4",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23",
+      "d6cd19b76bd4222934c9c1caa713201a32738251adf08afe65d3b0e38b1f611c"
+    ]
+  },
+  {
+    "engine": "naiwa",
+    "round": 3,
+    "tpot_ms": 42.212037739937934,
+    "ttft_ms": 484.47996587492526,
+    "total_ms": 5866.712033981457,
+    "hashes": [
+      "7b7450159b746ca0f448af077f4d2209f19991bb9e57d74eed8d3aa420b0823f",
+      "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2",
+      "d9d009c5b37e49d7e5bcc63d8a6c2a0bed1a39b4d2289dce08b3f892e769b359"
+    ]
+  },
+  {
+    "engine": "strata",
+    "round": 1,
+    "tpot_ms": 37.03306680251881,
+    "ttft_ms": 172.56266297772527,
+    "total_ms": 4873.225542949513,
+    "hashes": [
+      "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+    ]
+  },
+  {
+    "engine": "strata",
+    "round": 2,
+    "tpot_ms": 37.07474351156591,
+    "ttft_ms": 173.0628430377692,
+    "total_ms": 4877.444087062031,
+    "hashes": [
+      "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+    ]
+  },
+  {
+    "engine": "strata",
+    "round": 3,
+    "tpot_ms": 37.12651911044977,
+    "ttft_ms": 175.40531186386943,
+    "total_ms": 4884.889732114971,
+    "hashes": [
+      "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23",
+      "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+    ]
+  }
+]

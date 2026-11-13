@@ -1,0 +1,26 @@
+[
+  {
+    "left_records": 6192,
+    "right_records": 6192,
+    "equal": true,
+    "left_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "right_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "scope": "ordered records in entire supplied logs, including prefill if logged; activation identity NOT measured"
+  },
+  {
+    "left_records": 6192,
+    "right_records": 6192,
+    "equal": true,
+    "left_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "right_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "scope": "ordered records in entire supplied logs, including prefill if logged; activation identity NOT measured"
+  },
+  {
+    "left_records": 6192,
+    "right_records": 6192,
+    "equal": true,
+    "left_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "right_sha256": "4b606aff95499879b737c49dcc45e5f35673b4d9976f3576f7e4ea2f36159257",
+    "scope": "ordered records in entire supplied logs, including prefill if logged; activation identity NOT measured"
+  }
+]

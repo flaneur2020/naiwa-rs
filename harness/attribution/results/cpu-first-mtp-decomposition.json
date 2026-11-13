@@ -1,0 +1,65 @@
+[
+  {
+    "round": 1,
+    "request": 1,
+    "delta_tpot_ms": -0.49336050393701214,
+    "count_component_ms_per_token": 0.7088057113846485,
+    "cost_component_ms_per_token": -1.2021662153216581
+  },
+  {
+    "round": 1,
+    "request": 2,
+    "delta_tpot_ms": -2.162229803149607,
+    "count_component_ms_per_token": -1.4320860706625036,
+    "cost_component_ms_per_token": -0.7301437324870995
+  },
+  {
+    "round": 1,
+    "request": 3,
+    "delta_tpot_ms": -0.4268868976377931,
+    "count_component_ms_per_token": 0.0,
+    "cost_component_ms_per_token": -0.4268868976377983
+  },
+  {
+    "round": 2,
+    "request": 1,
+    "delta_tpot_ms": -0.9093564724409546,
+    "count_component_ms_per_token": 0.0,
+    "cost_component_ms_per_token": -0.9093564724409477
+  },
+  {
+    "round": 2,
+    "request": 2,
+    "delta_tpot_ms": 1.8579912913385783,
+    "count_component_ms_per_token": 2.1416390517488213,
+    "cost_component_ms_per_token": -0.2836477604102441
+  },
+  {
+    "round": 2,
+    "request": 3,
+    "delta_tpot_ms": 0.019410401574809555,
+    "count_component_ms_per_token": 1.4166314324739648,
+    "cost_component_ms_per_token": -1.397221030899169
+  },
+  {
+    "round": 3,
+    "request": 1,
+    "delta_tpot_ms": -3.9474586062992074,
+    "count_component_ms_per_token": -2.8564931510103513,
+    "cost_component_ms_per_token": -1.0909654552888568
+  },
+  {
+    "round": 3,
+    "request": 2,
+    "delta_tpot_ms": -0.7071652204724401,
+    "count_component_ms_per_token": 0.0,
+    "cost_component_ms_per_token": -0.7071652204724453
+  },
+  {
+    "round": 3,
+    "request": 3,
+    "delta_tpot_ms": -1.4551426771653482,
+    "count_component_ms_per_token": -0.7109044840923923,
+    "cost_component_ms_per_token": -0.7442381930729595
+  }
+]

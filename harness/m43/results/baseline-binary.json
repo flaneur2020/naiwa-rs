@@ -1,0 +1,6 @@
+{
+  "path": "/tmp/m43-r0/baseline",
+  "sha256": "187db5f7d153af6bb7a7a91342f7cd1fa2d5ee3dd04cbd83ae477580ca59d43a",
+  "source_snapshot": "/tmp/m43-r0",
+  "limitation": "Existing binary copied before changes; no fresh baseline rebuild establishing source equivalence before extraction."
+}

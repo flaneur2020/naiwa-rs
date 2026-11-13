@@ -1,0 +1,164 @@
+[
+  {
+    "fills": 31598,
+    "bytes": 64658995200,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 12013,
+        "bytes": 24596377600
+      },
+      "superseded_by_publication_used": {
+        "count": 18735,
+        "bytes": 38359168000
+      },
+      "right_censored_unused": {
+        "count": 258,
+        "bytes": 531456000
+      },
+      "right_censored_used": {
+        "count": 592,
+        "bytes": 1171993600
+      }
+    },
+    "unused_superseded_byte_fraction": 0.3804014820199371,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r1-repeat_0"
+  },
+  {
+    "fills": 31904,
+    "bytes": 65310796800,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 11739,
+        "bytes": 24024473600
+      },
+      "superseded_by_publication_used": {
+        "count": 19326,
+        "bytes": 39605452800
+      },
+      "right_censored_unused": {
+        "count": 240,
+        "bytes": 499609600
+      },
+      "right_censored_used": {
+        "count": 599,
+        "bytes": 1181260800
+      }
+    },
+    "unused_superseded_byte_fraction": 0.36784842288128383,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r1-repeat_1"
+  },
+  {
+    "fills": 31769,
+    "bytes": 65021926400,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 11600,
+        "bytes": 23730355200
+      },
+      "superseded_by_publication_used": {
+        "count": 19300,
+        "bytes": 39549312000
+      },
+      "right_censored_unused": {
+        "count": 195,
+        "bytes": 386688000
+      },
+      "right_censored_used": {
+        "count": 674,
+        "bytes": 1355571200
+      }
+    },
+    "unused_superseded_byte_fraction": 0.36495927626038466,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r2-repeat_0"
+  },
+  {
+    "fills": 31902,
+    "bytes": 65247897600,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 11884,
+        "bytes": 24316851200
+      },
+      "superseded_by_publication_used": {
+        "count": 19143,
+        "bytes": 39172096000
+      },
+      "right_censored_unused": {
+        "count": 292,
+        "bytes": 592332800
+      },
+      "right_censored_used": {
+        "count": 583,
+        "bytes": 1166617600
+      }
+    },
+    "unused_superseded_byte_fraction": 0.3726840571794914,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r2-repeat_1"
+  },
+  {
+    "fills": 31792,
+    "bytes": 65037286400,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 11727,
+        "bytes": 24027315200
+      },
+      "superseded_by_publication_used": {
+        "count": 19230,
+        "bytes": 39335372800
+      },
+      "right_censored_unused": {
+        "count": 275,
+        "bytes": 552371200
+      },
+      "right_censored_used": {
+        "count": 560,
+        "bytes": 1122227200
+      }
+    },
+    "unused_superseded_byte_fraction": 0.36943907918027774,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r3-repeat_0"
+  },
+  {
+    "fills": 31916,
+    "bytes": 65315097600,
+    "groups": {
+      "superseded_by_publication_unused": {
+        "count": 11850,
+        "bytes": 24253619200
+      },
+      "superseded_by_publication_used": {
+        "count": 19193,
+        "bytes": 39310643200
+      },
+      "right_censored_unused": {
+        "count": 277,
+        "bytes": 557107200
+      },
+      "right_censored_used": {
+        "count": 596,
+        "bytes": 1193728000
+      }
+    },
+    "unused_superseded_byte_fraction": 0.3713325110303441,
+    "unpaired_publications": 0,
+    "unpublished_queues": 0,
+    "warning": "No request/GPU-use IDs. tick>=3 local filter only. Resident-use means classified host hit, not GPU consumption. Superseded means next successful fill/promotion publication on slot, NOT exact eviction time. Borrow/unpublish/error paths not tracked; tail unused is censored, not wasted. Diagnostic lifecycle capture may alter policy. No TPOT savings inferred.",
+    "arm": "r3-repeat_1"
+  }
+]

@@ -9,6 +9,8 @@ use super::Hit;
 pub(crate) struct RoutePlan {
     pub hits: Vec<Vec<Hit>>,
     pub misses: Vec<Vec<(u32, f32)>>,
+    /// Diagnostic-only payload; no extra device read. Emitted after staging assignment.
+    pub work_trace: Option<serde_json::Value>,
 }
 
 pub(crate) struct Route;
@@ -80,10 +82,43 @@ impl Route {
 
         let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
+        // M40: compare this pass's real demand against the lookahead's prediction for this layer.
+        if crate::stats::predict_enabled() {
+            crate::stats::record_actual(layer.layer(), &ids_rows);
+        }
+        static WORK_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace_enabled = *WORK_TRACE.get_or_init(|| {
+            std::env::var("NAIWA_WORK_TRACE").as_deref() == Ok("1")
+        });
+        let mut work_trace = None;
         {
             let mut st = layer.state().lock().unwrap();
             st.tick += 1;
             let tick = st.tick;
+            if trace_enabled {
+                let residency: Vec<_> = st.slots.iter().enumerate()
+                    .filter(|(_, s)| s.buf.is_some())
+                    .filter_map(|(slot, s)| s.expert.map(|id| (slot, id))).collect();
+                work_trace = Some(serde_json::json!({
+                    "schema": 1, "layer": layer.layer(), "tick": tick, "rows": rows,
+                    "ids": ids_rows,
+                    "weight_bits": weight_rows.iter().map(|r| r.iter().map(|w| w.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+                    "residency": residency,
+                }));
+            }
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| {
+                std::env::var_os("NAIWA_CPU_LAYER_TRACE").is_some()
+                    || std::env::var_os("NAIWA_ROUTE_IDS").is_some()
+            }) {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SEQ: AtomicU64 = AtomicU64::new(0);
+                let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+                let resident: Vec<_> = st.slots.iter()
+                    .filter(|s| s.buf.is_some()).filter_map(|s| s.expert).collect();
+                eprintln!("ROUTE_IDS seq={seq} layer={} rows={} ids={:?} resident={:?}",
+                    layer.layer(), rows, ids_rows, resident);
+            }
             for (t, (ids, ws)) in ids_rows.iter().zip(&weight_rows).enumerate() {
                 for (&id, &w) in ids.iter().zip(ws) {
                     st.hit_counts[id as usize] += 1;
@@ -95,6 +130,7 @@ impl Route {
                     match resident {
                         Some((slot, buf)) => {
                             st.slots[slot].last_use = tick;
+                            crate::stats::schedule::detail(layer.layer(), tick, "resident_use", 0, Some(id as usize), Some(slot));
                             hits[t].push((buf, slot, w));
                         }
                         None => misses[t].push((id, w)),
@@ -118,6 +154,6 @@ impl Route {
             }
         }
 
-        Ok(RoutePlan { hits, misses })
+        Ok(RoutePlan { hits, misses, work_trace })
     }
 }

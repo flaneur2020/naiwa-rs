@@ -488,6 +488,9 @@ pub(crate) struct CachedLayer {
     /// R2a: the layer's GPU->host activation channel. `Some` only when the router exists
     /// and the slot device is CUDA.
     pub(crate) lookahead_chan: Option<Arc<LookaheadChannel>>,
+    /// M42: the same channel for the CPU-expert activation, so the token thread never blocks
+    /// on the D2H that used to empty the launch queue. `Some` only with the switch on.
+    pub(crate) cpu_chan: Option<Arc<LookaheadChannel>>,
     pub(crate) state: Mutex<LayerState>,
     /// Uploads fills alongside compute; `None` off CUDA, where fills go through candle.
     pub(crate) copy_stream: Option<Arc<CopyStream>>,
@@ -704,6 +707,11 @@ impl CachedLayer {
         self.lookahead_chan.as_ref()
     }
 
+    /// The CPU experts' activation channel (M42), `None` unless it was created.
+    pub(crate) fn cpu_chan(&self) -> Option<&Arc<LookaheadChannel>> {
+        self.cpu_chan.as_ref()
+    }
+
     pub(crate) fn copy_stream(&self) -> Option<&Arc<CopyStream>> {
         self.copy_stream.as_ref()
     }
@@ -890,7 +898,12 @@ impl CachedLayer {
         }
         let _ = &PROMOTED_THIS_STEP;
         // Always drain, even with the cap at zero: these `Arc`s must not survive the step.
-        let staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
+        // The staged list is built from a `HashMap` in `dma_miss`, so its order changes per process;
+        // with `cap = 1` the first eligible candidate wins, which made *which* expert became resident
+        // vary between runs. That changes the CPU/GPU placement and therefore the rounding of every
+        // later step. Sort by expert id so the promotion is a function of the demand alone.
+        let mut staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
+        staged.sort_unstable_by_key(|(id, _)| *id);
         if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
             eprintln!(
                 "PROMOTE_ENTER layer {} cap {} staged {} promoting {}",
@@ -1009,6 +1022,7 @@ impl CachedLayer {
                     let s = &mut st.slots[slot];
                     s.buf = Some(buf);
                     s.last_use = tick;
+                    crate::stats::schedule::detail(self.layer, tick, "promotion_publish", 0, Some(expert), Some(slot));
                     PROMOTED_THIS_STEP.fetch_add(1, Ordering::Relaxed);
                     promoted += 1;
                 }
@@ -1134,6 +1148,7 @@ impl CachedLayer {
                 let s = &mut st.slots[slot];
                 s.buf = Some(buf);
                 s.last_use = tick;
+                crate::stats::schedule::detail(self.layer, tick, "fill_publish", 0, Some(expert_id), Some(slot));
                 Ok(Some(slot))
             }
             Ok(None) => {
@@ -1201,6 +1216,11 @@ impl CachedLayer {
             // records the batch's completion on the same stream.
             unsafe { cs.queue_async(&buf.fence, &parts)? };
         }
+        if crate::stats::schedule::enabled() {
+            let bytes = parts.iter().map(|(_, src)| src.len() as u64).sum();
+            let tick = self.state.lock().unwrap().tick;
+            crate::stats::schedule::detail(self.layer, tick, "cache_fill_h2d", bytes, Some(expert_id), Some(slot));
+        }
         Ok(Some(Arc::clone(buf)))
     }
 
@@ -1239,6 +1259,21 @@ impl CachedLayer {
     pub(crate) fn prefetch_predicted(&self, x: &Tensor) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
+        // M40: the prediction is the only thing that knows a layer's experts before the top-k
+        // doorbell returns. Count what it got right, and how much of it the prefetch found
+        // resident already (a speculative copy that could not have helped).
+        if crate::stats::predict_enabled() {
+            let mut uniq = predicted.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let already = {
+                let st = self.state.lock().unwrap();
+                uniq.iter()
+                    .filter(|&&e| st.slots[..st.usable].iter().any(|s| s.expert == Some(e)))
+                    .count()
+            };
+            crate::stats::record_predicted(self.layer(), &uniq, already);
+        }
         let Some(cs) = &self.copy_stream else {
             return Ok(());
         };

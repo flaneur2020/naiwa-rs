@@ -1,0 +1,107 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "strata": [
+        {
+          "windows": 128,
+          "staged_MB_per_window": 155.6044,
+          "staged_groups_per_layer": 1.5960286458333333,
+          "cpu_entries_per_layer": 4.134765625,
+          "pool_callback_ms_per_window": 23.392805921875
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 141.5856,
+          "staged_groups_per_layer": 1.4554036458333333,
+          "cpu_entries_per_layer": 3.8805338541666665,
+          "pool_callback_ms_per_window": 21.8577319375
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 143.5512,
+          "staged_groups_per_layer": 1.4737955729166667,
+          "cpu_entries_per_layer": 3.9016927083333335,
+          "pool_callback_ms_per_window": 23.0253040859375
+        }
+      ],
+      "naiwa": {
+        "layer_windows": 18384,
+        "MB_per_48_layer_equivalent": {
+          "staged_h2d": 190.601491383812,
+          "cache_fill_h2d": 169.44018381201045
+        },
+        "warning": "tick>=3 is local layer filter, NOT request/decode ID. Cache fills may execute asynchronously across boundary. Does not account promotion D2D or fallback-owned uploads."
+      }
+    },
+    {
+      "round": 2,
+      "strata": [
+        {
+          "windows": 128,
+          "staged_MB_per_window": 155.6044,
+          "staged_groups_per_layer": 1.5960286458333333,
+          "cpu_entries_per_layer": 4.134765625,
+          "pool_callback_ms_per_window": 23.0620182578125
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 141.5856,
+          "staged_groups_per_layer": 1.4554036458333333,
+          "cpu_entries_per_layer": 3.8805338541666665,
+          "pool_callback_ms_per_window": 21.5699331953125
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 143.5512,
+          "staged_groups_per_layer": 1.4737955729166667,
+          "cpu_entries_per_layer": 3.9016927083333335,
+          "pool_callback_ms_per_window": 21.5989781015625
+        }
+      ],
+      "naiwa": {
+        "layer_windows": 18384,
+        "MB_per_48_layer_equivalent": {
+          "staged_h2d": 190.04718120104437,
+          "cache_fill_h2d": 169.55187467362924
+        },
+        "warning": "tick>=3 is local layer filter, NOT request/decode ID. Cache fills may execute asynchronously across boundary. Does not account promotion D2D or fallback-owned uploads."
+      }
+    },
+    {
+      "round": 3,
+      "strata": [
+        {
+          "windows": 128,
+          "staged_MB_per_window": 155.6044,
+          "staged_groups_per_layer": 1.5960286458333333,
+          "cpu_entries_per_layer": 4.134765625,
+          "pool_callback_ms_per_window": 23.3461508359375
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 141.5856,
+          "staged_groups_per_layer": 1.4554036458333333,
+          "cpu_entries_per_layer": 3.8805338541666665,
+          "pool_callback_ms_per_window": 21.631814890625
+        },
+        {
+          "windows": 128,
+          "staged_MB_per_window": 143.5512,
+          "staged_groups_per_layer": 1.4737955729166667,
+          "cpu_entries_per_layer": 3.9016927083333335,
+          "pool_callback_ms_per_window": 21.735646671875
+        }
+      ],
+      "naiwa": {
+        "layer_windows": 18384,
+        "MB_per_48_layer_equivalent": {
+          "staged_h2d": 191.72642088772847,
+          "cache_fill_h2d": 170.49860678851175
+        },
+        "warning": "tick>=3 is local layer filter, NOT request/decode ID. Cache fills may execute asynchronously across boundary. Does not account promotion D2D or fallback-owned uploads."
+      }
+    }
+  ],
+  "warning": "Diagnostic only. Strata staged bytes are selected full-blob transfer payload (kernel PCIe loads, not memcpy). Naiwa is queued projection-byte payload. No equality of request windows/work, no bandwidth-to-TPOT causal subtraction. Single GPU/no drafting only. Strata all-resident/batch/pipeline paths not instrumented."
+}

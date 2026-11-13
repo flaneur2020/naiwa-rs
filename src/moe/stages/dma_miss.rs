@@ -26,10 +26,12 @@ fn staging_waves() -> usize {
         .unwrap_or(1)
 }
 
+
 fn stream_pcie(
     layer: &Arc<CachedLayer>,
     misses: &mut [Vec<(u32, f32)>],
     hits: &mut [Vec<Hit>],
+    before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
 ) -> candle_core::Result<()> {
     let (Some(cs), Some(done)) = (layer.copy_stream(), layer.staging_done()) else {
         return Ok(());
@@ -43,7 +45,7 @@ fn stream_pcie(
     // Every path records the layer's completion event: `upload_async` after each expert's copies,
     // and one bare record when there was nothing to stage, so the consumer's wait is satisfied
     // either way (a wait on an event that was never recorded would hang the stream).
-    let staged = stage_misses(layer, cs, misses, hits);
+    let staged = stage_misses(layer, cs, misses, hits, before_dma);
     done.record(cs)?;
     staged
 }
@@ -58,6 +60,7 @@ fn stage_misses(
     cs: &Arc<CopyStream>,
     misses: &mut [Vec<(u32, f32)>],
     hits: &mut [Vec<Hit>],
+    before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
 ) -> candle_core::Result<()> {
     let Some((gate, up, down)) = layer.cpu().expert_qtensors() else {
         return Ok(());
@@ -81,6 +84,32 @@ fn stage_misses(
     let slot_of = {
         let mut ring = ring.lock().unwrap();
         let chosen = streamed_misses(misses, layer.pcie_frac(), ring.len());
+        // Selection is unchanged; the hook may submit only the complementary CPU set.
+        before_dma(misses, &chosen)?;
+        // NAIWA_STAGE_TRACE: the staged set is what decides whether a routed expert is computed by
+        // the GPU (streamed into the ring) or by the CPU, so repeated runs can be compared step by
+        // step. Limited to the first ticks, since only the earliest difference is diagnostic.
+        static STAGE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *STAGE_TRACE.get_or_init(|| std::env::var_os("NAIWA_STAGE_TRACE").is_some()) {
+            let tick = layer.state().lock().unwrap().tick;
+            if tick <= 12 {
+                let mut ids: Vec<u32> = chosen.clone();
+                ids.sort_unstable();
+                eprintln!("STAGE tick={tick} layer={} rows={} n={} chosen={ids:?}",
+                    layer.layer(), misses.len(), ids.len());
+            }
+        }
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("NAIWA_ADMISSION_TRACE").is_some()) {
+            let mut weights: HashMap<u32, f32> = HashMap::new();
+            for &(id, w) in misses.iter().flatten() {
+                *weights.entry(id).or_default() += w;
+            }
+            let mut ranked: Vec<_> = weights.into_iter().collect();
+            ranked.sort_by(|(a, wa), (b, wb)| wb.total_cmp(wa).then(a.cmp(b)));
+            eprintln!("ADMISSION layer={} rows={} ranked={:?} chosen={:?}",
+                layer.layer(), misses.len(), ranked, chosen);
+        }
         if chosen.is_empty() {
             HashMap::new()
         } else {
@@ -130,6 +159,10 @@ fn stage_misses(
                     )?;
                 }
                 stats::record_cache_pcie(bytes as u64);
+                if stats::schedule::enabled() {
+                    let tick = layer.state().lock().unwrap().tick;
+                    stats::schedule::bytes(layer.layer(), tick, "staged_h2d", bytes as u64);
+                }
                 let wave = i / per_wave;
                 wave_of.push((pos as u32, wave));
                 slot_of.insert(expert, (Arc::clone(buf), pos));
@@ -174,6 +207,14 @@ impl DmaMiss {
         layer: &Arc<CachedLayer>,
         plan: &mut super::RoutePlan,
     ) -> candle_core::Result<()> {
-        stream_pcie(layer, &mut plan.misses, &mut plan.hits)
+        stream_pcie(layer, &mut plan.misses, &mut plan.hits, &mut |_, _| Ok(()))
+    }
+
+    pub(crate) fn submit_cpu_first(
+        layer: &Arc<CachedLayer>,
+        plan: &mut super::RoutePlan,
+        before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
+    ) -> candle_core::Result<()> {
+        stream_pcie(layer, &mut plan.misses, &mut plan.hits, before_dma)
     }
 }

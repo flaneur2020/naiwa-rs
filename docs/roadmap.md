@@ -8,6 +8,8 @@ Design and current-state detail live in [`design.md`](design.md); per-milestone 
 Recorded 2026-10-16. Current milestone status and measurement decisions are linked below;
 historical closure/upper-bound claims must be read with their subsequent corrections.
 
+**M43** is planned: clarify module ownership and execution dataflow through staged, behavior-preserving refactoring, gated by correctness and five-restart performance comparisons. See [structure and dataflow refactoring plan](worklogs/m43-structure-and-dataflow-refactor.md). No implementation or default changes yet.
+
 **M42** is in progress: CPU-before-DMA, replacement budget, single-sequence GPU sampling and CPU-pool tuning have measured opt-in results. Recent decisions, five-restart Strata comparison, configuration and remaining adoption gates: [optimization summary](worklogs/m42-optimization-summary.md). Detailed attribution: [M42 worklog](worklogs/m42-token-thread-sync-reads.md). Defaults remain unchanged; the comparison uses neural MTP on naiwa versus suffix lookup on Strata, not matching neural drafters.
 
 **M41** is background for CPU submission and resident dispatch. M40's prior CPU-direction closure and exposure ceiling are withdrawn; prediction statistics require the corrected window accounting. See [M41](worklogs/m41-cpu-submit-and-resident-dispatch.md).

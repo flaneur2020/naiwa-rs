@@ -5,6 +5,7 @@
 //! - `cache` - the expert-cache counters the benchmark prints.
 //! - `lookahead` / `round` / `step` - the expert cache's per-step, per-round and per-layer probes.
 //! - `fused` / `retired` - the CPU MoE path: fused-decode cost and result-handoff latency.
+//! - `predict` - how well the lookahead's one-layer-ahead prediction matches the real routing.
 //!
 //! The modules are private; their `record_*` and `dump_*` functions are re-exported here so call
 //! sites use `crate::stats::record_*` / `crate::stats::dump_*`. Probes keep their accumulator and
@@ -15,9 +16,11 @@ mod budget;
 mod cache;
 mod fused;
 mod lookahead;
+mod predict;
 mod retired;
 mod round;
 mod step;
+pub(crate) mod schedule;
 
 pub(crate) mod expert_hist;
 pub(crate) use expert_hist::record_demand as record_expert_demand;
@@ -33,6 +36,9 @@ pub(crate) use fused::{dump_fused_stats, record_fused_decode};
 pub(crate) use lookahead::{
     dump_lookahead_stats, record_lookahead_job, record_lookahead_publish, record_lookahead_step,
 };
+pub(crate) use predict::{
+    dump_predict_stats, enabled as predict_enabled, record_actual, record_predicted,
+};
 pub(crate) use retired::{dump_retired_stats, record_retired};
 pub(crate) use round::{
     dump_round_stats, record_round_cpu_compute, record_round_pass, record_round_plan,
@@ -44,8 +50,8 @@ pub(crate) use step::{dump_step_stats, record_step_layer};
 // inference, so the names are not always referenced by path; keep the re-export anyway.
 #[allow(unused_imports)]
 pub(crate) use self::{
-    cache::CacheStats, fused::FusedStats, lookahead::LookaheadStats, retired::RetiredStats,
-    round::RoundStats, step::StepStats,
+    cache::CacheStats, fused::FusedStats, lookahead::LookaheadStats, predict::PredStats,
+    retired::RetiredStats, round::RoundStats, step::StepStats,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,3 +134,10 @@ fn ns_to_ms(ns: u64) -> f64 {
 fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
+
+#[cfg(feature = "cuda")]
+pub(crate) mod gpu_partition;
+#[cfg(feature = "cuda")]
+pub(crate) mod model_partition;
+#[cfg(feature = "cuda")]
+pub(crate) mod head_partition;

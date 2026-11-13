@@ -110,6 +110,15 @@ impl Executor {
     where
         F: FnOnce() -> Result<Vec<f32>> + Send + 'static,
     {
+        self.submit_result_tagged(device, rows, cols, None, compute)
+    }
+
+    pub(crate) fn submit_result_tagged<F>(
+        &'static self, device: &Device, rows: usize, cols: usize,
+        tag: Option<(usize, u64)>, compute: F,
+    ) -> Result<Pending>
+    where F: FnOnce() -> Result<Vec<f32>> + Send + 'static,
+    {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(dev) = device {
             cuda::take_error()?;
@@ -121,7 +130,11 @@ impl Executor {
             self.submit(Box::new(move || {
                 let t_start = Instant::now();
                 let mut done = done;
-                match compute() {
+                let result = compute();
+                if let Some((layer, tick)) = tag {
+                    crate::stats::schedule::event(layer, tick, "result_publish_begin");
+                }
+                match result {
                     Ok(v) if v.len() == len => done.publish(&v),
                     Ok(v) => {
                         cuda::record_error(format!("returned {} values, expected {len}", v.len()));
@@ -131,6 +144,9 @@ impl Executor {
                         cuda::record_error(e.to_string());
                         done.publish_empty();
                     }
+                }
+                if let Some((layer, tick)) = tag {
+                    crate::stats::schedule::event(layer, tick, "result_publish_return");
                 }
                 crate::stats::record_retired(t_submit, t_start);
             }));

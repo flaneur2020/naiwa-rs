@@ -1,0 +1,42 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "rounds": [
+    {
+      "round": 1,
+      "medians": {
+        "mtp2": 37.45682829133858,
+        "mtp2_gpu_sample": 37.62835541732283,
+        "strata": 37.680973031496066
+      }
+    },
+    {
+      "round": 2,
+      "medians": {
+        "mtp2_gpu_sample": 39.250767236220476,
+        "strata": 37.868967393700785,
+        "mtp2": 39.32450690551181
+      }
+    },
+    {
+      "round": 3,
+      "medians": {
+        "strata": 37.77066763779528,
+        "mtp2": 39.0457988503937,
+        "mtp2_gpu_sample": 39.03218792125984
+      }
+    }
+  ],
+  "median_of_process_medians": {
+    "mtp2": 39.0457988503937,
+    "mtp2_gpu_sample": 39.03218792125984,
+    "strata": 37.77066763779528
+  },
+  "paired_deltas": {
+    "mtp2_gpu_sample minus mtp2": -0.013610929133861305,
+    "strata minus mtp2": -1.2751312125984242,
+    "strata minus mtp2_gpu_sample": -1.261520283464563
+  },
+  "same_work_proven": false,
+  "warning": "Three-arm rotated-order policy comparison; inspect drafting logs, text and configuration differences. No cross-session subtraction."
+}

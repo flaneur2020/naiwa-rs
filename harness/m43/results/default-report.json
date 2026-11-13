@@ -1,0 +1,48 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "reference": "before",
+  "candidate": "after",
+  "pairs": [
+    {
+      "round": 1,
+      "before": 49.9398868976378,
+      "after": 50.404344062992124,
+      "delta_ms": 0.46445716535432524
+    },
+    {
+      "round": 2,
+      "before": 50.07462131496063,
+      "after": 49.34081988976378,
+      "delta_ms": -0.7338014251968517
+    },
+    {
+      "round": 3,
+      "before": 49.935045527559055,
+      "after": 49.103301692913384,
+      "delta_ms": -0.8317438346456711
+    },
+    {
+      "round": 4,
+      "before": 49.25693428346457,
+      "after": 49.703827984251966,
+      "delta_ms": 0.446893700787399
+    },
+    {
+      "round": 5,
+      "before": 49.33670586614173,
+      "after": 49.65649318110236,
+      "delta_ms": 0.31978731496063517
+    }
+  ],
+  "median_paired_delta_ms": 0.31978731496063517,
+  "performance_eligible": true,
+  "all_text_equal": false,
+  "text_equal_by_request_position": {
+    "1": false,
+    "2": false,
+    "3": false
+  },
+  "same_work_proven": false,
+  "warning": "Performance eligibility is not same-work causality; inspect SHA256 and matched diagnostic traces. Never pool diagnostic TPOT with clean TPOT."
+}

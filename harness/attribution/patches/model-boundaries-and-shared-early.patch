@@ -1,0 +1,114 @@
+diff --git a/mistralrs-core/src/vision_models/qwen4_exp/text.rs b/mistralrs-core/src/vision_models/qwen4_exp/text.rs
+index 1ab80fa4..0ef4ce2d 100644
+--- a/mistralrs-core/src/vision_models/qwen4_exp/text.rs
++++ b/mistralrs-core/src/vision_models/qwen4_exp/text.rs
+@@ -212,21 +212,32 @@ impl SparseMoeBlock {
+         // Measurement hook (MOE_DBG=1): the routed-experts call is where every expert read, the CPU
+         // misses and the PCIe DMA happen, so its share of the token is the one number the offload
+         // work is judged by.
++        // Diagnostic single-mechanism test: same shared operations/output, queued before routed experts.
++        static SHARED_EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let shared_early = if *SHARED_EARLY.get_or_init(|| std::env::var("NAIWA_SHARED_EARLY").as_deref() == Ok("1")) {
++            let gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
++                .reshape((b_size, seq_len, 1))?;
++            Some(self.shared_expert.forward(xs)?.broadcast_mul(&gate)?)
++        } else { None };
+         let hook_start = std::time::Instant::now();
+         let y = experts
+             .forward(xs, topk.values, &topk.indices)?
+             .reshape((b_size, seq_len, hidden_dim))?;
++        crate::qwen4_split::boundary(&y, usize::MAX, "routed_end");
+         let hook_nanos = hook_start.elapsed().as_nanos() as usize;
+         // The whole block, so the router, the shared expert and the residual come out as the
+         // difference rather than as part of "everything else".
+         let block_nanos = block_start.elapsed().as_nanos() as usize;
+         moe_block_probe(block_nanos, hook_nanos);
+-        let shared_gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
+-            .reshape((b_size, seq_len, 1))?;
+-        let shared_out = self
+-            .shared_expert
+-            .forward(xs)?
+-            .broadcast_mul(&shared_gate)?;
++        let shared_out = match shared_early {
++            Some(out) => out,
++            None => {
++                let shared_gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
++                    .reshape((b_size, seq_len, 1))?;
++                self.shared_expert.forward(xs)?.broadcast_mul(&shared_gate)?
++            }
++        };
++        crate::qwen4_split::boundary(&shared_out, usize::MAX, "shared_end");
+         y + shared_out
+     }
+ }
+@@ -968,7 +979,9 @@ impl Qwen4ExpTextModel {
+         // at 20%, so the remainder is compute somewhere in here.
+         let layer_dbg = std::env::var_os("MISTRALRS_LAYER_DBG").is_some();
+         for (i, layer) in self.layers.iter().enumerate() {
++            crate::qwen4_split::boundary(&res, i, "layer_start");
+             let t_layer = std::time::Instant::now();
++            let mut t_split = t_layer;
+             res = self.mapper.map(res, i)?;
+             #[cfg(feature = "cuda")]
+             let layout = if res.device().is_cuda() {
+@@ -1052,6 +1065,8 @@ impl Qwen4ExpTextModel {
+             };
+             let h = layer.attn_hc.mix(&xn)?;
+             let inject = layer.attn_hc.inject(&xn)?;
++            crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Pre);
++            crate::qwen4_split::boundary(&h, i, "mixer_start");
+             let out = match &layer.mixer {
+                 Mixer::Attention(attn) => {
+                     let Some(HybridLayerCache::Attention(kv_cache)) = hybrid_cache.get_mut(i)
+@@ -1152,6 +1167,8 @@ impl Qwen4ExpTextModel {
+                     out
+                 }
+             };
++            crate::qwen4_split::boundary(&out, i, "mixer_end");
++            crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Mixer);
+             let (next_res, xn) = layer
+                 .attn_hc
+                 .combine(&res, &out, &inject, Some(&layer.mlp_hc))?;
+@@ -1162,7 +1179,11 @@ impl Qwen4ExpTextModel {
+             };
+             let h = layer.mlp_hc.mix(&xn)?;
+             let inject = layer.mlp_hc.inject(&xn)?;
++            crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Pre);
++            crate::qwen4_split::boundary(&h, i, "moe_start");
+             let out = layer.moe.forward(&h)?;
++            crate::qwen4_split::boundary(&out, i, "moe_end");
++            crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Moe);
+             let next = match self.layers.get(i + 1) {
+                 Some(next) if next.ple.is_none() => Some(&next.attn_hc),
+                 Some(_) => None,
+@@ -1171,9 +1192,12 @@ impl Qwen4ExpTextModel {
+             let (next_res, xn) = layer.mlp_hc.combine(&res, &out, &inject, next)?;
+             res = next_res;
+             pending_norm = xn;
++            crate::qwen4_split::boundary(&res, i, "layer_end");
+             if layer_dbg {
+                 crate::prefix_dbg::note("layer", format!("{i} total={:?}", t_layer.elapsed()));
+             }
++            crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Post);
++            crate::qwen4_split::layer_done();
+         }
+         let res = res.to_device(&self.device)?;
+         if store_spec {
+@@ -1202,13 +1226,16 @@ impl Qwen4ExpTextModel {
+                 taps: Vec::new(),
+             });
+         }
++        let mut t_split = std::time::Instant::now();
+         let xn = match pending_norm {
+             Some(xn) if xn.device().same_device(&self.device) => xn,
+             _ => self.final_mixer.norm(&res)?,
+         };
+         let xn = ctx.logits(&xn)?;
+         let xs = self.final_mixer.mix(&xn)?;
+-        ctx.lm_head(&*self.lm_head, &xs)
++        let out = ctx.lm_head(&*self.lm_head, &xs);
++        crate::qwen4_split::mark(&mut t_split, crate::qwen4_split::Sec::Head);
++        out
+     }
+ }
+ 

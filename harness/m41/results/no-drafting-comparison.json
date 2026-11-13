@@ -1,0 +1,84 @@
+{
+  "naiwa": [
+    {
+      "round": 1,
+      "tpot_ms": 45.90426887363547,
+      "first_tpot_ms": 46.37685780391449,
+      "warm_tpot_ms": 45.87625687406582,
+      "ttft_ms": 484.01729902252555,
+      "total_ms": 6325.806956971064,
+      "hashes": [
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    },
+    {
+      "round": 2,
+      "tpot_ms": 46.6830010001555,
+      "first_tpot_ms": 46.93193380229586,
+      "warm_tpot_ms": 46.47635053989925,
+      "ttft_ms": 462.49585202895105,
+      "total_ms": 6391.236979048699,
+      "hashes": [
+        "747846837207fc2488430fd303de6ac145ab0b05fa88d1b4a8b1cb014bbc18b4",
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    },
+    {
+      "round": 3,
+      "tpot_ms": 45.819144804162654,
+      "first_tpot_ms": 46.09382121207735,
+      "warm_tpot_ms": 45.810751327291484,
+      "ttft_ms": 490.6881330534816,
+      "total_ms": 6309.719523182139,
+      "hashes": [
+        "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    }
+  ],
+  "strata": [
+    {
+      "round": 1,
+      "tpot_ms": 37.04694257572469,
+      "first_tpot_ms": 38.41988472487983,
+      "warm_tpot_ms": 36.92955119392329,
+      "ttft_ms": 212.46705087833107,
+      "total_ms": 4916.2977039813995,
+      "hashes": [
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    },
+    {
+      "round": 2,
+      "tpot_ms": 37.04139941709307,
+      "first_tpot_ms": 38.408420211818864,
+      "warm_tpot_ms": 36.950511732285364,
+      "ttft_ms": 213.36617902852595,
+      "total_ms": 4917.6239049993455,
+      "hashes": [
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    },
+    {
+      "round": 3,
+      "tpot_ms": 37.07102227472062,
+      "first_tpot_ms": 38.41836388978198,
+      "warm_tpot_ms": 36.939165543024174,
+      "ttft_ms": 209.37312301248312,
+      "total_ms": 4917.291891062632,
+      "hashes": [
+        "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52",
+        "daaedd645b10aaafdc4d20fc57456c818101b2410cdb1c1d5dae5152b89857b4",
+        "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      ]
+    }
+  ]
+}

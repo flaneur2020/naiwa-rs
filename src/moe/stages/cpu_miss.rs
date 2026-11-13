@@ -55,10 +55,14 @@ pub(crate) fn fused_decode(
 
 pub(crate) struct CpuPending {
     inner: executor::Pending,
+    timeline: Option<(std::time::Instant, usize, u64)>,
 }
 
 impl CpuPending {
     pub(crate) fn upload(self) -> Result<Tensor> {
+        if let Some((origin, layer, tick)) = self.timeline {
+            eprintln!("CPU_UPLOAD layer={layer} tick={tick} host_enqueue_us={}", origin.elapsed().as_micros());
+        }
         self.inner.upload()
     }
 }
@@ -71,10 +75,18 @@ impl CpuMiss {
         misses: &[Vec<(u32, f32)>],
         x2d: &Tensor,
         rows: usize,
+        route_ready: Option<std::time::Instant>,
+        published: Option<(Arc<crate::moe::LookaheadChannel>, u32)>,
     ) -> Result<Option<CpuPending>> {
         if misses.iter().all(Vec::is_empty) {
             return Ok(None);
         }
+        let schedule_tick = if crate::stats::schedule::enabled() {
+            layer.state().lock().unwrap().tick
+        } else { 0 };
+        let schedule_layer = layer.layer();
+        let timeline = route_ready.map(|origin| (origin, layer.layer(), layer.state().lock().unwrap().tick));
+        let enter_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let width = misses.iter().map(Vec::len).max().unwrap_or(0);
         let pad = misses.iter().flatten().next().map_or(0, |&(id, _)| id);
         let mut ids = Vec::with_capacity(rows * width);
@@ -86,16 +98,54 @@ impl CpuMiss {
                 ws.push(w);
             }
         }
-        let xs_cpu = x2d.unsqueeze(0)?.to_device(&Device::Cpu)?;
+        let copy_begin_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        // M42: with a queued publish the worker waits for the mapped copy instead of the token
+        // thread blocking on a stream-wide D2H (which empties the launch queue).
+        let xs_cpu = match published {
+            Some(_) => None,
+            None => Some(x2d.unsqueeze(0)?.to_device(&Device::Cpu)?),
+        };
+        crate::stats::schedule::event(schedule_layer, schedule_tick, "cpu_submit");
+        let submit_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let n = rows * layer.hidden();
         let this = Arc::clone(layer);
         let job = move || {
-            let x = xs_cpu
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            if let Some(ys) = fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)? {
+            crate::stats::schedule::event(schedule_layer, schedule_tick, "cpu_worker");
+            let worker_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            let x = match (xs_cpu, published) {
+                (Some(t), _) => t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                (None, Some((chan, seq))) => chan.read(seq, n).ok_or_else(|| {
+                    candle_core::Error::Msg("CPU activation publish timed out".into())
+                })?,
+                (None, None) => candle_core::bail!("CPU job without an activation source"),
+            };
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trace = *TRACE.get_or_init(|| std::env::var_os("NAIWA_CPU_LAYER_TRACE").is_some());
+            let started = trace.then(std::time::Instant::now);
+            let result = fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)?;
+            if let Some(started) = started {
+                // Time computation only; formatting and stderr are outside the measurement.
+                let us = started.elapsed().as_micros();
+                let active: Vec<_> = ids.iter().zip(&ws).filter(|(_, w)| **w != 0.0).map(|(id, _)| *id).collect();
+                let mut distinct = active.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                let dtype = this.cpu().expert_qtensors().map(|(g, _, _)| g.dtype());
+                eprintln!("CPU_IDS layer={} rows={} ids={:?}", this.layer(), rows, active);
+                eprintln!("CPU_LAYER layer={} rows={} pairs={} experts={} us={} dtype={:?} fused={}",
+                    this.layer(), rows, active.len(), distinct.len(), us, dtype, result.is_some());
+            }
+            if let Some((origin, layer, tick)) = timeline {
+                // Absolute offsets from Route::submit return. This is compute return, not publication
+                // or GPU consumption. Logging occurs after the timestamp and perturbs publication.
+                let done_us = origin.elapsed().as_micros();
+                eprintln!("CPU_TASK layer={layer} tick={tick} rows={rows} enter_us={enter_us} copy_begin_us={copy_begin_us} submit_us={submit_us} worker_us={worker_us} compute_return_us={done_us} fused={} ids={ids:?} weights={:?}", result.is_some(), ws.iter().map(|w| w.to_bits()).collect::<Vec<_>>());
+            }
+            if let Some(ys) = result {
+                crate::stats::schedule::event(schedule_layer, schedule_tick, "cpu_compute_return");
                 return Ok(ys);
             }
+            let xs_cpu = Tensor::from_vec(x, (1, rows, n / rows.max(1)), &Device::Cpu)?;
             let miss_w_t = Tensor::from_vec(ws, (rows, width), &Device::Cpu)?;
             let miss_ids_t = Tensor::from_vec(ids, (rows, width), &Device::Cpu)?;
             this.cpu()
@@ -104,8 +154,10 @@ impl CpuMiss {
                 .flatten_all()?
                 .to_vec1::<f32>()
         };
-        let pending =
-            executor::cpu().submit_result(layer.slot_device(), rows, layer.hidden(), job)?;
-        Ok(Some(CpuPending { inner: pending }))
+        let device = layer.slot_device().clone();
+        let hidden = layer.hidden();
+        let tag = crate::stats::schedule::enabled().then_some((schedule_layer, schedule_tick));
+        let pending = executor::cpu().submit_result_tagged(&device, rows, hidden, tag, job)?;
+        Ok(Some(CpuPending { inner: pending, timeline }))
     }
 }

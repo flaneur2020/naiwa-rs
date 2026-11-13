@@ -1,0 +1,36 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "reference": "current",
+  "candidate": "shared_early",
+  "pairs": [
+    {
+      "round": 1,
+      "current": 47.805687204724414,
+      "shared_early": 47.21031434645669,
+      "delta_ms": -0.5953728582677229
+    },
+    {
+      "round": 2,
+      "current": 47.808095740157476,
+      "shared_early": 47.724416795275594,
+      "delta_ms": -0.08367894488188199
+    },
+    {
+      "round": 3,
+      "current": 47.76169833070866,
+      "shared_early": 47.58069431496063,
+      "delta_ms": -0.18100401574803016
+    }
+  ],
+  "median_paired_delta_ms": -0.18100401574803016,
+  "performance_eligible": true,
+  "all_text_equal": false,
+  "text_equal_by_request_position": {
+    "1": false,
+    "2": false,
+    "3": false
+  },
+  "same_work_proven": false,
+  "warning": "Performance eligibility is not same-work causality; inspect SHA256 and matched diagnostic traces. Never pool diagnostic TPOT with clean TPOT."
+}

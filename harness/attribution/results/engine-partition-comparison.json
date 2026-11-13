@@ -1,0 +1,101 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "naiwa": {
+        "complete_groups": 377,
+        "segments_ms": {
+          "plan_submit": 6.902990603503285,
+          "preload_ready": 0.9505484472485927,
+          "resident_end": 4.029912792837904,
+          "staging_ready": 10.214036798564129,
+          "staged_end": 1.5212530907371948,
+          "promotion_end": 0.4152475314644667,
+          "cpu_ready": 9.892030222464935,
+          "combine_end": 0.284868347490656,
+          "next_route": 19.997738427524542
+        },
+        "span_ms": 54.208626261835704,
+        "warning": "Route-to-next-route rolling partition. next_route includes dense/shared/router/head/host/event collection and file I/O, not isolated dense compute. Structurally excludes prefill/cross-request groups; no actual request IDs. Last incomplete groups censored, not force-flushed."
+      },
+      "strata_gpu_ms": {
+        "dense_attention_router": 11.198984,
+        "shared_quant": 0.8791413333333331,
+        "plan_wait_copy": 0.2780160000000002,
+        "resident_experts": 1.5329386666666667,
+        "staging_wait_fetch": 11.342034666666665,
+        "staged_experts": 0.5221706666666668,
+        "cpu_wait": 7.973688000000001,
+        "result_copy_combine": 0.3829093333333333,
+        "inter_layer_gap": 0.032664000000000006,
+        "last_layer_to_head": 0.0015973333333333332,
+        "head": 1.1786186666666667
+      }
+    },
+    {
+      "round": 2,
+      "naiwa": {
+        "complete_groups": 377,
+        "segments_ms": {
+          "plan_submit": 6.9749929759779885,
+          "preload_ready": 0.9268783812438304,
+          "resident_end": 4.047135244768399,
+          "staging_ready": 10.319836083453751,
+          "staged_end": 1.5395163542316825,
+          "promotion_end": 0.4257437132437286,
+          "cpu_ready": 9.870706499275068,
+          "combine_end": 0.2905034638486743,
+          "next_route": 19.80121568037044
+        },
+        "span_ms": 54.19652839641356,
+        "warning": "Route-to-next-route rolling partition. next_route includes dense/shared/router/head/host/event collection and file I/O, not isolated dense compute. Structurally excludes prefill/cross-request groups; no actual request IDs. Last incomplete groups censored, not force-flushed."
+      },
+      "strata_gpu_ms": {
+        "dense_attention_router": 11.206589333333334,
+        "shared_quant": 0.8754159999999997,
+        "plan_wait_copy": 0.2802160000000002,
+        "resident_experts": 1.5398026666666667,
+        "staging_wait_fetch": 11.353719999999997,
+        "staged_experts": 0.5172053333333335,
+        "cpu_wait": 7.927933333333334,
+        "result_copy_combine": 0.38718666666666657,
+        "inter_layer_gap": 0.029400000000000006,
+        "last_layer_to_head": 0.0015173333333333332,
+        "head": 1.18068
+      }
+    },
+    {
+      "round": 3,
+      "naiwa": {
+        "complete_groups": 377,
+        "segments_ms": {
+          "plan_submit": 7.039794923920451,
+          "preload_ready": 0.938684358763007,
+          "resident_end": 4.055250318503546,
+          "staging_ready": 10.234718642891718,
+          "staged_end": 1.541105074733891,
+          "promotion_end": 0.42250662089500884,
+          "cpu_ready": 9.30374312450225,
+          "combine_end": 0.2903529658162625,
+          "next_route": 19.743843767643764
+        },
+        "span_ms": 53.5699997976699,
+        "warning": "Route-to-next-route rolling partition. next_route includes dense/shared/router/head/host/event collection and file I/O, not isolated dense compute. Structurally excludes prefill/cross-request groups; no actual request IDs. Last incomplete groups censored, not force-flushed."
+      },
+      "strata_gpu_ms": {
+        "dense_attention_router": 11.180754666666665,
+        "shared_quant": 0.8739839999999998,
+        "plan_wait_copy": 0.28298133333333353,
+        "resident_experts": 1.536136,
+        "staging_wait_fetch": 11.351362666666665,
+        "staged_experts": 0.5258986666666668,
+        "cpu_wait": 8.319968000000001,
+        "result_copy_combine": 0.3865253333333333,
+        "inter_layer_gap": 0.03212533333333334,
+        "last_layer_to_head": 0.0015413333333333334,
+        "head": 1.18892
+      }
+    }
+  ],
+  "warning": "Diagnostic policies/work differ. Event allocation, elapsed queries, JSON and per-step writes perturb naiwa; Strata profiling changes stream concurrency. Diagnostic gap is not clean gap. No causal per-component clean-gap subtraction."
+}

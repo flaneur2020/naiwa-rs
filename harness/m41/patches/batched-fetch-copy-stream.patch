@@ -1,0 +1,199 @@
+diff --git a/src/copy_stream.rs b/src/copy_stream.rs
+index 6e28007..b1b1970 100644
+--- a/src/copy_stream.rs
++++ b/src/copy_stream.rs
+@@ -57,7 +57,7 @@ impl CopyStreams {
+ mod cuda {
+     use std::sync::{Arc, Mutex};
+ 
+-    use candle_core::cuda::cudarc::driver::{result, sys, CudaEvent, CudaStream};
++    use candle_core::cuda::cudarc::driver::{result, sys, CudaEvent, CudaStream, DevicePtr};
+     use candle_core::quantized::cuda::QCudaStorage;
+     use candle_core::quantized::{QStorage, QTensor};
+     use candle_core::{Device, Error, Result};
+@@ -147,12 +147,131 @@ mod cuda {
+         }
+     }
+ 
++    /// A mapped pinned descriptor block: the host writes it, the device reads it.
++    pub(super) struct MappedDesc {
++        host: *mut u64,
++        dev: u64,
++        cap: usize,
++    }
++
++    // SAFETY: the pointers are a live mapped allocation owned by this struct; it is only
++    // touched under the `desc` lock, and the device reads it only from the launch that
++    // follows the write.
++    unsafe impl Send for MappedDesc {}
++
++    impl MappedDesc {
++        fn new(cap: usize) -> Result<Self> {
++            let bytes = cap * std::mem::size_of::<u64>();
++            let host = unsafe {
++                result::malloc_host(
++                    bytes,
++                    sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE,
++                )
++            }
++            .map_err(Error::wrap)? as *mut u64;
++            let mut dev = 0u64;
++            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host.cast(), 0) }
++                .result()
++                .map_err(Error::wrap)?;
++            Ok(Self { host, dev, cap })
++        }
++    }
++
++    impl Drop for MappedDesc {
++        fn drop(&mut self) {
++            if !self.host.is_null() {
++                unsafe { result::free_host(self.host.cast()) }.ok();
++            }
++        }
++    }
++
+     pub struct CopyStream {
+         stream: Arc<CudaStream>,
+         device: Device,
++        /// Mapped descriptors for the batched fetch: the kernel reads them straight out of host
++        /// memory, so a batch costs one launch and no copy.
++        desc: Mutex<Option<MappedDesc>>,
++        /// Host pointer -> device alias, for the registered expert stacks.
++        aliases: Mutex<std::collections::HashMap<usize, u64>>,
+     }
+ 
+     impl CopyStream {
++        #[cfg(test)]
++        pub fn stream_for_bench(&self) -> Arc<CudaStream> { Arc::clone(&self.stream) }
++
++        #[cfg(test)]
++        pub fn memcpy_for_bench(&self, src: &[u8], dst: &mut candle_core::cuda::cudarc::driver::CudaSlice<u8>) -> Result<()> {
++            self.stream.memcpy_htod(src, dst).map_err(Error::wrap)
++        }
++
++        #[cfg(test)]
++        pub fn sync_for_bench(&self) -> Result<()> { self.stream.synchronize().map_err(Error::wrap) }
++
++        /// One launch for every part of a layer's staging batch; the sources stay registered for
++        /// the model's lifetime, so their device aliases are cached after the first use.
++        pub unsafe fn queue_fetch_batch(
++            &self,
++            fences: &[&ReadFence],
++            parts: &[(&SlotMemory, &[u8])],
++        ) -> Result<()> {
++            extern "C" {
++                fn naiwa_fetch_batch(desc: u64, n: i32, stream: *mut std::ffi::c_void) -> i32;
++            }
++            self.stream.context().bind_to_thread().map_err(Error::wrap)?;
++            for fence in fences {
++                if let Some(event) = fence.event.lock().unwrap().as_ref() {
++                    self.stream.wait(event).map_err(Error::wrap)?;
++                }
++            }
++            let mut words: Vec<u64> = Vec::with_capacity(parts.len() * 3);
++            for (dst, src) in parts {
++                if src.len() != dst.len {
++                    candle_core::bail!("fetch source/slot length mismatch");
++                }
++                words.push(dst.ptr);
++                words.push(self.alias_of(src.as_ptr())?);
++                words.push(src.len() as u64);
++            }
++            let mut guard = self.desc.lock().unwrap();
++            if guard.as_ref().map_or(true, |d| d.cap < words.len()) {
++                *guard = Some(MappedDesc::new(words.len().next_power_of_two().max(64))?);
++            }
++            let desc = guard.as_ref().unwrap();
++            // SAFETY: `words` fits the mapping (`cap` checked above); a fence separates the previous
++            // batch's device read from this write.
++            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), desc.host, words.len()) };
++            let rc = naiwa_fetch_batch(desc.dev, parts.len() as i32, self.stream.cu_stream().cast());
++            if rc != 0 {
++                candle_core::bail!("batch fetch launch failed: CUDA runtime error {rc}");
++            }
++            Ok(())
++        }
++
++        /// Device alias of registered host memory, cached per base pointer.
++        fn alias_of(&self, host: *const u8) -> Result<u64> {
++            let mut cache = self.aliases.lock().unwrap();
++            if let Some(alias) = cache.get(&(host as usize)) {
++                return Ok(*alias);
++            }
++            let mut alias = 0u64;
++            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut alias, host as *mut _, 0) }
++                .result()
++                .map_err(Error::wrap)?;
++            cache.insert(host as usize, alias);
++            Ok(alias)
++        }
++
++        /// Benchmark-only entry to the fetch kernel: (a)sync read of registered host bytes.
++        #[cfg(test)]
++        pub fn bench_fetch(&self, dst: sys::CUdeviceptr, src_alias: u64, len: usize) -> Result<()> {
++            extern "C" {
++                fn naiwa_fetch_projection(dst: u64, src: u64, n: usize, stream: *mut std::ffi::c_void) -> i32;
++            }
++            let rc = unsafe { naiwa_fetch_projection(dst, src_alias, len, self.stream.cu_stream().cast()) };
++            if rc != 0 { candle_core::bail!("fetch launch failed: {rc}"); }
++            Ok(())
++        }
++
+         /// `None` when `device` is not CUDA.
+         pub fn new(device: &Device) -> Result<Option<Self>> {
+             let Device::Cuda(dev) = device else {
+@@ -166,6 +285,8 @@ mod cuda {
+             Ok(Some(Self {
+                 stream,
+                 device: device.clone(),
++                desc: Mutex::new(None),
++                aliases: Mutex::new(std::collections::HashMap::new()),
+             }))
+         }
+ 
+@@ -729,3 +850,44 @@ mod tests {
+         wait_for_readers(&owner);
+     }
+ }
++
++#[cfg(all(test, feature = "cuda"))]
++mod fetch_bandwidth {
++    use candle_core::cuda::cudarc::driver::{sys, DevicePtr};
++
++    /// `cargo test --release --features cuda --bin naiwa-rs h2d_fetch_vs_memcpy -- --ignored --nocapture`
++    #[test]
++    #[ignore = "bandwidth microbenchmark"]
++    fn h2d_fetch_vs_memcpy() {
++        let device = candle_core::Device::new_cuda(0).expect("cuda");
++        let cuda = device.as_cuda_device().expect("cuda device");
++        let cs = crate::copy_stream::CopyStream::new(&device).unwrap().unwrap();
++        for len in [700usize << 10, 2 << 20, 8 << 20] {
++            let mut src: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) & 255) as u8).collect();
++            let ptr = src.as_mut_ptr();
++            unsafe { sys::cuMemHostRegister_v2(ptr.cast(), len, sys::CU_MEMHOSTREGISTER_PORTABLE) }
++                .result().unwrap();
++            let mut alias = 0u64;
++            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut alias, ptr.cast(), 0) }.result().unwrap();
++            let mut dst = unsafe { cuda.alloc::<u8>(len) }.unwrap();
++            let stream = cs.stream_for_bench();
++            let dptr = { let (p, guard) = dst.device_ptr(&stream); let raw = p; drop(guard); raw };
++            let iters = (512usize << 20) / len;
++            cs.memcpy_for_bench(&src, &mut dst).unwrap();
++            cs.bench_fetch(dptr, alias, len).unwrap();
++            cs.sync_for_bench().unwrap();
++            let t = std::time::Instant::now();
++            for _ in 0..iters { cs.memcpy_for_bench(&src, &mut dst).unwrap(); }
++            cs.sync_for_bench().unwrap();
++            let memcpy_s = t.elapsed().as_secs_f64();
++            let t = std::time::Instant::now();
++            for _ in 0..iters { cs.bench_fetch(dptr, alias, len).unwrap(); }
++            cs.sync_for_bench().unwrap();
++            let fetch_s = t.elapsed().as_secs_f64();
++            let gbs = |s: f64| (len as f64 * iters as f64) / s / 1e9;
++            println!("len {:>9}  iters {:>5}  memcpy {:.2} GB/s   fetch {:.2} GB/s   ratio {:.2}",
++                len, iters, gbs(memcpy_s), gbs(fetch_s), gbs(fetch_s) / gbs(memcpy_s));
++            unsafe { sys::cuMemHostUnregister(ptr.cast()) }.result().unwrap();
++        }
++    }
++}

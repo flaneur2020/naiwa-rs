@@ -1,0 +1,79 @@
+diff --git a/src/copy_stream.rs b/src/copy_stream.rs
+index 6e28007..26dbb47 100644
+--- a/src/copy_stream.rs
++++ b/src/copy_stream.rs
+@@ -152,7 +152,33 @@ mod cuda {
+         device: Device,
+     }
+ 
++    extern "C" {
++        fn naiwa_fetch_projection(dst: u64, src: u64, n: usize, stream: *mut std::ffi::c_void) -> i32;
++    }
++
+     impl CopyStream {
++        /// Same lifetime and completion contract as queue_async; source must be CUDA registered.
++        pub unsafe fn queue_fetch(
++            &self,
++            fence: &ReadFence,
++            parts: &[(&SlotMemory, &[u8])],
++        ) -> Result<()> {
++            self.stream.context().bind_to_thread().map_err(Error::wrap)?;
++            if let Some(event) = fence.event.lock().unwrap().as_ref() {
++                self.stream.wait(event).map_err(Error::wrap)?;
++            }
++            for (dst, src) in parts {
++                if src.len() != dst.len { candle_core::bail!("fetch source/slot length mismatch"); }
++                let mut alias = 0;
++                // Registration belongs to the layer and outlives its completion event.
++                unsafe { sys::cuMemHostGetDevicePointer_v2(&mut alias, src.as_ptr() as *mut _, 0) }
++                    .result().map_err(Error::wrap)?;
++                let rc = unsafe { naiwa_fetch_projection(dst.ptr, alias, src.len(), self.stream.cu_stream().cast()) };
++                if rc != 0 { candle_core::bail!("GPU fetch launch failed: CUDA runtime error {rc}"); }
++            }
++            Ok(())
++        }
++
+         /// `None` when `device` is not CUDA.
+         pub fn new(device: &Device) -> Result<Option<Self>> {
+             let Device::Cuda(dev) = device else {
+@@ -384,6 +410,29 @@ mod cuda {
+             Ok(())
+         }
+ 
++        #[cfg(test)]
++        pub fn test_fetch_bytes(&self) -> Result<()> {
++            use candle_core::cuda::cudarc::driver::DevicePtr;
++            for (len, offset) in [(1usize, 0usize), (4097, 0), (65539, 3)] {
++                let mut source: Vec<u8> = (0..len + offset).map(|i| (i.wrapping_mul(37) & 255) as u8).collect();
++                let ptr = source.as_mut_ptr();
++                unsafe { sys::cuMemHostRegister_v2(ptr.cast(), source.len(), sys::CU_MEMHOSTREGISTER_PORTABLE) }
++                    .result().map_err(Error::wrap)?;
++                let mut alias = 0;
++                unsafe { sys::cuMemHostGetDevicePointer_v2(&mut alias, ptr.cast(), 0) }.result().map_err(Error::wrap)?;
++                let device = self.device.as_cuda_device()?;
++                let dst = unsafe { device.alloc::<u8>(len) }?;
++                let (target, _guard) = dst.device_ptr(&self.stream);
++                let rc = unsafe { naiwa_fetch_projection(target, alias + offset as u64, len, self.stream.cu_stream().cast()) };
++                assert_eq!(rc, 0);
++                self.stream.synchronize().map_err(Error::wrap)?;
++                let got = self.stream.clone_dtoh(&dst).map_err(Error::wrap)?;
++                assert_eq!(got, source[offset..]);
++                unsafe { sys::cuMemHostUnregister(ptr.cast()) }.result().map_err(Error::wrap)?;
++            }
++            Ok(())
++        }
++
+         fn queue_copies(&self, fence: &ReadFence, parts: &[(&SlotMemory, &[u8])]) -> Result<()> {
+             self.stream
+                 .context()
+@@ -729,3 +778,10 @@ mod tests {
+         wait_for_readers(&owner);
+     }
+ }
++
++#[cfg(all(test, feature = "cuda"))]
++#[test]
++fn gpu_fetch_registered_bytes_match() {
++    let device = candle_core::Device::new_cuda(0).expect("CUDA device");
++    CopyStream::new(&device).unwrap().unwrap().test_fetch_bytes().unwrap();
++}

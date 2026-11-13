@@ -1,0 +1,521 @@
+{
+  "schema": 1,
+  "reference": "swaps2",
+  "candidate": "swaps1",
+  "pairs": [
+    {
+      "round": 1,
+      "request": 1,
+      "reference": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 58,
+        "proposed": 116,
+        "accepted": 68,
+        "acceptance": 0.5862068965517241,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 15,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 58
+        },
+        "step_sha256": "4d1137f6ff60089ea660e6f03b3ebb3f79d5388878174e9453412636c5f6848b",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5307.705318,
+        "amortized_ms_per_outcome": 91.51216065517242,
+        "tpot_ms": 41.79295525984252,
+        "sha256": "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52"
+      },
+      "candidate": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 26,
+          "0": 14,
+          "1": 17
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "6485d1cbbaa4cd520cabec6fc263f384046b01757bb25c11cc62358da7fd7c23",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4926.963911,
+        "amortized_ms_per_outcome": 86.43796335087718,
+        "tpot_ms": 38.79499142519685,
+        "sha256": "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -0.7005910393938961,
+        "cost_component": -2.2973727952517815,
+        "total_delta": -2.9979638346456725
+      }
+    },
+    {
+      "round": 1,
+      "request": 2,
+      "reference": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 61,
+        "proposed": 122,
+        "accepted": 66,
+        "acceptance": 0.5409836065573771,
+        "accepted_histogram": {
+          "2": 23,
+          "0": 18,
+          "1": 20
+        },
+        "proposed_histogram": {
+          "2": 61
+        },
+        "step_sha256": "9b838c832a458e7a8a951474b40173829705c461a1d3abefc75c748e009115a7",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5527.060365,
+        "amortized_ms_per_outcome": 90.60754696721312,
+        "tpot_ms": 43.52016035433071,
+        "sha256": "2fc35b26fd48f3c044b6481aa8e1095b1748ceda47153244a7d407892b469f04"
+      },
+      "candidate": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 27,
+          "0": 15,
+          "1": 15
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "712530e240bb759a77b286a3a06fc6a1545e9e1493b0a69e920f01e1ae7602c1",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4834.82555,
+        "amortized_ms_per_outcome": 84.82150087719297,
+        "tpot_ms": 38.069492519685035,
+        "sha256": "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -2.762662170778049,
+        "cost_component": -2.688005663867629,
+        "total_delta": -5.4506678346456745
+      }
+    },
+    {
+      "round": 1,
+      "request": 3,
+      "reference": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 64,
+        "proposed": 128,
+        "accepted": 62,
+        "acceptance": 0.484375,
+        "accepted_histogram": {
+          "2": 22,
+          "0": 24,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 64
+        },
+        "step_sha256": "84735c9788bc35a07ef6f48f38c48c4f8bbe7d17fffb538b6e97cc48b73f5b3b",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5808.50448,
+        "amortized_ms_per_outcome": 90.7578825,
+        "tpot_ms": 45.736255748031496,
+        "sha256": "b6f88441cfbfeb8e6ab70f5cae375d3deb112d21668c60af42fd2fe1c19302fc"
+      },
+      "candidate": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 61,
+        "proposed": 122,
+        "accepted": 66,
+        "acceptance": 0.5409836065573771,
+        "accepted_histogram": {
+          "2": 24,
+          "0": 19,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 61
+        },
+        "step_sha256": "f34db39fa1a484850758af71f189b7ba3f8658f781b5cd2f6a0874f97d6ff940",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5305.05874,
+        "amortized_ms_per_outcome": 86.96817606557377,
+        "tpot_ms": 41.772116062992126,
+        "sha256": "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -2.0991266759713434,
+        "cost_component": -1.8650130090680226,
+        "total_delta": -3.9641396850393638
+      }
+    },
+    {
+      "round": 2,
+      "request": 1,
+      "reference": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 27,
+          "0": 15,
+          "1": 15
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "031cc8b27718b79cffe97ce4c15957e8f8517114c2b24591395ead74ec9d6662",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5157.166737,
+        "amortized_ms_per_outcome": 90.47660942105263,
+        "tpot_ms": 40.607612102362204,
+        "sha256": "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52"
+      },
+      "candidate": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 58,
+        "proposed": 116,
+        "accepted": 69,
+        "acceptance": 0.5948275862068966,
+        "accepted_histogram": {
+          "2": 27,
+          "0": 16,
+          "1": 15
+        },
+        "proposed_histogram": {
+          "2": 58
+        },
+        "step_sha256": "8f9474222b38b379ebdcb34f23af90e13a973403e9f714cbcfba2fcf1f61ff4b",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5012.661481,
+        "amortized_ms_per_outcome": 86.42519794827587,
+        "tpot_ms": 39.46977544094488,
+        "sha256": "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": 0.6964638085406633,
+        "cost_component": -1.8343004699579835,
+        "total_delta": -1.1378366614173185
+      }
+    },
+    {
+      "round": 2,
+      "request": 2,
+      "reference": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 60,
+        "proposed": 120,
+        "accepted": 66,
+        "acceptance": 0.55,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 19,
+          "1": 16
+        },
+        "proposed_histogram": {
+          "2": 60
+        },
+        "step_sha256": "86211b1c67c3ec7d9473dd07963432cfd58c9e92146a274375056ca3fcd1c992",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5492.039323,
+        "amortized_ms_per_outcome": 91.53398871666667,
+        "tpot_ms": 43.24440411811024,
+        "sha256": "5d35365870b2f2495e87d5471eca60ed620b8fa7ddd5bbc0bacd94f6611777aa"
+      },
+      "candidate": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 58,
+        "proposed": 116,
+        "accepted": 68,
+        "acceptance": 0.5862068965517241,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 15,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 58
+        },
+        "step_sha256": "2c83e46076ed609d8f41c56494df505bfcf457db11526c763059f2778f5d0537",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4917.782116,
+        "amortized_ms_per_outcome": 84.78934682758621,
+        "tpot_ms": 38.72269382677165,
+        "sha256": "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -1.3883727208208887,
+        "cost_component": -3.133337570517692,
+        "total_delta": -4.52171029133858
+      }
+    },
+    {
+      "round": 2,
+      "request": 3,
+      "reference": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 27,
+          "0": 15,
+          "1": 15
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "9d1ebf82b51eb5a312d046023899415ab0b160dc475e7805d425d54352a69eb6",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5134.266603,
+        "amortized_ms_per_outcome": 90.07485268421053,
+        "tpot_ms": 40.42729608661417,
+        "sha256": "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      },
+      "candidate": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 56,
+        "proposed": 112,
+        "accepted": 70,
+        "acceptance": 0.625,
+        "accepted_histogram": {
+          "2": 27,
+          "0": 13,
+          "1": 16
+        },
+        "proposed_histogram": {
+          "2": 56
+        },
+        "step_sha256": "1e8f7ef6c3d04af2f86fc25b3b37b7e571e0538c0f5f6d1eb4c399d2e16a6e04",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4743.71874,
+        "amortized_ms_per_outcome": 84.70926321428571,
+        "tpot_ms": 37.35211606299213,
+        "sha256": "9f6515deee29849aefa26c8123132ae7e543318967ee6ccf54578673e97103f7"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -0.6881264405452607,
+        "cost_component": -2.387053583076787,
+        "total_delta": -3.0751800236220457
+      }
+    },
+    {
+      "round": 3,
+      "request": 1,
+      "reference": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 58,
+        "proposed": 116,
+        "accepted": 68,
+        "acceptance": 0.5862068965517241,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 15,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 58
+        },
+        "step_sha256": "4d1137f6ff60089ea660e6f03b3ebb3f79d5388878174e9453412636c5f6848b",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5346.223184,
+        "amortized_ms_per_outcome": 92.17626179310345,
+        "tpot_ms": 42.09624554330709,
+        "sha256": "e19ca091d184a0157f86d5f8f7670eae39e142cfaf1548f085f51111717c7e52"
+      },
+      "candidate": {
+        "request": 1,
+        "seq_id": 1,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 26,
+          "0": 14,
+          "1": 17
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "6485d1cbbaa4cd520cabec6fc263f384046b01757bb25c11cc62358da7fd7c23",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4929.396492000001,
+        "amortized_ms_per_outcome": 86.48064021052633,
+        "tpot_ms": 38.81414560629921,
+        "sha256": "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -0.7033736299355504,
+        "cost_component": -2.5787263070723174,
+        "total_delta": -3.2820999370078714
+      }
+    },
+    {
+      "round": 3,
+      "request": 2,
+      "reference": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 59,
+        "proposed": 118,
+        "accepted": 68,
+        "acceptance": 0.576271186440678,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 16,
+          "1": 18
+        },
+        "proposed_histogram": {
+          "2": 59
+        },
+        "step_sha256": "d306148ff1a4dcb6737cf557d981ee790b716ab40ac4d48b659655677d68ae68",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5280.551823000001,
+        "amortized_ms_per_outcome": 89.50087835593222,
+        "tpot_ms": 41.579148212598426,
+        "sha256": "4a54db4d18782755a166937bf5cd2fae53c4acfb98afcfc6be59206ff678ef23"
+      },
+      "candidate": {
+        "request": 2,
+        "seq_id": 2,
+        "steps": 57,
+        "proposed": 114,
+        "accepted": 69,
+        "acceptance": 0.6052631578947368,
+        "accepted_histogram": {
+          "2": 26,
+          "0": 14,
+          "1": 17
+        },
+        "proposed_histogram": {
+          "2": 57
+        },
+        "step_sha256": "fcff66a9044bba64432b01d30ed5dec1214f828a6853774791b97cda13333a2d",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4913.4994719999995,
+        "amortized_ms_per_outcome": 86.20174512280701,
+        "tpot_ms": 38.688972220472444,
+        "sha256": "14be6dec503e513c344e0e3e9a6338730e0216903a3b0c0e78ffd01dd20188ab"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": -1.383485224242041,
+        "cost_component": -1.5066907678839514,
+        "total_delta": -2.8901759921259935
+      }
+    },
+    {
+      "round": 3,
+      "request": 3,
+      "reference": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 56,
+        "proposed": 112,
+        "accepted": 70,
+        "acceptance": 0.625,
+        "accepted_histogram": {
+          "2": 28,
+          "0": 14,
+          "1": 14
+        },
+        "proposed_histogram": {
+          "2": 56
+        },
+        "step_sha256": "325c28de44f084ac66ed31f7239c89060503d3ae032a1010f8cff589566d0c02",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 5056.217812,
+        "amortized_ms_per_outcome": 90.28960378571428,
+        "tpot_ms": 39.812738677165356,
+        "sha256": "c651bc5c36d25755748a3f2272d3d992bf1be2023a3748cc512b80156bfdb3b2"
+      },
+      "candidate": {
+        "request": 3,
+        "seq_id": 3,
+        "steps": 58,
+        "proposed": 116,
+        "accepted": 69,
+        "acceptance": 0.5948275862068966,
+        "accepted_histogram": {
+          "2": 25,
+          "0": 14,
+          "1": 19
+        },
+        "proposed_histogram": {
+          "2": 58
+        },
+        "step_sha256": "2b7be6e9c7f657c2215d98735c91a70a99a8a2afb4915db9aae01826a99ac863",
+        "completion_tokens": 128,
+        "decode_intervals": 127,
+        "client_decode_ms": 4947.534549,
+        "amortized_ms_per_outcome": 85.30231981034483,
+        "tpot_ms": 38.956964952755904,
+        "sha256": "142013e365b7e2b358ce0455e18eda24cf10c138bed9277a1baccdd7bd44ada3"
+      },
+      "text_equal": false,
+      "steps_equal": false,
+      "decomposition": {
+        "count_component": 1.3826135716225125,
+        "cost_component": -2.238387296031958,
+        "total_delta": -0.855773724409448
+      }
+    }
+  ],
+  "warning": "Sequential request order maps terminal seq records to requests; no concurrent clients/cancellations. Counts cover completed verification outcomes only. Cost includes drafting/bootstrap/transport, not pure verify kernel. Exact accounting is not causal same-work attribution. Diagnostic timings are not clean benchmark evidence."
+}

@@ -1,0 +1,86 @@
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index deb25f0..9a9ee57 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -376,6 +376,12 @@ private:
+     size_t trace_n_ = 0;
+     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
+                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
++    // Opt-in single-stage run() ledger; drained at the existing request profile boundary.
++    bool ledger_on_ = false;
++    struct LedgerRow { int64_t pos, layer, rows, gpu_entries, hit_groups, staged_groups, staged_bytes; double pool_ms, reach_wait_ms; };
++    std::vector<LedgerRow> ledger_;
++    struct LedgerWindow { int64_t pos, rows; double tail_sync_ms; std::vector<unsigned long long> stamps; };
++    std::vector<LedgerWindow> ledger_windows_;
+     bool prof_on_ = false;
+     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
+     std::vector<unsigned long long> prof_h_;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 71c0c7d..68d93fc 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -578,6 +578,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         std::fprintf(stderr, "strata verify trace (#649): on\n");
+ #endif
+     }
++    ledger_on_ = std::getenv("STRATA_WORK_LEDGER_FILE") != nullptr;
++    if (ledger_on_) ledger_.reserve(65536);
+     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+     if (prof_on_) {
+         const size_t np = (size_t) g.n_layers * kProfPer + 4;
+@@ -1629,6 +1631,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ }
+ 
+ std::string Verifier::profile_report() {
++    if (ledger_on_ && !ledger_.empty()) {
++        const char* path = std::getenv("STRATA_WORK_LEDGER_FILE");
++        FILE* f = path ? std::fopen(path, "a") : nullptr;
++        if (!f) { std::fprintf(stderr, "STRATA_LEDGER_ERROR cannot open output\n"); }
++        else {
++            for (const auto& r : ledger_)
++                std::fprintf(f, "{\"pos\":%lld,\"layer\":%lld,\"rows\":%lld,\"gpu_entries\":%lld,\"hit_groups\":%lld,\"staged_groups\":%lld,\"staged_bytes\":%lld,\"pool_ms\":%.6f,\"reach_wait_ms\":%.6f}\n",
++                    (long long)r.pos,(long long)r.layer,(long long)r.rows,(long long)r.gpu_entries,
++                    (long long)r.hit_groups,(long long)r.staged_groups,(long long)r.staged_bytes,r.pool_ms,r.reach_wait_ms);
++            for (const auto& w : ledger_windows_) {
++                std::fprintf(f, "{\"kind\":\"gpu_window\",\"pos\":%lld,\"rows\":%lld,\"tail_sync_ms\":%.6f,\"stamps\":[", (long long)w.pos,(long long)w.rows,w.tail_sync_ms);
++                for (size_t i=0;i<w.stamps.size();++i) std::fprintf(f, "%s%llu", i ? "," : "",w.stamps[i]);
++                std::fprintf(f, "]}\n");
++            }
++            std::fprintf(f, "{\"request_boundary\":true}\n");
++            if (std::fclose(f) != 0) std::fprintf(stderr, "STRATA_LEDGER_ERROR close output\n");
++        }
++        ledger_.clear();
++        ledger_windows_.clear();
++    }
+     if (!prof_on_ || prof_windows_ == 0) return std::string();
+     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
+                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
+@@ -2009,6 +2031,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+         if (remote_opt_) remote_opt_->end();
++        if (ledger_on_) ledger_.push_back({pos0, l, n, sink_.counts[1], sink_.counts[0], sink_.counts[2],
++            (int64_t)sink_.counts[2] * strata::kernels::cpu::expert_layout().blob_bytes(l), ms_since(b),
++            std::chrono::duration<double, std::milli>(b-a).count()});
+         VDBG("layer %lld served\n", (long long) l);
+         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
+                               (int64_t) ms_since(b));   // aux: ms the CPU experts took
+@@ -2048,7 +2073,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
+     // beside the expert workers).
+     trace_ev("SYNC", -1, -1, 0);
++    const auto ledger_sync_begin = Clock::now();
+     const cudaError_t se = cudaStreamSynchronize(cs_);
++    const double ledger_tail_sync_ms = ms_since(ledger_sync_begin);
+     trace_ev("SYNCED", -1, -1, (int64_t) se);
+     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
+@@ -2063,6 +2090,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         copy_used_ = false;
+     }
+     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
++    if (ledger_on_ && prof_on_ && G == 1)
++        ledger_windows_.push_back({pos0,T,ledger_tail_sync_ms,prof_h_});
+     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
+     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
+     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever

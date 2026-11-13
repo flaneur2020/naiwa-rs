@@ -523,6 +523,17 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             None
         };
 
+        // M42: the CPU experts read their activation from mapped memory instead of forcing the
+        // token thread into a stream-wide D2H. Sized like the lookahead channel; off by default.
+        let cpu_chan = if slot_device.is_cuda()
+            && std::env::var_os("NAIWA_CPU_ACT_ASYNC").is_some()
+            && router.is_some()
+        {
+            LookaheadChannel::new(&slot_device, 5, hidden).ok().flatten()
+        } else {
+            None
+        };
+
         // With a copy stream, each slot's memory is allocated once here and every fill overwrites
         // it in place from the copy stream; otherwise each fill uploads a fresh copy. All of a
         // layer's slots are one bank per projection, so a decode step runs them in one fused call.
@@ -581,6 +592,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             act: ctx.act,
             router,
             lookahead_chan,
+            cpu_chan,
             #[cfg(feature = "cuda")]
             state: Mutex::new(LayerState {
                 doorbell: None,

@@ -1,0 +1,42 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "rounds": [
+    {
+      "round": 1,
+      "medians": {
+        "naiwa_best": 37.95565117322835,
+        "naiwa_rayon": 39.3004584488189,
+        "strata": 37.79450833070866
+      }
+    },
+    {
+      "round": 2,
+      "medians": {
+        "naiwa_rayon": 38.910001346456696,
+        "strata": 37.88589570078741,
+        "naiwa_best": 36.529564653543304
+      }
+    },
+    {
+      "round": 3,
+      "medians": {
+        "strata": 37.76508603149606,
+        "naiwa_best": 38.17517662204724,
+        "naiwa_rayon": 37.57749132283464
+      }
+    }
+  ],
+  "median_of_process_medians": {
+    "naiwa_best": 37.95565117322835,
+    "naiwa_rayon": 38.910001346456696,
+    "strata": 37.79450833070866
+  },
+  "paired_deltas": {
+    "naiwa_rayon minus naiwa_best": 1.3448072755905542,
+    "strata minus naiwa_best": -0.1611428425196877,
+    "strata minus naiwa_rayon": -1.0241056456692874
+  },
+  "same_work_proven": false,
+  "warning": "Three-arm rotated-order policy comparison; inspect drafting logs, text and configuration differences. No cross-session subtraction."
+}

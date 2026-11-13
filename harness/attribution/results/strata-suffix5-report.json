@@ -1,0 +1,58 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "rounds": [
+    {
+      "round": 1,
+      "medians": {
+        "naiwa_best": 36.80452420472441,
+        "strata": 37.84890094488189,
+        "strata_suffix3": 37.73957822047244
+      }
+    },
+    {
+      "round": 2,
+      "medians": {
+        "strata": 37.796935519685036,
+        "strata_suffix3": 37.79074514173228,
+        "naiwa_best": 37.78427526771653
+      }
+    },
+    {
+      "round": 3,
+      "medians": {
+        "strata_suffix3": 37.79591382677165,
+        "naiwa_best": 36.702337094488186,
+        "strata": 37.84052504724409
+      }
+    },
+    {
+      "round": 4,
+      "medians": {
+        "naiwa_best": 36.317768157480316,
+        "strata": 37.82691774015748,
+        "strata_suffix3": 37.853184220472436
+      }
+    },
+    {
+      "round": 5,
+      "medians": {
+        "strata": 37.91268601574804,
+        "strata_suffix3": 37.79424988188977,
+        "naiwa_best": 38.220186204724406
+      }
+    }
+  ],
+  "median_of_process_medians": {
+    "naiwa_best": 36.80452420472441,
+    "strata": 37.84052504724409,
+    "strata_suffix3": 37.79424988188977
+  },
+  "paired_deltas": {
+    "strata minus naiwa_best": 1.0443767401574817,
+    "strata_suffix3 minus naiwa_best": 0.9350540157480296,
+    "strata_suffix3 minus strata": -0.04461122047244004
+  },
+  "same_work_proven": false,
+  "warning": "Three-arm rotated-order policy comparison; inspect drafting logs, text and configuration differences. No cross-session subtraction."
+}

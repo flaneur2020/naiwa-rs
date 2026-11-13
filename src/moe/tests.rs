@@ -222,6 +222,7 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         act: Activation::Silu,
         router: None,
         lookahead_chan: None,
+        cpu_chan: None,
         state: Mutex::new(LayerState {
             doorbell: None,
             slots: (0..slots).map(|_| Slot::empty()).collect(),

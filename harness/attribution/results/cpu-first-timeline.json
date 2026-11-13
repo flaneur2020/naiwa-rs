@@ -1,0 +1,134 @@
+[
+  {
+    "round": 1,
+    "arm": "base",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 12.888397594623276,
+      "p50": 8.0,
+      "p95": 16,
+      "max": 2731
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 601.3673505482844,
+      "p50": 488.5,
+      "p95": 913,
+      "max": 16134
+    },
+    "enter_to_submit_mean_us": 12.569508312698975,
+    "enter_to_submit_p50_us": 10.0
+  },
+  {
+    "round": 1,
+    "arm": "cpu_first",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 13.658118146444995,
+      "p50": 9.0,
+      "p95": 16,
+      "max": 1913
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 599.3088079235939,
+      "p50": 482.0,
+      "p95": 906,
+      "max": 17626
+    },
+    "enter_to_submit_mean_us": 9.229571984435797,
+    "enter_to_submit_p50_us": 8.0
+  },
+  {
+    "round": 2,
+    "arm": "base",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 15.518924655111425,
+      "p50": 11.0,
+      "p95": 18,
+      "max": 2912
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 610.0245843650513,
+      "p50": 496.0,
+      "p95": 932,
+      "max": 18651
+    },
+    "enter_to_submit_mean_us": 13.109126282278034,
+    "enter_to_submit_p50_us": 11.0
+  },
+  {
+    "round": 2,
+    "arm": "cpu_first",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 18.38468340997524,
+      "p50": 9.0,
+      "p95": 14,
+      "max": 3041
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 588.9874425185709,
+      "p50": 459.0,
+      "p95": 884,
+      "max": 21282
+    },
+    "enter_to_submit_mean_us": 9.548107534488857,
+    "enter_to_submit_p50_us": 8.0
+  },
+  {
+    "round": 3,
+    "arm": "base",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 14.812875840113195,
+      "p50": 11.0,
+      "p95": 18,
+      "max": 3109
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 608.5733993632826,
+      "p50": 493.0,
+      "p95": 930,
+      "max": 17899
+    },
+    "enter_to_submit_mean_us": 13.090555359037849,
+    "enter_to_submit_p50_us": 11.0
+  },
+  {
+    "round": 3,
+    "arm": "cpu_first",
+    "work_equal": true,
+    "task_count": 5654,
+    "submit_to_worker": {
+      "count": 5654,
+      "mean": 13.312345242306332,
+      "p50": 9.0,
+      "p95": 14,
+      "max": 2870
+    },
+    "worker_to_return": {
+      "count": 5654,
+      "mean": 587.7334630350194,
+      "p50": 464.0,
+      "p95": 886,
+      "max": 18730
+    },
+    "enter_to_submit_mean_us": 9.476653696498055,
+    "enter_to_submit_p50_us": 9.0
+  }
+]

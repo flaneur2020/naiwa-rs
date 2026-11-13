@@ -1,0 +1,41 @@
+[
+  {
+    "arm": "r1-head",
+    "calls": 384,
+    "blocks": [
+      0,
+      0,
+      0,
+      1,
+      0,
+      378
+    ],
+    "device_greedy": 5
+  },
+  {
+    "arm": "r2-head",
+    "calls": 384,
+    "blocks": [
+      0,
+      0,
+      0,
+      1,
+      0,
+      378
+    ],
+    "device_greedy": 5
+  },
+  {
+    "arm": "r3-head",
+    "calls": 384,
+    "blocks": [
+      0,
+      0,
+      0,
+      1,
+      0,
+      378
+    ],
+    "device_greedy": 5
+  }
+]

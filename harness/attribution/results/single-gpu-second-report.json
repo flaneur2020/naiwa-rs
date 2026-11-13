@@ -1,0 +1,36 @@
+{
+  "status": "complete",
+  "mode": "clean",
+  "reference": "current",
+  "candidate": "single_gpu",
+  "pairs": [
+    {
+      "round": 1,
+      "current": 48.32987070866142,
+      "single_gpu": 46.64851849606299,
+      "delta_ms": -1.6813522125984264
+    },
+    {
+      "round": 2,
+      "current": 48.399465055118114,
+      "single_gpu": 46.51252345669292,
+      "delta_ms": -1.8869415984251958
+    },
+    {
+      "round": 3,
+      "current": 48.55302985826772,
+      "single_gpu": 46.33234788976378,
+      "delta_ms": -2.220681968503939
+    }
+  ],
+  "median_paired_delta_ms": -1.8869415984251958,
+  "performance_eligible": true,
+  "all_text_equal": false,
+  "text_equal_by_request_position": {
+    "1": false,
+    "2": false,
+    "3": false
+  },
+  "same_work_proven": false,
+  "warning": "Performance eligibility is not same-work causality; inspect SHA256 and matched diagnostic traces. Never pool diagnostic TPOT with clean TPOT."
+}

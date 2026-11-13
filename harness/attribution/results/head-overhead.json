@@ -1,0 +1,36 @@
+{
+  "status": "complete",
+  "mode": "diagnostic",
+  "reference": "control",
+  "candidate": "head",
+  "pairs": [
+    {
+      "round": 1,
+      "control": 47.86106154330709,
+      "head": 47.47211701574803,
+      "delta_ms": -0.3889445275590546
+    },
+    {
+      "round": 2,
+      "control": 47.25679163779528,
+      "head": 47.59653190551182,
+      "delta_ms": 0.339740267716536
+    },
+    {
+      "round": 3,
+      "control": 47.38031349606299,
+      "head": 48.21366052755906,
+      "delta_ms": 0.8333470314960678
+    }
+  ],
+  "median_paired_delta_ms": 0.339740267716536,
+  "performance_eligible": false,
+  "all_text_equal": false,
+  "text_equal_by_request_position": {
+    "1": false,
+    "2": false,
+    "3": false
+  },
+  "same_work_proven": false,
+  "warning": "Performance eligibility is not same-work causality; inspect SHA256 and matched diagnostic traces. Never pool diagnostic TPOT with clean TPOT."
+}

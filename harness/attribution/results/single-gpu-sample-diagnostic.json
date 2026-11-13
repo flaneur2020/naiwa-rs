@@ -1,0 +1,110 @@
+[
+  {
+    "arm": "r1-current",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 384,
+      "sampler_device_greedy": 5,
+      "sampler_mean_ms_per_call": 1.269319640625,
+      "mean_ms": {
+        "final_hc": 0.04364358565574932,
+        "lm_head": 1.1133466958110307,
+        "head_to_next_model": 1.8780975917289997
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {
+      "pipeline_reject_single_or_mixed": 384
+    }
+  },
+  {
+    "arm": "r1-single_gpu",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 0,
+      "sampler_device_greedy": 0,
+      "sampler_mean_ms_per_call": null,
+      "mean_ms": {
+        "final_hc": 0.04358382975628269,
+        "lm_head": 1.114960189543131,
+        "head_to_next_model": 0.5429785700628549
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {}
+  },
+  {
+    "arm": "r2-current",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 384,
+      "sampler_device_greedy": 5,
+      "sampler_mean_ms_per_call": 1.2877264921875,
+      "mean_ms": {
+        "final_hc": 0.04418682172617799,
+        "lm_head": 1.117318092610697,
+        "head_to_next_model": 1.911408992281643
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {
+      "pipeline_reject_single_or_mixed": 384
+    }
+  },
+  {
+    "arm": "r2-single_gpu",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 0,
+      "sampler_device_greedy": 0,
+      "sampler_mean_ms_per_call": null,
+      "mean_ms": {
+        "final_hc": 0.04373593572082507,
+        "lm_head": 1.1146229594570414,
+        "head_to_next_model": 0.5673300587530161
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {}
+  },
+  {
+    "arm": "r3-current",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 384,
+      "sampler_device_greedy": 5,
+      "sampler_mean_ms_per_call": 1.2716202578125,
+      "mean_ms": {
+        "final_hc": 0.0439776758359503,
+        "lm_head": 1.1148734439846217,
+        "head_to_next_model": 1.8806749095334931
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {
+      "pipeline_reject_single_or_mixed": 384
+    }
+  },
+  {
+    "arm": "r3-single_gpu",
+    "summary": {
+      "samples": 377,
+      "excluded": 6,
+      "sampler_calls": 0,
+      "sampler_device_greedy": 0,
+      "sampler_mean_ms_per_call": null,
+      "mean_ms": {
+        "final_hc": 0.04324430713444869,
+        "lm_head": 1.1136475937831307,
+        "head_to_next_model": 0.5570005978450219
+      },
+      "warning": "Row-shape excludes ordinary prompt transitions, not proven request IDs. Warmup may remain. Last2tails censored. GPU timestamps span host idle, not kernel-only. Tail event does not mark engine sampling boundary."
+    },
+    "reasons": {}
+  }
+]

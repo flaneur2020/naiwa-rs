@@ -1,0 +1,62 @@
+[
+  {
+    "round": 1,
+    "dma": {
+      "median_tpot_ms": 46.78319597719457,
+      "hashes": [
+        "4a54db4d",
+        "daaedd64",
+        "5d353658"
+      ]
+    },
+    "fetch": {
+      "median_tpot_ms": 48.05066171615553,
+      "hashes": [
+        "c651bc5c",
+        "e19ca091",
+        "9f6515de"
+      ]
+    },
+    "fetch_minus_dma_ms": 1.2674657389609578
+  },
+  {
+    "round": 2,
+    "dma": {
+      "median_tpot_ms": 46.216671826229906,
+      "hashes": [
+        "e19ca091",
+        "e19ca091",
+        "4a54db4d"
+      ]
+    },
+    "fetch": {
+      "median_tpot_ms": 48.07546404813688,
+      "hashes": [
+        "4a54db4d",
+        "5d353658",
+        "daaedd64"
+      ]
+    },
+    "fetch_minus_dma_ms": 1.858792221906974
+  },
+  {
+    "round": 3,
+    "dma": {
+      "median_tpot_ms": 46.437234401438886,
+      "hashes": [
+        "5d353658",
+        "4a54db4d",
+        "c651bc5c"
+      ]
+    },
+    "fetch": {
+      "median_tpot_ms": 47.801225299499635,
+      "hashes": [
+        "a627d3c5",
+        "9f6515de",
+        "5d353658"
+      ]
+    },
+    "fetch_minus_dma_ms": 1.3639908980607487
+  }
+]
