@@ -13,6 +13,32 @@ python3 harness/chat/summarize.py --out ~/bench-rel/m10/$(date +%F)
 `run.py` prints a line per turn; `summarize.py` prints the markdown tables that go into the
 milestone. Results belong in the milestone document, not in this directory.
 
+## Chatting by hand
+
+`chat.sh` is the one-liner: start the engine, wait for it, hand the terminal to a chat client.
+
+```bash
+harness/chat/chat.sh                     # serve-pi arm + cli.py REPL
+harness/chat/chat.sh --no-serve          # attach to a server already on :8095
+harness/chat/chat.sh -- --once "hi"      # one turn, then exit
+```
+
+`cli.py` is the client: stdlib only (this box has no `python3-venv`), streams
+`/v1/chat/completions`, keeps the conversation so each turn exercises the prefix cache, and prints
+the same cost line `run.py` records — tokens, tok/s, TTFT, `cached`/`prompt`. `/help` lists the
+slash commands; Ctrl-C cancels the *turn* and leaves the session and the engine running. `--thinking`
+turns the reasoning block back on (off by default, as in every other arm here).
+
+The client is swappable: `chat.sh` exports `OPENAI_BASE_URL`, `OPENAI_API_BASE` and `API_BASE_URL`
+(`.../v1`), sets `OPENAI_API_KEY` to a dummy (the engine does not authenticate), and the model to ask
+for is `default`. Anything that honours that contract runs in its place — shell-gpt is the closest
+fit (it reads `API_BASE_URL` and takes `--repl`/`--model`), though `cli.py` is the client every run
+in this directory actually used:
+
+```bash
+CHAT_CLI='sgpt --repl naiwa --model default' harness/chat/chat.sh
+```
+
 ## Protocol
 
 | rule | why |
@@ -42,6 +68,8 @@ Turn 1 has nothing to reuse, so the headline is turns ≥2.
 
 ```
 corpus.jsonl                one conversation per line; `_constants` on line 1 supplies {{DOC}}
+chat.sh                     one line: engine up, then chat (wraps serve/serve-pi.sh + cli.py)
+cli.py                      the client: streaming REPL, slash commands, /v1/chat/completions only
 run.py                      driver: launch, readiness, warmup, replay, timestamps, peaks
 summarize.py                run directory → markdown tables
 engines/naiwa.json          naiwa chat arm: prefill stream on, no MTP, 1 GB cache, prefix 1
