@@ -19,8 +19,10 @@ mod lookahead;
 mod predict;
 mod retired;
 mod round;
+mod sink;
 mod step;
 pub(crate) mod schedule;
+pub(crate) mod vram_peak;
 
 pub(crate) mod expert_hist;
 pub(crate) use expert_hist::record_demand as record_expert_demand;

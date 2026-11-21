@@ -519,8 +519,11 @@ impl RoutedExperts for CachedExperts {
         // (no predecessor triggers it); a layer already full or filling is a no-op.
         // The decode side of the VRAM low-water instrument (`NAIWA_PREFILL_PEAK=1`), once per step: sampling
         // every layer would be 48 driver calls per token.
-        if layer.layer == 0 && num_tokens <= prefill_threshold() && crate::vram_peak::enabled() {
-            crate::vram_peak::note_step(&layer.slot_device);
+        if layer.layer == 0
+            && num_tokens <= prefill_threshold()
+            && crate::stats::vram_peak::enabled()
+        {
+            crate::stats::vram_peak::note_step(&layer.slot_device);
         }
         // `NAIWA_LAYER_DBG=1`: one line per *step* (layer 0) naming the branch the MoE forward takes, the row count
         // and whether the slab still considers its bytes loaned. Added for M35 §15, where a single-chunk prompt
@@ -562,7 +565,7 @@ impl RoutedExperts for CachedExperts {
                 return Ok(out);
             }
             if let Some(ps) = &layer.prefill {
-                if crate::vram_peak::checking() {
+                if crate::config::diag().borrow_check {
                     let finite_in = xs
                         .to_dtype(DType::F32)?
                         .to_device(&Device::Cpu)?
@@ -620,7 +623,7 @@ impl RoutedExperts for CachedExperts {
         let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
         // `NAIWA_BORROW_CHECK=1`: the first layer whose decode output is not finite is where garbage entered; a
         // borrowed chunk empties the whole cache, so a decode step right after it reads slots that must be refilled.
-        if crate::vram_peak::checking() {
+        if crate::config::diag().borrow_check {
             let finite = out
                 .to_dtype(DType::F32)?
                 .to_device(&Device::Cpu)?

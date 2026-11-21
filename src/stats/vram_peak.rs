@@ -1,10 +1,5 @@
 //! `NAIWA_PREFILL_PEAK=1`: the low-water mark of free VRAM over a run, sampled once per decode step.
 //!
-//! The chunk-side instrument (`prefill_stream::Peak`) answers "what does a prompt chunk cost". This answers the
-//! other half of the same question - "what does everything *else* need" - because growing the expert cache breaks
-//! on whichever of the two is deeper. The 2.6 GB experiment showed exactly that: the chunk finished with 222 MiB
-//! to spare and the OOM came from the post-chunk work.
-//!
 //! Sampling every layer would be 48 driver calls per step, so the caller samples once per step (layer 0).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,20 +12,13 @@ const REPORT_EVERY: usize = 16;
 static MIN_FREE: AtomicUsize = AtomicUsize::new(0);
 static STEPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the instrument is on. Computed once: it is on a decode path.
+/// Whether the instrument is on.
+#[inline]
 pub(crate) fn enabled() -> bool {
     crate::config::diag().prefill_peak
 }
 
-/// `NAIWA_BORROW_CHECK=1`: check whether a decode step's output is finite (a diagnostic, not a probe for runs).
-pub(crate) fn checking() -> bool {
-    crate::config::diag().borrow_check
-}
-
 /// Sample free VRAM once per decode step and report the low-water mark periodically.
-///
-/// `free_at_start` is the value the model had when it was ready to serve; passing it lets the report say how much
-/// of the free VRAM the run has consumed, which is the number a cache sizing has to leave room for.
 pub(crate) fn note_step(device: &Device) {
     let Some(free) = crate::copy_stream::free_bytes(device) else {
         return;
@@ -60,8 +48,6 @@ mod tests {
     fn the_low_water_mark_only_moves_down() {
         MIN_FREE.store(0, Ordering::Relaxed);
         STEPS.store(0, Ordering::Relaxed);
-        // The bookkeeping is a min, so a larger reading must not raise it. Exercised through the same atomics
-        // the decode path uses, without a device.
         let note = |free: usize| {
             let min = MIN_FREE.load(Ordering::Relaxed);
             if min == 0 || free < min {

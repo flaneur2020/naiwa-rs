@@ -7,7 +7,6 @@ mod commands;
 mod config;
 mod copy_stream;
 mod doorbell;
-mod vram_peak;
 mod executor;
 mod spin_pool;
 mod host_memory;
