@@ -5,7 +5,7 @@ use std::sync::Arc;
 use candle_core::Tensor;
 use mistralrs_core::layers::Activation;
 
-use super::stages::{CpuMiss, CpuPending, DmaMiss, Gpu, Hit, Preload, Route};
+use super::stages::{CpuMiss, CpuPending, DmaMiss, Gpu, Preload, Route};
 use crate::stats;
 
 use super::CachedLayer;
@@ -82,12 +82,6 @@ pub(crate) fn forward(
         };
     }
     Preload::submit(layer, &x2d, rows, hidden)?;
-    // M42: hand the same activation to the CPU experts through mapped memory, queued here (before
-    // the routing read) so the token thread never has to sync for it.
-    let cpu_act = match layer.cpu_chan() {
-        Some(chan) if rows * hidden <= chan.max_n() => chan.publish(&x2d, rows * hidden)?,
-        _ => None,
-    };
 
     // NAIWA_XSUM: checksum of this layer's MoE input, for the first few ticks only. Repeated runs
     // of one greedy request that end up with different tokens diverge somewhere; the first layer
@@ -105,11 +99,8 @@ pub(crate) fn forward(
     }
 
     // M27: the raw routing demand, before any cache decision, for the allocation study.
-    // Do not synchronize/copy routing ids for a disabled histogram. The debug
-    // override preserves the previous behaviour for an A/B measurement.
-    if crate::config::diag().expert_hist.is_some()
-        || crate::config::diag().force_hist_read
-    {
+    // Do not synchronize/copy routing ids for a disabled histogram.
+    if crate::config::diag().expert_hist.is_some() {
         if let Ok(ids) = topk_ids.flatten_all() {
             if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
                 stats::record_expert_demand(layer.layer(), &ids);
@@ -144,8 +135,7 @@ pub(crate) fn forward(
                 let cpu_misses: Vec<Vec<(u32, f32)>> = misses.iter().map(|row| {
                     row.iter().copied().filter(|(id, _)| !chosen.contains(id)).collect()
                 }).collect();
-                let pending = CpuMiss::submit(layer, &cpu_misses, &x2d, rows,
-                    route_ready, cpu_act.clone())?;
+                let pending = CpuMiss::submit(layer, &cpu_misses, &x2d, rows, route_ready)?;
                 cpu_work = CpuWork::Submitted(pending);
                 Ok(())
             })?;
@@ -213,7 +203,7 @@ pub(crate) fn forward(
     }
     let cpu = match cpu_work {
         CpuWork::Submitted(pending) => pending,
-        CpuWork::Deferred => CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready, cpu_act)?,
+        CpuWork::Deferred => CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready)?,
     };
     stats::schedule::event(layer.layer(), schedule_tick, "cpu_submit_return");
     mark!(stats::BudgetPhase::Spawn);
@@ -274,44 +264,7 @@ pub(crate) fn forward(
         if plan.staged.iter().all(Vec::is_empty) {
             Ok(resident_out)
         } else {
-            // M26: submit the staged experts wave by wave, waiting only for the wave about to run, so
-            // the later waves' DMA lands under the earlier waves' kernels.
-            let waves = layer.wave_count();
-            let mut acc: Option<Tensor> = None;
-            if waves > 1 {
-                let rows = plan.staged.len();
-                let mut groups: Vec<Vec<Vec<Hit>>> =
-                    (0..waves).map(|_| vec![Vec::new(); rows]).collect();
-                for (t, row) in plan.staged.iter().enumerate() {
-                    for hit in row {
-                        let pos = hit
-                            .1
-                            .saturating_sub(crate::moe::STAGING_RING_FIRST) as u32;
-                        let w = layer.wave_of_slot(pos).min(waves - 1);
-                        groups[w][t].push(hit.clone());
-                    }
-                }
-                for (w, group) in groups.iter().enumerate() {
-                    if group.iter().all(|row| row.is_empty()) {
-                        continue;
-                    }
-                    // Wave `w`'s own event, or the layer's final event for the last wave.
-                    if w + 1 < waves {
-                        layer.wait_staging_wave(w)?;
-                    } else {
-                        layer.wait_staging()?;
-                    }
-                    let out = Gpu::submit(layer, group, &x2d, act)?;
-                    acc = Some(match acc {
-                        Some(a) => (a + out)?,
-                        None => out,
-                    });
-                }
-            }
-            let staged_out = match acc {
-                Some(v) => v,
-                None => Gpu::submit(layer, &plan.staged, &x2d, act)?,
-            };
+            let staged_out = Gpu::submit(layer, &plan.staged, &x2d, act)?;
             resident_out + staged_out
         }
     } else {

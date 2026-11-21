@@ -223,7 +223,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         act: Activation::Silu,
         router: None,
         lookahead_chan: None,
-        cpu_chan: None,
         state: Mutex::new(LayerState {
             doorbell: None,
             slots: (0..slots).map(|_| Slot::empty()).collect(),
@@ -239,8 +238,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         filling: AtomicBool::new(false),
         preload: None,
         staging_done: None,
-        staging_waves: std::sync::Mutex::new(Vec::new()),
-        staged_wave_of: std::sync::Mutex::new(Vec::new()),
         staged_now: Mutex::new(Vec::new()),
     })
 }

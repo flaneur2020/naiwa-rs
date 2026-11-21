@@ -5,7 +5,7 @@
 //! - [`planner`] — pure VRAM budget math (`plan*`, `chunk_scratch`, `kv_reserve`).
 //! - [`buffers`] — layer buffer lifecycle, cache-slab borrowing, chunk begin/zero/empty, upload, downgrade.
 //! - [`split`] — `--prefill-split` expert sub-range views and masked launches.
-//! - [`diagnostics`] — opt-in peak, snapshot, canary, and wall-clock probes.
+//! - [`diagnostics`] — opt-in peak and wall-clock probes.
 
 mod buffers;
 mod diagnostics;
@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use candle_core::quantized::QTensor;
 use candle_core::{Device, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::moe_offload::ExpertLoadContext;
@@ -56,8 +55,6 @@ pub struct PrefillStream {
     min_tokens: usize,
     pub(in crate::prefill_stream) peak: Mutex<Peak>,
     last_entry: Mutex<Option<Instant>>,
-    pub(super) private_slab: Mutex<Option<Arc<candle_core::quantized::cuda::QCudaStorage>>>,
-    pub(super) snap: Mutex<Option<Arc<QTensor>>>,
     pub(super) slab: Option<Arc<crate::moe::slab::Slab>>,
     pub(super) cache: Option<Arc<crate::moe::Layers>>,
     pub(super) borrow_gate: Arc<crate::moe::slab::BorrowGate>,
@@ -115,8 +112,6 @@ impl PrefillStream {
             checked: AtomicBool::new(false),
             min_tokens,
             peak: Mutex::new(Peak::default()),
-            snap: Mutex::new(None),
-            private_slab: Mutex::new(None),
             slab,
             cache,
             borrow_gate,
@@ -198,7 +193,7 @@ impl PrefillStream {
         if stride == 0 {
             return Ok(None);
         }
-        if layer == 0 && !crate::config::runtime().prefill_noquiesce {
+        if layer == 0 {
             crate::moe::quiesce(true);
         }
         self.begin_chunk(layer)?;
@@ -232,7 +227,6 @@ impl PrefillStream {
             }
             prefetch = t.elapsed();
         }
-        self.check_inputs_finite(layer, xs, topk_weights);
 
         let buf = self.bufs[layer % stride].lock().unwrap();
         let experts = buf.experts.as_ref().expect("loaded");
@@ -252,27 +246,15 @@ impl PrefillStream {
             );
         }
 
-        let take_snap = self.probe_before_compute(layer, &buf)?;
-        if self.borrows() && crate::config::runtime().borrow_barrier {
-            self.copy.after_device_work()?;
-            self.copy.synchronize()?;
-        }
-
         let t_compute = Instant::now();
         let out = self.dispatch(experts, &buf, xs, topk_weights, topk_ids);
         self.log_copy_and_layer_timing(layer, rows, stride, gap, prefetch, waited, t_compute, &buf);
-        if take_snap {
-            self.snap_after_compute(&buf)?;
-        }
 
         // Fence even on error: kernels reading the buffer may already be queued.
         buf.released.record_reads(&self.device)?;
         if self.borrows() {
             self.copy.after_device_work()?;
             self.copy.synchronize()?;
-            if take_snap {
-                self.verify_snap_after_sync(layer)?;
-            }
         }
         out.map(Some)
     }

@@ -336,9 +336,6 @@ impl CachedLayer {
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
         if self.borrow_gate.borrowed() {
-            if crate::config::diag().borrow_check {
-                eprintln!("UPLOAD_REFUSED layer {} expert {expert_id}", self.layer);
-            }
             return Ok(None);
         }
         if sync {

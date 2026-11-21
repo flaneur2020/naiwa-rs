@@ -320,7 +320,7 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     expert.rs              CpuExperts fallback + per-expert byte slicing
     cached_layer.rs        LayerState + CachedLayer + CachedExperts entry point + accessors/sync
     layer_registry.rs      Layers model-wide registry + loan empty/refill coordination
-    activation_channel.rs  LookaheadChannel (advisory) + CpuActivationChannel
+    activation_channel.rs  LookaheadChannel (advisory GPU -> host activation channel)
     cache_policy.rs        pure ranking/selection/victim policy functions
     cache_updates.rs       admit/replace/upload/promotion/lookahead prediction/spawn_fill
     slot.rs                Slot/SlotBuf/Bank/Projections + slot byte estimate

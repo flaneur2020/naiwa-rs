@@ -74,7 +74,6 @@ impl CpuMiss {
         x2d: &Tensor,
         rows: usize,
         route_ready: Option<std::time::Instant>,
-        published: Option<(Arc<crate::moe::CpuActivationChannel>, u32)>,
     ) -> Result<Option<CpuPending>> {
         if misses.iter().all(Vec::is_empty) {
             return Ok(None);
@@ -97,12 +96,7 @@ impl CpuMiss {
             }
         }
         let copy_begin_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        // M42: with a queued publish the worker waits for the mapped copy instead of the token
-        // thread blocking on a stream-wide D2H (which empties the launch queue).
-        let xs_cpu = match published {
-            Some(_) => None,
-            None => Some(x2d.unsqueeze(0)?.to_device(&Device::Cpu)?),
-        };
+        let xs_cpu = x2d.unsqueeze(0)?.to_device(&Device::Cpu)?;
         crate::stats::schedule::event(schedule_layer, schedule_tick, "cpu_submit");
         let submit_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let n = rows * layer.hidden();
@@ -110,13 +104,7 @@ impl CpuMiss {
         let job = move || {
             crate::stats::schedule::event(schedule_layer, schedule_tick, "cpu_worker");
             let worker_us = route_ready.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-            let x = match (xs_cpu, published) {
-                (Some(t), _) => t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
-                (None, Some((chan, seq))) => chan.read(seq, n).ok_or_else(|| {
-                    candle_core::Error::Msg("CPU activation publish timed out".into())
-                })?,
-                (None, None) => candle_core::bail!("CPU job without an activation source"),
-            };
+            let x = xs_cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
             let trace = crate::config::diag().cpu_layer_trace;
             let started = trace.then(std::time::Instant::now);
             let result = fused_decode(&this.cpu(), this.act(), &x, &ids, &ws, width)?;

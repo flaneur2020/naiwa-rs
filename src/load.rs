@@ -84,18 +84,6 @@ static GPU_CACHE_PROVIDER: OnceLock<Arc<GpuCacheMoeProvider>> = OnceLock::new();
 /// v2 M1/M2: build every fixed-address structure after load and before the first decode — each
 /// resident bank's fixed-grid capture path, and (with `--pcie-frac`) the quant shapes' staging
 /// rings. Returns `(captures, rings)`; `(0, 0)` when no GPU expert cache is installed.
-/// `NAIWA_QSA_MMA_CHECK=1`: run the tensor-core attention primitive's self-check once. It compares a
-/// 16x8 score tile computed with `mma.sync.m16n8k16.bf16` against a per-element f32 dot product and prints
-/// the difference; the fragment layout is the one part of the coming rewrite that fails silently, so it is
-/// checked before it is trusted (M33 §20.7).
-pub fn qsa_mma_check() -> Result<()> {
-    if !crate::config::runtime().qsa_mma_check {
-        return Ok(());
-    }
-    mistralrs_core::cuda::qwen4_exp::qsa_mma_check(256)?;
-    Ok(())
-}
-
 pub fn warmup() -> Result<(usize, usize)> {
     match GPU_CACHE_PROVIDER.get() {
         Some(provider) => Ok(provider.warmup()?),

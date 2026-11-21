@@ -66,20 +66,12 @@ impl PrefillStream {
         g: usize,
         per: usize,
     ) -> candle_core::Result<Tensor> {
-        let mask = crate::config::diag().split_check;
-        let whole = if mask {
-            Some(experts.forward(xs, topk_weights.clone(), topk_ids)?)
-        } else {
-            None
-        };
         let mut acc: Option<Tensor> = None;
-        let mut built = 0usize;
         for k in 0..g {
             let a = k * per;
             let Some(sub) = self.sub_experts(memory, a, per)? else {
                 return experts.forward(xs, topk_weights.clone(), topk_ids);
             };
-            built += 1;
             let (w, ids) = self.mask_range(topk_weights, topk_ids, a, per)?;
             let part = sub.forward(xs, w, &ids)?;
             acc = Some(match acc {
@@ -87,31 +79,7 @@ impl PrefillStream {
                 Some(prev) => prev.add(&part)?,
             });
         }
-        let out = acc.expect("at least one sub-range");
-        if let Some(whole) = whole {
-            let (a, b) = (
-                whole.flatten_all()?.to_dtype(DType::F32)?,
-                out.flatten_all()?.to_dtype(DType::F32)?,
-            );
-            let (av, bv) = (
-                a.to_vec1::<f32>().map_err(candle_core::Error::wrap)?,
-                b.to_vec1::<f32>().map_err(candle_core::Error::wrap)?,
-            );
-            let mut worst = 0f32;
-            let mut scale = 0f32;
-            for (x, y) in av.iter().zip(&bv) {
-                worst = worst.max((x - y).abs());
-                scale = scale.max(x.abs());
-            }
-            crate::dbg_note(
-                "prefill_split",
-                &format!(
-                    "split {g} in {built} sub-ranges: worst |diff| {worst:.3e} (scale {scale:.3e}, relative {:.2e})",
-                    (worst / scale.max(1e-30)) as f64
-                ),
-            );
-        }
-        Ok(out)
+        Ok(acc.expect("at least one sub-range"))
     }
 
     /// `MoEExperts` over experts `[a, a + n)` of one uploaded layer, as views of the buffer's own bytes.

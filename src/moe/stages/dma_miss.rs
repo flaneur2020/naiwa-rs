@@ -11,20 +11,6 @@ use crate::stats;
 
 use super::Hit;
 
-/// How many waves a layer's staging splits into (M26). 1 = the whole step's misses in one batch, which is
-/// what every earlier milestone did; 2 is the shipping value: the second half's copies hide behind the
-/// first half's kernels.
-#[inline]
-fn staging_waves() -> usize {
-    // M26 measured waves = 2 against waves = 1 and found no difference (TPOT 38.1 against 38.5 ms, inside
-    // the +-8% noise) while `staging_wait` grew by 1.6 ms, so the default stays at one batch. M36 §13
-    // re-measured: 4 waves win on the decode-only arm (42.8 / 44.2 / 42.3 against 44.3 / 45.5 / 44.2 ms per
-    // token) but lose in the chat harness (TPOT median 41.6 against 40.2 over 154 turns) - the waves
-    // interleave with prefill and with reuse, so the single-batch default is the one that ships.
-    crate::config::runtime().staging_waves
-}
-
-
 fn stream_pcie(
     layer: &Arc<CachedLayer>,
     misses: &mut [Vec<(u32, f32)>],
@@ -113,18 +99,6 @@ fn stage_misses(
             let start = ring.acquire(chosen.len());
             let taken = ring.take(start, chosen.len());
             let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
-            // M26: stage in waves so the compute of wave `w` runs while wave `w+1`'s copies are still
-            // in flight. One event per wave boundary, recorded after that wave's copies are queued; the
-            // consumer (`decode`) waits for a wave's event, submits that wave, and only then waits for
-            // the next. `STAGING_WAVES` of 1 restores the single-batch behaviour exactly.
-            let waves = staging_waves().min(chosen.len()).max(1);
-            let per_wave = chosen.len().div_ceil(waves);
-            let wave_events = if waves > 1 {
-                layer.ensure_wave_events(cs, waves - 1)?
-            } else {
-                Vec::new()
-            };
-            let mut wave_of: Vec<(u32, usize)> = Vec::with_capacity(chosen.len());
             let mut slot_of: HashMap<u32, (Arc<SlotBuf>, usize)> =
                 HashMap::with_capacity(chosen.len());
             for (i, staging) in taken.into_iter().enumerate() {
@@ -159,15 +133,8 @@ fn stage_misses(
                     let tick = layer.state().lock().unwrap().tick;
                     stats::schedule::bytes(layer.layer(), tick, "staged_h2d", bytes as u64);
                 }
-                let wave = i / per_wave;
-                wave_of.push((pos as u32, wave));
                 slot_of.insert(expert, (Arc::clone(buf), pos));
-                // Close the wave when the next expert starts a new one.
-                if waves > 1 && wave + 1 < waves && (i + 1) % per_wave == 0 {
-                    wave_events[wave].record(cs)?;
-                }
             }
-            layer.set_wave_of(wave_of);
             let pending: Vec<(u32, Arc<SlotBuf>)> = slot_of
                 .iter()
                 .map(|(id, (buf, _))| (*id, Arc::clone(buf)))

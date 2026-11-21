@@ -76,13 +76,6 @@ impl PrefillStream {
 
     /// Measure now and return what fits, or `None` if nothing does.
     pub(super) fn decide(&self) -> Option<(Plan, usize)> {
-        // `NAIWA_PLAN_TRIM=1` (default off; any value other than `0` enables) trims the pool before measuring.
-        if crate::config::runtime().plan_trim {
-            match trim_device_pool(&self.device) {
-                Ok(()) => crate::dbg_note("prefill_plan", "trimmed the pool before measuring"),
-                Err(e) => crate::dbg_note("prefill_plan", &format!("trim failed: {e}")),
-            }
-        }
         let free = crate::copy_stream::free_bytes(&self.device).unwrap_or(0);
         let (stride, chunk) = plan_with_lend_depth(
             free,
@@ -116,58 +109,6 @@ impl PrefillStream {
         crate::config::runtime().prefill_strict
     }
 
-    /// Borrow the three projections from a private allocation (`NAIWA_BORROW_PRIVATE=1`).
-    fn borrow_private(&self, stacks: &[Arc<QTensor>; 3]) -> candle_core::Result<[SlotMemory; 3]> {
-        let slab = {
-            let mut slot = self.private_slab.lock().unwrap();
-            if slot.is_none() {
-                let dev = self
-                    .device
-                    .as_cuda_device()
-                    .map_err(|e| candle_core::Error::Msg(format!("private borrow needs CUDA: {e}")))?;
-                let st = if crate::config::runtime().borrow_unused {
-                    let slab = self.slab.as_ref().ok_or_else(|| {
-                        candle_core::Error::Msg("unused-borrow needs the cache slab".into())
-                    })?;
-                    let block = 900usize << 20;
-                    let tail = slab.bytes().saturating_sub(block);
-                    slab.borrow_at(
-                        tail,
-                        (block - (40 << 20)) / 4,
-                        candle_core::quantized::GgmlDType::F32,
-                        &self.device,
-                    )?
-                } else {
-                    candle_core::quantized::cuda::QCudaStorage::zeros(
-                        dev,
-                        (768usize << 20) / 4,
-                        candle_core::quantized::GgmlDType::F32,
-                    )?
-                };
-                slot.replace(Arc::new(st));
-            }
-            Arc::clone(slot.as_ref().unwrap())
-        };
-        let dev = self
-            .device
-            .as_cuda_device()
-            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
-        let mut out = Vec::with_capacity(3);
-        let mut offset = 0usize;
-        for stack in stacks {
-            let st = candle_core::quantized::cuda::QCudaStorage::borrow_from(
-                &slab,
-                offset,
-                stack.shape().elem_count(),
-                stack.dtype(),
-                dev,
-            )?;
-            offset = (offset + st.allocated_bytes() + 255) & !255;
-            out.push(self.copy.like_from_storage(stack, st)?);
-        }
-        Ok([out.remove(0), out.remove(0), out.remove(0)])
-    }
-
     /// Three 256-byte-aligned projection buffers carved from the slab's low end.
     fn borrow_buffers(
         &self,
@@ -175,9 +116,6 @@ impl PrefillStream {
         buf: usize,
         stacks: &[Arc<QTensor>; 3],
     ) -> candle_core::Result<[SlotMemory; 3]> {
-        if crate::config::runtime().borrow_private {
-            return self.borrow_private(stacks);
-        }
         let slab = self.slab.as_ref().expect("checked by borrows()");
         let mut out = Vec::with_capacity(3);
         let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
@@ -185,14 +123,7 @@ impl PrefillStream {
         for stack in stacks {
             let padded =
                 stack.shape().elem_count() + candle_core::quantized::cuda::MATRIX_ROW_PADDING;
-            let storage = if crate::config::runtime().borrow_unused {
-                match slab.alloc(padded, stack.dtype(), &self.device)? {
-                    Some(st) => st,
-                    None => candle_core::bail!("slab is full"),
-                }
-            } else {
-                slab.borrow_at(offset, padded, stack.dtype(), &self.device)?
-            };
+            let storage = slab.borrow_at(offset, padded, stack.dtype(), &self.device)?;
             // 256-byte aligned, matching `alloc_like` (M35 §16).
             offset = (offset + storage.allocated_bytes() + 255) & !255;
             out.push(self.copy.like_from_storage(stack, storage)?);
@@ -217,10 +148,6 @@ impl PrefillStream {
                 kinds.join(" ")
             );
         }
-        if crate::config::runtime().prefill_quiesce {
-            crate::moe::quiesce(true);
-            let _ = self.device.synchronize();
-        }
         Ok([out.remove(0), out.remove(0), out.remove(0)])
     }
 
@@ -242,28 +169,22 @@ impl PrefillStream {
         }
         let base = slab.base()?;
         self.copy.after_device_work()?;
-        if !crate::config::runtime().borrow_nozero {
-            let stream = self.copy.cuda_stream();
-            let zeroed = loaned.max(650usize << 20).min(slab.bytes());
-            // SAFETY: the span is inside the live slab; memset is queued before any upload.
-            unsafe {
-                let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
-                    base,
-                    0,
-                    zeroed,
-                    stream.cu_stream(),
-                );
-                if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    candle_core::bail!("memset of the borrowed span failed: {rc:?}");
-                }
+        let stream = self.copy.cuda_stream();
+        let zeroed = loaned.max(650usize << 20).min(slab.bytes());
+        // SAFETY: the span is inside the live slab; memset is queued before any upload.
+        unsafe {
+            let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
+                base,
+                0,
+                zeroed,
+                stream.cu_stream(),
+            );
+            if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                candle_core::bail!("memset of the borrowed span failed: {rc:?}");
             }
         }
         if let Some(cache) = self.cache.as_ref() {
-            let emptied = if crate::config::runtime().borrow_noempty {
-                0
-            } else {
-                cache.empty_range(base, base + loaned as u64)
-            };
+            let emptied = cache.empty_range(base, base + loaned as u64);
             self.copy.synchronize()?;
             crate::dbg_note(
                 "prefill_borrow",
@@ -438,9 +359,6 @@ impl PrefillStream {
             }
             buf.experts = None;
             buf.memory = None;
-            if crate::config::runtime().shape_trim {
-                trim_device_pool(&self.device)?;
-            }
             trace_buffer_bytes(&self.device, layer, &stacks);
             crate::dbg_note(
                 "prefill_load",
@@ -494,16 +412,10 @@ impl PrefillStream {
             "prefill_load",
             &format!("layer {layer}: queueing {} bytes", buf.bytes),
         );
-        if crate::config::runtime().stream_sync {
-            self.copy.upload(&buf.released, &parts)?;
-        } else {
-            let split = crate::config::runtime().copy_split;
-            // SAFETY: registered stacks are page-locked, and `self.layers` keeps them alive
-            // past `Drop` (`self.copy.synchronize()`).
-            unsafe {
-                self.copy
-                    .upload_async_split(&buf.released, &parts, split, &buf.ready)?
-            };
+        // SAFETY: registered stacks are page-locked, and `self.layers` keeps them alive
+        // past `Drop` (`self.copy.synchronize()`).
+        unsafe {
+            self.copy.upload_async(&buf.released, &parts, &buf.ready)?;
         }
         buf.queued = Some(queued);
         buf.loaded = Some(layer);

@@ -3,14 +3,14 @@
 //!
 //! Companion modules split the surrounding responsibilities:
 //! - [`super::layer_registry`] — model-wide `Layers` registry and loan empty/refill.
-//! - [`super::activation_channel`] — `LookaheadChannel` (advisory) and `CpuActivationChannel`.
+//! - [`super::activation_channel`] — `LookaheadChannel` (advisory).
 //! - [`super::cache_policy`] — pure selection/ranking/victim functions (`#[inline]`).
 //! - [`super::cache_updates`] — `admit`, `replace`, `promote_staged`, `prefetch_predicted`, `spawn_fill`.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
@@ -21,7 +21,7 @@ use crate::host_memory::PinnedStack;
 use crate::prefill_stream::PrefillStream;
 use crate::stats;
 
-use super::activation_channel::{CpuActivationChannel, LookaheadChannel};
+use super::activation_channel::LookaheadChannel;
 use super::layer_registry::Layers;
 use super::slab::BorrowGate;
 use super::{Slot, SlotBuf, StagingRings};
@@ -57,9 +57,6 @@ pub(crate) struct CachedLayer {
     pub(crate) borrow_gate: Arc<BorrowGate>,
     /// This step's staged experts, drained unconditionally within one step on the token thread.
     pub(crate) staged_now: Mutex<Vec<(u32, Arc<SlotBuf>)>>,
-    /// M26: wave-boundary events when staging splits across multiple waves.
-    pub(crate) staging_waves: Mutex<Vec<Arc<CopyDone>>>,
-    pub(crate) staged_wave_of: Mutex<Vec<(u32, usize)>>,
     pub(crate) hidden: usize,
     pub(crate) num_experts: usize,
     pub(crate) top_k: usize,
@@ -68,8 +65,6 @@ pub(crate) struct CachedLayer {
     pub(crate) router: Option<Tensor>,
     /// Advisory GPU -> host activation channel for lookahead prediction.
     pub(crate) lookahead_chan: Option<Arc<LookaheadChannel>>,
-    /// M42 opt-in GPU -> host activation channel for CPU-miss jobs.
-    pub(crate) cpu_chan: Option<Arc<CpuActivationChannel>>,
     pub(crate) state: Mutex<LayerState>,
     /// Uploads fills alongside compute; `None` off CUDA.
     pub(crate) copy_stream: Option<Arc<CopyStream>>,
@@ -132,40 +127,8 @@ impl RoutedExperts for CachedExperts {
                 }
                 layer.spawn_fill();
             }
-            if let Some(out) = crate::moe::rings_exec::forward(layer, xs, &topk_weights, topk_ids)?
-            {
-                return Ok(out);
-            }
             if let Some(ps) = &layer.prefill {
-                if crate::config::diag().borrow_check {
-                    let finite_in = xs
-                        .to_dtype(DType::F32)?
-                        .to_device(&Device::Cpu)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?
-                        .iter()
-                        .all(|v| v.is_finite());
-                    if !finite_in {
-                        eprintln!("BORROW_IN layer {}: chunk INPUT not finite", layer.layer);
-                    }
-                }
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
-                    if crate::config::diag().borrow_check {
-                        let finite = out
-                            .to_dtype(DType::F32)?
-                            .to_device(&Device::Cpu)?
-                            .flatten_all()?
-                            .to_vec1::<f32>()?
-                            .iter()
-                            .all(|v| v.is_finite());
-                        if !finite {
-                            crate::dbg_note(
-                                "prefill_borrow",
-                                &format!("layer {}: chunk output is NOT finite", layer.layer),
-                            );
-                            eprintln!("BORROW_CHECK layer {}: chunk output not finite", layer.layer);
-                        }
-                    }
                     return Ok(out);
                 }
             }
@@ -185,24 +148,7 @@ impl RoutedExperts for CachedExperts {
                 crate::dbg_note("prefill_borrow", "the loan was given back");
             }
         }
-        let out = super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)?;
-        if crate::config::diag().borrow_check {
-            let finite = out
-                .to_dtype(DType::F32)?
-                .to_device(&Device::Cpu)?
-                .flatten_all()?
-                .to_vec1::<f32>()?
-                .iter()
-                .all(|v| v.is_finite());
-            if !finite {
-                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 8 {
-                    eprintln!("DECODE_NAN layer {} (rows {num_tokens})", layer.layer);
-                }
-            }
-        }
-        Ok(out)
+        super::decode::forward(layer, xs, &topk_weights, topk_ids, layer.act)
     }
 }
 
@@ -258,11 +204,6 @@ impl CachedLayer {
     }
 
     #[inline]
-    pub(crate) fn cpu_chan(&self) -> Option<&Arc<CpuActivationChannel>> {
-        self.cpu_chan.as_ref()
-    }
-
-    #[inline]
     pub(crate) fn copy_stream(&self) -> Option<&Arc<CopyStream>> {
         self.copy_stream.as_ref()
     }
@@ -270,50 +211,6 @@ impl CachedLayer {
     #[inline]
     pub(crate) fn pcie_frac(&self) -> f32 {
         self.pcie_frac
-    }
-
-    #[inline]
-    pub(crate) fn set_wave_of(&self, v: Vec<(u32, usize)>) {
-        *self.staged_wave_of.lock().unwrap() = v;
-    }
-
-    #[inline]
-    pub(crate) fn wave_of_slot(&self, pos: u32) -> usize {
-        self.staged_wave_of
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(p, _)| *p == pos)
-            .map(|(_, w)| *w)
-            .unwrap_or(0)
-    }
-
-    #[inline]
-    pub(crate) fn wave_count(&self) -> usize {
-        self.staging_waves.lock().unwrap().len() + 1
-    }
-
-    pub(crate) fn ensure_wave_events(
-        &self,
-        cs: &CopyStream,
-        n: usize,
-    ) -> candle_core::Result<Vec<Arc<CopyDone>>> {
-        let mut events = self.staging_waves.lock().unwrap();
-        while events.len() < n {
-            events.push(Arc::new(CopyDone::new(cs)?));
-        }
-        Ok(events[..n].to_vec())
-    }
-
-    pub(crate) fn wait_staging_wave(&self, w: usize) -> candle_core::Result<()> {
-        let events = self.staging_waves.lock().unwrap();
-        match events.get(w) {
-            Some(done) => {
-                stats::record_cache_sync_wait();
-                done.wait_on(&self.slot_device)
-            }
-            None => Ok(()),
-        }
     }
 
     #[inline]

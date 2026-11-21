@@ -267,21 +267,20 @@ mod cuda {
             self.stream.wait(&done).map_err(Error::wrap)
         }
 
-        /// `NAIWA_COPY_SPLIT=g` probe: queue copies of each `src` into its `dst` once the readers are done
-        /// (`fence`), issuing each projection's copy as `g` commands of `1/g` of its length, then record `done`.
+        /// Queue async copies of each `src` into its `dst` once prior readers finish (`fence`),
+        /// then record `done`.
         ///
         /// # Safety
         /// Every `src` must be page-locked (or the call blocks until it is staged) and must stay
         /// alive and unmodified until `done` completes.
-        pub unsafe fn upload_async_split(
+        pub unsafe fn upload_async(
             &self,
             fence: &ReadFence,
             parts: &[(&SlotMemory, &[u8])],
-            split: usize,
             done: &CopyDone,
         ) -> Result<()> {
             done.start_timing(self)?;
-            self.queue_copies_split(fence, parts, split.max(1))?;
+            self.queue_copies_bounded(fence, parts)?;
             done.stop_timing(self)?;
             done.event.record(&self.stream).map_err(Error::wrap)
         }
@@ -308,11 +307,12 @@ mod cuda {
             self.stream.synchronize().map_err(Error::wrap)
         }
 
-        fn queue_copies_split(
+        /// Like [`Self::queue_copies`], allowing `src.len() <= dst.len` because borrowed prefill
+        /// buffers include `MATRIX_ROW_PADDING` extra elements for sub-range views.
+        fn queue_copies_bounded(
             &self,
             fence: &ReadFence,
             parts: &[(&SlotMemory, &[u8])],
-            split: usize,
         ) -> Result<()> {
             self.stream
                 .context()
@@ -322,8 +322,6 @@ mod cuda {
                 self.stream.wait(event).map_err(Error::wrap)?;
             }
             for (dst, src) in parts {
-                // `<=`: a slot is carved with `MATRIX_ROW_PADDING` more elements than the stack holds, so the last
-                // expert sub-range can be viewed (M34 §17).
                 if src.len() > dst.len {
                     candle_core::bail!(
                         "slot upload of {} bytes into a {}-byte slot",
@@ -331,22 +329,9 @@ mod cuda {
                         dst.len
                     );
                 }
-                // 4 KiB boundaries, so a sub-copy never straddles a page in the pinned source.
-                let unit = (src.len() / split).max(4096) / 4096 * 4096;
-                let mut off = 0usize;
-                while off < src.len() {
-                    let len = unit.min(src.len() - off);
-                    // SAFETY: the caller guarantees the whole slot and the whole source are alive until `done`.
-                    unsafe {
-                        result::memcpy_htod_async(
-                            dst.ptr + off as u64,
-                            &src[off..off + len],
-                            self.stream.cu_stream(),
-                        )
-                    }
+                // SAFETY: caller guarantees `dst` and `src` stay live until `done` completes.
+                unsafe { result::memcpy_htod_async(dst.ptr, src, self.stream.cu_stream()) }
                     .map_err(Error::wrap)?;
-                    off += len;
-                }
             }
             Ok(())
         }
@@ -605,11 +590,10 @@ mod stub {
 
         /// # Safety
         /// See the CUDA version.
-        pub unsafe fn upload_async_split(
+        pub unsafe fn upload_async(
             &self,
             _fence: &ReadFence,
             _parts: &[(&SlotMemory, &[u8])],
-            _split: usize,
             _done: &CopyDone,
         ) -> Result<()> {
             match *self {}

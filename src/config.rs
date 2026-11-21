@@ -6,8 +6,7 @@
 //! Parsing semantics intentionally preserve historical behavior verbatim:
 //! - presence-only flags (`var_os().is_some()`) stay presence-only (e.g., `NAIWA_CPU_PHYSICAL_LAYOUT`)
 //! - strict `=1` flags (`== "1"`) stay strict `=1` (`NAIWA_CPU_BEFORE_DMA`, `NAIWA_WORK_TRACE`)
-//! - default-on flags (`0`/`off`/`false`/`no` disable) stay default-on (`NAIWA_CACHE_SLAB`, `NAIWA_PREFILL_BORROW`)
-//! - `NAIWA_PLAN_TRIM` preserves its current default-off (`is_ok_and(|v| v != "0")`) behavior.
+//! - default-on flags (`0`/`off`/`false`/`no` disable) stay default-on (`NAIWA_CACHE_SLAB`, `NAIWA_PREFILL_BORROW`).
 
 use std::ffi::OsString;
 use std::sync::OnceLock;
@@ -23,8 +22,6 @@ const DEFAULT_PREFILL_THRESHOLD: usize = 32;
 pub(crate) struct RuntimeConfig {
     /// `NAIWA_CPU_BEFORE_DMA=1`: submit complementary CPU misses before demand DMA.
     pub cpu_before_dma: bool,
-    /// `NAIWA_CPU_ACT_ASYNC` (presence): deliver CPU activations via mapped channel.
-    pub cpu_act_async: bool,
     /// `NAIWA_CPU_SPIN_US` (raw value when set): enables `spin_pool::dispatch` and sets spin budget.
     pub cpu_spin_us_raw: Option<OsString>,
     /// `NAIWA_CPU_MOE_THREADS` (usize, default 8): worker count for `spin_pool`.
@@ -36,8 +33,6 @@ pub(crate) struct RuntimeConfig {
     pub promote_max: usize,
     /// `NAIWA_PROMOTE_MIN_HITS` (u64, default 4): minimum cumulative routing hits before promotion.
     pub promote_min_hits: u64,
-    /// `NAIWA_STAGING_WAVES` (usize, default 1): number of demand-staging DMA waves.
-    pub staging_waves: usize,
     /// `NAIWA_PREFILL_THRESHOLD` (usize, default 32, clamped to `1..=MAX_DECODE_ROWS`).
     pub prefill_threshold: usize,
 
@@ -52,16 +47,10 @@ pub(crate) struct RuntimeConfig {
 
     /// `NAIWA_PREFILL_BORROW` (default true; `0`/`off`/`false`/`no` disables).
     pub prefill_borrow: bool,
-    /// `NAIWA_PREFILL_RINGS` (presence): run prefill chunks in rounds over cache slots.
-    pub prefill_rings: bool,
     /// `NAIWA_PREFILL_ALLOW_CPU` (presence): allow fallback to CPU prefill if stream does not fit.
     pub prefill_allow_cpu: bool,
     /// `NAIWA_PREFILL_STRICT` (presence): fail rather than downgrade buffers on OOM.
     pub prefill_strict: bool,
-    /// `NAIWA_PREFILL_NOQUIESCE` (presence): do not quiesce lookahead at chunk layer 0.
-    pub prefill_noquiesce: bool,
-    /// `NAIWA_PREFILL_QUIESCE` (presence): extra device-sync quiesce inside `borrow_buffers`.
-    pub prefill_quiesce: bool,
     /// `NAIWA_NO_PREFILL_FILL` (presence): disable background empty-slot fills during prefill.
     pub no_prefill_fill: bool,
     /// `NAIWA_REFILL` (`== "0"` disables): whether displaced loan slots are refilled after a chunk.
@@ -80,29 +69,8 @@ pub(crate) struct RuntimeConfig {
     /// `NAIWA_KV_RESERVE_MIB` (usize MiB, default 384 MiB) in bytes.
     pub kv_reserve_bytes: usize,
 
-    /// `NAIWA_PLAN_TRIM` (default false; active when set and `!= "0"`).
-    pub plan_trim: bool,
-    /// `NAIWA_SHAPE_TRIM` (presence): trim CUDA memory pool on mixed-quant shape switches.
-    pub shape_trim: bool,
-    /// `NAIWA_STREAM_SYNC` (presence): serialize prefill uploads for throughput measurement.
-    pub stream_sync: bool,
-    /// `NAIWA_COPY_SPLIT` (usize, default 1): sub-copies per projection on prefill upload.
-    pub copy_split: usize,
-
     /// `NAIWA_GPU_ONLY_EXPERTS` (presence): lossy perfect-cache upper-bound probe.
     pub gpu_only_experts: bool,
-    /// `NAIWA_BORROW_PRIVATE` (presence): borrow from a private allocation instead of the cache slab.
-    pub borrow_private: bool,
-    /// `NAIWA_BORROW_UNUSED` (presence): carve from the slab's unused tail.
-    pub borrow_unused: bool,
-    /// `NAIWA_BORROW_NOZERO` (presence): skip zeroing the borrowed span before upload.
-    pub borrow_nozero: bool,
-    /// `NAIWA_BORROW_NOEMPTY` (presence): skip emptying overlapping cache slots on borrow.
-    pub borrow_noempty: bool,
-    /// `NAIWA_BORROW_BARRIER` (presence): serialize copy stream before borrowed compute.
-    pub borrow_barrier: bool,
-    /// `NAIWA_QSA_MMA_CHECK` (presence): run tensor-core attention self-check after load.
-    pub qsa_mma_check: bool,
 }
 
 impl RuntimeConfig {
@@ -147,8 +115,6 @@ pub(crate) struct DiagConfig {
 
     /// `NAIWA_EXPERT_HIST` (optional output path).
     pub expert_hist: Option<String>,
-    /// `NAIWA_FORCE_HIST_READ` (presence).
-    pub force_hist_read: bool,
     /// `NAIWA_XSUM` (presence).
     pub xsum: bool,
     /// `NAIWA_CPU_TIMELINE` (presence).
@@ -172,16 +138,8 @@ pub(crate) struct DiagConfig {
 
     /// `NAIWA_PREFILL_PEAK` (presence).
     pub prefill_peak: bool,
-    /// `NAIWA_BORROW_CHECK` (presence).
-    pub borrow_check: bool,
-    /// `NAIWA_BORROW_SNAP` (presence).
-    pub borrow_snap: bool,
-    /// `NAIWA_BORROW_CANARY` (presence).
-    pub borrow_canary: bool,
     /// `NAIWA_COPY_TIME` (presence).
     pub copy_time: bool,
-    /// `NAIWA_SPLIT_CHECK` (presence).
-    pub split_check: bool,
     /// `NAIWA_REQ_TIME` (presence).
     pub req_time: bool,
 
@@ -232,14 +190,12 @@ impl EnvConfig {
 
         let runtime = RuntimeConfig {
             cpu_before_dma: eq_1("NAIWA_CPU_BEFORE_DMA"),
-            cpu_act_async: present("NAIWA_CPU_ACT_ASYNC"),
             cpu_spin_us_raw: get("NAIWA_CPU_SPIN_US"),
             cpu_moe_threads: usize_or("NAIWA_CPU_MOE_THREADS", 8),
             cpu_physical_layout: present("NAIWA_CPU_PHYSICAL_LAYOUT"),
 
             promote_max: usize_or("NAIWA_PROMOTE_MAX", 1),
             promote_min_hits: u64_or("NAIWA_PROMOTE_MIN_HITS", 4),
-            staging_waves: usize_or("NAIWA_STAGING_WAVES", 1),
             prefill_threshold: usize_or("NAIWA_PREFILL_THRESHOLD", DEFAULT_PREFILL_THRESHOLD)
                 .clamp(1, MAX_DECODE_ROWS),
 
@@ -249,11 +205,8 @@ impl EnvConfig {
             profile_fill: f64_or("NAIWA_PROFILE_FILL", 1.0),
 
             prefill_borrow: default_true("NAIWA_PREFILL_BORROW"),
-            prefill_rings: present("NAIWA_PREFILL_RINGS"),
             prefill_allow_cpu: present("NAIWA_PREFILL_ALLOW_CPU"),
             prefill_strict: present("NAIWA_PREFILL_STRICT"),
-            prefill_noquiesce: present("NAIWA_PREFILL_NOQUIESCE"),
-            prefill_quiesce: present("NAIWA_PREFILL_QUIESCE"),
             no_prefill_fill: present("NAIWA_NO_PREFILL_FILL"),
             refill_lent: str_val("NAIWA_REFILL").as_deref() != Some("0"),
 
@@ -264,18 +217,7 @@ impl EnvConfig {
             depth_cap: usize_or("NAIWA_DEPTH_CAP", 2),
             kv_reserve_bytes: usize_or("NAIWA_KV_RESERVE_MIB", 384) << 20,
 
-            plan_trim: str_val("NAIWA_PLAN_TRIM").is_some_and(|v| v != "0"),
-            shape_trim: present("NAIWA_SHAPE_TRIM"),
-            stream_sync: present("NAIWA_STREAM_SYNC"),
-            copy_split: usize_or("NAIWA_COPY_SPLIT", 1),
-
             gpu_only_experts: present("NAIWA_GPU_ONLY_EXPERTS"),
-            borrow_private: present("NAIWA_BORROW_PRIVATE"),
-            borrow_unused: present("NAIWA_BORROW_UNUSED"),
-            borrow_nozero: present("NAIWA_BORROW_NOZERO"),
-            borrow_noempty: present("NAIWA_BORROW_NOEMPTY"),
-            borrow_barrier: present("NAIWA_BORROW_BARRIER"),
-            qsa_mma_check: present("NAIWA_QSA_MMA_CHECK"),
         };
 
         let diag = DiagConfig {
@@ -290,7 +232,6 @@ impl EnvConfig {
             pred_dbg: present("NAIWA_PRED_DBG"),
 
             expert_hist: str_val("NAIWA_EXPERT_HIST"),
-            force_hist_read: present("NAIWA_FORCE_HIST_READ"),
             xsum: present("NAIWA_XSUM"),
             cpu_timeline: present("NAIWA_CPU_TIMELINE"),
             work_trace: eq_1("NAIWA_WORK_TRACE"),
@@ -303,11 +244,7 @@ impl EnvConfig {
             layer_dbg: present("NAIWA_LAYER_DBG"),
 
             prefill_peak: present("NAIWA_PREFILL_PEAK"),
-            borrow_check: present("NAIWA_BORROW_CHECK"),
-            borrow_snap: present("NAIWA_BORROW_SNAP"),
-            borrow_canary: present("NAIWA_BORROW_CANARY"),
             copy_time: present("NAIWA_COPY_TIME"),
-            split_check: present("NAIWA_SPLIT_CHECK"),
             req_time: present("NAIWA_REQ_TIME"),
 
             schedule_file: get("NAIWA_SCHEDULE_FILE"),
@@ -358,14 +295,12 @@ mod tests {
     fn defaults_match_historical_values() {
         let c = cfg(&[]);
         assert!(!c.runtime.cpu_before_dma);
-        assert!(!c.runtime.cpu_act_async);
         assert!(c.runtime.cpu_spin_us_raw.is_none());
         assert_eq!(c.runtime.spin_budget(), Some(Duration::from_micros(1000)));
         assert_eq!(c.runtime.cpu_moe_threads, 8);
         assert!(!c.runtime.cpu_physical_layout);
         assert_eq!(c.runtime.promote_max, 1);
         assert_eq!(c.runtime.promote_min_hits, 4);
-        assert_eq!(c.runtime.staging_waves, 1);
         assert_eq!(c.runtime.prefill_threshold, 32);
         assert!(c.runtime.cache_slab);
         assert_eq!(c.runtime.slab_mib, 1536);
@@ -379,8 +314,6 @@ mod tests {
         assert_eq!(c.runtime.decode_reserve_bytes, 700 << 20);
         assert_eq!(c.runtime.depth_cap, 2);
         assert_eq!(c.runtime.kv_reserve_bytes, 384 << 20);
-        assert!(!c.runtime.plan_trim);
-        assert_eq!(c.runtime.copy_split, 1);
         assert!(!c.diag.work_trace);
         assert_eq!(c.diag.model_partition_stride, 1);
     }
@@ -395,7 +328,6 @@ mod tests {
             ("NAIWA_CACHE_SLAB", "off"),
             ("NAIWA_PREFILL_BORROW", "0"),
             ("NAIWA_REFILL", "0"),
-            ("NAIWA_PLAN_TRIM", "0"),
         ]);
         assert!(c.runtime.cpu_physical_layout);
         assert!(!c.runtime.cpu_before_dma);
@@ -403,19 +335,16 @@ mod tests {
         assert!(!c.runtime.cache_slab);
         assert!(!c.runtime.prefill_borrow);
         assert!(!c.runtime.refill_lent);
-        assert!(!c.runtime.plan_trim);
 
         let c2 = cfg(&[
             ("NAIWA_CPU_BEFORE_DMA", "1"),
             ("NAIWA_WORK_TRACE", "1"),
-            ("NAIWA_PLAN_TRIM", "1"),
             ("NAIWA_CPU_SPIN_US", "forever"),
             ("NAIWA_PREFILL_THRESHOLD", "9999"),
             ("NAIWA_MODEL_PARTITION_STRIDE", "0"),
         ]);
         assert!(c2.runtime.cpu_before_dma);
         assert!(c2.diag.work_trace);
-        assert!(c2.runtime.plan_trim);
         assert_eq!(c2.runtime.spin_budget(), None);
         assert_eq!(c2.runtime.prefill_threshold, crate::moe::MAX_DECODE_ROWS);
         assert_eq!(c2.diag.model_partition_stride, 1);
@@ -426,14 +355,12 @@ mod tests {
         let c = cfg(&[
             ("NAIWA_PROMOTE_MAX", "abc"),
             ("NAIWA_PROMOTE_MIN_HITS", "-1"),
-            ("NAIWA_STAGING_WAVES", "nope"),
             ("NAIWA_CPU_MOE_THREADS", "x"),
             ("NAIWA_SLAB_MIB", "bad"),
             ("NAIWA_PROFILE_FILL", "nan?"),
         ]);
         assert_eq!(c.runtime.promote_max, 1);
         assert_eq!(c.runtime.promote_min_hits, 4);
-        assert_eq!(c.runtime.staging_waves, 1);
         assert_eq!(c.runtime.cpu_moe_threads, 8);
         assert_eq!(c.runtime.slab_mib, 1536);
         assert_eq!(c.runtime.profile_fill, 1.0);

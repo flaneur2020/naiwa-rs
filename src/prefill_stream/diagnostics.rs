@@ -1,11 +1,9 @@
-//! Opt-in prefill diagnostics (`NAIWA_PREFILL_PEAK`, `NAIWA_REQ_TIME`, `NAIWA_BORROW_CHECK`,
-//! `NAIWA_BORROW_SNAP`, `NAIWA_BORROW_CANARY`, `NAIWA_COPY_TIME`), kept out of `forward()`.
+//! Opt-in prefill diagnostics (`NAIWA_PREFILL_PEAK`, `NAIWA_REQ_TIME`, `NAIWA_STREAM_DBG`),
+//! kept out of `forward()`.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use candle_core::{DType, Device, Tensor};
 use tracing::info;
 
 use super::buffers::LayerBuf;
@@ -124,143 +122,6 @@ impl PrefillStream {
                 ),
             );
         }
-    }
-
-    /// `NAIWA_BORROW_CHECK=1`: check whether the chunk's row inputs are finite.
-    pub(super) fn check_inputs_finite(&self, layer: usize, xs: &Tensor, topk_weights: &Tensor) {
-        if !crate::config::diag().borrow_check {
-            return;
-        }
-        let finite = |t: &Tensor| -> bool {
-            t.flatten_all()
-                .and_then(|f| f.to_dtype(DType::F32))
-                .and_then(|f| f.to_device(&Device::Cpu))
-                .and_then(|f| f.to_vec1::<f32>())
-                .map(|v| v.iter().all(|x| x.is_finite()))
-                .unwrap_or(true)
-        };
-        static N: AtomicUsize = AtomicUsize::new(0);
-        if (!finite(xs) || !finite(topk_weights)) && N.fetch_add(1, Ordering::Relaxed) < 8 {
-            eprintln!("PREFILL_NAN layer {layer}: the chunk's row inputs are not finite");
-        }
-    }
-
-    /// `NAIWA_BORROW_SNAP=1` pre-compute snapshot queued on the copy stream + `NAIWA_BORROW_CANARY=1`.
-    pub(super) fn probe_before_compute(
-        &self,
-        layer: usize,
-        buf: &LayerBuf,
-    ) -> candle_core::Result<bool> {
-        let take_snap = self.borrows() && crate::config::diag().borrow_snap;
-        if take_snap {
-            let shadow = {
-                let mut slot = self.snap.lock().unwrap();
-                if slot.is_none() {
-                    let dev = self.device.as_cuda_device().expect("cuda");
-                    let st = candle_core::quantized::cuda::QCudaStorage::zeros(
-                        dev,
-                        2 * 3 * 4096 / 4,
-                        candle_core::quantized::GgmlDType::F32,
-                    )?;
-                    slot.replace(Arc::new(candle_core::quantized::QTensor::new(
-                        candle_core::quantized::QStorage::Cuda(st),
-                        (2 * 3 * 4096 / 4,),
-                    )?));
-                }
-                Arc::clone(slot.as_ref().unwrap())
-            };
-            if let Some(m) = buf.memory.as_ref() {
-                for (i, mem) in m.iter().enumerate() {
-                    mem.tensor().copy_range_to(
-                        &shadow,
-                        0,
-                        i * 4096,
-                        4096,
-                        self.copy.cuda_stream(),
-                    )?;
-                }
-            }
-        }
-        if self.borrows() && crate::config::diag().borrow_canary {
-            if let Some(m) = buf.memory.as_ref() {
-                let before: Vec<Vec<u8>> = m
-                    .iter()
-                    .map(|mem| mem.tensor().read_bytes_at(0, 256).unwrap_or_default())
-                    .collect();
-                for (i, mem) in m.iter().enumerate() {
-                    if let Ok(now) = mem.tensor().read_bytes_at(0, 256) {
-                        if now != before[i] {
-                            let at = now
-                                .iter()
-                                .zip(&before[i])
-                                .position(|(a, b)| a != b)
-                                .unwrap_or(0);
-                            eprintln!(
-                                "CANARY_MISMATCH layer {layer} proj {i} first byte {at}: was {:02x} now {:02x}",
-                                before[i][at], now[at]
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Ok(take_snap)
-    }
-
-    /// `NAIWA_BORROW_SNAP=1` post-compute snapshot queued on candle's stream.
-    pub(super) fn snap_after_compute(&self, buf: &LayerBuf) -> candle_core::Result<()> {
-        let shadow = self.snap.lock().unwrap().as_ref().map(Arc::clone);
-        if let Some(shadow) = shadow {
-            if let Some(m) = buf.memory.as_ref() {
-                let dev = self
-                    .device
-                    .as_cuda_device()
-                    .map_err(|e| candle_core::Error::Msg(format!("cuda: {e}")))?;
-                for (i, mem) in m.iter().enumerate() {
-                    mem.tensor().copy_range_to(
-                        &shadow,
-                        0,
-                        3 * 4096 + i * 4096,
-                        4096,
-                        &dev.cuda_stream(),
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Compare pre- and post-compute snapshots against host stacks after the copy stream syncs.
-    pub(super) fn verify_snap_after_sync(&self, layer: usize) -> candle_core::Result<()> {
-        let shadow = self.snap.lock().unwrap().as_ref().map(Arc::clone);
-        if let Some(shadow) = shadow {
-            let host_stacks = self
-                .stacks(layer)
-                .unwrap_or_else(|| unreachable!("loaded above"));
-            for (i, stack) in host_stacks.iter().enumerate() {
-                let host = stack.data()?;
-                let want = &host[..4096.min(host.len())];
-                let a = shadow.read_bytes_at(i * 4096, 4096).unwrap_or_default();
-                let b = shadow
-                    .read_bytes_at(3 * 4096 + i * 4096, 4096)
-                    .unwrap_or_default();
-                if a.len() == want.len() && a != want {
-                    let at = a.iter().zip(want).position(|(x, y)| x != y).unwrap_or(0);
-                    eprintln!(
-                        "SNAP_A_MISMATCH layer {layer} proj {i} byte {at}: upload wrote {:02x}, host has {:02x}",
-                        a[at], want[at]
-                    );
-                }
-                if a != b {
-                    let at = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
-                    eprintln!(
-                        "SNAP_B_MISMATCH layer {layer} proj {i} byte {at}: after upload {:02x}, after compute {:02x}",
-                        a[at], b[at]
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn log_copy_and_layer_timing(

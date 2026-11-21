@@ -17,7 +17,7 @@ use mistralrs_core::MoEExperts;
 
 use super::{
     slab::BorrowGate, slot_bytes_from_stack, staging::alloc_bank_in, CachedExperts, CachedLayer,
-    CpuActivationChannel, LayerState, Layers, LookaheadChannel, Slot, StagingRings,
+    LayerState, Layers, LookaheadChannel, Slot, StagingRings,
     MAX_DECODE_ROWS,
 };
 
@@ -528,19 +528,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             None
         };
 
-        // M42: the CPU experts read their activation from mapped memory instead of forcing the
-        // token thread into a stream-wide D2H. Sized like the lookahead channel; off by default.
-        let cpu_chan = if slot_device.is_cuda()
-            && crate::config::runtime().cpu_act_async
-            && router.is_some()
-        {
-            CpuActivationChannel::new(&slot_device, 5, hidden)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-
         // With a copy stream, each slot's memory is allocated once here and every fill overwrites
         // it in place from the copy stream; otherwise each fill uploads a fresh copy. All of a
         // layer's slots are one bank per projection, so a decode step runs them in one fused call.
@@ -592,15 +579,12 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             staging: Arc::clone(&self.staging),
             borrow_gate: Arc::clone(&self.borrow_gate),
             staged_now: Mutex::new(Vec::new()),
-            staging_waves: Mutex::new(Vec::new()),
-            staged_wave_of: Mutex::new(Vec::new()),
             hidden,
             num_experts,
             top_k: ctx.config.num_experts_per_tok,
             act: ctx.act,
             router,
             lookahead_chan,
-            cpu_chan,
             state: Mutex::new(LayerState {
                 doorbell: None,
                 slots,

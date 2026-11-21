@@ -25,8 +25,6 @@ mod layer_registry;
 mod profile;
 mod provider;
 mod resident;
-mod rings;
-pub(crate) mod rings_exec;
 pub(crate) mod slab;
 mod slot;
 mod stages;
@@ -39,7 +37,7 @@ pub use provider::GpuCacheMoeProvider;
 pub(crate) use stages::{fused_decode, quiesce};
 
 // Cross-module items are re-exported here; siblings import them from `super`.
-pub(crate) use activation_channel::{CpuActivationChannel, LookaheadChannel};
+pub(crate) use activation_channel::LookaheadChannel;
 #[cfg(test)]
 pub(in crate::moe) use cache_policy::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 pub(crate) use cache_policy::streamed_misses;
