@@ -22,6 +22,7 @@ mod cached_layer;
 mod decode;
 mod expert;
 mod layer_registry;
+mod observer;
 mod profile;
 mod provider;
 mod resident;
@@ -41,7 +42,10 @@ pub(crate) use activation_channel::LookaheadChannel;
 #[cfg(test)]
 pub(in crate::moe) use cache_policy::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
 pub(crate) use cache_policy::streamed_misses;
-pub(crate) use cached_layer::{CachedExperts, CachedLayer, LayerState, MAX_DECODE_ROWS};
+pub(crate) use cached_layer::{
+    CachedExperts, CachedLayer, LayerCache, LayerState, LayerTransport, LayerWeights,
+    MAX_DECODE_ROWS,
+};
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
 pub(crate) use layer_registry::Layers;
 #[cfg(test)]

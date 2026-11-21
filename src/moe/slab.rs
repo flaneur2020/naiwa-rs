@@ -102,11 +102,6 @@ impl Layout {
         self.ranges.push(Range { offset, bytes });
     }
 
-    #[cfg(test)]
-    pub(crate) fn ranges(&self) -> &[Range] {
-        &self.ranges
-    }
-
     /// Bytes carved so far: the end of the last range.
     pub(crate) fn end(&self) -> usize {
         self.ranges.last().map_or(0, |r| r.end())

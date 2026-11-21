@@ -18,13 +18,13 @@ impl CachedLayer {
     /// Byte-slice expert `expert_id` out of the CPU stacks onto the slot device — never
     /// dequantized. `None` when the backend holds no `QTensor`s.
     fn expert_weights(&self, expert_id: usize) -> candle_core::Result<Option<Projections>> {
-        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+        let Some((gate, up, down)) = self.weights.cpu.expert_qtensors() else {
             return Ok(None);
         };
         Ok(Some(Projections {
-            gate: expert_qtensor_on_device(&gate, expert_id, &self.slot_device)?,
-            up: expert_qtensor_on_device(&up, expert_id, &self.slot_device)?,
-            down: expert_qtensor_on_device(&down, expert_id, &self.slot_device)?,
+            gate: expert_qtensor_on_device(&gate, expert_id, &self.weights.slot_device)?,
+            up: expert_qtensor_on_device(&up, expert_id, &self.weights.slot_device)?,
+            down: expert_qtensor_on_device(&down, expert_id, &self.weights.slot_device)?,
         }))
     }
 
@@ -40,19 +40,21 @@ impl CachedLayer {
     }
 
     /// Promote this step's staged experts into the cache, up to `NAIWA_PROMOTE_MAX` per layer per step.
+    ///
+    /// Consumes `staged` by value so every staging-ring `Arc<SlotBuf>` is dropped before the step
+    /// returns (making cross-step refcount retention impossible by construction).
     pub(crate) fn promote_staged(
         &self,
         candle_stream: &Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+        mut staged: Vec<(u32, Arc<SlotBuf>)>,
     ) -> candle_core::Result<usize> {
         let cap = Self::promote_cap();
-        // Always drain, even with the cap at zero: these `Arc`s must not survive the step.
         // Sort by expert id so promotion is a deterministic function of demand.
-        let mut staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
         staged.sort_unstable_by_key(|(id, _)| *id);
         if crate::config::diag().promote_trace {
             eprintln!(
                 "PROMOTE_ENTER layer {} cap {} staged {} promoting {}",
-                self.layer,
+                self.weights.layer,
                 cap,
                 staged.len(),
                 self.promoting()
@@ -62,10 +64,10 @@ impl CachedLayer {
             return Ok(0);
         }
         // Never block the token thread here: the lookahead holds `access` while waiting for our readers.
-        let Some(_access) = self.borrow_gate.try_lock_access() else {
+        let Some(_access) = self.cache.borrow_gate.try_lock_access() else {
             return Ok(0);
         };
-        if self.borrow_gate.borrowed() {
+        if self.cache.borrow_gate.borrowed() {
             return Ok(0);
         }
         let min_sightings = crate::config::runtime().promote_min_hits;
@@ -84,7 +86,7 @@ impl CachedLayer {
             seen.push(*expert);
             let expert = *expert as usize;
             let slot = {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.cache.state.lock().unwrap();
                 if st.slots.iter().any(|s| s.expert == Some(expert)) {
                     skipped += 1;
                     continue;
@@ -112,7 +114,7 @@ impl CachedLayer {
                 slot
             };
             let storage = {
-                let st = self.state.lock().unwrap();
+                let st = self.cache.state.lock().unwrap();
                 Arc::clone(&st.slots[slot].storage)
             };
             let copied: candle_core::Result<Arc<SlotBuf>> = 'copy: {
@@ -148,13 +150,13 @@ impl CachedLayer {
                             }
                             .map_err(candle_core::Error::wrap)?;
                         }
-                        dst.fence.record_reads(&self.slot_device)?;
+                        dst.fence.record_reads(&self.weights.slot_device)?;
                         Ok(Arc::clone(dst))
                     }
                     _ => Ok(Arc::clone(src_buf)),
                 }
             };
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.cache.state.lock().unwrap();
             match copied {
                 Ok(buf) => {
                     let tick = st.tick;
@@ -162,7 +164,7 @@ impl CachedLayer {
                     s.buf = Some(buf);
                     s.last_use = tick;
                     crate::stats::schedule::detail(
-                        self.layer,
+                        self.weights.layer,
                         tick,
                         "promotion_publish",
                         0,
@@ -183,12 +185,13 @@ impl CachedLayer {
         if crate::config::diag().promote_trace {
             eprintln!(
                 "PROMOTE layer {} staged {} promoted {} skipped {} cold {} filled {}",
-                self.layer,
+                self.weights.layer,
                 staged.len(),
                 promoted,
                 skipped,
                 cold,
-                self.state
+                self.cache
+                    .state
                     .lock()
                     .unwrap()
                     .slots
@@ -203,11 +206,11 @@ impl CachedLayer {
     /// Put `expert_id` into an empty slot. The slot is reserved under the lock before the copy
     /// and published only after it. `None`: already resident or no empty slot.
     pub(crate) fn admit(&self, expert_id: usize, sync: bool) -> candle_core::Result<Option<usize>> {
-        if self.borrow_gate.borrowed() {
+        if self.cache.borrow_gate.borrowed() {
             return Ok(None);
         }
         let slot = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.cache.state.lock().unwrap();
             if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
                 return Ok(None);
             }
@@ -228,11 +231,11 @@ impl CachedLayer {
         protect: &[usize],
         sync: bool,
     ) -> candle_core::Result<Option<usize>> {
-        if self.borrow_gate.borrowed() {
+        if self.cache.borrow_gate.borrowed() {
             return Ok(None);
         }
         let slot = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.cache.state.lock().unwrap();
             if st.slots.iter().any(|s| s.expert == Some(expert_id)) {
                 return Ok(None);
             }
@@ -254,12 +257,12 @@ impl CachedLayer {
         sync: bool,
     ) -> candle_core::Result<Option<usize>> {
         // Lock order: `access -> state -> storage`.
-        let _access = self.borrow_gate.lock_access();
-        if self.borrow_gate.borrowed() {
-            self.state.lock().unwrap().slots[slot].expert = None;
+        let _access = self.cache.borrow_gate.lock_access();
+        if self.cache.borrow_gate.borrowed() {
+            self.cache.state.lock().unwrap().slots[slot].expert = None;
             return Ok(None);
         }
-        let loaded = match &self.copy_stream {
+        let loaded = match &self.transport.copy_stream {
             Some(cs) => self.upload_in_place(cs, expert_id, slot, sync),
             None => self.expert_weights(expert_id).map(|w| {
                 w.map(|proj| {
@@ -270,8 +273,8 @@ impl CachedLayer {
                 })
             }),
         };
-        let mut st = self.state.lock().unwrap();
-        if self.borrow_gate.borrowed() {
+        let mut st = self.cache.state.lock().unwrap();
+        if self.cache.borrow_gate.borrowed() {
             st.slots[slot].expert = None;
             return Ok(None);
         }
@@ -286,7 +289,7 @@ impl CachedLayer {
                 s.buf = Some(buf);
                 s.last_use = tick;
                 crate::stats::schedule::detail(
-                    self.layer,
+                    self.weights.layer,
                     tick,
                     "fill_publish",
                     0,
@@ -314,11 +317,11 @@ impl CachedLayer {
         slot: usize,
         sync: bool,
     ) -> candle_core::Result<Option<Arc<SlotBuf>>> {
-        let Some((gate, up, down)) = self.cpu.expert_qtensors() else {
+        let Some((gate, up, down)) = self.weights.cpu.expert_qtensors() else {
             return Ok(None);
         };
         let storage = {
-            let st = self.state.lock().unwrap();
+            let st = self.cache.state.lock().unwrap();
             Arc::clone(&st.slots[slot].storage)
         };
         let entry = storage.lock();
@@ -335,7 +338,7 @@ impl CachedLayer {
             (&memory[1], &u[expert_range(&up, expert_id)?]),
             (&memory[2], &d[expert_range(&down, expert_id)?]),
         ];
-        if self.borrow_gate.borrowed() {
+        if self.cache.borrow_gate.borrowed() {
             return Ok(None);
         }
         if sync {
@@ -346,9 +349,9 @@ impl CachedLayer {
         }
         if crate::stats::schedule::enabled() {
             let bytes = parts.iter().map(|(_, src)| src.len() as u64).sum();
-            let tick = self.state.lock().unwrap().tick;
+            let tick = self.cache.state.lock().unwrap().tick;
             crate::stats::schedule::detail(
-                self.layer,
+                self.weights.layer,
                 tick,
                 "cache_fill_h2d",
                 bytes,
@@ -361,17 +364,17 @@ impl CachedLayer {
 
     /// Predict this layer's routed experts for CPU activation `x` (`[rows, hidden]`).
     fn predict(&self, x: &Tensor) -> candle_core::Result<Vec<usize>> {
-        let Some(router) = &self.router else {
+        let Some(router) = &self.weights.router else {
             return Ok(Vec::new());
         };
         let rows = x.dims().first().copied().unwrap_or(0);
-        let x = x.to_dtype(DType::F32)?.reshape((rows, self.hidden))?;
+        let x = x.to_dtype(DType::F32)?.reshape((rows, self.weights.hidden))?;
         let logits = x.matmul(&router.t()?)?;
         Ok(union_by_votes(
             logits
                 .to_vec2::<f32>()?
                 .iter()
-                .map(|row| top_k_ids(row, self.top_k)),
+                .map(|row| top_k_ids(row, self.weights.top_k)),
         ))
     }
 
@@ -379,13 +382,13 @@ impl CachedLayer {
     pub(crate) fn prefetch_predicted(&self, x: &Tensor) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
-        let Some(cs) = &self.copy_stream else {
+        let Some(cs) = &self.transport.copy_stream else {
             return Ok(());
         };
-        let max_swaps = self.lookahead_swaps * rows;
+        let max_swaps = self.transport.lookahead_swaps * rows;
         let mut swaps = 0;
         for &e in &predicted {
-            if e >= self.num_experts {
+            if e >= self.weights.num_experts {
                 continue;
             }
             if self.admit(e, false)?.is_some() {
@@ -397,7 +400,7 @@ impl CachedLayer {
                 stats::record_cache_swap();
             }
         }
-        if let Some(cell) = &self.preload {
+        if let Some(cell) = &self.transport.preload {
             cell.claim(cs)?;
         }
         Ok(())
@@ -405,7 +408,7 @@ impl CachedLayer {
 
     /// The next expert to fill into this layer, if a slot is still empty.
     pub(super) fn next_fill_candidate(&self) -> Option<usize> {
-        let st = self.state.lock().unwrap();
+        let st = self.cache.state.lock().unwrap();
         fill_candidate(&st.slots[..st.usable], &st.hit_counts)
     }
 
@@ -415,6 +418,7 @@ impl CachedLayer {
             return;
         }
         if self
+            .cache
             .filling
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -428,12 +432,15 @@ impl CachedLayer {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(err) => {
-                        debug!("expert cache: layer {} fill stopped: {err}", this.layer);
+                        debug!(
+                            "expert cache: layer {} fill stopped: {err}",
+                            this.weights.layer
+                        );
                         break;
                     }
                 }
             }
-            this.filling.store(false, Ordering::Release);
+            this.cache.filling.store(false, Ordering::Release);
         });
     }
 }

@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, Weak};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
+use super::slab::{BorrowGate, Slab};
 use super::{CachedLayer, SlotBuf, SlotData};
+use crate::copy_stream::CopyStream;
 
 /// Every cached layer of one model, by decoder-layer index.
 /// Weak references: the model owns the layers, not this index.
@@ -41,6 +43,63 @@ impl Layers {
         self.layers.read().get(layer).and_then(Weak::upgrade)
     }
 
+    /// Transition from Decode into a Prefill chunk that borrows `[0, loaned)` of `slab`:
+    /// quiesce lookahead, raise `borrow_gate`, order `copy` after prior GPU work, zero the span,
+    /// empty overlapping cache slots, and synchronize prior fills.
+    pub(crate) fn enter_prefill_loan(
+        &self,
+        borrow_gate: &BorrowGate,
+        copy: &CopyStream,
+        slab: &Slab,
+        stride: usize,
+        loaned: usize,
+    ) -> candle_core::Result<usize> {
+        super::quiesce(true);
+        {
+            let _guard = borrow_gate.lock_access();
+            borrow_gate.set_borrowed(true);
+        }
+        let base = slab.base()?;
+        copy.after_device_work()?;
+        let stream = copy.cuda_stream();
+        let zeroed = loaned.max(650usize << 20).min(slab.bytes());
+        // SAFETY: the span is inside the live slab; memset is queued before any upload.
+        unsafe {
+            let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
+                base,
+                0,
+                zeroed,
+                stream.cu_stream(),
+            );
+            if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                candle_core::bail!("memset of the borrowed span failed: {rc:?}");
+            }
+        }
+        let emptied = self.empty_range(base, base + loaned as u64);
+        copy.synchronize()?;
+        crate::dbg_note(
+            "prefill_borrow",
+            &format!(
+                "chunk: borrowed {:.0} MiB of the pool in {stride} range(s), {emptied} slots emptied",
+                (loaned as f64) / (1u64 << 20) as f64
+            ),
+        );
+        Ok(emptied)
+    }
+
+    /// Transition back into Decode mode: release `borrow_gate`, resume lookahead at layer 0, and
+    /// refill any displaced loan slots.
+    #[inline]
+    pub(crate) fn enter_decode(&self, borrow_gate: &BorrowGate, is_layer_0: bool) {
+        borrow_gate.set_borrowed(false);
+        if is_layer_0 {
+            super::quiesce(false);
+            if self.refill_lent() > 0 {
+                crate::dbg_note("prefill_borrow", "the loan was given back");
+            }
+        }
+    }
+
     /// Empty every slot whose bank overlaps `[base, end)`, and report how many were emptied.
     ///
     /// Three-phase protocol to respect lock ordering (`access -> lent -> state -> storage`, and
@@ -56,7 +115,7 @@ impl Layers {
         let mut held: Vec<(usize, usize, Arc<SlotBuf>)> = Vec::new();
         let mut skipped = 0usize;
         for (li, layer) in layers.iter().enumerate() {
-            let mut state = layer.state.lock().unwrap();
+            let mut state = layer.cache.state.lock().unwrap();
             for (si, slot) in state.slots.iter_mut().enumerate() {
                 let overlaps = {
                     let storage = slot.storage.lock();
@@ -99,7 +158,7 @@ impl Layers {
         }
         let mut still = 0usize;
         for layer in self.all() {
-            let state = layer.state.lock().unwrap();
+            let state = layer.cache.state.lock().unwrap();
             for slot in state.slots.iter() {
                 let overlaps = {
                     let storage = slot.storage.lock();
@@ -125,7 +184,7 @@ impl Layers {
         }
         // Phase 3: restore storage buffers and re-clear metadata.
         for (li, si, buf) in held {
-            let mut state = layers[li].state.lock().unwrap();
+            let mut state = layers[li].cache.state.lock().unwrap();
             let slot = &mut state.slots[si];
             slot.expert = None;
             slot.buf = None;

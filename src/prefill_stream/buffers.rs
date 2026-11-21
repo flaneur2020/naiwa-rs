@@ -151,49 +151,20 @@ impl PrefillStream {
         Ok([out.remove(0), out.remove(0), out.remove(0)])
     }
 
-    /// Once-per-chunk work at layer 0: raise the borrow gate, order the copy stream after the
-    /// cache's queued work, zero the span, empty overlapping cache slots, and sync prior fills.
+    /// Once-per-chunk work at layer 0: delegate the Decode -> Prefill slab loan transition to
+    /// [`Layers::enter_prefill_loan`] (quiesce lookahead, raise borrow gate, zero span, empty
+    /// overlapping cache slots, synchronize prior fills).
     pub(super) fn begin_chunk(&self, layer: usize) -> candle_core::Result<()> {
         if !self.borrows() || layer != 0 {
             return Ok(());
         }
-        let Some(slab) = self.slab.as_ref() else {
+        let (Some(slab), Some(cache)) = (self.slab.as_ref(), self.cache.as_ref()) else {
             return Ok(());
         };
         let stride = self.current().stride.max(1);
         let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
         let loaned = stride * span;
-        {
-            let _guard = self.borrow_gate.lock_access();
-            self.borrow_gate.set_borrowed(true);
-        }
-        let base = slab.base()?;
-        self.copy.after_device_work()?;
-        let stream = self.copy.cuda_stream();
-        let zeroed = loaned.max(650usize << 20).min(slab.bytes());
-        // SAFETY: the span is inside the live slab; memset is queued before any upload.
-        unsafe {
-            let rc = candle_core::cuda::cudarc::driver::sys::cuMemsetD8Async(
-                base,
-                0,
-                zeroed,
-                stream.cu_stream(),
-            );
-            if rc != candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                candle_core::bail!("memset of the borrowed span failed: {rc:?}");
-            }
-        }
-        if let Some(cache) = self.cache.as_ref() {
-            let emptied = cache.empty_range(base, base + loaned as u64);
-            self.copy.synchronize()?;
-            crate::dbg_note(
-                "prefill_borrow",
-                &format!(
-                    "chunk: borrowed {:.0} MiB of the pool in {stride} range(s), {emptied} slots emptied",
-                    (loaned as f64) / (1u64 << 20) as f64
-                ),
-            );
-        }
+        cache.enter_prefill_loan(&self.borrow_gate, &self.copy, slab, stride, loaned)?;
         Ok(())
     }
 

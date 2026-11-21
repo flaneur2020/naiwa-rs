@@ -16,38 +16,31 @@ fn stream_pcie(
     misses: &mut [Vec<(u32, f32)>],
     hits: &mut [Vec<Hit>],
     before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
-) -> candle_core::Result<()> {
+) -> candle_core::Result<Vec<(u32, Arc<SlotBuf>)>> {
     let (Some(cs), Some(done)) = (layer.copy_stream(), layer.staging_done()) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    // Promotion first: those copies then fall under the same completion event as this step's staging, and the
-    // pending `Arc`s are released before the ring may re-use their slots.
-    // This step's staging replaces last step's candidate list, and the clearing is **unconditional**: a clone left
-    // in there keeps a ring slot's refcount above one, and `stage_misses` waits on that refcount
-    // (`wait_for_readers`). Gating this on `promoting()` was the bug that hung warmup at cap 0.
-    layer.set_staged_now(Vec::new());
-    // Every path records the layer's completion event: `upload_async` after each expert's copies,
-    // and one bare record when there was nothing to stage, so the consumer's wait is satisfied
-    // either way (a wait on an event that was never recorded would hang the stream).
+    // Every path records the layer's completion event: even when nothing was staged, so the
+    // consumer's wait is satisfied either way (a wait on an unrecorded event would hang).
     let staged = stage_misses(layer, cs, misses, hits, before_dma);
     done.record(cs)?;
     staged
 }
 
-/// The DMA half of [`Self::stream_pcie`]: pick this step's misses, queue their copies on the
-/// copy stream, and turn them into hits.
+/// The DMA half of [`stream_pcie`]: pick this step's misses, queue their copies on the copy
+/// stream, move them into `hits`, and return the promotion candidates on the stack.
 ///
-/// The copies queue without a completion event: the caller records the layer's event once, after
-/// the last of them, and `candle`'s stream waits on it before it reads a staged slot.
+/// Returning candidates by value (instead of stashing them on `CachedLayer`) guarantees every
+/// staging-ring `Arc<SlotBuf>` is released before the step finishes, even on error.
 fn stage_misses(
     layer: &Arc<CachedLayer>,
     cs: &Arc<CopyStream>,
     misses: &mut [Vec<(u32, f32)>],
     hits: &mut [Vec<Hit>],
     before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
-) -> candle_core::Result<()> {
+) -> candle_core::Result<Vec<(u32, Arc<SlotBuf>)>> {
     let Some((gate, up, down)) = layer.cpu().expert_qtensors() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     // Lazily create the ring at the first decode step that has misses to stream (model
     // load is over by then, so the allocation is not fighting load-time fragmentation).
@@ -57,14 +50,15 @@ fn stage_misses(
         layer.slot_device(),
     )?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     // Everything below runs under the ring mutex: the whole pipeline is on the token
     // thread, so this lock only excludes the (one-time) creation race in `staging_ring`.
     // Working on `&Arc<SlotBuf>` directly matters: `wait_for_readers` waits for the refcount
     // to fall back to the ring's own `Arc` — cloning into a borrow list first would count
     // that clone and spin forever (W105: three 900s-timeout hangs, exactly here).
-    let mut slot_of_pending: Vec<(u32, Arc<SlotBuf>)> = Vec::new();
+    let promote = layer.promoting();
+    let mut promote_candidates: Vec<(u32, Arc<SlotBuf>)> = Vec::new();
     let slot_of = {
         let mut ring = ring.lock().unwrap();
         let chosen = streamed_misses(misses, layer.pcie_frac(), ring.len());
@@ -134,21 +128,18 @@ fn stage_misses(
                 }
                 slot_of.insert(expert, (Arc::clone(buf), pos));
             }
-            let pending: Vec<(u32, Arc<SlotBuf>)> = slot_of
-                .iter()
-                .map(|(id, (buf, _))| (*id, Arc::clone(buf)))
-                .collect();
-            slot_of_pending = pending;
+            if promote {
+                promote_candidates = slot_of
+                    .iter()
+                    .map(|(id, (buf, _))| (*id, Arc::clone(buf)))
+                    .collect();
+            }
             slot_of
         }
     };
-    // Only worth remembering when something will drain it (same step, on this thread).
-    if layer.promoting() {
-        layer.set_staged_now(slot_of_pending);
-    }
     let bank_first = STAGING_RING_FIRST;
     if slot_of.is_empty() {
-        return Ok(());
+        return Ok(promote_candidates);
     }
     // Move every (row, weight) routed to a streamed expert from the CPU list to the hits.
     for (row_misses, row_hits) in misses.iter_mut().zip(hits.iter_mut()) {
@@ -160,7 +151,7 @@ fn stage_misses(
             None => true,
         });
     }
-    Ok(())
+    Ok(promote_candidates)
 }
 pub(crate) struct DmaMiss;
 
@@ -168,7 +159,7 @@ impl DmaMiss {
     pub(crate) fn submit(
         layer: &Arc<CachedLayer>,
         plan: &mut super::RoutePlan,
-    ) -> candle_core::Result<()> {
+    ) -> candle_core::Result<Vec<(u32, Arc<SlotBuf>)>> {
         stream_pcie(layer, &mut plan.misses, &mut plan.staged, &mut |_, _| Ok(()))
     }
 
@@ -176,7 +167,7 @@ impl DmaMiss {
         layer: &Arc<CachedLayer>,
         plan: &mut super::RoutePlan,
         before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
-    ) -> candle_core::Result<()> {
+    ) -> candle_core::Result<Vec<(u32, Arc<SlotBuf>)>> {
         stream_pcie(layer, &mut plan.misses, &mut plan.staged, before_dma)
     }
 }

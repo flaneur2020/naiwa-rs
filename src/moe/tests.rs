@@ -210,35 +210,40 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
     )
     .unwrap();
     Arc::new(CachedLayer {
-        _pinned: Vec::new(),
-        cpu,
-        slot_device: Device::Cpu,
-        layer: 0,
-        layers: Arc::default(),
-        staging: Arc::default(),
-        borrow_gate: Arc::default(),
-        hidden,
-        num_experts: e,
-        top_k: 2,
-        act: Activation::Silu,
-        router: None,
-        lookahead_chan: None,
-        state: Mutex::new(LayerState {
-            doorbell: None,
-            slots: (0..slots).map(|_| Slot::empty()).collect(),
-            hit_counts: vec![0; e],
-            tick: 0,
-            usable: slots,
-        }),
-        copy_stream: None,
-        pcie_frac: 0.0,
-        lookahead_swaps: 2,
-        lookahead: true,
+        weights: LayerWeights {
+            _pinned: Vec::new(),
+            cpu,
+            slot_device: Device::Cpu,
+            layer: 0,
+            hidden,
+            num_experts: e,
+            top_k: 2,
+            act: Activation::Silu,
+            router: None,
+        },
+        cache: LayerCache {
+            state: Mutex::new(LayerState {
+                doorbell: None,
+                slots: (0..slots).map(|_| Slot::empty()).collect(),
+                hit_counts: vec![0; e],
+                tick: 0,
+                usable: slots,
+            }),
+            layers: Arc::default(),
+            borrow_gate: Arc::default(),
+            filling: AtomicBool::new(false),
+        },
+        transport: LayerTransport {
+            copy_stream: None,
+            staging: Arc::default(),
+            staging_done: None,
+            preload: None,
+            lookahead_chan: None,
+            pcie_frac: 0.0,
+            lookahead_swaps: 2,
+            lookahead: true,
+        },
         prefill: None,
-        filling: AtomicBool::new(false),
-        preload: None,
-        staging_done: None,
-        staged_now: Mutex::new(Vec::new()),
     })
 }
 
@@ -254,7 +259,7 @@ fn decode_split_matches_running_every_expert_on_the_cpu() {
     let ids = Tensor::new(&[[0u32, 3]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4]], &Device::Cpu).unwrap();
     let got = super::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
-    let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
+    let want = layer.cpu().forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)
         .unwrap()
@@ -284,7 +289,7 @@ fn verify_rows_split_matches_running_every_expert_on_the_cpu() {
     let ids = Tensor::new(&[[0u32, 3], [2, 0], [3, 5]], &Device::Cpu).unwrap();
     let ws = Tensor::new(&[[0.6f32, 0.4], [0.7, 0.3], [0.5, 0.5]], &Device::Cpu).unwrap();
     let got = super::decode::forward(&layer, &xs, &ws, &ids, Activation::Silu).unwrap();
-    let want = layer.cpu.forward(&xs, ws, &ids).unwrap();
+    let want = layer.cpu().forward(&xs, ws, &ids).unwrap();
     assert_eq!(got.dims(), want.dims());
     let diff = (got - want)
         .unwrap()

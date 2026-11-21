@@ -17,7 +17,8 @@ use mistralrs_core::MoEExperts;
 
 use super::{
     slab::BorrowGate, slot_bytes_from_stack, staging::alloc_bank_in, CachedExperts, CachedLayer,
-    LayerState, Layers, LookaheadChannel, Slot, StagingRings,
+    LayerCache, LayerState, LayerTransport, LayerWeights, Layers, LookaheadChannel, Slot,
+    StagingRings,
     MAX_DECODE_ROWS,
 };
 
@@ -565,35 +566,40 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         };
 
         let cached = Arc::new(CachedLayer {
-            _pinned: pinned,
-            cpu: cpu_experts,
-            slot_device,
-            layer: layer_idx,
-            layers: Arc::clone(&self.layers),
-            staging: Arc::clone(&self.staging),
-            borrow_gate: Arc::clone(&self.borrow_gate),
-            staged_now: Mutex::new(Vec::new()),
-            hidden,
-            num_experts,
-            top_k: ctx.config.num_experts_per_tok,
-            act: ctx.act,
-            router,
-            lookahead_chan,
-            state: Mutex::new(LayerState {
-                doorbell: None,
-                slots,
-                hit_counts: vec![0u64; num_experts],
-                tick: 0,
-                usable: num_slots,
-            }),
-            copy_stream,
-            pcie_frac: self.pcie_frac,
-            lookahead_swaps: self.lookahead_swaps,
-            lookahead: self.lookahead,
+            weights: LayerWeights {
+                _pinned: pinned,
+                cpu: cpu_experts,
+                slot_device,
+                layer: layer_idx,
+                hidden,
+                num_experts,
+                top_k: ctx.config.num_experts_per_tok,
+                act: ctx.act,
+                router,
+            },
+            cache: LayerCache {
+                state: Mutex::new(LayerState {
+                    doorbell: None,
+                    slots,
+                    hit_counts: vec![0u64; num_experts],
+                    tick: 0,
+                    usable: num_slots,
+                }),
+                layers: Arc::clone(&self.layers),
+                borrow_gate: Arc::clone(&self.borrow_gate),
+                filling: AtomicBool::new(false),
+            },
+            transport: LayerTransport {
+                copy_stream,
+                staging: Arc::clone(&self.staging),
+                staging_done,
+                preload,
+                lookahead_chan,
+                pcie_frac: self.pcie_frac,
+                lookahead_swaps: self.lookahead_swaps,
+                lookahead: self.lookahead,
+            },
             prefill,
-            filling: AtomicBool::new(false),
-            preload,
-            staging_done,
         });
         self.layers.insert(layer_idx, &cached);
         Ok(Some(Arc::new(CachedExperts(cached))))

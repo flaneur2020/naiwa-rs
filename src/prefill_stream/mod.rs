@@ -193,7 +193,7 @@ impl PrefillStream {
         if stride == 0 {
             return Ok(None);
         }
-        if layer == 0 {
+        if layer == 0 && !self.borrows() {
             crate::moe::quiesce(true);
         }
         self.begin_chunk(layer)?;
