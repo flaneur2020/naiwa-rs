@@ -78,10 +78,8 @@ impl Gpu {
         hits: &[Vec<Hit>],
         x2d: &Tensor,
         act: Activation,
-    ) -> candle_core::Result<(Tensor, Option<Arc<Bank>>)> {
+    ) -> candle_core::Result<Tensor> {
         let rows = hits.len();
-        // M9: no captures, so nothing to remember for the CPU-return node.
-        let capture_bank: Option<Arc<Bank>> = None;
         let mut acc: Option<Tensor> = None;
         let mut add = |y: Tensor| -> candle_core::Result<()> {
             acc = Some(match acc.take() {
@@ -132,11 +130,8 @@ impl Gpu {
                 add(fused_decode(bank, x2d, ids, ws, rows, act_type)?)?;
             }
             return match acc {
-                Some(acc) => Ok((acc, capture_bank)),
-                None => Ok((
-                    Tensor::zeros((rows, layer.hidden()), DType::F32, &layer.slot_device())?,
-                    None,
-                )),
+                Some(acc) => Ok(acc),
+                None => Tensor::zeros((rows, layer.hidden()), DType::F32, &layer.slot_device()),
             };
         }
         // One expert at a time, row by row.
@@ -154,7 +149,7 @@ impl Gpu {
             out.push(sum);
         }
         add(Tensor::cat(&out, 0)?)?;
-        Ok((acc.expect("added above"), capture_bank))
+        Ok(acc.expect("added above"))
     }
 }
 

@@ -98,6 +98,7 @@ impl Profile {
     }
 
     /// Total pairs read, after the layer/expert filter.
+    #[cfg(test)]
     pub fn pairs(&self) -> usize {
         self.per_layer.iter().map(Vec::len).sum()
     }

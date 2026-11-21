@@ -109,6 +109,7 @@ impl Layout {
         self.ranges.push(Range { offset, bytes });
     }
 
+    #[cfg(test)]
     pub(crate) fn ranges(&self) -> &[Range] {
         &self.ranges
     }
@@ -123,6 +124,7 @@ impl Layout {
     }
 
     /// The ranges a span touches, in offset order.
+    #[cfg(test)]
     pub(crate) fn overlapping(&self, from: usize, to: usize) -> &[Range] {
         let first = self.ranges.partition_point(|r| r.end() <= from);
         let rest = &self.ranges[first..];
@@ -132,6 +134,7 @@ impl Layout {
 
     /// The offset where a span of `bytes` ending at the end of the carved region starts, or `None` when the slab
     /// has not carved that much yet.
+    #[cfg(test)]
     pub(crate) fn tail_start(&self, bytes: usize) -> Option<usize> {
         self.end().checked_sub(bytes)
     }

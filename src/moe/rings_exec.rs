@@ -150,7 +150,7 @@ pub(crate) fn forward(
                 hits[*row].push((Arc::clone(&held.buf), slot, *weight));
             }
         }
-        let (out, _) = Gpu::submit(layer, &hits, &x2d, act)?;
+        let out = Gpu::submit(layer, &hits, &x2d, act)?;
         sum = Some(match sum {
             Some(acc) => acc.add(&out)?,
             None => out,

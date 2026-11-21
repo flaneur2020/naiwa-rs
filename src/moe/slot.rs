@@ -96,6 +96,7 @@ fn projection_bytes(qt: &QTensor) -> Option<u64> {
 
 /// Slot-bytes estimate for a single expert from a `QTensor` stack.
 /// Returns `None` when the stack is not accessible (dense/float).
+#[cfg(test)]
 pub(crate) fn slot_bytes_from_qtensor(qt: &QTensor) -> Option<u64> {
     let dims = qt.shape().dims();
     if dims.len() < 2 {

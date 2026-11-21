@@ -26,8 +26,6 @@ use mistralrs_core::moe_offload::RoutedExperts;
 use mistralrs_core::MoEExperts;
 use mistralrs_quant::Comm;
 
-/// The resident pool's weight format: 2.25 bit/weight, the model's own expert dtype.
-const Q2_0: GgmlDType = GgmlDType::Q2_0;
 /// Elements per Q2_0 block, and the packed block's size.
 const QK2_0: usize = 64;
 const Q2_0_BYTES: usize = 18;

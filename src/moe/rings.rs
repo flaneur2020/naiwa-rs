@@ -33,6 +33,7 @@ pub(crate) struct Round {
     pub(crate) rows: Vec<(usize, Vec<(u32, f32)>)>,
 }
 
+#[cfg(test)]
 impl Round {
     /// Routing entries this round computes; the cost model the balancing uses.
     pub(crate) fn pairs(&self) -> usize {
@@ -46,6 +47,7 @@ pub(crate) struct RingPlan {
     pub(crate) rounds: Vec<Round>,
 }
 
+#[cfg(test)]
 impl RingPlan {
     pub(crate) fn pairs(&self) -> usize {
         self.rounds.iter().map(Round::pairs).sum()

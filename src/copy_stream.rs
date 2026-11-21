@@ -169,21 +169,6 @@ mod cuda {
             }))
         }
 
-        /// Device memory for `slots` experts of `stack` (`[E, N, K]` -> `[slots, N, K]`) and one
-        /// view per expert, each holding the allocation. Allocated and zeroed on candle's stream;
-        /// call [`Self::after_device_work`] before the first upload.
-        pub fn alloc_bank(
-            &self,
-            stack: &QTensor,
-            slots: usize,
-        ) -> Result<(Arc<QTensor>, Vec<SlotMemory>)> {
-            let Device::Cuda(dev) = &self.device else {
-                candle_core::bail!("copy stream on a non-CUDA device");
-            };
-            let storage = self.bank_storage(stack, slots)?;
-            self.bank_from_storage(stack, slots, storage)
-        }
-
         /// A bank's storage as its own allocation, sized and typed from `stack`.
         pub fn bank_storage(&self, stack: &QTensor, slots: usize) -> Result<QCudaStorage> {
             let Device::Cuda(dev) = &self.device else {
@@ -282,30 +267,12 @@ mod cuda {
             self.stream.wait(&done).map_err(Error::wrap)
         }
 
-        /// Queue copies of each `src` into its `dst` once the readers are done (`fence`), then
-        /// record `done`; returns at once.
+        /// `NAIWA_COPY_SPLIT=g` probe: queue copies of each `src` into its `dst` once the readers are done
+        /// (`fence`), issuing each projection's copy as `g` commands of `1/g` of its length, then record `done`.
         ///
         /// # Safety
         /// Every `src` must be page-locked (or the call blocks until it is staged) and must stay
         /// alive and unmodified until `done` completes.
-        pub unsafe fn upload_async(
-            &self,
-            fence: &ReadFence,
-            parts: &[(&SlotMemory, &[u8])],
-            done: &CopyDone,
-        ) -> Result<()> {
-            done.start_timing(self)?;
-            self.queue_copies(fence, parts)?;
-            done.stop_timing(self)?;
-            done.event.record(&self.stream).map_err(Error::wrap)
-        }
-
-        /// `NAIWA_COPY_SPLIT=g` probe: the same bytes as [`Self::upload_async`], but each projection's copy is issued
-        /// as `g` commands of `1/g` of its length, all into the same destination at their own offsets. Everything else
-        /// - the fence, the single completion event, the call sites - is identical, so what the probe measures is
-        /// **whether a smaller copy unit costs throughput**. That is the first question M34's split half has to
-        /// answer: if a 1/4 of a layer copy is as fast per byte as a whole-layer one, splitting the unit is free and
-        /// only the consumer side (S2) has to change; if it is not, the split has to be paid for somewhere else.
         pub unsafe fn upload_async_split(
             &self,
             fence: &ReadFence,
@@ -584,6 +551,14 @@ mod stub {
         pub fn tensor(&self) -> &Arc<QTensor> {
             match *self {}
         }
+
+        pub fn ptr(&self) -> u64 {
+            match *self {}
+        }
+
+        pub fn len(&self) -> usize {
+            match *self {}
+        }
     }
 
     /// Never constructed without CUDA.
@@ -599,6 +574,10 @@ mod stub {
         }
 
         pub fn wait_on(&self, _device: &Device) -> Result<()> {
+            match *self {}
+        }
+
+        pub fn micros(&self) -> Option<f32> {
             match *self {}
         }
     }
@@ -626,25 +605,28 @@ mod stub {
 
         /// # Safety
         /// See the CUDA version.
-        pub unsafe fn upload_async(
+        pub unsafe fn upload_async_split(
             &self,
             _fence: &ReadFence,
             _parts: &[(&SlotMemory, &[u8])],
+            _split: usize,
             _done: &CopyDone,
+        ) -> Result<()> {
+            match *self {}
+        }
+
+        /// # Safety
+        /// See the CUDA version.
+        pub unsafe fn queue_async(
+            &self,
+            _fence: &ReadFence,
+            _parts: &[(&SlotMemory, &[u8])],
         ) -> Result<()> {
             match *self {}
         }
 
         pub fn new(_device: &Device) -> Result<Option<Self>> {
             Ok(None)
-        }
-
-        pub fn alloc_bank(
-            &self,
-            _stack: &QTensor,
-            _slots: usize,
-        ) -> Result<(Arc<QTensor>, Vec<SlotMemory>)> {
-            match *self {}
         }
 
         pub fn after_device_work(&self) -> Result<()> {

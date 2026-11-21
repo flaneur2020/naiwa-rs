@@ -33,7 +33,6 @@
 //!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
 //! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
 
-mod arena;
 mod cached_layer;
 mod decode;
 mod expert;
@@ -52,9 +51,6 @@ mod tests;
 
 pub use profile::Profile;
 pub use provider::GpuCacheMoeProvider;
-pub(crate) use arena::SlotArena;
-pub(crate) use rings::{plan as plan_rings, RingPlan, Round, RoundSlots};
-pub(crate) use rings_exec as prefill_rings;
 pub(crate) use stages::fused_decode;
 
 // Cross-module items are re-exported here; siblings import them from `super`, never from
@@ -66,7 +62,9 @@ pub(crate) use cached_layer::{
     MAX_DECODE_ROWS,
 };
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
-pub(crate) use slot::{slot_bytes_from_qtensor, slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};
+#[cfg(test)]
+pub(in crate::moe) use slot::slot_bytes_from_qtensor;
+pub(crate) use slot::{slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};
 pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;

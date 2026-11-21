@@ -26,9 +26,7 @@ pub(crate) fn fused_decode(
     weights: &[f32],
     topk: usize,
 ) -> candle_core::Result<Option<Vec<f32>>> {
-    static GENERIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
-    let _ = &GENERIC;
     if !matches!(act, Activation::Silu | Activation::Swish) {
         if crate::config::diag().fused_dbg {
             eprintln!("FUSED_MISS act={act:?}");

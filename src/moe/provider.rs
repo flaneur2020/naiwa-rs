@@ -584,7 +584,6 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             router,
             lookahead_chan,
             cpu_chan,
-            #[cfg(feature = "cuda")]
             state: Mutex::new(LayerState {
                 doorbell: None,
                 slots,

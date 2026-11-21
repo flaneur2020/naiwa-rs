@@ -150,11 +150,10 @@ asserted frozen across decode. Static addresses keep the steady state allocation
 Banks are per-layer because the model is mixed-quant (7 expert shapes); shared structures carry
 counts/offsets/pointers only.
 
-**A prompt step runs in row batches of 256** (`SUB_ROWS` in `prefill_stream.rs`), so the MoE
-activation footprint is set by the batch and not by the chunk: an 8192-token chunk costs the same
-activations as a 256-token one, and only attention still grows with the chunk (24 KiB a token). That
-is what lets the plan below buy a large chunk instead of a second buffer — the same "ubatch" trade
-Strata makes.
+**A prompt step runs the whole chunk through `experts.forward`** (or `--prefill-split` expert
+sub-ranges in `prefill_stream.rs`). The chunk's real VRAM footprint scales linearly with row count
+(`chunk_scratch`: ~32 MiB + 354 KiB/row, measured via `NAIWA_PREFILL_PEAK`), which is what drives
+the planner's chunk-size vs buffer-count trade below.
 
 **A sequence slot costs ~112 MiB of recurrent state** on this hybrid model, and the engine defaults to
 `--max-seqs 32`: ~3.5 GiB of the card for slots a one-request-at-a-time server never uses. A chat server

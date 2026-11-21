@@ -278,14 +278,14 @@ pub(crate) fn forward(
         Vec::new()
     };
     #[cfg(feature = "cuda")]
-    let acc = if let Some((resident_out, resident_bank)) = resident_acc {
+    let acc = if let Some(resident_out) = resident_acc {
         if hits_to_run.iter().all(|row| row.is_empty()) {
-            Ok((resident_out, resident_bank))
+            Ok(resident_out)
         } else {
             // M26: submit the staged experts wave by wave, waiting only for the wave about to run, so
             // the later waves' DMA lands under the earlier waves' kernels.
             let waves = layer.wave_count();
-            let mut acc: Option<(Tensor, Option<Arc<crate::moe::Bank>>)> = None;
+            let mut acc: Option<Tensor> = None;
             if waves > 1 {
                 let rows = hits_to_run.len();
                 let mut groups: Vec<Vec<Vec<Hit>>> =
@@ -309,18 +309,18 @@ pub(crate) fn forward(
                     } else {
                         layer.wait_staging()?;
                     }
-                    let (out, bank) = Gpu::submit(layer, group, &x2d, act)?;
+                    let out = Gpu::submit(layer, group, &x2d, act)?;
                     acc = Some(match acc {
-                        Some((a, ab)) => ((a + out)?, ab.or(bank)),
-                        None => (out, bank),
+                        Some(a) => (a + out)?,
+                        None => out,
                     });
                 }
             }
-            let (staged_out, staged_bank) = match acc {
+            let staged_out = match acc {
                 Some(v) => v,
                 None => Gpu::submit(layer, &hits_to_run, &x2d, act)?,
             };
-            Ok(((resident_out + staged_out)?, resident_bank.or(staged_bank)))
+            resident_out + staged_out
         }
     } else {
         Gpu::submit(layer, &plan.hits, &x2d, act)
@@ -360,8 +360,7 @@ pub(crate) fn forward(
     }
     mark!(stats::BudgetPhase::StagingWait);
     drop(plan.hits);
-    #[allow(unused_variables)]
-    let (gpu_out, capture_bank) = acc?;
+    let gpu_out = acc?;
     fenced?;
     mark!(stats::BudgetPhase::Fence);
 

@@ -1,7 +1,7 @@
 //! Cached layers and the model-wide `Layers` index.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::{DType, Device, Tensor};
@@ -218,11 +218,6 @@ impl Layers {
             );
         }
         asked
-    }
-
-    /// How many entries the loan's ledger holds (diagnostics).
-    pub(crate) fn lent(&self) -> usize {
-        self.lent.lock().unwrap().len()
     }
 
     /// How many layers the cache holds: what a step's budget divides by.
@@ -657,9 +652,6 @@ impl RoutedExperts for CachedExperts {
     }
 }
 
-/// Promotions spent in the current step, across layers (see `CachedLayer::promote_staged`).
-static PROMOTED_THIS_STEP: AtomicUsize = AtomicUsize::new(0);
-
 impl CachedLayer {
     pub(crate) fn state(&self) -> &Mutex<LayerState> {
         &self.state
@@ -879,13 +871,7 @@ impl CachedLayer {
     }
 
     pub(crate) fn promote_staged(&self, candle_stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>) -> candle_core::Result<usize> {
-        // The cap is **per step across all layers**, not per layer: at a per-layer cap of 8 this queued
-        // 48 x 8 = 384 d2d copies of 1.88 MB (720 MB) per token, which ran prefill at 5.8 T/s.
         let cap = Self::promote_cap();
-        if self.layer == 0 {
-            PROMOTED_THIS_STEP.store(0, Ordering::Relaxed);
-        }
-        let _ = &PROMOTED_THIS_STEP;
         // Always drain, even with the cap at zero: these `Arc`s must not survive the step.
         // The staged list is built from a `HashMap` in `dma_miss`, so its order changes per process;
         // with `cap = 1` the first eligible candidate wins, which made *which* expert became resident
@@ -1009,7 +995,6 @@ impl CachedLayer {
                     s.buf = Some(buf);
                     s.last_use = tick;
                     crate::stats::schedule::detail(self.layer, tick, "promotion_publish", 0, Some(expert), Some(slot));
-                    PROMOTED_THIS_STEP.fetch_add(1, Ordering::Relaxed);
                     promoted += 1;
                 }
                 Err(e) => {

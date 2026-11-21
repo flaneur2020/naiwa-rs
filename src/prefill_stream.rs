@@ -153,6 +153,7 @@ pub(crate) const MAX_DEPTH: usize = 4;
 /// Default for `--prefill-depth`: the double buffer this file was built around (M18's 16-19% overlap).
 pub const DEFAULT_DEPTH: usize = 2;
 
+#[cfg(test)]
 pub(crate) fn plan(free: usize, layer_bytes: usize, ceiling: usize, borrowing: bool) -> Option<(usize, usize)> {
     plan_with_reserve(free, layer_bytes, ceiling, borrowing, 0)
 }
@@ -219,7 +220,6 @@ pub(crate) fn plan_with_lend_depth(
     // between one buffer and two at this card's free VRAM, so it is worth calibrating instead of trusting.
     let slack_override = crate::config::runtime().prefill_slack_bytes;
     let fits = |chunk: usize, stride: usize| {
-        let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| MAX_HEADROOM.max(free / 8));
         if borrowing {
             // The layer buffers are ranges of the cache's own bytes, so they cost nothing here; the chunk pays only
@@ -643,10 +643,6 @@ impl PrefillStream {
         // the upload of layer L+1 lands while layer L computes - and it costs no VRAM, because the pool's bytes
         // already belong to the cache.
         let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
-        // What the chunk holds of the pool: one range per buffer in the plan's force. `span` is the *biggest*
-        // layer's three projections, so a smaller layer's range leaves a hole - free, it is not uploaded.
-        let stride = self.current().stride.max(1);
-        let loaned = stride * span;
         let mut offset = buf * span;
         for stack in stacks {
             let dims = stack.shape().dims();
@@ -2040,36 +2036,6 @@ fn log_plan(stream: &PrefillStream, plan: Plan, free: usize, when: &str) {
 fn is_out_of_memory(error: &candle_core::Error) -> bool {
     let text = error.to_string();
     text.contains("OUT_OF_MEMORY") || text.contains("out of memory")
-}
-
-/// One layer's MoE over a prompt step, in row batches of `SUB_ROWS`.
-///
-/// The routing is row-independent, so slicing the rows changes nothing but the GEMM shapes; it is
-/// what keeps a 8192-token chunk's activations inside the same memory a 256-token one needs. Only
-/// one sequence is sub-batched: with several sequences in the step the rows of one batch would have
-/// to be interleaved, and a prompt step in this server is one sequence.
-fn forward_batched(
-    experts: &MoEExperts,
-    xs: &Tensor,
-    topk_weights: &Tensor,
-    topk_ids: &Tensor,
-    batch: usize,
-    seq: usize,
-) -> candle_core::Result<Tensor> {
-    if batch != 1 || seq <= SUB_ROWS {
-        return experts.forward(xs, topk_weights.clone(), topk_ids);
-    }
-    let mut parts = Vec::with_capacity(seq.div_ceil(SUB_ROWS));
-    let mut start = 0;
-    while start < seq {
-        let len = SUB_ROWS.min(seq - start);
-        let x = xs.narrow(1, start, len)?;
-        let w = topk_weights.narrow(0, start, len)?;
-        let i = topk_ids.narrow(0, start, len)?;
-        parts.push(experts.forward(&x, w, &i)?);
-        start += len;
-    }
-    Tensor::cat(&parts, 1)
 }
 
 #[cfg(test)]
