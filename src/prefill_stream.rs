@@ -1519,7 +1519,6 @@ impl PrefillStream {
                 }
                 Arc::clone(slot.as_ref().unwrap())
             };
-            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
             if let Some(m) = buf.memory.as_ref() {
                 for (i, mem) in m.iter().enumerate() {
                     // Queued on the copy stream, right after the upload: no host wait, so the race is untouched.
@@ -1528,22 +1527,7 @@ impl PrefillStream {
                 }
             }
         }
-        // `NAIWA_BORROW_SNAP=1`: snapshot the first 4 KiB of each projection right after the upload with a
-        // **device-to-device** copy (queued, never a host wait), then compare at the end of the layer. This is the
-        // one observation that does not itself serialise the race the way a host read does.
-        if self.borrows() && crate::config::diag().borrow_snap {
-            let snap = {
-                let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
-                buf.memory.as_ref().map(|m| {
-                    m.iter()
-                        .map(|mem| mem.tensor().read_bytes_at(0, 0).map(|_| ()).ok())
-                        .count()
-                })
-            };
-            let _ = snap;
-        }
         let canary = if self.borrows() && crate::config::diag().borrow_canary {
-            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
             buf.memory.as_ref().map(|m| {
                 m.iter()
                     .map(|mem| mem.tensor().read_bytes_at(0, 256).unwrap_or_default())
@@ -1553,7 +1537,6 @@ impl PrefillStream {
             None
         };
         if let Some(before) = &canary {
-            let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
             if let Some(m) = buf.memory.as_ref() {
                 for (i, mem) in m.iter().enumerate() {
                     if let Ok(now) = mem.tensor().read_bytes_at(0, 256) {
@@ -1599,7 +1582,6 @@ impl PrefillStream {
             // stream after candle's work, and that alone hid the race: 0/12 with all snapshots clean).
             let shadow = self.snap.lock().unwrap().as_ref().map(Arc::clone);
             if let Some(shadow) = shadow {
-                let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
                 if let Some(m) = buf.memory.as_ref() {
                     for (i, mem) in m.iter().enumerate() {
                         let dev = self.device.as_cuda_device()

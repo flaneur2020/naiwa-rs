@@ -66,12 +66,12 @@ pub(crate) fn forward(
         stats::record_step_boundary(layer.layers().len());
     }
     let budget = stats::budget_enabled();
-    let mut t = if budget { std::time::Instant::now() } else { std::time::Instant::now() };
+    let mut t = budget.then(std::time::Instant::now);
     macro_rules! mark {
         ($phase:expr) => {
-            if budget {
-                stats::record_budget($phase, t.elapsed().as_nanos() as u64);
-                t = std::time::Instant::now();
+            if let Some(prev) = t.as_mut() {
+                stats::record_budget($phase, prev.elapsed().as_nanos() as u64);
+                *prev = std::time::Instant::now();
             }
         };
     }
@@ -179,7 +179,7 @@ pub(crate) fn forward(
     // M22.3: how much of the step's expert demand is distinct experts, i.e. the headroom a per-expert row batch
     // (llama.cpp MMVQ's `ncols`) would have. Resident and staged hits are counted by slot, misses by expert id.
     #[cfg(feature = "cuda")]
-    {
+    if budget {
         // Every (row, expert) pair this layer will run, resident + staged + CPU.
         let pairs: usize = plan.hits.iter().map(Vec::len).sum::<usize>()
             + plan.misses.iter().map(Vec::len).sum::<usize>();

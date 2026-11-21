@@ -65,7 +65,6 @@ pub(crate) use expert::{expert_qtensor_on_device, expert_range};
 #[cfg(test)]
 pub(in crate::moe) use slot::slot_bytes_from_qtensor;
 pub(crate) use slot::{slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};
-pub(in crate::moe) use staging::alloc_bank;
 #[cfg(test)]
 pub(in crate::moe) use staging::staging_ring_slots;
 pub(crate) use staging::{StagingRings, STAGING_RING_FIRST};

@@ -20,7 +20,7 @@ use super::expert::expert_range;
 use super::rings::{self, RoundSlots};
 use super::slot::{SlotBuf, SlotData};
 use super::stages::{Gpu, Hit};
-use crate::copy_stream::{CopyDone, CopyStream};
+use crate::copy_stream::CopyDone;
 
 /// Whether a chunk should take the ring path. Off by default.
 pub(crate) fn enabled() -> bool {
@@ -73,101 +73,128 @@ pub(crate) fn forward(
                 continue;
             };
             // Everything that could keep a reference alive must be dropped **before** the wait: the storage
-            // (taken above), the published contents (`buf`) and the expert label. Only then is the refcount
-            // this function's own, which is what `wait_for_readers` waits for.
+            // (taken above), the published contents (`buf`) and the expert label. Wait only after releasing
+            // `layer.state`, matching `Layers::empty_range`, so an in-flight background fill cannot deadlock
+            // trying to re-acquire `layer.state`.
             slot.expert = None;
             slot.buf = None;
-            crate::copy_stream::wait_for_readers(&buf);
             out.push(Rented { buf, slot: index });
         }
         out
     };
+    for rent in &rented {
+        crate::copy_stream::wait_for_readers(&rent.buf);
+    }
     if rented.is_empty() {
         return Ok(None);
     }
 
-    // Routing to the host: `rows x top_k` u32 ids and f32 weights.
-    let ids = topk_ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
-    let weights = topk_weights.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
-    let mut entries: Vec<(usize, u32, f32)> = Vec::with_capacity(rows * layer.top_k);
-    for (row, (row_ids, row_weights)) in ids.iter().zip(&weights).enumerate() {
-        for (expert, weight) in row_ids.iter().zip(row_weights) {
-            entries.push((row, *expert, *weight));
-        }
-    }
-
-    // Plan with the layer's own slots as the ring. A lender would add its slots here.
-    let plan = rings::plan(&entries, rented.len(), 0, None);
-    let plan_rounds = plan.rounds.len();
-
-    let g = gate.data()?;
-    let u = up.data()?;
-    let d = down.data()?;
-    let x2d = xs.reshape((rows, hidden))?;
-    let act: Activation = layer.act;
-    let mut sum: Option<Tensor> = None;
-    let mut computed = 0usize;
-    for round in &plan.rounds {
-        debug_assert!(matches!(round.slots, RoundSlots::Own), "no lender is wired yet");
-        if round.experts.is_empty() {
-            continue;
-        }
-        // DMA this round's experts into the rented slots, in order.
-        let mut slot_of: HashMap<u32, usize> = HashMap::with_capacity(round.experts.len());
-        let done = CopyDone::new(copy)?;
-        for (i, expert) in round.experts.iter().enumerate() {
-            let held = &rented[i % rented.len()];
-            let SlotData::Banked { memory, .. } = &held.buf.data else {
-                unreachable!("cache slots are banked")
-            };
-            let e = *expert as usize;
-            let er = expert_range(&gate, e)?;
-            let upper = expert_range(&up, e)?;
-            let lower = expert_range(&down, e)?;
-            // SAFETY: the stacks are page-locked and outlive the copies (`layer.cpu()` holds them).
-            unsafe {
-                copy.queue_async(
-                    &held.buf.fence,
-                    &[
-                        (&memory[0], &g[er]),
-                        (&memory[1], &u[upper]),
-                        (&memory[2], &d[lower]),
-                    ],
-                )?;
-            }
-            slot_of.insert(*expert, held.slot);
-            computed += 1;
-        }
-        done.record(copy)?;
-        done.wait_on(&layer.slot_device)?;
-
-        // Per row, the round's hits with their weights, addressed inside the slot buffers' banks.
-        let mut hits: Vec<Vec<Hit>> = vec![Vec::with_capacity(layer.top_k); rows];
-        for (row, experts) in &round.rows {
-            for (expert, weight) in experts {
-                let slot = slot_of[expert];
-                let held = &rented[slot_index_of(&rented, slot)];
-                hits[*row].push((Arc::clone(&held.buf), slot, *weight));
+    let result: candle_core::Result<Option<Tensor>> = (|| {
+        // Routing to the host: `rows x top_k` u32 ids and f32 weights.
+        let ids = topk_ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let weights = topk_weights
+            .to_device(&Device::Cpu)?
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec2::<f32>()?;
+        let mut entries: Vec<(usize, u32, f32)> = Vec::with_capacity(rows * layer.top_k);
+        for (row, (row_ids, row_weights)) in ids.iter().zip(&weights).enumerate() {
+            for (expert, weight) in row_ids.iter().zip(row_weights) {
+                entries.push((row, *expert, *weight));
             }
         }
-        let out = Gpu::submit(layer, &hits, &x2d, act)?;
-        sum = Some(match sum {
-            Some(acc) => acc.add(&out)?,
-            None => out,
-        });
-    }
 
-    crate::dbg_note(
-        "prefill_rings",
-        &format!(
-            "layer {} {rows} rows: {plan_rounds} rounds over {} slots, {computed} expert DMA",
-            layer.layer,
-            rented.len()
-        ),
-    );
+        // Plan with the layer's own slots as the ring. A lender would add its slots here.
+        let plan = rings::plan(&entries, rented.len(), 0, None);
+        let plan_rounds = plan.rounds.len();
 
-    // Give the slots back: their contents were overwritten by the rounds, so they come back empty and the
-    // cache refills them as it would after any eviction.
+        let g = gate.data()?;
+        let u = up.data()?;
+        let d = down.data()?;
+        let x2d = xs.reshape((rows, hidden))?;
+        let act: Activation = layer.act;
+        let mut sum: Option<Tensor> = None;
+        let mut computed = 0usize;
+        for round in &plan.rounds {
+            debug_assert!(matches!(round.slots, RoundSlots::Own), "no lender is wired yet");
+            if round.experts.is_empty() {
+                continue;
+            }
+            // DMA this round's experts into the rented slots, in order.
+            let mut slot_of: HashMap<u32, usize> = HashMap::with_capacity(round.experts.len());
+            let done = CopyDone::new(copy)?;
+            for (i, expert) in round.experts.iter().enumerate() {
+                let held = &rented[i % rented.len()];
+                let SlotData::Banked { memory, .. } = &held.buf.data else {
+                    unreachable!("cache slots are banked")
+                };
+                let e = *expert as usize;
+                let er = expert_range(&gate, e)?;
+                let upper = expert_range(&up, e)?;
+                let lower = expert_range(&down, e)?;
+                // SAFETY: the stacks are page-locked and outlive the copies (`layer.cpu()` holds them).
+                unsafe {
+                    copy.queue_async(
+                        &held.buf.fence,
+                        &[
+                            (&memory[0], &g[er]),
+                            (&memory[1], &u[upper]),
+                            (&memory[2], &d[lower]),
+                        ],
+                    )?;
+                }
+                slot_of.insert(*expert, held.slot);
+                computed += 1;
+            }
+            done.record(copy)?;
+            done.wait_on(&layer.slot_device)?;
+
+            // Per row, the round's hits with their weights, addressed inside the slot buffers' banks.
+            let mut hits: Vec<Vec<Hit>> = vec![Vec::with_capacity(layer.top_k); rows];
+            for (row, experts) in &round.rows {
+                for (expert, weight) in experts {
+                    let slot = slot_of[expert];
+                    let held = &rented[slot_index_of(&rented, slot)];
+                    hits[*row].push((Arc::clone(&held.buf), slot, *weight));
+                }
+            }
+            let out = Gpu::submit(layer, &hits, &x2d, act);
+            // Record read fences on every slot read by this round before the next round (or a later
+            // cache fill) can overwrite it.
+            let mut fenced = Ok(());
+            for (buf, _, _) in hits.iter().flatten() {
+                if let Err(e) = buf.fence.record_reads(&layer.slot_device) {
+                    fenced = fenced.and(Err(e));
+                }
+            }
+            if fenced.is_err() {
+                let _ = layer.slot_device.synchronize();
+            }
+            drop(hits);
+            let out = out?;
+            fenced?;
+            sum = Some(match sum {
+                Some(acc) => acc.add(&out)?,
+                None => out,
+            });
+        }
+
+        crate::dbg_note(
+            "prefill_rings",
+            &format!(
+                "layer {} {rows} rows: {plan_rounds} rounds over {} slots, {computed} expert DMA",
+                layer.layer,
+                rented.len()
+            ),
+        );
+
+        match sum {
+            Some(sum) => Ok(Some(sum.reshape((batch, seq, hidden))?.to_dtype(xs.dtype())?)),
+            None => Ok(None),
+        }
+    })();
+
+    // Always return the rented slots, even on error: their contents were overwritten by the rounds, so they
+    // come back empty and the cache refills them as it would after any eviction.
     {
         let mut state = layer.state.lock().unwrap();
         for rent in &rented {
@@ -178,10 +205,7 @@ pub(crate) fn forward(
         }
     }
 
-    match sum {
-        Some(sum) => Ok(Some(sum.reshape((batch, seq, hidden))?.to_dtype(xs.dtype())?)),
-        None => Ok(None),
-    }
+    result
 }
 
 /// The index of the rented slot with plain slot number `slot`.

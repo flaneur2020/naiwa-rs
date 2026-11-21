@@ -404,18 +404,6 @@ pub(super) fn lru_victim(slots: &[Slot], protect: &[usize]) -> Option<(usize, us
         .min_by_key(|(expert, slot)| (slots[*slot].last_use, *expert))
 }
 
-// Number of rows above which we skip the cache entirely.
-// Calls with more rows than this are prefill chunks: every expert runs on the CPU (or the prefill
-// stream). Up to it they take the decode split, which is what a speculative verify step needs (the
-// target runs the n drafts plus one token in one forward).
-//
-// 32 because of the *tail* of a prompt chunk. The recurrent checkpoint boundary is
-// `align_down(prompt, 32)`, so every prompt is prefilled as `[0, boundary)` followed by a remainder
-// of at most 31 rows — and at 16 those remainders took the whole-chunk CPU path, where a few rows
-// still touch nearly every expert of every layer (measured 2.3 s per `doc`/`long` turn). At 32 they
-// take the decode split instead, whose expert cache the preceding chunk has just warmed.
-const PREFILL_THRESHOLD: usize = 32;
-
 /// The largest row count the *decode split* may be asked to take, i.e. what every warmup-sized mapped buffer and
 /// the CPU-result ring must cover. It is the ceiling for `NAIWA_PREFILL_THRESHOLD`, not that value itself: the
 /// buffers are sized once (a bigger threshold allocates more, a smaller one wastes it) and the routing decision is
