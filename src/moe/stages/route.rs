@@ -7,7 +7,8 @@ use crate::moe::CachedLayer;
 use super::Hit;
 
 pub(crate) struct RoutePlan {
-    pub hits: Vec<Vec<Hit>>,
+    pub resident: Vec<Vec<Hit>>,
+    pub staged: Vec<Vec<Hit>>,
     pub misses: Vec<Vec<(u32, f32)>>,
     /// Diagnostic-only payload; no extra device read. Emitted after staging assignment.
     pub work_trace: Option<serde_json::Value>,
@@ -80,7 +81,8 @@ impl Route {
             )
         };
 
-        let mut hits: Vec<Vec<Hit>> = vec![Vec::new(); rows];
+        let mut resident: Vec<Vec<Hit>> = vec![Vec::new(); rows];
+        let staged: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
         // M40: compare this pass's real demand against the lookahead's prediction for this layer.
         if crate::stats::predict_enabled() {
@@ -115,16 +117,16 @@ impl Route {
             for (t, (ids, ws)) in ids_rows.iter().zip(&weight_rows).enumerate() {
                 for (&id, &w) in ids.iter().zip(ws) {
                     st.hit_counts[id as usize] += 1;
-                    let resident = st
+                    let found = st
                         .slots
                         .iter()
                         .position(|s| s.expert == Some(id as usize) && s.buf.is_some())
                         .map(|slot| (slot, st.slots[slot].buf.clone().unwrap()));
-                    match resident {
+                    match found {
                         Some((slot, buf)) => {
                             st.slots[slot].last_use = tick;
                             crate::stats::schedule::detail(layer.layer(), tick, "resident_use", 0, Some(id as usize), Some(slot));
-                            hits[t].push((buf, slot, w));
+                            resident[t].push((buf, slot, w));
                         }
                         None => misses[t].push((id, w)),
                     }
@@ -147,6 +149,6 @@ impl Route {
             }
         }
 
-        Ok(RoutePlan { hits, misses, work_trace })
+        Ok(RoutePlan { resident, staged, misses, work_trace })
     }
 }

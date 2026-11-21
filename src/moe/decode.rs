@@ -5,10 +5,16 @@ use std::sync::Arc;
 use candle_core::Tensor;
 use mistralrs_core::layers::Activation;
 
-use super::stages::{CpuMiss, DmaMiss, Gpu, Hit, Preload, Route};
+use super::stages::{CpuMiss, CpuPending, DmaMiss, Gpu, Hit, Preload, Route};
 use crate::stats;
 
 use super::CachedLayer;
+
+/// Tracks whether the complementary CPU-miss job was already submitted inside `DmaMiss::submit_cpu_first`.
+enum CpuWork {
+    Deferred,
+    Submitted(Option<CpuPending>),
+}
 
 /// Decode path (one token, or the few rows of a speculative verify step): split each row's
 /// top-k into GPU hits and CPU misses, run both concurrently, sum. Misses are never loaded on
@@ -125,26 +131,22 @@ pub(crate) fn forward(
     let route_ready = crate::config::diag()
         .cpu_timeline
         .then(std::time::Instant::now);
-    let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
+    let n_hits: usize = plan.resident.iter().map(Vec::len).sum();
     stats::record_cache_hits(n_hits);
 
-    // `--pcie-frac`: DMA the highest-weight misses into the staging ring and run them on the
-    // GPU with the hits, leaving the rest on the CPU. `stage_misses` only *appends* to
-    // `plan.hits`, so the resident prefix is exactly what was there before the call.
+    // `--pcie-frac`: DMA the highest-weight misses into the staging ring (`plan.staged`), leaving
+    // the complementary misses on the CPU (`plan.misses`).
     mark!(stats::BudgetPhase::Plan);
-    #[cfg(feature = "cuda")]
-    let resident_prefix: Vec<usize> = plan.hits.iter().map(Vec::len).collect();
-    let mut early_cpu = None;
-    let mut cpu_submitted = false;
+    let mut cpu_work = CpuWork::Deferred;
     if layer.staging_enabled() {
         if crate::config::runtime().cpu_before_dma {
             DmaMiss::submit_cpu_first(layer, &mut plan, &mut |misses, chosen| {
                 let cpu_misses: Vec<Vec<(u32, f32)>> = misses.iter().map(|row| {
                     row.iter().copied().filter(|(id, _)| !chosen.contains(id)).collect()
                 }).collect();
-                early_cpu = CpuMiss::submit(layer, &cpu_misses, &x2d, rows,
+                let pending = CpuMiss::submit(layer, &cpu_misses, &x2d, rows,
                     route_ready, cpu_act.clone())?;
-                cpu_submitted = true;
+                cpu_work = CpuWork::Submitted(pending);
                 Ok(())
             })?;
         } else {
@@ -154,8 +156,9 @@ pub(crate) fn forward(
 
     stats::schedule::event(layer.layer(), schedule_tick, "dma_enqueued");
     if let Some(mut trace) = plan.work_trace.take() {
-        trace["gpu_slots_weight_bits"] = serde_json::json!(plan.hits.iter()
-            .map(|row| row.iter().map(|(_, slot, w)| (*slot, w.to_bits())).collect::<Vec<_>>())
+        trace["gpu_slots_weight_bits"] = serde_json::json!(plan.resident.iter()
+            .zip(&plan.staged)
+            .map(|(res, stg)| res.iter().chain(stg.iter()).map(|(_, slot, w)| (*slot, w.to_bits())).collect::<Vec<_>>())
             .collect::<Vec<_>>());
         trace["cpu_ids_weight_bits"] = serde_json::json!(plan.misses.iter()
             .map(|row| row.iter().map(|(id, w)| (*id, w.to_bits())).collect::<Vec<_>>())
@@ -181,9 +184,15 @@ pub(crate) fn forward(
     #[cfg(feature = "cuda")]
     if budget {
         // Every (row, expert) pair this layer will run, resident + staged + CPU.
-        let pairs: usize = plan.hits.iter().map(Vec::len).sum::<usize>()
-            + plan.misses.iter().map(Vec::len).sum::<usize>();
-        let mut ids: Vec<usize> = plan.hits.iter().flatten().map(|h| h.1).collect();
+        let staged_n: usize = plan.staged.iter().map(Vec::len).sum();
+        let pairs = n_hits + staged_n + n_cpu;
+        let mut ids: Vec<usize> = plan
+            .resident
+            .iter()
+            .chain(&plan.staged)
+            .flatten()
+            .map(|h| h.1)
+            .collect();
         ids.extend(plan.misses.iter().flatten().map(|&(id, _)| id as usize));
         ids.sort_unstable();
         ids.dedup();
@@ -192,7 +201,7 @@ pub(crate) fn forward(
     // Experts that went to the staging ring: counted apart from both hits and CPU misses.
     #[cfg(feature = "cuda")]
     {
-        let staged_n: usize = plan.hits.iter().map(Vec::len).sum::<usize>() - n_hits;
+        let staged_n: usize = plan.staged.iter().map(Vec::len).sum();
         stats::record_cache_staged(staged_n);
         stats::record_round_plan(n_hits, staged_n, n_cpu);
     }
@@ -202,10 +211,9 @@ pub(crate) fn forward(
     if candle_core::cuda_backend::alloc_trace::enabled() {
         // Handled at the step boundary: the window accumulates across the step.
     }
-    let cpu = if cpu_submitted {
-        early_cpu
-    } else {
-        CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready, cpu_act)?
+    let cpu = match cpu_work {
+        CpuWork::Submitted(pending) => pending,
+        CpuWork::Deferred => CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready, cpu_act)?,
     };
     stats::schedule::event(layer.layer(), schedule_tick, "cpu_submit_return");
     mark!(stats::BudgetPhase::Spawn);
@@ -238,15 +246,9 @@ pub(crate) fn forward(
     let expert_ev = cuda_stream.as_ref().and_then(|s| stats::budget_dev::start(s));
     #[cfg(feature = "cuda")]
     let resident_acc = if split {
-        let residents: Vec<Vec<Hit>> = plan
-            .hits
-            .iter()
-            .zip(&resident_prefix)
-            .map(|(row, &n)| row[..n].to_vec())
-            .collect();
-        let acc = Gpu::submit(layer, &residents, &x2d, act);
+        let acc = Gpu::submit(layer, &plan.resident, &x2d, act);
         let mut fenced = Ok(());
-        for (buf, _, _) in residents.iter().flatten() {
+        for (buf, _, _) in plan.resident.iter().flatten() {
             if let Err(e) = buf.fence.record_reads(layer.slot_device()) {
                 fenced = fenced.and(Err(e));
             }
@@ -268,18 +270,8 @@ pub(crate) fn forward(
     mark!(stats::BudgetPhase::Gpu);
 
     #[cfg(feature = "cuda")]
-    let hits_to_run: Vec<Vec<Hit>> = if split {
-        plan.hits
-            .iter()
-            .zip(&resident_prefix)
-            .map(|(row, &n)| row[n..].to_vec())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    #[cfg(feature = "cuda")]
     let acc = if let Some(resident_out) = resident_acc {
-        if hits_to_run.iter().all(|row| row.is_empty()) {
+        if plan.staged.iter().all(Vec::is_empty) {
             Ok(resident_out)
         } else {
             // M26: submit the staged experts wave by wave, waiting only for the wave about to run, so
@@ -287,10 +279,10 @@ pub(crate) fn forward(
             let waves = layer.wave_count();
             let mut acc: Option<Tensor> = None;
             if waves > 1 {
-                let rows = hits_to_run.len();
+                let rows = plan.staged.len();
                 let mut groups: Vec<Vec<Vec<Hit>>> =
                     (0..waves).map(|_| vec![Vec::new(); rows]).collect();
-                for (t, row) in hits_to_run.iter().enumerate() {
+                for (t, row) in plan.staged.iter().enumerate() {
                     for hit in row {
                         let pos = hit
                             .1
@@ -318,25 +310,27 @@ pub(crate) fn forward(
             }
             let staged_out = match acc {
                 Some(v) => v,
-                None => Gpu::submit(layer, &hits_to_run, &x2d, act)?,
+                None => Gpu::submit(layer, &plan.staged, &x2d, act)?,
             };
             resident_out + staged_out
         }
     } else {
-        Gpu::submit(layer, &plan.hits, &x2d, act)
+        Gpu::submit(layer, &plan.resident, &x2d, act)
     };
     #[cfg(not(feature = "cuda"))]
-    let acc = Gpu::submit(layer, &plan.hits, &x2d, act);
+    let acc = Gpu::submit(layer, &plan.resident, &x2d, act);
     #[cfg(feature = "cuda")]
     if let Some(stream) = &cuda_stream {
         stats::budget_dev::end(stream, expert_ev);
     }
     gpu_mark!("staged_end");
     // Kernels reading these slots may be queued even if a later step failed: fence every
-    // slot before letting go of it, so an in-place fill cannot overtake them. If a fence
-    // cannot be recorded, wait for the device instead.
+    // slot before letting go of it, so an in-place fill cannot overtake them. When `split`
+    // is active, resident slots were already fenced right after their compute; fence the
+    // staged slots here (or all resident slots when `!split`).
     let mut fenced = Ok(());
-    for (buf, _, _) in plan.hits.iter().flatten() {
+    let slots_to_fence = if split { &plan.staged } else { &plan.resident };
+    for (buf, _, _) in slots_to_fence.iter().flatten() {
         if let Err(e) = buf.fence.record_reads(layer.slot_device()) {
             fenced = fenced.and(Err(e));
         }
@@ -359,7 +353,8 @@ pub(crate) fn forward(
         }
     }
     mark!(stats::BudgetPhase::StagingWait);
-    drop(plan.hits);
+    drop(plan.resident);
+    drop(plan.staged);
     let gpu_out = acc?;
     fenced?;
     mark!(stats::BudgetPhase::Fence);

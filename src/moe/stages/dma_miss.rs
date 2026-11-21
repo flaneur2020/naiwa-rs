@@ -203,7 +203,7 @@ impl DmaMiss {
         layer: &Arc<CachedLayer>,
         plan: &mut super::RoutePlan,
     ) -> candle_core::Result<()> {
-        stream_pcie(layer, &mut plan.misses, &mut plan.hits, &mut |_, _| Ok(()))
+        stream_pcie(layer, &mut plan.misses, &mut plan.staged, &mut |_, _| Ok(()))
     }
 
     pub(crate) fn submit_cpu_first(
@@ -211,6 +211,6 @@ impl DmaMiss {
         plan: &mut super::RoutePlan,
         before_dma: &mut dyn FnMut(&[Vec<(u32, f32)>], &[u32]) -> candle_core::Result<()>,
     ) -> candle_core::Result<()> {
-        stream_pcie(layer, &mut plan.misses, &mut plan.hits, before_dma)
+        stream_pcie(layer, &mut plan.misses, &mut plan.staged, before_dma)
     }
 }
