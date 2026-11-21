@@ -1,4 +1,4 @@
-//! Compiles this crate's CUDA kernels (`src/doorbell/doorbell.cu`) into `libnaiwadoorbell.a`.
+//! Compiles this crate's CUDA kernels (`src/transport/doorbell/doorbell.cu`) into `libnaiwadoorbell.a`.
 //!
 //! The kernels are v2's own sync primitives, so they live here rather than in the mistral.rs fork
 //! (whose doorbell had no consumer there). `cudaforge` is the same helper the fork's build uses, so
@@ -9,7 +9,7 @@ fn main() {
         use std::path::PathBuf;
 
         println!("cargo:rerun-if-changed=build.rs");
-        println!("cargo:rerun-if-changed=src/doorbell");
+        println!("cargo:rerun-if-changed=src/transport/doorbell");
         println!("cargo:rerun-if-env-changed=CUDA_NVCC_FLAGS");
         println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -20,8 +20,8 @@ fn main() {
         std::fs::create_dir_all(&build_dir).expect("create the doorbell build dir");
 
         let mut builder = cudaforge::KernelBuilder::new()
-            .source_glob("src/doorbell/*.cu")
-            .watch(["src/doorbell"])
+            .source_glob("src/transport/doorbell/*.cu")
+            .watch(["src/transport/doorbell"])
             .out_dir(&build_dir)
             .arg("-std=c++17")
             .arg("-O3")

@@ -1,19 +1,19 @@
 //! naiwa-rs: a Qwen3.8-Flash-Next-only inference server built on the mistral.rs crates.
 //!
 //! Models are loaded from the local filesystem only; Hugging Face Hub access is disabled.
+//!
+//! # Architecture (strict 4-layer DAG + cross-cutting `config` / `stats`)
+//! - `transport` (L1): hardware async primitives (copy stream, mapped doorbells, CPU executor, spin pool).
+//! - `memory`    (L2): host pinned stacks, VRAM slab/borrow gate, per-layer cache directory, staging rings.
+//! - `pipeline`  (L3): mutually-exclusive Decode & Prefill execution pipelines + MoE provider factory.
+//! - `app`       (L4): CLI arguments, model loader, and OpenAI/Anthropic HTTP server.
 
-mod args;
-mod commands;
+mod app;
 mod config;
-mod copy_stream;
-mod doorbell;
-mod executor;
-mod spin_pool;
-mod host_memory;
-mod load;
-mod moe;
-mod prefill_stream;
+mod memory;
+mod pipeline;
 mod stats;
+mod transport;
 
 /// `NAIWA_STREAM_DBG=1`: the prefill stream's per-layer DMA wait against its compute, so a slow
 /// prefill chunk can be attributed instead of guessed at.
@@ -30,8 +30,7 @@ use mistralrs_core::{
 };
 use tracing_subscriber::EnvFilter;
 
-use args::{Cli, Command};
-use commands::run_serve;
+use app::{run_serve, Cli, Command};
 
 // Tensor ops allocate fresh output buffers constantly; mimalloc removes the page-fault
 // churn that dominates small-model CPU inference with the system allocator.
@@ -46,7 +45,9 @@ async fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     stats::model_partition::install();
     if config::runtime().cpu_spin_us_raw.is_some() {
-        mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(spin_pool::dispatch));
+        mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(
+            transport::spin_pool::dispatch,
+        ));
     }
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);

@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::moe::MAX_DECODE_ROWS;
+use crate::memory::MAX_DECODE_ROWS;
 
 /// Default row threshold above which MoE forward takes the whole-chunk prefill path.
 const DEFAULT_PREFILL_THRESHOLD: usize = 32;
@@ -322,7 +322,7 @@ mod tests {
         assert!(c2.runtime.cpu_before_dma);
         assert!(c2.diag.work_trace);
         assert_eq!(c2.runtime.spin_budget(), None);
-        assert_eq!(c2.runtime.prefill_threshold, crate::moe::MAX_DECODE_ROWS);
+        assert_eq!(c2.runtime.prefill_threshold, crate::memory::MAX_DECODE_ROWS);
         assert_eq!(c2.diag.model_partition_stride, 1);
     }
 
