@@ -303,50 +303,48 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 ## 8. Layout and commands
 
 ```
-~/code/naiwa-rs            engine + docs/ + harness/
-  src/config.rs            centralized NAIWA_* env config (RuntimeConfig + DiagConfig)
-  src/doorbell/            mapped doorbells + kernels
-    mod.rs                 ffi + re-exports
-    mapped.rs              single mapped-allocation owner
-    payload_ring.rs        seq + slot-ring layout
-    d2h/topk.rs            TopkDoorbell (device -> host)
-    d2h/activation.rs      ActivationDoorbell (device -> host)
-    h2d/result.rs          ResultDoorbell (host -> device)
-    handoff.rs             PassCell (cross-thread completion claim)
-    tests.rs
-  src/moe/                 MoE execution + GPU expert cache
-    mod.rs                 module docs, lock-ordering DAG, exports
-    provider.rs            GPU-cache provider + layer construction + staging rings + attach_prefill
-    expert.rs              CpuExperts fallback + per-expert byte slicing
-    cached_layer.rs        LayerState + CachedLayer + CachedExperts entry point + accessors/sync
-    layer_registry.rs      Layers model-wide registry + loan empty/refill coordination
-    activation_channel.rs  LookaheadChannel (advisory GPU -> host activation channel)
-    cache_policy.rs        pure ranking/selection/victim policy functions
-    cache_updates.rs       admit/replace/upload/promotion/lookahead prediction/spawn_fill
-    slot.rs                Slot/SlotBuf/Bank/Projections + slot byte estimate
-    slab.rs                VRAM Slab bump allocator + per-provider BorrowGate
-    staging.rs             StagingRings/StagingRing + alloc_bank_in
-    decode.rs              decode orchestrator (resident/staged/CPU split)
-    stages/                route, gpu, cpu-miss (+ fused decode), dma-miss, preload
-  src/prefill_stream/      streaming GPU prefill over pinned host stacks / loaned slab ranges
-    mod.rs                 PrefillStreams + PrefillStream facade and forward()
-    planner.rs             pure VRAM budget math (plan*, chunk_scratch, kv_reserve)
-    buffers.rs             LayerBuf lifecycle, slab borrow, begin_chunk, load, downgrade
-    split.rs               --prefill-split expert sub-range views & masked dispatch
-    diagnostics.rs         opt-in peak, snapshot, canary, and wall-clock probes
-  src/load.rs              model loading + provider install + warmup
-  src/stats/               cache counters + JSONL attribution sinks
-    mod.rs                 re-exports
-    sink.rs                shared bounded AsyncJsonSink writer
-    cache.rs               expert-cache counters (`NAIWA_STATS=1`, `dump_cache_stats`)
-    schedule.rs            NAIWA_SCHEDULE_FILE buffered host-clock trace
+~/code/naiwa-rs               engine + docs/ + harness/
+  src/main.rs                 thin entrypoint
+  src/config.rs               cross-cutting NAIWA_* env config (RuntimeConfig + DiagConfig)
+  src/stats/                  cross-cutting cache counters + JSONL attribution sinks
+    mod.rs                    re-exports
+    sink.rs                   shared bounded AsyncJsonSink writer
+    cache.rs                  expert-cache counters (`NAIWA_STATS=1`, `dump_cache_stats`)
+    schedule.rs               NAIWA_SCHEDULE_FILE buffered host-clock trace
     gpu_partition.rs / model_partition.rs / head_partition.rs
-  src/executor.rs          single-thread CPU executor + result doorbell + idle signal
-  src/spin_pool.rs         experimental spin-wait parallel dispatcher for fused CPU MoE
-  harness/                 primitives, oracle, attribution, chat, bandwidth harnesses
-~/code/mistral.rs-iq4xs    fork
-~/code/naiwa-rs/target          crate target
-~/bench-rel/naiwa-v2/      binaries/logs
+  src/transport/              L1: hardware async primitives (zero MoE semantics)
+    copy_stream.rs            CUDA copy stream, CopyDone, ReadFence, SlotMemory
+    doorbell/                 mapped doorbells + CUDA kernels (Topk / Activation / Result / PassCell)
+    activation_channel.rs     LookaheadChannel (advisory GPU -> host activation channel)
+    executor.rs               single-thread CPU FIFO executor + result doorbell + idle signal
+    spin_pool.rs              opt-in spin-wait parallel dispatcher for fused CPU MoE
+  src/memory/                 L2: cross-domain host/VRAM weight & cache ownership
+    mod.rs                    lock-ordering DAG + re-exports
+    host_weights.rs           page-locked host stacks + huge-page advice
+    expert.rs                 CpuExperts fallback, fused CPU decode, per-expert byte slicing
+    resident.rs               Q2_0 resident MTP drafter expert pool
+    profile.rs                `--expert-profile` startup ranking loader
+    slab.rs                   VRAM Slab bump allocator + per-provider BorrowGate
+    slot.rs                   Slot/SlotBuf/Bank/Projections + slot byte estimate
+    staging.rs                StagingRings/StagingRing + alloc_bank_in
+    layer.rs                  CachedLayer split into LayerWeights / LayerCache / LayerTransport
+    layer_registry.rs         Layers model-wide registry + loan empty/refill
+    cache_policy.rs           pure ranking/selection/victim functions (#[inline])
+    cache_updates.rs          admit/replace/upload/promote_staged/prefetch_predicted/spawn_fill
+  src/pipeline/               L3: mutually-exclusive Decode & Prefill execution pipelines
+    mod.rs                    CachedExperts router + Decode <-> Prefill slab loan transitions
+    decode.rs                 linear 6-step decode orchestrator + run_and_fence_gpu
+    observer.rs               zero-cost #[inline] DecodeObserver
+    stages/                   route, gpu, cpu_miss, dma_miss, preload
+    provider.rs               GpuCacheMoeProvider factory + warmup
+    prefill/                  streaming GPU prefill (mod, planner, buffers, split, diagnostics)
+  src/app/                    L4: CLI, model loader, HTTP server
+    args.rs                   clap CLI definitions (`serve`)
+    load.rs                   local checkpoint validation + provider install + warmup
+    serve.rs                  OpenAI / Anthropic HTTP server + graceful shutdown stats
+  harness/                    primitives, oracle, attribution, chat, serve profiles
+~/code/mistral.rs-iq4xs       fork
+~/code/naiwa-rs/target        crate target
 ```
 
 ```bash
