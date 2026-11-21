@@ -86,10 +86,7 @@ impl Route {
         if crate::stats::predict_enabled() {
             crate::stats::record_actual(layer.layer(), &ids_rows);
         }
-        static WORK_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let trace_enabled = *WORK_TRACE.get_or_init(|| {
-            std::env::var("NAIWA_WORK_TRACE").as_deref() == Ok("1")
-        });
+        let trace_enabled = crate::config::diag().work_trace;
         let mut work_trace = None;
         {
             let mut st = layer.state().lock().unwrap();
@@ -106,11 +103,7 @@ impl Route {
                     "residency": residency,
                 }));
             }
-            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *TRACE.get_or_init(|| {
-                std::env::var_os("NAIWA_CPU_LAYER_TRACE").is_some()
-                    || std::env::var_os("NAIWA_ROUTE_IDS").is_some()
-            }) {
+            if crate::config::diag().cpu_layer_trace || crate::config::diag().route_ids {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static SEQ: AtomicU64 = AtomicU64::new(0);
                 let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -142,7 +135,7 @@ impl Route {
         // Probe `NAIWA_GPU_ONLY_EXPERTS`: once the cache is full, drop every expert that is not
         // resident and never stage or compute one. This is lossy; it bounds the perfect-cache path.
         #[cfg(feature = "cuda")]
-        if std::env::var_os("NAIWA_GPU_ONLY_EXPERTS").is_some() {
+        if crate::config::runtime().gpu_only_experts {
             let full = {
                 let st = layer.state().lock().unwrap();
                 st.slots[..st.usable].iter().all(|s| s.expert.is_some())

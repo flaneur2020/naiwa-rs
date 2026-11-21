@@ -28,7 +28,7 @@ static FUSED_STATS: Mutex<FusedStats> = Mutex::new(FusedStats {
     rows: 0,
     last_end: None,
 });
-static PROBE: Probe = Probe::new("NAIWA_FUSED_DBG");
+static PROBE: Probe = Probe::new(|d| d.fused_dbg);
 static WINDOW: Window = Window::new(480);
 static HEADER: AtomicBool = AtomicBool::new(false);
 

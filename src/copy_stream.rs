@@ -481,7 +481,7 @@ mod cuda {
                 .context()
                 .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
                 .map_err(Error::wrap)?;
-            let timing = if std::env::var_os("NAIWA_COPY_TIME").is_some() {
+            let timing = if crate::config::diag().copy_time {
                 let ctx = cs.stream.context();
                 // `CU_EVENT_DEFAULT`, not `None`: cudarc's `new_event(None)` means DISABLE_TIMING, and an event
                 // without timing answers `cuEventElapsedTime` with CUDA_ERROR_INVALID_HANDLE.

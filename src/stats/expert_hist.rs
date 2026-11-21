@@ -16,13 +16,13 @@ const DUMP_EVERY: u64 = 2048;
 static HIST: OnceLock<Vec<AtomicU64>> = OnceLock::new();
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
-fn path() -> Option<String> {
-    std::env::var("NAIWA_EXPERT_HIST").ok()
+fn path() -> Option<&'static str> {
+    crate::config::diag().expert_hist.as_deref()
 }
 
+#[inline]
 fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| path().is_some())
+    path().is_some()
 }
 
 fn table() -> &'static Vec<AtomicU64> {

@@ -14,16 +14,14 @@ use super::Hit;
 /// How many waves a layer's staging splits into (M26). 1 = the whole step's misses in one batch, which is
 /// what every earlier milestone did; 2 is the shipping value: the second half's copies hide behind the
 /// first half's kernels.
+#[inline]
 fn staging_waves() -> usize {
     // M26 measured waves = 2 against waves = 1 and found no difference (TPOT 38.1 against 38.5 ms, inside
     // the +-8% noise) while `staging_wait` grew by 1.6 ms, so the default stays at one batch. M36 §13
     // re-measured: 4 waves win on the decode-only arm (42.8 / 44.2 / 42.3 against 44.3 / 45.5 / 44.2 ms per
     // token) but lose in the chat harness (TPOT median 41.6 against 40.2 over 154 turns) - the waves
     // interleave with prefill and with reuse, so the single-batch default is the one that ships.
-    std::env::var("NAIWA_STAGING_WAVES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
+    crate::config::runtime().staging_waves
 }
 
 
@@ -89,8 +87,7 @@ fn stage_misses(
         // NAIWA_STAGE_TRACE: the staged set is what decides whether a routed expert is computed by
         // the GPU (streamed into the ring) or by the CPU, so repeated runs can be compared step by
         // step. Limited to the first ticks, since only the earliest difference is diagnostic.
-        static STAGE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *STAGE_TRACE.get_or_init(|| std::env::var_os("NAIWA_STAGE_TRACE").is_some()) {
+        if crate::config::diag().stage_trace {
             let tick = layer.state().lock().unwrap().tick;
             if tick <= 12 {
                 let mut ids: Vec<u32> = chosen.clone();
@@ -99,8 +96,7 @@ fn stage_misses(
                     layer.layer(), misses.len(), ids.len());
             }
         }
-        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *TRACE.get_or_init(|| std::env::var_os("NAIWA_ADMISSION_TRACE").is_some()) {
+        if crate::config::diag().admission_trace {
             let mut weights: HashMap<u32, f32> = HashMap::new();
             for &(id, w) in misses.iter().flatten() {
                 *weights.entry(id).or_default() += w;

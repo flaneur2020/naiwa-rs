@@ -32,7 +32,7 @@ static ROUND_STATS: Mutex<RoundStats> = Mutex::new(RoundStats {
     last_round: None,
     round_times: Vec::new(),
 });
-static PROBE: Probe = Probe::new("NAIWA_ROUND_STATS");
+static PROBE: Probe = Probe::new(|d| d.round_stats);
 static WINDOW: Window = Window::new(4); // passes
 static HEADER: AtomicBool = AtomicBool::new(false);
 

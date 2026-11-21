@@ -89,7 +89,7 @@ static GPU_CACHE_PROVIDER: OnceLock<Arc<GpuCacheMoeProvider>> = OnceLock::new();
 /// the difference; the fragment layout is the one part of the coming rewrite that fails silently, so it is
 /// checked before it is trusted (M33 §20.7).
 pub fn qsa_mma_check() -> Result<()> {
-    if std::env::var_os("NAIWA_QSA_MMA_CHECK").is_none() {
+    if !crate::config::runtime().qsa_mma_check {
         return Ok(());
     }
     mistralrs_core::cuda::qwen4_exp::qsa_mma_check(256)?;

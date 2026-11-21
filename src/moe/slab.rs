@@ -142,13 +142,7 @@ impl Slab {
     /// pile of separate `cudaMalloc`s and nothing can be lent from them. `NAIWA_CACHE_SLAB=0` turns it off (probe:
     /// the pre-M33 layout, one allocation per bank).
     pub(crate) fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            !matches!(
-                std::env::var("NAIWA_CACHE_SLAB").as_deref(),
-                Ok("0") | Ok("off") | Ok("false") | Ok("no")
-            )
-        })
+        crate::config::runtime().cache_slab
     }
 
     /// Allocate `bytes` of VRAM. The slab's own dtype is irrelevant - `F32` has a block size of one, so the element
@@ -208,11 +202,7 @@ impl Slab {
     /// Read as a **value**, not as presence: `=0` is the arm without the loan (a presence test made `=0` mean on,
     /// and the first A/B of M33 ran the loan twice).
     pub(crate) fn borrowing() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| match std::env::var("NAIWA_PREFILL_BORROW").as_deref() {
-            Ok("0") | Ok("off") | Ok("false") | Ok("no") => false,
-            _ => true,
-        })
+        crate::config::runtime().prefill_borrow
     }
 
     /// The slab's device pointer: the borrow ranges are `[base, base + end)`.

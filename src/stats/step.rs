@@ -27,7 +27,7 @@ static STEP_STATS: Mutex<StepStats> = Mutex::new(StepStats {
     wait_ns: 0,
     last: None,
 });
-static PROBE: Probe = Probe::new("NAIWA_STEP_DBG");
+static PROBE: Probe = Probe::new(|d| d.step_dbg);
 static WINDOW: Window = Window::new(48); // one token's worth of layers
 
 #[cfg(feature = "cuda")]

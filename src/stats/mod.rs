@@ -57,17 +57,16 @@ pub(crate) use self::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// One probe's environment gate. `NAIWA_*` is read once; after that the hot path never calls
-/// `getenv` again.
+/// One probe's environment gate, backed by [`crate::config::diag`].
 struct Probe {
-    var: &'static str,
+    flag: fn(&crate::config::DiagConfig) -> bool,
     on: OnceLock<bool>,
 }
 
 impl Probe {
-    const fn new(var: &'static str) -> Self {
+    const fn new(flag: fn(&crate::config::DiagConfig) -> bool) -> Self {
         Self {
-            var,
+            flag,
             on: OnceLock::new(),
         }
     }
@@ -78,7 +77,7 @@ impl Probe {
     fn enabled(&self, extra: bool) -> bool {
         *self
             .on
-            .get_or_init(|| extra || std::env::var_os(self.var).is_some())
+            .get_or_init(|| extra || (self.flag)(crate::config::diag()))
     }
 }
 

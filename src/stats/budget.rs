@@ -63,9 +63,9 @@ static SLOW_CPU: AtomicU64 = AtomicU64::new(0);
 /// The threshold above which a layer's wait counts as a stub rather than scheduling noise.
 const SLOW_NS: u64 = 200_000;
 
+#[inline]
 fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NAIWA_STEP_BUDGET").is_some())
+    crate::config::diag().step_budget
 }
 
 pub(crate) fn enabled() -> bool {

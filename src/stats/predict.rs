@@ -36,7 +36,7 @@ static PRED_STATS: Mutex<PredStats> = Mutex::new(PredStats {
     wasted: 0,
     predicted: 0,
 });
-static PROBE: Probe = Probe::new("NAIWA_PRED_DBG");
+static PROBE: Probe = Probe::new(|d| d.pred_dbg);
 static WINDOW: Window = Window::new(48); // one pass over the model's layers
 static HEADER: AtomicBool = AtomicBool::new(false);
 

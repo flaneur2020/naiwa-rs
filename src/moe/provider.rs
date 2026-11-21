@@ -102,14 +102,8 @@ impl GpuCacheMoeProvider {
                 // `CUDA_ERROR_OUT_OF_MEMORY`, the whole chat run then lost its stream and failed a turn), so a
                 // refusal halves the window and tries again; below `NAIWA_SLAB_MIN_MIB` there is no pool and the
                 // banks allocate individually, which is exactly the pre-M33 behaviour.
-                let ceiling = std::env::var("NAIWA_SLAB_MIB")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(1536);
-                let min = std::env::var("NAIWA_SLAB_MIN_MIB")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(512);
+                let ceiling = crate::config::runtime().slab_mib;
+                let min = crate::config::runtime().slab_min_mib;
                 let mut mib = ceiling;
                 loop {
                     match super::slab::Slab::new(device, mib << 20) {
@@ -221,10 +215,7 @@ impl GpuCacheMoeProvider {
             // `NAIWA_PROFILE_FILL` (probe, 0..1): seed only this share of each layer's slots, leaving the rest empty
             // for the demand path, which fills an empty slot without evicting anything. A full seed has no fast path
             // left: every expert the conversation actually wants must then displace a guess.
-            let share: f64 = std::env::var("NAIWA_PROFILE_FILL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0);
+            let share: f64 = crate::config::runtime().profile_fill;
             let mut filled = 0usize;
             for layer in &layers {
                 let budget = ((layer.state().lock().unwrap().usable as f64) * share).round() as usize;
@@ -526,7 +517,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // M42: the CPU experts read their activation from mapped memory instead of forcing the
         // token thread into a stream-wide D2H. Sized like the lookahead channel; off by default.
         let cpu_chan = if slot_device.is_cuda()
-            && std::env::var_os("NAIWA_CPU_ACT_ASYNC").is_some()
+            && crate::config::runtime().cpu_act_async
             && router.is_some()
         {
             LookaheadChannel::new(&slot_device, 5, hidden).ok().flatten()

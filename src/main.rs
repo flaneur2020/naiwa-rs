@@ -4,6 +4,7 @@
 
 mod args;
 mod commands;
+mod config;
 mod copy_stream;
 mod doorbell;
 mod vram_peak;
@@ -18,7 +19,7 @@ mod stats;
 /// `NAIWA_STREAM_DBG=1`: the prefill stream's per-layer DMA wait against its compute, so a slow
 /// prefill chunk can be attributed instead of guessed at.
 pub(crate) fn dbg_note(site: &str, msg: &str) {
-    if std::env::var_os("NAIWA_STREAM_DBG").is_some() {
+    if config::diag().stream_dbg {
         eprintln!("STREAM_DBG {site}: {msg}");
     }
 }
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
     candle_core::utils::init_global_threadpool();
     #[cfg(feature = "cuda")]
     stats::model_partition::install();
-    if std::env::var_os("NAIWA_CPU_SPIN_US").is_some() {
+    if config::runtime().cpu_spin_us_raw.is_some() {
         mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(spin_pool::dispatch));
     }
     let cli = Cli::parse();

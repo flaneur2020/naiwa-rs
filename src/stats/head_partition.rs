@@ -14,10 +14,11 @@ pub(crate) fn host_mark(phase:&'static str){if !enabled(){return} SAMPLE.with(|s
  "sample_end"=>{let start=s.begin.take().expect("sample begin");s.sum_ns+=start.elapsed().as_nanos() as u64;s.calls+=1;},"sample_block_cpu_input"=>s.blocks[5]+=1,"sample_block_logprobs"=>s.blocks[0]+=1,"sample_block_speculative"=>s.blocks[1]+=1,"sample_block_multi"=>s.blocks[2]+=1,"sample_block_temperature"=>s.blocks[3]+=1,"sample_block_processors"=>s.blocks[4]+=1,_=>unreachable!()}});}
 thread_local!{static PENDING:RefCell<Vec<Tail>>=const{RefCell::new(Vec::new())};static FREE:RefCell<Vec<Tail>>=const{RefCell::new(Vec::new())};}
 static TX:OnceLock<mpsc::SyncSender<serde_json::Value>>=OnceLock::new();
-pub(crate) fn enabled()->bool {static ON:OnceLock<bool>=OnceLock::new();*ON.get_or_init(||std::env::var_os("NAIWA_HEAD_PARTITION_FILE").is_some())}
+#[inline]
+pub(crate) fn enabled()->bool { crate::config::diag().head_partition_file.is_some() }
 pub(crate) fn mark(xs:&Tensor,phase:&str){
  if !enabled()||!xs.device().is_cuda(){return}
- let tx=TX.get_or_init(||{let (tx,rx)=mpsc::sync_channel::<serde_json::Value>(4096);let file=std::fs::File::create(std::env::var_os("NAIWA_HEAD_PARTITION_FILE").unwrap()).expect("head file");std::thread::spawn(move||{use std::io::Write;let mut f=std::io::BufWriter::new(file);while let Ok(v)=rx.recv(){writeln!(f,"{v}").unwrap();f.flush().unwrap();}});tx});
+ let tx=TX.get_or_init(||{let (tx,rx)=mpsc::sync_channel::<serde_json::Value>(4096);let file=std::fs::File::create(crate::config::diag().head_partition_file.as_ref().unwrap()).expect("head file");std::thread::spawn(move||{use std::io::Write;let mut f=std::io::BufWriter::new(file);while let Ok(v)=rx.recv(){writeln!(f,"{v}").unwrap();f.flush().unwrap();}});tx});
  let stream=xs.device().as_cuda_device().unwrap().cuda_stream();
  PENDING.with(|p|{let mut p=p.borrow_mut();
  if phase=="tail_start"{let mut a=FREE.with(|f|f.borrow_mut().pop()).unwrap_or_else(||Tail{events:(0..4).map(|_|stream.context().new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap()).collect(),count:0,rows:0,next_rows:0,host:Instant::now()});a.count=0;a.rows=xs.elem_count()/xs.dims().last().copied().unwrap_or(1);a.host=Instant::now();p.push(a);}

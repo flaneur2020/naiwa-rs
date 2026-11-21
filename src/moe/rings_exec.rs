@@ -24,8 +24,7 @@ use crate::copy_stream::{CopyDone, CopyStream};
 
 /// Whether a chunk should take the ring path. Off by default.
 pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NAIWA_PREFILL_RINGS").is_some())
+    crate::config::runtime().prefill_rings
 }
 
 /// One rented slot: the buffer to DMA into and the slot index the kernel addresses.

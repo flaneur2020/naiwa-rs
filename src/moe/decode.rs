@@ -87,8 +87,7 @@ pub(crate) fn forward(
     // of one greedy request that end up with different tokens diverge somewhere; the first layer
     // whose input checksum differs is that point, which no earlier probe could localize. Costs a
     // D2H per layer, so it is diagnostic only.
-    static XSUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *XSUM.get_or_init(|| std::env::var_os("NAIWA_XSUM").is_some()) {
+    if crate::config::diag().xsum {
         let tick = layer.state().lock().unwrap().tick + 1;
         if tick <= 3 {
             if let Ok(v) = x2d.to_dtype(candle_core::DType::F32).and_then(|t| t.flatten_all()?.to_vec1::<f32>()) {
@@ -102,8 +101,8 @@ pub(crate) fn forward(
     // M27: the raw routing demand, before any cache decision, for the allocation study.
     // Do not synchronize/copy routing ids for a disabled histogram. The debug
     // override preserves the previous behaviour for an A/B measurement.
-    if std::env::var_os("NAIWA_EXPERT_HIST").is_some()
-        || std::env::var_os("NAIWA_FORCE_HIST_READ").is_some()
+    if crate::config::diag().expert_hist.is_some()
+        || crate::config::diag().force_hist_read
     {
         if let Ok(ids) = topk_ids.flatten_all() {
             if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
@@ -123,8 +122,8 @@ pub(crate) fn forward(
     gpu_mark!("route");
     stats::schedule::event(layer.layer(), schedule_tick, "route_ready");
     // M41: this boundary follows host routing/classification, not GPU top-k completion.
-    static CPU_TIMELINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let route_ready = (*CPU_TIMELINE.get_or_init(|| std::env::var_os("NAIWA_CPU_TIMELINE").is_some()))
+    let route_ready = crate::config::diag()
+        .cpu_timeline
         .then(std::time::Instant::now);
     let n_hits: usize = plan.hits.iter().map(Vec::len).sum();
     stats::record_cache_hits(n_hits);
@@ -138,7 +137,7 @@ pub(crate) fn forward(
     let mut early_cpu = None;
     let mut cpu_submitted = false;
     if layer.staging_enabled() {
-        if std::env::var("NAIWA_CPU_BEFORE_DMA").as_deref() == Ok("1") {
+        if crate::config::runtime().cpu_before_dma {
             DmaMiss::submit_cpu_first(layer, &mut plan, &mut |misses, chosen| {
                 let cpu_misses: Vec<Vec<(u32, f32)>> = misses.iter().map(|row| {
                     row.iter().copied().filter(|(id, _)| !chosen.contains(id)).collect()
@@ -163,7 +162,7 @@ pub(crate) fn forward(
             .collect::<Vec<_>>());
         // Separate sink prevents tracing's stdout logger from interleaving JSON bytes.
         static WORK_FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
-        let file = WORK_FILE.get_or_init(|| std::env::var_os("NAIWA_WORK_TRACE_FILE")
+        let file = WORK_FILE.get_or_init(|| crate::config::diag().work_trace_file.as_ref()
             .map(|path| std::sync::Mutex::new(std::fs::File::create(path)
                 .expect("create NAIWA_WORK_TRACE_FILE"))));
         if let Some(file) = file {

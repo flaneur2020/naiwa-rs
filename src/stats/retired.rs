@@ -19,7 +19,7 @@ static RETIRED_STATS: Mutex<RetiredStats> = Mutex::new(RetiredStats {
     queue_ns: 0,
     compute_ns: 0,
 });
-static PROBE: Probe = Probe::new("NAIWA_RET_DBG");
+static PROBE: Probe = Probe::new(|d| d.ret_dbg);
 static WINDOW: Window = Window::new(48);
 
 pub(crate) fn record_retired(t_submit: Instant, t_start: Instant) {

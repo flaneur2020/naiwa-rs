@@ -27,7 +27,7 @@ static LOOKAHEAD_STATS: Mutex<LookaheadStats> = Mutex::new(LookaheadStats {
     steps: 0,
     d2h_ms: 0.0,
 });
-static PROBE: Probe = Probe::new("NAIWA_LOOKAHEAD_DBG");
+static PROBE: Probe = Probe::new(|d| d.lookahead_dbg);
 static WINDOW: Window = Window::new(384); // eight layer passes
 
 /// Token-thread cost of queueing the publish (the `publish` call, host side).

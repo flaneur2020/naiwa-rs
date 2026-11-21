@@ -173,7 +173,7 @@ impl Layers {
         // `NAIWA_REFILL=0`: the displaced experts stay empty and come back on demand, which is the pre-M33
         // behaviour. It is here because it is the one-step bisection of the loan's NaN (M33 §15): if the failure
         // survives without the refill, the refill is not what corrupts the slots.
-        if std::env::var("NAIWA_REFILL").is_ok_and(|v| v == "0") {
+        if !crate::config::runtime().refill_lent {
             if !lent.is_empty() {
                 tracing::info!(
                     "expert cache: the loan is given back, 0 of {} displaced experts refilled (NAIWA_REFILL=0)",
@@ -437,15 +437,9 @@ pub(crate) const MAX_DECODE_ROWS: usize = 256;
 /// would take in a few cheap steps against the cache the previous turn just warmed.
 ///
 /// `NAIWA_PREFILL_THRESHOLD` (probe) raises the cut so a whole small suffix takes the decode split.
+#[inline]
 fn prefill_threshold() -> usize {
-    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("NAIWA_PREFILL_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(PREFILL_THRESHOLD)
-            .clamp(1, MAX_DECODE_ROWS)
-    })
+    crate::config::runtime().prefill_threshold
 }
 
 /// Mutable per-layer decode state: doorbell, slots and LRU/hit counters.
@@ -549,7 +543,7 @@ impl RoutedExperts for CachedExperts {
         // and whether the slab still considers its bytes loaned. Added for M35 §15, where a single-chunk prompt
         // returned no token at all with the loan on: the two arms differ only in what happens *after* the prompt
         // steps, so the branch and the flag are the two facts that separate them.
-        if layer.layer == 0 && std::env::var_os("NAIWA_LAYER_DBG").is_some() {
+        if layer.layer == 0 && crate::config::diag().layer_dbg {
             eprintln!(
                 "LAYER_DBG rows={num_tokens} prefill_threshold={} slab_borrowed={} prefill_engine={}",
                 prefill_threshold(),
@@ -571,7 +565,7 @@ impl RoutedExperts for CachedExperts {
             // A borrowing stream writes into the cache's own bytes, so nothing may be filling those slots at the
             // same time: a background fill would hold a slot buffer (and queue a copy into it) across the chunk.
             // The fills are worthless during a chunk anyway - measured, `NAIWA_NO_PREFILL_FILL` changes nothing.
-            if std::env::var_os("NAIWA_NO_PREFILL_FILL").is_none()
+            if !crate::config::runtime().no_prefill_fill
                 && !crate::moe::slab::Slab::borrowing()
             {
                 if let Some(next) = layer.layers.get(layer.layer + 1) {
@@ -600,7 +594,7 @@ impl RoutedExperts for CachedExperts {
                 if let Some(out) = ps.forward(layer.layer, xs, &topk_weights, topk_ids)? {
                     // `NAIWA_BORROW_CHECK=1`: a chunk whose output is not finite is the borrow corrupting its own
                     // buffer; one whose output is finite points the failure at the decode side instead.
-                    if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
+                    if crate::config::diag().borrow_check {
                         // `flatten_all`, not `to_vec2`: `out` is [batch, seq, hidden] and `to_vec2` requires
                         // rank 2 - the check itself raised "unexpected rank" until this was fixed, which made a
                         // diagnostic look like the defect.
@@ -873,14 +867,9 @@ impl CachedLayer {
     /// fall as they always did (`wait_for_readers` depends on exactly that).
     /// Promote up to this many staged experts **per layer per step** (default 1; `0` switches promotion off
     /// entirely, and is the only value that makes the decode path pay nothing for it).
+    #[inline]
     fn promote_cap() -> usize {
-        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            std::env::var("NAIWA_PROMOTE_MAX")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1)
-        })
+        crate::config::runtime().promote_max
     }
 
     /// Whether promotion is switched on at all. Read once: the decode path calls this every layer, so it must not
@@ -904,7 +893,7 @@ impl CachedLayer {
         // later step. Sort by expert id so the promotion is a function of the demand alone.
         let mut staged = std::mem::take(&mut *self.staged_now.lock().unwrap());
         staged.sort_unstable_by_key(|(id, _)| *id);
-        if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
+        if crate::config::diag().promote_trace {
             eprintln!(
                 "PROMOTE_ENTER layer {} cap {} staged {} promoting {}",
                 self.layer,
@@ -928,10 +917,7 @@ impl CachedLayer {
         // **Second sighting, at least**: an expert that just missed is by definition a rare one, and evicting a hot
         // resident to hold it is how this mechanism lost 2-4 ms (§23/§24). `hit_counts` counts *demand* (every routed
         // expert, resident or not), so this admits only what has actually been asked for repeatedly.
-        let min_sightings = std::env::var("NAIWA_PROMOTE_MIN_HITS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(4);
+        let min_sightings = crate::config::runtime().promote_min_hits;
         let mut promoted = 0usize;
         let mut skipped = 0usize;
         let mut cold = 0usize;
@@ -1035,7 +1021,7 @@ impl CachedLayer {
         if promoted > 0 {
             stats::record_promotions(promoted);
         }
-        if std::env::var_os("NAIWA_PROMOTE_TRACE").is_some() {
+        if crate::config::diag().promote_trace {
             // Off by default; `NAIWA_PROMOTE_TRACE=1` prints one line per layer per step.
             eprintln!(
                 "PROMOTE layer {} staged {} promoted {} skipped {} cold {} filled {}",
@@ -1201,7 +1187,7 @@ impl CachedLayer {
             // A borrowed chunk owns the slab's low end right now: this slot may *be* part of the chunk's buffer, so
             // the upload must not happen at all. The slot keeps its reservation and has no published buffer, so the
             // hit path treats it as a miss.
-            if std::env::var_os("NAIWA_BORROW_CHECK").is_some() {
+            if crate::config::diag().borrow_check {
                 eprintln!("UPLOAD_REFUSED layer {} expert {expert_id}", self.layer);
             }
             return Ok(None);

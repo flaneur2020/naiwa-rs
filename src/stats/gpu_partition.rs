@@ -8,10 +8,11 @@ struct Row { layer:usize,rows:usize,ms:[f32;10] }
 struct Buffer { rows:Vec<Row>,last:Instant,dropped:u64 }
 static BUFFER:OnceLock<Arc<Mutex<Buffer>>>=OnceLock::new();
 thread_local! { static PENDING:RefCell<Vec<Layer>>=const{RefCell::new(Vec::new())}; static FREE:RefCell<Vec<Layer>>=const{RefCell::new(Vec::new())}; }
-pub(crate) fn enabled()->bool { static ON:OnceLock<bool>=OnceLock::new();*ON.get_or_init(||std::env::var_os("NAIWA_GPU_PARTITION_FILE").is_some()) }
+#[inline]
+pub(crate) fn enabled()->bool { crate::config::diag().gpu_partition_file.is_some() }
 fn buffer()->&'static Arc<Mutex<Buffer>> { BUFFER.get_or_init(|| {
  let buffer=Arc::new(Mutex::new(Buffer{rows:Vec::with_capacity(65536),last:Instant::now(),dropped:0}));let writer=buffer.clone();
- let path=std::env::var_os("NAIWA_GPU_PARTITION_FILE").unwrap();
+ let path=crate::config::diag().gpu_partition_file.as_ref().unwrap();
  let file=std::fs::File::create(path).expect("partition file");
  std::thread::spawn(move||{ use std::io::Write;let mut f=std::io::BufWriter::new(file);loop{std::thread::sleep(Duration::from_millis(100));let batch={let mut b=writer.lock().unwrap();if b.rows.is_empty()||b.last.elapsed()<Duration::from_millis(300){continue}let rows=std::mem::replace(&mut b.rows,Vec::with_capacity(65536));let dropped=b.dropped;b.dropped=0;(rows,dropped)};for r in batch.0{let mut endpoints:Vec<_>=PHASES.iter().zip(r.ms.iter()).map(|(p,t)|serde_json::json!([p,t])).collect();endpoints.push(serde_json::json!(["next_route",r.ms[9]]));writeln!(f,"{}",serde_json::json!({"layer":r.layer,"rows":r.rows,"endpoints_ms":endpoints})).unwrap();}writeln!(f,"{}",serde_json::json!({"flush":true,"dropped":batch.1})).unwrap();f.flush().unwrap();}});buffer
  }) }

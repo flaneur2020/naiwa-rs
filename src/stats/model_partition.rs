@@ -7,19 +7,19 @@ struct Row {layer:usize,rows:usize,ms:[f32;19]}
 struct Buffer {rows:Vec<Row>,last:Instant,dropped:u64}
 static BUFFER:OnceLock<Arc<Mutex<Buffer>>>=OnceLock::new();
 thread_local! {static PENDING:RefCell<Vec<Layer>>=const{RefCell::new(Vec::new())};static FREE:RefCell<Vec<Layer>>=const{RefCell::new(Vec::new())};static ACTIVE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
-pub(crate) fn install(){if std::env::var_os("NAIWA_MODEL_PARTITION_FILE").is_some()||super::head_partition::enabled(){assert!(mistralrs_core::qwen4_split::set_boundary_probe(dispatch));}}
+pub(crate) fn install(){if crate::config::diag().model_partition_file.is_some()||super::head_partition::enabled(){assert!(mistralrs_core::qwen4_split::set_boundary_probe(dispatch));}}
 fn dispatch(xs:&Tensor,layer:usize,phase:&'static str){
  if phase.starts_with("sample_")||phase.starts_with("pipeline_"){super::head_partition::host_mark(phase);return;}
  if matches!(phase,"tail_start"|"head_start"|"head_end"|"next_model"){super::head_partition::mark(xs,phase);return;}
- if std::env::var_os("NAIWA_MODEL_PARTITION_FILE").is_some(){mark(xs,layer,phase);}
+ if crate::config::diag().model_partition_file.is_some(){mark(xs,layer,phase);}
 }
 fn buffer()->&'static Arc<Mutex<Buffer>>{BUFFER.get_or_init(||{
  let b=Arc::new(Mutex::new(Buffer{rows:Vec::with_capacity(65536),last:Instant::now(),dropped:0}));let writer=b.clone();
- let file=std::fs::File::create(std::env::var_os("NAIWA_MODEL_PARTITION_FILE").unwrap()).expect("model partition file");
+ let file=std::fs::File::create(crate::config::diag().model_partition_file.as_ref().unwrap()).expect("model partition file");
  std::thread::spawn(move||{use std::io::Write;let mut f=std::io::BufWriter::new(file);loop{std::thread::sleep(Duration::from_millis(100));let batch={let mut b=writer.lock().unwrap();if b.rows.is_empty()||b.last.elapsed()<Duration::from_millis(300){continue}let rows=std::mem::replace(&mut b.rows,Vec::with_capacity(65536));let drops=b.dropped;b.dropped=0;(rows,drops)};for r in batch.0{let mut ep:Vec<_>=PHASES.iter().zip(r.ms).enumerate().map(|(i,(p,t))|{let name=match i {2=>"attn_down",3=>"attn_act",4=>"attn_up",9=>"mlp_down",10=>"mlp_act",11=>"mlp_up",_=>p};serde_json::json!([name,t])}).collect();ep.push(serde_json::json!(["next_layer",r.ms[18]]));writeln!(f,"{}",serde_json::json!({"layer":r.layer,"rows":r.rows,"endpoints_ms":ep})).unwrap();}writeln!(f,"{}",serde_json::json!({"flush":true,"dropped":batch.1})).unwrap();f.flush().unwrap();}});b
 })}
 fn mark(xs:&Tensor,layer:usize,phase:&'static str){
- static STRIDE:OnceLock<usize>=OnceLock::new();let stride=*STRIDE.get_or_init(||std::env::var("NAIWA_MODEL_PARTITION_STRIDE").ok().and_then(|v|v.parse().ok()).unwrap_or(1).max(1));
+ let stride=crate::config::diag().model_partition_stride;
  if phase=="layer_start"{ACTIVE.with(|a|a.set(layer%stride==0));}
  if !ACTIVE.with(|a|a.get()){return;}
  if !xs.device().is_cuda(){return}let stream=xs.device().as_cuda_device().unwrap().cuda_stream();let b=buffer();

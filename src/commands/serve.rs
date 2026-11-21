@@ -82,7 +82,7 @@ pub async fn run_serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    if std::env::var_os("NAIWA_STATS").is_some() {
+    if crate::config::diag().stats {
         let s = crate::stats::dump_cache_stats();
         if s.installed {
             info!(

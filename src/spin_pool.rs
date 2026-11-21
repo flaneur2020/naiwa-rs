@@ -7,8 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 fn aligned() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NAIWA_CPU_PHYSICAL_LAYOUT").is_some())
+    crate::config::runtime().cpu_physical_layout
 }
 fn pin(cpu: usize) {
     #[cfg(target_os = "linux")]
@@ -134,13 +133,10 @@ impl Drop for Pool {
 pub(crate) fn dispatch(n: usize, f: Callback<'_>) {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let workers = std::env::var("NAIWA_CPU_MOE_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let cfg = crate::config::runtime();
+        let workers = cfg.cpu_moe_threads;
         if aligned() { assert_eq!(workers, 5, "physical layout requires five workers plus caller"); }
-        let spin = match std::env::var("NAIWA_CPU_SPIN_US").as_deref() {
-            Ok("forever") => None,
-            Ok(value) => Some(Duration::from_micros(value.parse().expect("NAIWA_CPU_SPIN_US must be integer or forever"))),
-            Err(_) => Some(Duration::from_micros(1000)),
-        };
+        let spin = cfg.spin_budget();
         Pool::new(workers, spin)
     }).run(n, f);
 }

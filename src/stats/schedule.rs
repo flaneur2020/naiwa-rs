@@ -22,9 +22,9 @@ struct Recorder {
 }
 static RECORDER: OnceLock<Option<std::sync::Arc<Recorder>>> = OnceLock::new();
 
+#[inline]
 pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NAIWA_SCHEDULE_FILE").is_some())
+    crate::config::diag().schedule_file.is_some()
 }
 
 pub(crate) fn event(layer: usize, tick: u64, phase: &'static str) {
@@ -38,7 +38,7 @@ pub(crate) fn bytes(layer: usize, tick: u64, phase: &'static str, bytes: u64) {
 pub(crate) fn detail(layer: usize, tick: u64, phase: &'static str, bytes: u64, expert: Option<usize>, slot: Option<usize>) {
     if !enabled() { return; }
     let recorder = RECORDER.get_or_init(|| {
-        let path = std::env::var_os("NAIWA_SCHEDULE_FILE")?;
+        let path = crate::config::diag().schedule_file.as_ref()?;
         let file = std::fs::File::create(path).expect("create schedule event file");
         let r = std::sync::Arc::new(Recorder {
             origin: Instant::now(),

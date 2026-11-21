@@ -120,16 +120,9 @@ pub(crate) const SUB_ROWS: usize = 256;
 /// The constants stay overridable (`NAIWA_CHUNK_FIXED_MIB`, `NAIWA_CHUNK_PER_ROW_KIB`) because they encode this
 /// model's shapes, not the hardware's.
 pub(crate) fn chunk_scratch(rows: usize) -> usize {
-    let fixed = std::env::var("NAIWA_CHUNK_FIXED_MIB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mib| mib << 20)
-        .unwrap_or(32 << 20);
-    let per_row = std::env::var("NAIWA_CHUNK_PER_ROW_KIB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|kib| kib << 10)
-        .unwrap_or(354 << 10);
+    let cfg = crate::config::runtime();
+    let fixed = cfg.chunk_fixed_bytes;
+    let per_row = cfg.chunk_per_row_bytes;
     // **No floor from `activation_bytes`**: the shape estimate is 337 MiB for 288 rows (it carries a fixed per-call
     // MoE term that the measurement says is not there) and 359 MiB for 1 216 where the measurement reads 386 - so a
     // `max` would price a small chunk 5x too high and refuse chunks that run. The line is the measurement.
@@ -224,10 +217,7 @@ pub(crate) fn plan_with_lend_depth(
     // `NAIWA_PREFILL_SLACK_MIB` (probe): the free-VRAM slack the plan keeps beyond the buffers and the
     // activations. The 512 MiB floor is what M10 measured as safe, and it is also the only thing standing
     // between one buffer and two at this card's free VRAM, so it is worth calibrating instead of trusting.
-    let slack_override = std::env::var("NAIWA_PREFILL_SLACK_MIB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mib| mib << 20);
+    let slack_override = crate::config::runtime().prefill_slack_bytes;
     let fits = |chunk: usize, stride: usize| {
         let act = activation_bytes(chunk);
         let head = slack_override.unwrap_or_else(|| MAX_HEADROOM.max(free / 8));
@@ -265,11 +255,7 @@ pub(crate) fn plan_with_lend_depth(
     // and a fixed head and then granted two buffers with 606 MiB spare - which OOM'd a 1725-row prompt
     // (`moe experts forward: CUDA_ERROR_OUT_OF_MEMORY`). One buffer still fits in that case, so refusing the second
     // degrades rather than disables, which is the failure posture the design asks for.
-    let reserve = std::env::var("NAIWA_DECODE_RESERVE_MIB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mib| mib << 20)
-        .unwrap_or(700 << 20);
+    let reserve = crate::config::runtime().decode_reserve_bytes;
     let depth_max = max_depth.clamp(1, MAX_DEPTH);
     // Walk the depth down from the ceiling: deeper is preferred, the first one that fits wins, and 1 always can.
     let mut stride = 1;
@@ -285,10 +271,7 @@ pub(crate) fn plan_with_lend_depth(
         // `NAIWA_DEPTH_CAP` (probe): the wipe is *not* capped in the code any more, it is capped here so that a
         // configuration which produced no decode tokens (§15) is not reachable by accident. Set it high to measure
         // what a deeper queue does on a card that has the room.
-        let cap = std::env::var("NAIWA_DEPTH_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2);
+        let cap = crate::config::runtime().depth_cap;
         stride = (lend_bytes / layer_bytes.max(1)).clamp(1, depth_max.min(cap));
     } else {
         for d in (2..=depth_max).rev() {
@@ -309,14 +292,7 @@ pub(crate) fn plan_with_lend_depth(
 ///
 /// `NAIWA_KV_RESERVE_MIB` (probe): override it, e.g. `0` to reproduce the pre-M21 behaviour.
 fn kv_reserve() -> usize {
-    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *R.get_or_init(|| {
-        std::env::var("NAIWA_KV_RESERVE_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|mib| mib << 20)
-            .unwrap_or(384 << 20)
-    })
+    crate::config::runtime().kv_reserve_bytes
 }
 
 /// One layer's host stacks (gate, up, down). Holding them keeps the memory that in-flight
@@ -512,8 +488,8 @@ impl PrefillStream {
         // itself against a card that looked full when the process had simply grown into the space. Measured
         // 2026-11-05: freeing a 6.6 GiB game from this 12 GiB card made the *plan worse* (chunk 2 560 -> 1 792) for
         // exactly this reason, and a trim before the measurement is what separates the two.
-        // `NAIWA_PLAN_TRIM=0` is the arm without it.
-        if std::env::var("NAIWA_PLAN_TRIM").is_ok_and(|v| v != "0") {
+        // `NAIWA_PLAN_TRIM=1` (default off; any value other than `0` enables) trims the pool before measuring.
+        if crate::config::runtime().plan_trim {
             match crate::copy_stream::trim_device_pool(&self.device) {
                 Ok(()) => crate::dbg_note("prefill_plan", "trimmed the pool before measuring"),
                 Err(e) => crate::dbg_note("prefill_plan", &format!("trim failed: {e}")),
@@ -563,8 +539,7 @@ impl PrefillStream {
     /// default so a cache that starves the stream fails at startup with the number to fix, instead of serving at
     /// 41x slower (m21 §10).
     fn allow_cpu() -> bool {
-        static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *A.get_or_init(|| std::env::var_os("NAIWA_PREFILL_ALLOW_CPU").is_some())
+        crate::config::runtime().prefill_allow_cpu
     }
 
     /// How many buffers to use, decided once from free VRAM: `2` (overlap the next layer's upload
@@ -592,7 +567,7 @@ impl PrefillStream {
                 // The largest layer's three projections fit comfortably in 768 MiB. With `NAIWA_BORROW_UNUSED`
                 // the same block is carved from the cache slab's unused tail instead of a private allocation: the
                 // bytes are the cache's, but no bank points at them.
-                let st = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
+                let st = if crate::config::runtime().borrow_unused {
                     let slab = self.slab.as_ref().ok_or_else(|| {
                         candle_core::Error::Msg("unused-borrow needs the cache slab".into())
                     })?;
@@ -657,7 +632,7 @@ impl PrefillStream {
     ) -> candle_core::Result<[SlotMemory; 3]> {
         // Diagnostic arm only: the loan is meant to be the pool's own bytes, and `NAIWA_BORROW_PRIVATE=1` is how the
         // beside-the-cache chunk is measured against it (that arm is what M18 measured).
-        if std::env::var_os("NAIWA_BORROW_PRIVATE").is_some() {
+        if crate::config::runtime().borrow_private {
             return self.borrow_private(stacks);
         }
         let slab = self.slab.as_ref().expect("checked by borrows()");
@@ -695,7 +670,7 @@ impl PrefillStream {
             // `offset + padded`, so without those bytes the *last* expert sub-range of a layer cannot be viewed
             // (it overran by exactly the padding and the split fell back to whole layers - M34 §17).
             let padded = stack.shape().elem_count() + candle_core::quantized::cuda::MATRIX_ROW_PADDING;
-            let storage = if std::env::var_os("NAIWA_BORROW_UNUSED").is_some() {
+            let storage = if crate::config::runtime().borrow_unused {
                 match slab.alloc(padded, stack.dtype(), &self.device)? {
                     Some(st) => st,
                     None => candle_core::bail!("slab is full"),
@@ -716,7 +691,7 @@ impl PrefillStream {
         // `NAIWA_LAYER_DBG=1` (M35 §15): the layout's own numbers, because `span` is computed from *unpadded*
         // layer sums while the placement below pads every projection by `MATRIX_ROW_PADDING` and aligns to 256
         // bytes - so a layer's real footprint can exceed the range it was given and reach into the next buffer.
-        if std::env::var_os("NAIWA_LAYER_DBG").is_some() {
+        if crate::config::diag().layer_dbg {
             let used = offset - buf * span;
             let kinds: Vec<String> = stacks
                 .iter()
@@ -736,7 +711,7 @@ impl PrefillStream {
                 kinds.join(" ")
             );
         }
-        if std::env::var_os("NAIWA_PREFILL_QUIESCE").is_some() {
+        if crate::config::runtime().prefill_quiesce {
             // Make the non-overlap a fact rather than an assumption: no prediction job runs during a chunk, and the
             // ones the previous decode step queued are dropped, so nothing the lookahead started can be in flight
             // when the chunk takes the cache's bytes.
@@ -794,7 +769,7 @@ impl PrefillStream {
         // `upload_async` waits on it - and at layer 0 the range is emptied (which waits for its readers) and the
         // chunk's first upload has nothing of its own to race.
         self.copy.after_device_work()?;
-        if std::env::var_os("NAIWA_BORROW_NOZERO").is_none() {
+        if !crate::config::runtime().borrow_nozero {
             // **Default** (disable with `NAIWA_BORROW_NOZERO`): zero the whole borrowed span before the upload. The
             // chunk only DMAs each projection's
             // `size_in_bytes`; `MATRIX_ROW_PADDING` bytes at the end - which a kernel may legitimately read - are
@@ -821,7 +796,7 @@ impl PrefillStream {
         if let Some(cache) = self.cache.as_ref() {
             // Probe: keep everything identical but skip the emptying, to tell "the chunk writing into the cache's
             // bytes" from "the cache's slot metadata being cleared".
-            let emptied = if std::env::var_os("NAIWA_BORROW_NOEMPTY").is_some() {
+            let emptied = if crate::config::runtime().borrow_noempty {
                 0
             } else {
                 cache.empty_range(base, base + loaned as u64)
@@ -843,7 +818,7 @@ impl PrefillStream {
     }
 
     fn sample_peak(&self, layer: usize, rows: usize) {
-        if std::env::var_os("NAIWA_PREFILL_PEAK").is_none() {
+        if !crate::config::diag().prefill_peak {
             return;
         }
         let Some(free) = crate::copy_stream::free_bytes(&self.device) else {
@@ -915,8 +890,7 @@ impl PrefillStream {
     /// CPU. The measured failure mode is otherwise brutal: at `--expert-cache-gb 2.8` the plan misses by ~20 MiB,
     /// the stream turns itself off, and `doc` turn-1 goes 4.0 s -> 132 s with one WARN in the log.
     fn strict() -> bool {
-        static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *STRICT.get_or_init(|| std::env::var_os("NAIWA_PREFILL_STRICT").is_some())
+        crate::config::runtime().prefill_strict
     }
 
     fn reserve(&self) -> candle_core::Result<usize> {
@@ -1100,7 +1074,7 @@ impl PrefillStream {
             // and 4.51 -> 4.05 s with one, with no OOM and the plan's free VRAM unchanged - so the pool does
             // not hoard the way the original comment feared.
             // `NAIWA_SHAPE_TRIM=1` restores it for an A/B.
-            if std::env::var_os("NAIWA_SHAPE_TRIM").is_some() {
+            if crate::config::runtime().shape_trim {
                 trim_device_pool(&self.device)?;
             }
             trace_buffer_bytes(&self.device, layer, &stacks);
@@ -1150,17 +1124,14 @@ impl PrefillStream {
         // unmodified for as long as this stream exists (`Drop` waits for the copies).
         let queued = std::time::Instant::now();
         crate::dbg_note("prefill_load", &format!("layer {layer}: queueing {} bytes", buf.bytes));
-        if std::env::var_os("NAIWA_STREAM_SYNC").is_some() {
+        if crate::config::runtime().stream_sync {
             // Serial probe: the blocking upload waits for the copies, so the line above reports the copy's own
             // wall time and rate instead of the queue-side latency (`wait_on` only *enqueues* a stream wait).
             // It also removes every overlap, so this mode measures throughput and nothing else.
             self.copy.upload(&buf.released, &parts)?;
         } else {
             // `NAIWA_COPY_SPLIT=g` (probe): the same upload as g sub-copies per projection.
-            let split = std::env::var("NAIWA_COPY_SPLIT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1);
+            let split = crate::config::runtime().copy_split;
             unsafe { self.copy.upload_async_split(&buf.released, &parts, split, &buf.ready)? };
         }
         buf.queued = Some(queued);
@@ -1225,7 +1196,7 @@ impl PrefillStream {
         g: usize,
         per: usize,
     ) -> candle_core::Result<Tensor> {
-        let mask = std::env::var_os("NAIWA_SPLIT_CHECK").is_some();
+        let mask = crate::config::diag().split_check;
         let whole = if mask {
             Some(experts.forward(xs, topk_weights.clone(), topk_ids)?)
         } else {
@@ -1403,7 +1374,7 @@ impl PrefillStream {
         // `NAIWA_REQ_TIME=1`: absolute wall-clock stamps at the first and last layer of a chunk, so the prefill can be
         // split against what the *client* sees. `gap` cannot do this: it is entry-to-entry over layers 1..47, so layer
         // 0's work, the last layer's work and everything before/after the loop are all outside it (M34 §21).
-        if std::env::var_os("NAIWA_REQ_TIME").is_some() {
+        if crate::config::diag().req_time {
             use std::sync::atomic::{AtomicU64, Ordering};
             static FIRST: AtomicU64 = AtomicU64::new(0);
             static LAST: AtomicU64 = AtomicU64::new(0);
@@ -1449,7 +1420,7 @@ impl PrefillStream {
         }
         // A chunk starts here: gate the cache's fillers out, zero the span and empty every slot the loan covers -
         // **once per chunk, and whether or not this chunk had to allocate** (see `begin_chunk`).
-        if layer == 0 && std::env::var_os("NAIWA_PREFILL_NOQUIESCE").is_none() {
+        if layer == 0 && !crate::config::runtime().prefill_noquiesce {
             // **Stop the prediction machinery for the chunk** - the default since M33 §20. Measured: the device spent
             // 0.486 s of a 1 072-row prompt spinning in `doorbell_wait_copy_f32_kernel`, 40% of that chunk's kernel
             // time, waiting for CPU-computed experts it does not need, because the lookahead kept running per layer
@@ -1533,7 +1504,7 @@ impl PrefillStream {
         }
         // Canary (`NAIWA_BORROW_CANARY=1`): the chunk's bytes as they were after the upload; compared again right
         // before the compute. A difference proves someone wrote inside the window and names the offset.
-        let take_snap = self.borrows() && std::env::var_os("NAIWA_BORROW_SNAP").is_some();
+        let take_snap = self.borrows() && crate::config::diag().borrow_snap;
         if take_snap {
             let shadow = {
                 let mut slot = self.snap.lock().unwrap();
@@ -1564,7 +1535,7 @@ impl PrefillStream {
         // `NAIWA_BORROW_SNAP=1`: snapshot the first 4 KiB of each projection right after the upload with a
         // **device-to-device** copy (queued, never a host wait), then compare at the end of the layer. This is the
         // one observation that does not itself serialise the race the way a host read does.
-        if self.borrows() && std::env::var_os("NAIWA_BORROW_SNAP").is_some() {
+        if self.borrows() && crate::config::diag().borrow_snap {
             let snap = {
                 let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
                 buf.memory.as_ref().map(|m| {
@@ -1575,7 +1546,7 @@ impl PrefillStream {
             };
             let _ = snap;
         }
-        let canary = if self.borrows() && std::env::var_os("NAIWA_BORROW_CANARY").is_some() {
+        let canary = if self.borrows() && crate::config::diag().borrow_canary {
             let buf = self.bufs[layer % stride.max(1)].lock().unwrap();
             buf.memory.as_ref().map(|m| {
                 m.iter()
@@ -1601,7 +1572,7 @@ impl PrefillStream {
                 }
             }
         }
-        if self.borrows() && std::env::var_os("NAIWA_BORROW_BARRIER").is_some() {
+        if self.borrows() && crate::config::runtime().borrow_barrier {
             // Probe: everything settled before the compute touches the buffer.
             self.copy.after_device_work()?;
             self.copy.synchronize()?;
