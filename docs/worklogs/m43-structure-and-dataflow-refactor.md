@@ -1,6 +1,6 @@
 # M43 — 执行结构与数据流重构计划
 
-**Status：** In progress；R0 已保存工作区快照，R1 首次拆分已实测并回退，尚无代码重构通过验收。
+**Status：** Completed（naiwa-rs 范围：R0/R1/R2/R3/R4/R5 及结构清理已分阶段完成并通过正确性与性能门；R6 fork 采样边界与 R7 harness 拆分留待后续独立里程碑）。
 
 **Parent：** [M42 优化总结](m42-optimization-summary.md)、[M42 归因记录](m42-token-thread-sync-reads.md)。
 
@@ -173,3 +173,20 @@ src/moe/
 - **再次不接受该候选**：已回退本轮所有源代码变化，保留补丁、源码清单、oracle及全部逐轮证据，见 `harness/m43/README.md`。回退后release build/check通过。
 - MTP文本/工作不同、未采接受数，不能断言纯函数搬迁导致慢0.591ms。下一步先量化同binary重复性，并建立no-lookahead MTP工作/接受身份控制；不重复同候选直到中位数有利，也不事后放宽门限。
 - 首个候选oracle因外层命令总时限中断、未发生成请求；新完整采集通过，两组性能batch无失败/重试。第二prompt/完整工作身份门未完成，R1仍未完成。默认不变。
+
+## 12. 完成记录（分阶段重构与全量门控验收）
+
+以 `75641da` 为源码匹配冻结基线（`/tmp/naiwa-refactor-baseline/baseline`，SHA256 `187db5f7...`），按配置→清理→缺陷修复→模块拆分→热路径数据流与 `CachedLayer` 拆分顺序完成 6 个独立提交（均未改动 `../candle` 或 `../mistral.rs-iq4xs`，未改动任何默认值）：
+
+1. **Phase 3 (`6892597`) — 集中配置（对应 R2）：** 新增 `src/config.rs`（`RuntimeConfig` / `DiagConfig` / `EnvConfig::from_lookup`），收口全部 73 处 `NAIWA_*` 环境变量读取；保留原有存在性判定与默认关闭语义（含 `NAIWA_PLAN_TRIM` 默认关）。
+   - 验收：Rust 61/61、冻结 oracle 字节一致、`--no-lookahead` `MOE_WORK` 6,192/6,192 字节一致；5 轮配对中位数：默认 **-0.618 ms/tok**、调优/MTP2 **-0.272 ms/tok**。
+2. **Phase 2 (`32785d4`) — 死代码与非 CUDA stub 清理：** 删除未使用 `src/moe/arena.rs`、死函数/静态量与冗余 `capture_bank` 返回值；修复 `provider.rs` 错误 `#[cfg(feature = "cuda")]` 与 `copy_stream::stub`。
+   - 验收：Rust 55/55、冻结 oracle 字节一致。
+3. **Phase 1 (`0d11c7b`) — 正确性与热路径修补：** 修复 `prefill_stream` 诊断自锁死锁；修复 `rings_exec` 持锁等待 `wait_for_readers`、缺失 `fence.record_reads` 与错误路径未恢复 slot；`decode.rs` 将预算计数分配/排序与 `Instant::now()` 门控到 `if budget`。
+   - 验收：Rust 55/55、冻结 oracle 字节一致；5 轮配对中位数：默认 **-0.408 ms/tok**、调优/MTP2 **+0.187 ms/tok**（+0.49%）。
+4. **Phase 4 (`d0419ca`) — `prefill_stream` 拆分与 `stats` 统一（对应 R5）：** `src/prefill_stream.rs`（2,050 行）拆分为 `mod/planner/buffers/split/diagnostics.rs`；迁移 `src/stats/vram_peak.rs`；抽出 `src/stats/sink.rs`（`AsyncJsonSink<T>`）统一 4 个 JSONL 诊断 sink 并格式化长行。
+   - 验收：Rust 55/55、Python harness 15/15、冻结 oracle 字节一致；实机验证 4 类 JSONL 诊断输出 0 drops。
+5. **Phase 5a (`cfbd2fe`) — 显式执行计划（对应 R3）：** `RoutePlan` 拆分为 `resident` / `staged`（消除每层两次 `Vec<Vec<Hit>>` clone 与冗余 resident fence）；`early_cpu + cpu_submitted` 替换为 `CpuWork` enum。
+   - 验收：Rust 55/55、冻结 oracle 字节一致；5 轮配对中位数：默认 **-0.189 ms/tok**、调优/MTP2 **-0.169 ms/tok**。
+6. **Phase 5b+5c（对应 R1/R4/文档同步）：** `src/moe/cached_layer.rs`（1,337→396 行）拆出 `layer_registry.rs`、`activation_channel.rs`、`cache_policy.rs`、`cache_updates.rs`（关键热路径辅助函数标注 `#[inline]` 避免跨模块内联回退）；将全局 `slab::BORROWED`/`ACCESS` 替换为 per-provider `BorrowGate`；在 `src/moe/mod.rs` 文档化锁序 DAG 并同步 `docs/design.md`。
+   - 验收：Rust 56/56（含新增 `BorrowGate` 单测）、Python harness 15/15、冻结 oracle 字节一致、`--no-lookahead` `MOE_WORK` 6,192/6,192 字节一致（`all_text_equal: true`）；5 轮配对中位数：默认 **-0.081 ms/tok**、调优/MTP2 **+0.215 ms/tok**（+0.58%），全部满足 `<= +0.3 ms/tok` 且 `<= +1%` 门限。

@@ -74,7 +74,7 @@ impl CpuMiss {
         x2d: &Tensor,
         rows: usize,
         route_ready: Option<std::time::Instant>,
-        published: Option<(Arc<crate::moe::LookaheadChannel>, u32)>,
+        published: Option<(Arc<crate::moe::CpuActivationChannel>, u32)>,
     ) -> Result<Option<CpuPending>> {
         if misses.iter().all(Vec::is_empty) {
             return Ok(None);

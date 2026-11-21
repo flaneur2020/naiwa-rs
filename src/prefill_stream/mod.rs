@@ -42,8 +42,8 @@ pub struct PrefillStream {
     pub(super) split: usize,
     pub(super) act: Activation,
     pub(super) comm: Arc<Comm>,
-    pub(super) layers: RwLock<Vec<Option<HostStacks>>>,
-    pub(super) bufs: Vec<Mutex<LayerBuf>>,
+    pub(in crate::prefill_stream) layers: RwLock<Vec<Option<HostStacks>>>,
+    pub(in crate::prefill_stream) bufs: Vec<Mutex<LayerBuf>>,
     /// `--prefill-depth`: the most buffers the plan may use.
     pub(super) depth: usize,
     /// The memory plan in force (buffers and prompt step), from warmup and re-checked at the first long chunk.
@@ -54,12 +54,13 @@ pub struct PrefillStream {
     pub(super) checked: AtomicBool,
     /// Chunks shorter than this stay on the CPU.
     min_tokens: usize,
-    pub(super) peak: Mutex<Peak>,
+    pub(in crate::prefill_stream) peak: Mutex<Peak>,
     last_entry: Mutex<Option<Instant>>,
     pub(super) private_slab: Mutex<Option<Arc<candle_core::quantized::cuda::QCudaStorage>>>,
     pub(super) snap: Mutex<Option<Arc<QTensor>>>,
     pub(super) slab: Option<Arc<crate::moe::slab::Slab>>,
     pub(super) cache: Option<Arc<crate::moe::Layers>>,
+    pub(super) borrow_gate: Arc<crate::moe::slab::BorrowGate>,
 }
 
 impl PrefillStream {
@@ -77,6 +78,7 @@ impl PrefillStream {
         split: usize,
         slab: Option<Arc<crate::moe::slab::Slab>>,
         cache: Option<Arc<crate::moe::Layers>>,
+        borrow_gate: Arc<crate::moe::slab::BorrowGate>,
     ) -> candle_core::Result<Option<Self>> {
         let Some(copy) = copy else {
             return Ok(None);
@@ -117,6 +119,7 @@ impl PrefillStream {
             private_slab: Mutex::new(None),
             slab,
             cache,
+            borrow_gate,
         }))
     }
 
@@ -315,6 +318,7 @@ impl PrefillStreams {
     /// Register `experts` (this block's CPU stacks) for streaming and return the device's
     /// stream. `None` for the MTP head, for stacks that are not all page-locked (`pinned`), and
     /// off CUDA: such a layer keeps its prefill on the CPU.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
         ctx: &ExpertLoadContext<'_>,
@@ -323,6 +327,7 @@ impl PrefillStreams {
         copy_streams: &CopyStreams,
         slab: Option<Arc<crate::moe::slab::Slab>>,
         cache: Option<Arc<crate::moe::Layers>>,
+        borrow_gate: Arc<crate::moe::slab::BorrowGate>,
     ) -> candle_core::Result<Option<Arc<PrefillStream>>> {
         if ctx.site.is_mtp || !pinned || experts.expert_qtensors().is_none() {
             return Ok(None);
@@ -344,6 +349,7 @@ impl PrefillStreams {
                     self.split,
                     slab,
                     cache,
+                    borrow_gate,
                 )?
                 else {
                     return Ok(None);

@@ -17,48 +17,41 @@ use candle_core::quantized::cuda::QCudaStorage;
 use candle_core::quantized::GgmlDType;
 use candle_core::Device;
 
-/// Set while a chunk is computing inside the slab, i.e. while the cache's own bytes are the chunk's layer buffer.
+/// Per-provider gate coordinating cache slot fills against prefill-stream slab borrows.
 ///
-/// Every writer into cache slots consults it. Without that gate the lookahead's fills (and the preload handoff)
-/// keep DMA-ing into slots of the borrowed range *during* the chunk, which overwrote the layer buffer and made the
-/// chunk's output NaN - measured as 62 non-finite chunk outputs per run at `--pcie-frac 0`, and zero with
-/// `--no-lookahead`.
-static BORROWED: AtomicBool = AtomicBool::new(false);
-
-/// Serialises "may a fill write into cache memory right now" against "the borrow is taking the range".
-///
-/// The two sides are *asynchronous*: the lookahead is queued during a decode step and its worker can still be
-/// running when the next request's chunk begins - the two phases are mutually exclusive in steady state, but not
-/// across that boundary. Checking [`borrowed`] alone was a TOCTOU: a fill could pass the check and queue its DMA
-/// after the borrow had taken the range (which is why `WRITE_DURING_BORROW` read 0 while the chunk still came out
-/// NaN). A fill now holds this lock from the check until its copies are queued, and the borrow holds it from
-/// setting the flag until its range is empty and every queued copy has landed.
-static ACCESS: Mutex<()> = Mutex::new(());
-
-/// Held by a fill for the moment it checks the flag and queues its copies.
-pub(crate) fn lock_access() -> MutexGuard<'static, ()> {
-    ACCESS.lock().unwrap_or_else(|e| e.into_inner())
+/// Replaces process-global `BORROWED`/`ACCESS` statics so each provider owns an isolated gate.
+/// Lock order: `access` -> `Layers::lent` -> `CachedLayer::state` -> `Slot::storage`.
+#[derive(Default)]
+pub(crate) struct BorrowGate {
+    borrowed: AtomicBool,
+    access: Mutex<()>,
 }
 
-/// [`lock_access`] for a caller on the token thread that must **never** block on it.
-///
-/// The lookahead holds this lock across `upload_in_place`, which waits for the readers of the slot it is
-/// overwriting (`copy_stream::wait_for_readers`, spinning on refcounts that only the token thread can drop). A
-/// token-thread waiter would therefore deadlock against it - measured as "a request never finishes" with promotion
-/// on. Nothing on the token path needs the lock: it needs to *know* whether a chunk owns the slab, and that is an
-/// atomic read (`borrowed()`). So: try, and stand down if it is busy.
-pub(crate) fn try_lock_access() -> Option<MutexGuard<'static, ()>> {
-    ACCESS.try_lock().ok()
-}
+impl BorrowGate {
+    /// Held by a fill from the gate check through copy queueing and slot publication.
+    #[inline]
+    pub(crate) fn lock_access(&self) -> MutexGuard<'_, ()> {
+        self.access.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-/// Mark the slab as borrowed (or not) for the duration of one layer's compute.
-pub(crate) fn set_borrowed(on: bool) {
-    BORROWED.store(on, Ordering::Release);
-}
+    /// Non-blocking [`Self::lock_access`] for token-thread callers (e.g. promotion) that must
+    /// never block behind a lookahead fill spinning in `wait_for_readers`.
+    #[inline]
+    pub(crate) fn try_lock_access(&self) -> Option<MutexGuard<'_, ()>> {
+        self.access.try_lock().ok()
+    }
 
-/// Whether a chunk owns the slab's low end right now: writers into cache slots must stand down.
-pub(crate) fn borrowed() -> bool {
-    BORROWED.load(Ordering::Acquire)
+    /// Mark the slab as borrowed (or released) for a chunk.
+    #[inline]
+    pub(crate) fn set_borrowed(&self, on: bool) {
+        self.borrowed.store(on, Ordering::Release);
+    }
+
+    /// Whether a prefill chunk currently owns the borrowed slab range.
+    #[inline]
+    pub(crate) fn borrowed(&self) -> bool {
+        self.borrowed.load(Ordering::Acquire)
+    }
 }
 
 /// One VRAM allocation, handed out as byte ranges.
@@ -326,5 +319,20 @@ mod tests {
         assert_eq!(layout.tail_start(40), Some(100));
         assert_eq!(layout.tail_start(140), Some(0));
         assert_eq!(layout.tail_start(141), None, "a loan bigger than the cache has no start");
+    }
+
+    #[test]
+    fn borrow_gate_tracks_flag_and_try_lock_contention() {
+        let gate = super::BorrowGate::default();
+        assert!(!gate.borrowed());
+        {
+            let _guard = gate.lock_access();
+            assert!(gate.try_lock_access().is_none());
+            gate.set_borrowed(true);
+            assert!(gate.borrowed());
+        }
+        assert!(gate.try_lock_access().is_some());
+        gate.set_borrowed(false);
+        assert!(!gate.borrowed());
     }
 }

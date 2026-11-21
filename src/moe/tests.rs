@@ -216,6 +216,7 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         layer: 0,
         layers: Arc::default(),
         staging: Arc::default(),
+        borrow_gate: Arc::default(),
         hidden,
         num_experts: e,
         top_k: 2,
@@ -242,12 +243,6 @@ fn cpu_layer(e: usize, slots: usize) -> Arc<CachedLayer> {
         staged_wave_of: std::sync::Mutex::new(Vec::new()),
         staged_now: Mutex::new(Vec::new()),
     })
-}
-
-fn wait_for_fill(layer: &CachedLayer) {
-    while layer.filling.load(Ordering::Acquire) {
-        std::thread::yield_now();
-    }
 }
 
 #[test]

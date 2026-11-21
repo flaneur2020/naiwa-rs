@@ -237,8 +237,8 @@ impl PrefillStream {
         let span = (self.layer_bytes() + (2 << 20) - 1) & !((2 << 20) - 1);
         let loaned = stride * span;
         {
-            let _guard = crate::moe::slab::lock_access();
-            crate::moe::slab::set_borrowed(true);
+            let _guard = self.borrow_gate.lock_access();
+            self.borrow_gate.set_borrowed(true);
         }
         let base = slab.base()?;
         self.copy.after_device_work()?;

@@ -1,48 +1,33 @@
-//! MoE execution: the GPU expert cache, CPU-side routed experts, and both providers.
+//! MoE execution: the GPU expert cache, CPU-side routed experts, and providers.
 //!
-//! Each decoder layer gets its own per-layer slot range from a total VRAM budget. Slots hold the
-//! expert's *quantized* bytes (GGML block format) — never a dequantized copy — so both the GPU
-//! and CPU paths run with the same quantization and the cache costs the same VRAM as the CPU tier
-//! costs in RAM.
+//! # Lock Ordering & Synchronization Invariants
 //!
-//! # Format support
-//!
-//! - **GGUF** (Q4_K, Q6_K, …): `get_qtensor()` returns the stacked `[E, N, K]` `QTensor`; bytes
-//!   are sliced per expert and re-assembled as a `[N, K]` `QTensor` on the slot device.
-//! - **ISQ-quantized** (`--isq`): same path, because ISQ leaves a `QTensor` behind.
-//! - **BF16 safetensors**: `get_qtensor()` returns `None`; the cache falls back to a dense
-//!   `Tensor` copy instead. Dense slots cost ~4× more VRAM per expert than Q4K.
-//!
-//! # Prefill
-//!
-//! Every routed expert runs on the CPU (all of them are needed anyway). Each layer first starts
-//! a background fill of the *next* layer's empty slots. On CUDA a fill is a copy on a dedicated
-//! copy stream into slot memory allocated once at load, so it overlaps this layer's CPU experts
-//! and the next layer's attention (`copy_stream`). Elsewhere it uploads through candle's stream.
-//!
-//! # Decode (single token)
-//!
-//! - Top-k is split into slot hits and misses. Hits run via `QMatMul` on the slot device, misses
-//!   on the CPU with only the miss ids, through the fused two-pass decode (`stages::cpu_miss::fused_decode`)
-//!   or, for experts it does not serve, `MoEExperts::forward`; both sides at once, router weights
-//!   applied once per side. The misses run on the `deferred` worker over host copies; every CUDA
-//!   call stays on the calling thread.
-//! - Misses are never loaded on the token path. Instead, each layer submits its activation to a
-//!   lookahead thread that runs the next layer's router on it and loads the predicted experts:
-//!   into empty slots freely, over least-recently-used residents at most `--lookahead-swaps`
-//!   times per row. Whatever is not resident when the next layer runs goes to the CPU.
-//! - A token captures its hits' weights (`Arc`s) under the layer lock, so a slot replaced later
+//! 1. **Lock hierarchy (strict DAG):**
+//!    `BorrowGate::access` → `Layers::lent` → `CachedLayer::state` → `Slot::storage`.
+//!    - `StagingRing` is independent and must never be acquired while holding `CachedLayer::state`.
+//!    - `copy_stream::wait_for_readers` must **never** be called while holding `CachedLayer::state`
+//!      (a background fill holding an `Arc<SlotBuf>` needs `state` to finish).
+//!    - Token-thread callers (`promote_staged`) must use `BorrowGate::try_lock_access()` and stand
+//!      down if contended, never blocking on a lookahead fill spinning in `wait_for_readers`.
+//! 2. **Stream ordering:**
+//!    - Preload completion (`PassCell::wait_latest`) is waited before resident compute.
+//!    - Resident experts run before `wait_staging`; staged experts run after `wait_staging`.
+//!    - Read fences (`ReadFence::record_reads`) are recorded after kernels reading a slot are
+//!      enqueued and before any `Arc<SlotBuf>` is dropped.
 
+mod activation_channel;
+mod cache_policy;
+mod cache_updates;
 mod cached_layer;
 mod decode;
 mod expert;
+mod layer_registry;
 mod profile;
 mod provider;
-mod rings;
-pub(crate) mod slab;
-pub(crate) use stages::quiesce;
-pub(crate) mod rings_exec;
 mod resident;
+mod rings;
+pub(crate) mod rings_exec;
+pub(crate) mod slab;
 mod slot;
 mod stages;
 mod staging;
@@ -51,17 +36,16 @@ mod tests;
 
 pub use profile::Profile;
 pub use provider::GpuCacheMoeProvider;
-pub(crate) use stages::fused_decode;
+pub(crate) use stages::{fused_decode, quiesce};
 
-// Cross-module items are re-exported here; siblings import them from `super`, never from
-// another child module directly. The submodules themselves stay private.
+// Cross-module items are re-exported here; siblings import them from `super`.
+pub(crate) use activation_channel::{CpuActivationChannel, LookaheadChannel};
 #[cfg(test)]
-pub(in crate::moe) use cached_layer::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
-pub(crate) use cached_layer::{
-    streamed_misses, CachedExperts, CachedLayer, Layers, LayerState, LookaheadChannel,
-    MAX_DECODE_ROWS,
-};
+pub(in crate::moe) use cache_policy::{fill_candidate, lru_victim, top_k_ids, union_by_votes};
+pub(crate) use cache_policy::streamed_misses;
+pub(crate) use cached_layer::{CachedExperts, CachedLayer, LayerState, MAX_DECODE_ROWS};
 pub(crate) use expert::{expert_qtensor_on_device, expert_range};
+pub(crate) use layer_registry::Layers;
 #[cfg(test)]
 pub(in crate::moe) use slot::slot_bytes_from_qtensor;
 pub(crate) use slot::{slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};

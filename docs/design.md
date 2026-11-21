@@ -304,6 +304,7 @@ The doorbell was the only clean extraction; everything else is a kernel or model
 
 ```
 ~/code/naiwa-rs            engine + docs/ + harness/
+  src/config.rs            centralized NAIWA_* env config (RuntimeConfig + DiagConfig)
   src/doorbell/            mapped doorbells + kernels
     mod.rs                 ffi + re-exports
     mapped.rs              single mapped-allocation owner
@@ -314,25 +315,41 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     handoff.rs             PassCell (cross-thread completion claim)
     tests.rs
   src/moe/                 MoE execution + GPU expert cache
-    mod.rs                 module docs, constants, exports
+    mod.rs                 module docs, lock-ordering DAG, exports
     provider.rs            GPU-cache provider + layer construction + staging rings + attach_prefill
     expert.rs              CpuExperts fallback + per-expert byte slicing
-    cached_layer.rs        Layers + LayerState + CachedLayer + CachedExperts + lookahead prediction
+    cached_layer.rs        LayerState + CachedLayer + CachedExperts entry point + accessors/sync
+    layer_registry.rs      Layers model-wide registry + loan empty/refill coordination
+    activation_channel.rs  LookaheadChannel (advisory) + CpuActivationChannel
+    cache_policy.rs        pure ranking/selection/victim policy functions
+    cache_updates.rs       admit/replace/upload/promotion/lookahead prediction/spawn_fill
     slot.rs                Slot/SlotBuf/Bank/Projections + slot byte estimate
-    staging.rs             StagingRings/StagingRing + alloc_bank
-    decode.rs              decode orchestrator
+    slab.rs                VRAM Slab bump allocator + per-provider BorrowGate
+    staging.rs             StagingRings/StagingRing + alloc_bank_in
+    decode.rs              decode orchestrator (resident/staged/CPU split)
     stages/                route, gpu, cpu-miss (+ fused decode), dma-miss, preload
+  src/prefill_stream/      streaming GPU prefill over pinned host stacks / loaned slab ranges
+    mod.rs                 PrefillStreams + PrefillStream facade and forward()
+    planner.rs             pure VRAM budget math (plan*, chunk_scratch, kv_reserve)
+    buffers.rs             LayerBuf lifecycle, slab borrow, begin_chunk, load, downgrade
+    split.rs               --prefill-split expert sub-range views & masked dispatch
+    diagnostics.rs         opt-in peak, snapshot, canary, and wall-clock probes
   src/load.rs              model loading + provider install + warmup
   src/stats/               counters + NAIWA_* measurement probes
     mod.rs                 shared gate/window/header/units; re-exports record_*/dump_*
+    sink.rs                shared bounded AsyncJsonSink writer
+    vram_peak.rs           decode low-water VRAM sampler
     cache.rs               expert-cache counters (`dump_cache_stats`)
     lookahead.rs           LOOKAHEAD_DBG
     round.rs               ROUND_STATS
     step.rs                STEP_DBG + ROUND_DBG
     fused.rs               FUSED_DBG
     retired.rs             RET_DBG
+    schedule.rs            NAIWA_SCHEDULE_FILE buffered host-clock trace
+    gpu_partition.rs / model_partition.rs / head_partition.rs
   src/executor.rs          single-thread CPU executor + result doorbell + idle signal
-  harness/                  primitives, oracle, bandwidth harnesses
+  src/spin_pool.rs         experimental spin-wait parallel dispatcher for fused CPU MoE
+  harness/                 primitives, oracle, attribution, chat, bandwidth harnesses
 ~/code/mistral.rs-iq4xs    fork
 ~/code/naiwa-rs/target          crate target
 ~/bench-rel/naiwa-v2/      binaries/logs

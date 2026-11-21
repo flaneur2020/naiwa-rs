@@ -16,12 +16,14 @@ use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpert
 use mistralrs_core::MoEExperts;
 
 use super::{
-    staging::alloc_bank_in, slot_bytes_from_stack, CachedExperts, CachedLayer, LayerState, Layers,
-    LookaheadChannel, Slot, StagingRings, MAX_DECODE_ROWS,
+    slab::BorrowGate, slot_bytes_from_stack, staging::alloc_bank_in, CachedExperts, CachedLayer,
+    CpuActivationChannel, LayerState, Layers, LookaheadChannel, Slot, StagingRings,
+    MAX_DECODE_ROWS,
 };
 
 /// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
 /// stream. The pinned registrations must live as long as the layer.
+#[allow(clippy::too_many_arguments)]
 fn attach_prefill(
     prefill: &Option<PrefillStreams>,
     ctx: &ExpertLoadContext<'_>,
@@ -29,13 +31,22 @@ fn attach_prefill(
     copy_streams: &CopyStreams,
     slab: Option<Arc<super::slab::Slab>>,
     cache: Option<Arc<Layers>>,
+    borrow_gate: Arc<BorrowGate>,
 ) -> candle_core::Result<(Vec<PinnedStack>, Option<Arc<PrefillStream>>)> {
     let Some(streams) = prefill else {
         return Ok((Vec::new(), None));
     };
     // Prefill uploads read straight from the stacks, asynchronously: they must be pinned.
     let (pinned, failed) = pin_expert_stacks(experts, ctx.layer_device);
-    let stream = streams.attach(ctx, experts, failed == 0, copy_streams, slab, cache)?;
+    let stream = streams.attach(
+        ctx,
+        experts,
+        failed == 0,
+        copy_streams,
+        slab,
+        cache,
+        borrow_gate,
+    )?;
     Ok((pinned, stream))
 }
 
@@ -74,6 +85,8 @@ pub struct GpuCacheMoeProvider {
     /// `NAIWA_CACHE_SLAB=1`: every layer's bank is carved from this one allocation instead of its own, so the
     /// cache's bytes are a contiguous pool the prefill stream can borrow from.
     slab: std::sync::OnceLock<Option<Arc<super::slab::Slab>>>,
+    /// Per-provider gate coordinating cache slot fills against prefill-stream slab borrows.
+    borrow_gate: Arc<BorrowGate>,
 }
 
 impl GpuCacheMoeProvider {
@@ -169,6 +182,7 @@ impl GpuCacheMoeProvider {
             lookahead,
             profile,
             slab: std::sync::OnceLock::new(),
+            borrow_gate: Arc::new(BorrowGate::default()),
         }
     }
 
@@ -416,6 +430,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 &self.copy_streams,
                 self.slab(&ctx.layer_device),
                 Some(Arc::clone(&self.layers)),
+                Arc::clone(&self.borrow_gate),
             )?;
             return Ok(Some(Arc::new(CpuExperts::new(
                 cpu_experts,
@@ -469,16 +484,15 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         }
 
         let prefill = match &self.prefill {
-            Some(streams) => {
-                streams.attach(
-                    &ctx,
-                    &cpu_experts,
-                    pin_failed == 0,
-                    &self.copy_streams,
-                    slab.clone(),
-                    Some(Arc::clone(&self.layers)),
-                )?
-            }
+            Some(streams) => streams.attach(
+                &ctx,
+                &cpu_experts,
+                pin_failed == 0,
+                &self.copy_streams,
+                slab.clone(),
+                Some(Arc::clone(&self.layers)),
+                Arc::clone(&self.borrow_gate),
+            )?,
             None => None,
         };
 
@@ -520,7 +534,9 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             && crate::config::runtime().cpu_act_async
             && router.is_some()
         {
-            LookaheadChannel::new(&slot_device, 5, hidden).ok().flatten()
+            CpuActivationChannel::new(&slot_device, 5, hidden)
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -574,6 +590,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             layer: layer_idx,
             layers: Arc::clone(&self.layers),
             staging: Arc::clone(&self.staging),
+            borrow_gate: Arc::clone(&self.borrow_gate),
             staged_now: Mutex::new(Vec::new()),
             staging_waves: Mutex::new(Vec::new()),
             staged_wave_of: Mutex::new(Vec::new()),
