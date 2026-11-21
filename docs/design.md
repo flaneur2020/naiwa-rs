@@ -335,16 +335,10 @@ The doorbell was the only clean extraction; everything else is a kernel or model
     split.rs               --prefill-split expert sub-range views & masked dispatch
     diagnostics.rs         opt-in peak, snapshot, canary, and wall-clock probes
   src/load.rs              model loading + provider install + warmup
-  src/stats/               counters + NAIWA_* measurement probes
-    mod.rs                 shared gate/window/header/units; re-exports record_*/dump_*
+  src/stats/               cache counters + JSONL attribution sinks
+    mod.rs                 re-exports
     sink.rs                shared bounded AsyncJsonSink writer
-    vram_peak.rs           decode low-water VRAM sampler
-    cache.rs               expert-cache counters (`dump_cache_stats`)
-    lookahead.rs           LOOKAHEAD_DBG
-    round.rs               ROUND_STATS
-    step.rs                STEP_DBG + ROUND_DBG
-    fused.rs               FUSED_DBG
-    retired.rs             RET_DBG
+    cache.rs               expert-cache counters (`NAIWA_STATS=1`, `dump_cache_stats`)
     schedule.rs            NAIWA_SCHEDULE_FILE buffered host-clock trace
     gpu_partition.rs / model_partition.rs / head_partition.rs
   src/executor.rs          single-thread CPU executor + result doorbell + idle signal
@@ -364,12 +358,10 @@ diff ~/bench-rel/naiwa-v2/m4/reference.X.txt harness/m1/reference.oracle.txt
 cargo test --offline --release --features cuda     # 33/33
 ```
 
-Reference bench (np8):
+Reference tuned MTP2 serve (`--no-lookahead` measured 34.7 ms/tok / 28.8 tok/s):
 
 ```bash
-$BIN bench -m ~/Models/qwen3-coder/requant -f '<shard1>;<shard2>' --cpu-moe \
-  --expert-cache-gb 4 --pcie-frac 0.2 --depth 4 --mtp-n-predict 8 \
-  --prompt-file <predictable-prompt> --gen-len 96
+./harness/serve/serve-tuned-mtp2.sh
 ```
 
 ---

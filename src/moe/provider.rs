@@ -306,12 +306,6 @@ impl GpuCacheMoeProvider {
         }
         Ok((captures, rings))
     }
-
-    /// v2 M1 criterion ①: rings created so far. Must not change once warmup has run and the
-    /// decode has started.
-    pub fn ring_creations(&self) -> usize {
-        self.staging.creations()
-    }
 }
 
 // ---------------------------------------------------------------------------

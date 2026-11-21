@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -126,9 +126,7 @@ impl Executor {
             let seq = chan.next_job();
             let len = rows * cols;
             let done = cuda::SetFlag::new(Arc::clone(chan.doorbell()), seq);
-            let t_submit = Instant::now();
             self.submit(Box::new(move || {
-                let t_start = Instant::now();
                 let mut done = done;
                 let result = compute();
                 if let Some((layer, tick)) = tag {
@@ -148,7 +146,6 @@ impl Executor {
                 if let Some((layer, tick)) = tag {
                     crate::stats::schedule::event(layer, tick, "result_publish_return");
                 }
-                crate::stats::record_retired(t_submit, t_start);
             }));
             return Ok(Pending {
                 device: device.clone(),

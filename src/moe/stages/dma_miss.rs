@@ -118,7 +118,6 @@ fn stage_misses(
                 // SAFETY: the stacks are page-locked, and `layer.cpu()` keeps them alive and
                 // unmodified for the model's lifetime, well past `done`.
                 unsafe {
-                    stats::record_round_staged_bytes(bytes as u64);
                     cs.queue_async(
                         &buf.fence,
                         &[

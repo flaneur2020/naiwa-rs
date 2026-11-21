@@ -98,23 +98,7 @@ pub(crate) struct DiagConfig {
     pub stream_dbg: bool,
     /// `NAIWA_STATS` (presence): print cache totals on graceful `serve` shutdown.
     pub stats: bool,
-    /// `NAIWA_STEP_BUDGET` (presence).
-    pub step_budget: bool,
-    /// `NAIWA_STEP_DBG` (presence).
-    pub step_dbg: bool,
-    /// `NAIWA_ROUND_STATS` (presence).
-    pub round_stats: bool,
-    /// `NAIWA_RET_DBG` (presence).
-    pub ret_dbg: bool,
-    /// `NAIWA_FUSED_DBG` (presence).
-    pub fused_dbg: bool,
-    /// `NAIWA_LOOKAHEAD_DBG` (presence).
-    pub lookahead_dbg: bool,
-    /// `NAIWA_PRED_DBG` (presence).
-    pub pred_dbg: bool,
 
-    /// `NAIWA_EXPERT_HIST` (optional output path).
-    pub expert_hist: Option<String>,
     /// `NAIWA_XSUM` (presence).
     pub xsum: bool,
     /// `NAIWA_CPU_TIMELINE` (presence).
@@ -223,15 +207,7 @@ impl EnvConfig {
         let diag = DiagConfig {
             stream_dbg: present("NAIWA_STREAM_DBG"),
             stats: present("NAIWA_STATS"),
-            step_budget: present("NAIWA_STEP_BUDGET"),
-            step_dbg: present("NAIWA_STEP_DBG"),
-            round_stats: present("NAIWA_ROUND_STATS"),
-            ret_dbg: present("NAIWA_RET_DBG"),
-            fused_dbg: present("NAIWA_FUSED_DBG"),
-            lookahead_dbg: present("NAIWA_LOOKAHEAD_DBG"),
-            pred_dbg: present("NAIWA_PRED_DBG"),
 
-            expert_hist: str_val("NAIWA_EXPERT_HIST"),
             xsum: present("NAIWA_XSUM"),
             cpu_timeline: present("NAIWA_CPU_TIMELINE"),
             work_trace: eq_1("NAIWA_WORK_TRACE"),

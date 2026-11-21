@@ -38,127 +38,6 @@ pub enum Command {
         #[command(flatten)]
         server: ServerOptions,
     },
-
-    /// Run performance benchmarks
-    Bench {
-        #[command(flatten)]
-        model: ModelOptions,
-
-        #[command(flatten)]
-        runtime: BenchRuntimeOptions,
-
-        /// Input lengths used to measure time to first token. Zero skips TTFT. Accepts comma-separated values for sweeps.
-        #[arg(long, value_delimiter = ',', default_value = "512")]
-        prompt_len: Vec<usize>,
-
-        /// Use this file's text as the prompt instead of the synthetic token ramp. The text is
-        /// tokenized by the engine, as `serve` does, so the model sees real text; TTFT is skipped
-        /// (the file's length is not known up front) and the decode cases run against it.
-        #[arg(long = "prompt-file", value_name = "PATH")]
-        prompt_file: Option<std::path::PathBuf>,
-
-        /// Output tokens per decode request. Values below 2 skip decode metrics.
-        #[arg(long, default_value = "128")]
-        gen_len: usize,
-
-        /// Input context lengths used to measure decode TPOT. Accepts comma-separated values for sweeps.
-        #[arg(long, value_delimiter = ',', default_value = "4")]
-        depth: Vec<usize>,
-
-        /// Number of benchmark iterations
-        #[arg(long, default_value = "3")]
-        iterations: usize,
-
-        /// Number of warmup runs per benchmark case (discarded)
-        #[arg(long, default_value = "1")]
-        warmup: usize,
-    },
-
-    /// Generate UQFF quantized model files
-    Quantize {
-        #[command(flatten)]
-        source: ModelSource,
-
-        #[command(flatten)]
-        device: DeviceOptions,
-
-        #[command(flatten)]
-        quantization: QuantizeOptions,
-
-        /// Output path: a `.uqff` file, or a directory to auto-name one file per ISQ type
-        #[arg(short = 'o', long)]
-        output: PathBuf,
-    },
-
-    /// Inspect or verify UQFF artifacts in a local directory
-    Uqff {
-        #[command(subcommand)]
-        command: UqffCommand,
-    },
-
-    /// Recommend quantization + device mapping for this machine.
-    /// Pass `--isq <level>` to bias the recommendation toward a specific quantization target.
-    Tune {
-        #[command(flatten)]
-        model: ModelOptions,
-
-        /// Tuning profile (quality, balanced, fast)
-        #[arg(long, value_enum, default_value = "balanced")]
-        profile: TuneProfileArg,
-
-        /// Output JSON instead of human-readable text
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum UqffCommand {
-    /// Print or write a UQFF report
-    Report {
-        /// Local directory containing UQFF files
-        #[arg(short = 'm', long)]
-        model_id: PathBuf,
-
-        /// Quant group to inspect, such as 3, q3k, afq3, or all
-        #[arg(long)]
-        quant: Option<String>,
-
-        /// Write uqff_report.json beside the artifacts
-        #[arg(long)]
-        write: bool,
-
-        /// Print JSON instead of human-readable text
-        #[arg(long)]
-        json: bool,
-
-        /// Base model ID to include in a written report
-        #[arg(long)]
-        base_model: Option<String>,
-    },
-
-    /// Validate UQFF artifact structure
-    Verify {
-        /// Local directory containing UQFF files
-        #[arg(short = 'm', long)]
-        model_id: PathBuf,
-
-        /// Quant group to inspect, such as 3, q3k, afq3, or all
-        #[arg(long)]
-        quant: Option<String>,
-
-        /// Print JSON instead of human-readable text
-        #[arg(long)]
-        json: bool,
-
-        /// Fail on missing report/producer metadata or fallback layers
-        #[arg(long)]
-        strict: bool,
-
-        /// Allow same-major UQFF files with a newer minor version
-        #[arg(long)]
-        allow_newer_minor: bool,
-    },
 }
 
 #[derive(Args, Clone)]
@@ -363,25 +242,6 @@ pub struct QuantizationOptions {
     pub calibration_file: Option<PathBuf>,
 }
 
-#[derive(Args, Clone)]
-pub struct QuantizeOptions {
-    /// ISQ type(s) to write. Repeat or comma-separate for multiple outputs
-    #[arg(long = "isq", required = true, value_delimiter = ',')]
-    pub in_situ_quant: Vec<String>,
-
-    /// ISQ organization strategy: default or moqe
-    #[arg(long)]
-    pub isq_organization: Option<IsqOrganization>,
-
-    /// imatrix file for enhanced quantization
-    #[arg(long)]
-    pub imatrix: Option<PathBuf>,
-
-    /// Calibration file for imatrix generation
-    #[arg(long, conflicts_with = "imatrix")]
-    pub calibration_file: Option<PathBuf>,
-}
-
 #[derive(Args, Clone, Default)]
 pub struct DeviceOptions {
     /// Force CPU-only execution
@@ -540,24 +400,6 @@ pub struct RuntimeOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BenchRuntimeOptions {
-    /// Maximum tokens processed in one paged-attention scheduler step
-    #[arg(long, default_value_t = default_max_num_batched_tokens())]
-    pub max_num_batched_tokens: NonZeroUsize,
-
-    /// CUDA prompt-token quantum used while decode is resident and for recurrent prefill batching
-    #[arg(long, default_value_t = default_max_prefill_chunk_tokens())]
-    pub max_prefill_chunk_tokens: NonZeroUsize,
-
-    /// Disable KV cache entirely
-    #[arg(long)]
-    pub no_kv_cache: bool,
-
-    #[command(flatten)]
-    pub mtp: MtpOptions,
-}
-
-#[derive(Args, Clone)]
 pub struct ServerOptions {
     /// HTTP server port
     #[arg(short = 'p', long, default_value_t = 1234)]
@@ -606,23 +448,6 @@ impl ServerOptions {
             access_log_health: self.access_log_health,
             request_id_header: !self.disable_request_id_header,
             metrics: !self.disable_metrics,
-        }
-    }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum TuneProfileArg {
-    Quality,
-    Balanced,
-    Fast,
-}
-
-impl From<TuneProfileArg> for mistralrs_core::TuneProfile {
-    fn from(value: TuneProfileArg) -> Self {
-        match value {
-            TuneProfileArg::Quality => Self::Quality,
-            TuneProfileArg::Balanced => Self::Balanced,
-            TuneProfileArg::Fast => Self::Fast,
         }
     }
 }

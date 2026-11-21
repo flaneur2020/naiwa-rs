@@ -28,27 +28,12 @@ pub(crate) fn fused_decode(
 ) -> candle_core::Result<Option<Vec<f32>>> {
     // M9: one fixed behaviour - the fused path for the activations it supports, the generic one otherwise.
     if !matches!(act, Activation::Silu | Activation::Swish) {
-        if crate::config::diag().fused_dbg {
-            eprintln!("FUSED_MISS act={act:?}");
-        }
         return Ok(None);
     }
     let Some((gate, up, down)) = experts.expert_qtensors() else {
-        if crate::config::diag().fused_dbg {
-            eprintln!("FUSED_MISS no expert_qtensors");
-        }
         return Ok(None);
     };
-    let t0 = std::time::Instant::now();
-    let ys = mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk);
-    if matches!(&ys, Ok(None)) && crate::config::diag().fused_dbg {
-        eprintln!(
-            "FUSED_MISS fused_moe_decode None: gate={:?} up={:?} down={:?} xs={} ids={} topk={topk}",
-            gate.dtype(), up.dtype(), down.dtype(), xs.len(), ids.len()
-        );
-    }
-    crate::stats::record_fused_decode(t0, ids, weights, topk);
-    ys
+    mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk)
 }
 
 pub(crate) struct CpuPending {

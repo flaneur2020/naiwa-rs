@@ -84,10 +84,6 @@ impl Route {
         let mut resident: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let staged: Vec<Vec<Hit>> = vec![Vec::new(); rows];
         let mut misses: Vec<Vec<(u32, f32)>> = vec![Vec::new(); rows];
-        // M40: compare this pass's real demand against the lookahead's prediction for this layer.
-        if crate::stats::predict_enabled() {
-            crate::stats::record_actual(layer.layer(), &ids_rows);
-        }
         let trace_enabled = crate::config::diag().work_trace;
         let mut work_trace = None;
         {

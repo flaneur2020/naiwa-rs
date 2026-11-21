@@ -99,12 +99,6 @@ impl RoutedExperts for CachedExperts {
         debug_assert_eq!(hidden_dim, layer.hidden);
         let num_tokens = batch * seq;
 
-        if layer.layer == 0
-            && num_tokens <= prefill_threshold()
-            && crate::stats::vram_peak::enabled()
-        {
-            crate::stats::vram_peak::note_step(&layer.slot_device);
-        }
         if layer.layer == 0 && crate::config::diag().layer_dbg {
             eprintln!(
                 "LAYER_DBG rows={num_tokens} prefill_threshold={} slab_borrowed={} prefill_engine={}",

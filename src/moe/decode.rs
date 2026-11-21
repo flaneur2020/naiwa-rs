@@ -46,8 +46,6 @@ pub(crate) fn forward(
     let (batch, seq, hidden) = xs.dims3()?;
     let rows = batch * seq;
     let x2d = xs.reshape((rows, hidden))?;
-    stats::record_step_layer(layer.slot_device(), layer.layer());
-    // A step's first layer marks the boundary: print the previous step's budget (see `stats::budget`).
     // M28: allocation ledger. Every `CudaDevice::alloc`/`alloc_zeros` between two layers belongs to the previous
     // layer, so the window is taken at the layer boundary; at a step boundary the previous step's totals print.
     if candle_core::cuda_backend::alloc_trace::enabled() {
@@ -68,19 +66,6 @@ pub(crate) fn forward(
             );
         }
     }
-    if layer.layer() == 0 {
-        stats::record_step_boundary(layer.layers().len());
-    }
-    let budget = stats::budget_enabled();
-    let mut t = budget.then(std::time::Instant::now);
-    macro_rules! mark {
-        ($phase:expr) => {
-            if let Some(prev) = t.as_mut() {
-                stats::record_budget($phase, prev.elapsed().as_nanos() as u64);
-                *prev = std::time::Instant::now();
-            }
-        };
-    }
     Preload::submit(layer, &x2d, rows, hidden)?;
 
     // NAIWA_XSUM: checksum of this layer's MoE input, for the first few ticks only. Repeated runs
@@ -98,15 +83,6 @@ pub(crate) fn forward(
         }
     }
 
-    // M27: the raw routing demand, before any cache decision, for the allocation study.
-    // Do not synchronize/copy routing ids for a disabled histogram.
-    if crate::config::diag().expert_hist.is_some() {
-        if let Ok(ids) = topk_ids.flatten_all() {
-            if let Ok(ids) = ids.to_dtype(candle_core::DType::U32).and_then(|t| t.to_vec1::<u32>()) {
-                stats::record_expert_demand(layer.layer(), &ids);
-            }
-        }
-    }
     let mut plan = Route::submit(layer, topk_ids, topk_weights, rows)?;
     let schedule_tick = if stats::schedule::enabled() {
         layer.state().lock().unwrap().tick
@@ -127,7 +103,6 @@ pub(crate) fn forward(
 
     // `--pcie-frac`: DMA the highest-weight misses into the staging ring (`plan.staged`), leaving
     // the complementary misses on the CPU (`plan.misses`).
-    mark!(stats::BudgetPhase::Plan);
     let mut cpu_work = CpuWork::Deferred;
     if layer.staging_enabled() {
         if crate::config::runtime().cpu_before_dma {
@@ -166,47 +141,20 @@ pub(crate) fn forward(
             eprintln!("MOE_WORK {trace}");
         }
     }
-    mark!(stats::BudgetPhase::Stage);
     let n_cpu: usize = plan.misses.iter().map(Vec::len).sum();
     stats::record_cache_misses(n_cpu);
-    // M22.3: how much of the step's expert demand is distinct experts, i.e. the headroom a per-expert row batch
-    // (llama.cpp MMVQ's `ncols`) would have. Resident and staged hits are counted by slot, misses by expert id.
-    #[cfg(feature = "cuda")]
-    if budget {
-        // Every (row, expert) pair this layer will run, resident + staged + CPU.
-        let staged_n: usize = plan.staged.iter().map(Vec::len).sum();
-        let pairs = n_hits + staged_n + n_cpu;
-        let mut ids: Vec<usize> = plan
-            .resident
-            .iter()
-            .chain(&plan.staged)
-            .flatten()
-            .map(|h| h.1)
-            .collect();
-        ids.extend(plan.misses.iter().flatten().map(|&(id, _)| id as usize));
-        ids.sort_unstable();
-        ids.dedup();
-        stats::record_budget_pairs(ids.len(), pairs);
-    }
     // Experts that went to the staging ring: counted apart from both hits and CPU misses.
     #[cfg(feature = "cuda")]
     {
         let staged_n: usize = plan.staged.iter().map(Vec::len).sum();
         stats::record_cache_staged(staged_n);
-        stats::record_round_plan(n_hits, staged_n, n_cpu);
     }
 
-    // M28: this layer's allocation bytes (no reset here; the step boundary reads the window).
-    #[cfg(feature = "cuda")]
-    if candle_core::cuda_backend::alloc_trace::enabled() {
-        // Handled at the step boundary: the window accumulates across the step.
-    }
     let cpu = match cpu_work {
         CpuWork::Submitted(pending) => pending,
         CpuWork::Deferred => CpuMiss::submit(layer, &plan.misses, &x2d, rows, route_ready)?,
     };
     stats::schedule::event(layer.layer(), schedule_tick, "cpu_submit_return");
-    mark!(stats::BudgetPhase::Spawn);
 
     gpu_mark!("plan_submit");
     // Wait for the latest preload claim on candle's stream. The claim carries its own completion
@@ -217,7 +165,6 @@ pub(crate) fn forward(
         layer.wait_preload()?;
     }
     gpu_mark!("preload_ready");
-    mark!(stats::BudgetPhase::PreloadWait);
     // S2: the resident experts run *before* the staging wait, so the DMA lands under their compute
     // instead of in front of it (measured 78.9 -> 62.8 ms per pass, -20%, and the p50 wait drops
     // from 858 us to 11 us). The staged experts still need the ring, so they keep the wait. This is
@@ -227,13 +174,6 @@ pub(crate) fn forward(
     #[cfg(not(feature = "cuda"))]
     let split = false;
 
-    #[cfg(feature = "cuda")]
-    let cuda_stream = if stats::budget_enabled() {
-        Some(layer.slot_device().as_cuda_device()?.cuda_stream())
-    } else {
-        None
-    };
-    let expert_ev = cuda_stream.as_ref().and_then(|s| stats::budget_dev::start(s));
     #[cfg(feature = "cuda")]
     let resident_acc = if split {
         let acc = Gpu::submit(layer, &plan.resident, &x2d, act);
@@ -257,7 +197,6 @@ pub(crate) fn forward(
     #[cfg(feature = "cuda")]
     layer.wait_staging()?;
     gpu_mark!("staging_ready");
-    mark!(stats::BudgetPhase::Gpu);
 
     #[cfg(feature = "cuda")]
     let acc = if let Some(resident_out) = resident_acc {
@@ -272,10 +211,6 @@ pub(crate) fn forward(
     };
     #[cfg(not(feature = "cuda"))]
     let acc = Gpu::submit(layer, &plan.resident, &x2d, act);
-    #[cfg(feature = "cuda")]
-    if let Some(stream) = &cuda_stream {
-        stats::budget_dev::end(stream, expert_ev);
-    }
     gpu_mark!("staged_end");
     // Kernels reading these slots may be queued even if a later step failed: fence every
     // slot before letting go of it, so an in-place fill cannot overtake them. When `split`
@@ -305,24 +240,20 @@ pub(crate) fn forward(
             }
         }
     }
-    mark!(stats::BudgetPhase::StagingWait);
     drop(plan.resident);
     drop(plan.staged);
     let gpu_out = acc?;
     fenced?;
-    mark!(stats::BudgetPhase::Fence);
 
     // Queue the misses' upload even if the hits failed, so the worker's buffer is released.
     gpu_mark!("promotion_end");
     let cpu_out = cpu.map(|p| p.upload()).transpose();
     gpu_mark!("cpu_ready");
-    mark!(stats::BudgetPhase::CpuJoin);
     let sum = match cpu_out? {
         None => gpu_out,
         Some(c) => (gpu_out + c)?,
     };
     let out = sum.to_dtype(xs.dtype())?.reshape((batch, seq, hidden))?;
     gpu_mark!("combine_end");
-    mark!(stats::BudgetPhase::Other);
     Ok(out)
 }

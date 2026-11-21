@@ -53,11 +53,9 @@ impl Preload {
                             }
                         }));
                     }
-                    stats::record_lookahead_step(0.0, queued);
                 } else if let (true, Some(chan)) = (queued, layer.lookahead_chan()) {
                     let n = rows * hidden;
                     let next = Arc::clone(&next);
-                    let t0 = std::time::Instant::now();
                     // The channel is sized for the widest verify window (np4 + 1 = 5 rows). A prompt
                     // chunk's tail can be wider than that, and a 5-row prediction could not cover its
                     // routing anyway — the chunk's own hit counts fill the cache instead. Advisory, so
@@ -67,10 +65,8 @@ impl Preload {
                     } else {
                         chan.publish(&x2d, n)?
                     };
-                    stats::record_lookahead_publish(t0.elapsed().as_secs_f64() * 1e3);
                     if let Some((sh, last_seq)) = pub_res {
                         schedule(Box::new(move || {
-                            let t0 = std::time::Instant::now();
                             // The GAP is the scheduler's business, not this
                             // closure's: the lookahead thread only drains its queue
                             // while no expert batch is running, and a batch's
@@ -86,17 +82,13 @@ impl Preload {
                                     );
                                 }
                             }
-                            stats::record_lookahead_job(t0.elapsed().as_secs_f64() * 1e3);
                         }));
                     }
-                    stats::record_lookahead_step(0.0, true);
                 } else if queued {
                     // CUDA without the channel (the mapped allocation failed): fall
                     // back to the W105 blocking `to_vec1` on the token thread rather
                     // than silently losing the lookahead.
-                    let t0 = std::time::Instant::now();
                     let x_clone = x2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    let d2h = t0.elapsed().as_secs_f64() * 1e3;
                     let next = Arc::clone(&next);
                     schedule(Box::new(move || {
                         let x = Tensor::from_vec(x_clone, (rows, next.hidden()), &Device::Cpu);
@@ -104,9 +96,6 @@ impl Preload {
                             debug!("expert cache: layer {} lookahead failed: {e}", next.layer());
                         }
                     }));
-                    stats::record_lookahead_step(d2h, true);
-                } else {
-                    stats::record_lookahead_step(0.0, false);
                 }
             }
         }

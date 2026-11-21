@@ -91,13 +91,6 @@ pub fn warmup() -> Result<(usize, usize)> {
     }
 }
 
-/// v2 M1 criterion ①: staging rings created so far. Must not change after warmup — a further
-/// increment means a ring materialized on the decode path, i.e. an address that was not fixed
-/// up front (which a capture cannot tolerate).
-pub fn ring_creations() -> usize {
-    GPU_CACHE_PROVIDER.get().map_or(0, |p| p.ring_creations())
-}
-
 /// The architecture this server runs on, across both on-disk representations.
 const HF_ARCHITECTURE: &str = "Qwen4ExpForConditionalGeneration";
 const GGUF_ARCHITECTURE: &str = "qwen4exp";
@@ -547,11 +540,10 @@ mod tests {
     }
 
     fn model_options(args: &[&str]) -> ModelOptions {
-        let mut argv = vec!["naiwa-rs", "tune"];
+        let mut argv = vec!["naiwa-rs", "serve"];
         argv.extend_from_slice(args);
         match Cli::try_parse_from(argv).unwrap().command {
-            crate::args::Command::Tune { model, .. } => model,
-            _ => unreachable!(),
+            crate::args::Command::Serve { model, .. } => model,
         }
     }
 
@@ -614,7 +606,7 @@ mod tests {
 
     #[test]
     fn cpu_moe_requires_an_expert_cache() {
-        let err = match Cli::try_parse_from(["naiwa-rs", "tune", "-m", "x", "--cpu-moe"]) {
+        let err = match Cli::try_parse_from(["naiwa-rs", "serve", "-m", "x", "--cpu-moe"]) {
             Ok(_) => panic!("--cpu-moe parsed without --expert-cache-gb"),
             Err(err) => err.to_string(),
         };

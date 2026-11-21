@@ -14,7 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 PORT=${1:-19980}
 CACHE_GB=${2:-2.2}
-shift 2 || true
+if [ $# -ge 2 ]; then shift 2; elif [ $# -eq 1 ]; then shift 1; fi
 
 MODEL=${MODEL:-$HOME/Models/qwen3-coder/IQ1_M}
 FILES="Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"

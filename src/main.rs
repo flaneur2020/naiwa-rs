@@ -31,7 +31,7 @@ use mistralrs_core::{
 use tracing_subscriber::EnvFilter;
 
 use args::{Cli, Command};
-use commands::{run_bench, run_quantize, run_serve, run_tune, run_uqff, BenchRunConfig};
+use commands::run_serve;
 
 // Tensor ops allocate fresh output buffers constantly; mimalloc removes the page-fault
 // churn that dominates small-model CPU inference with the system allocator.
@@ -57,43 +57,6 @@ async fn main() -> Result<()> {
             runtime,
             server,
         } => run_serve(model, runtime, server, cli.global).await,
-        Command::Bench {
-            model,
-            runtime,
-            prompt_len,
-            prompt_file,
-            gen_len,
-            depth,
-            iterations,
-            warmup,
-        } => {
-            run_bench(
-                model,
-                runtime,
-                cli.global,
-                BenchRunConfig {
-                    prompt_lens: prompt_len,
-                    prompt_file,
-                    gen_len,
-                    depths: depth,
-                    iterations,
-                    warmup,
-                },
-            )
-            .await
-        }
-        Command::Quantize {
-            source,
-            device,
-            quantization,
-            output,
-        } => run_quantize(source, device, quantization, output).await,
-        Command::Uqff { command } => run_uqff(command, cli.global.verbose > 0).await,
-        Command::Tune {
-            model,
-            profile,
-            json,
-        } => run_tune(model, profile, json).await,
     }
 }
 

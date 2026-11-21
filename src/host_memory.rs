@@ -308,7 +308,7 @@ mod h2d_probe {
                 }
             }
         }
-        let mut copy = |dsts: &mut Vec<_>| {
+        let copy = |dsts: &mut Vec<_>| {
             for (dst, src) in dsts.iter_mut().zip(parts) {
                 stream.memcpy_htod(src, dst).expect("copy");
             }

@@ -6,7 +6,7 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 use mistralrs_core::layers::Activation;
 use mistralrs_core::MoEExperts;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::copy_stream::ReadFence;

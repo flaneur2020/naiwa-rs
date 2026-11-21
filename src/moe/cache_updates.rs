@@ -379,18 +379,6 @@ impl CachedLayer {
     pub(crate) fn prefetch_predicted(&self, x: &Tensor) -> candle_core::Result<()> {
         let rows = x.dims().first().copied().unwrap_or(0);
         let predicted = self.predict(x)?;
-        if crate::stats::predict_enabled() {
-            let mut uniq = predicted.clone();
-            uniq.sort_unstable();
-            uniq.dedup();
-            let already = {
-                let st = self.state.lock().unwrap();
-                uniq.iter()
-                    .filter(|&&e| st.slots[..st.usable].iter().any(|s| s.expert == Some(e)))
-                    .count()
-            };
-            crate::stats::record_predicted(self.layer(), &uniq, already);
-        }
         let Some(cs) = &self.copy_stream else {
             return Ok(());
         };
