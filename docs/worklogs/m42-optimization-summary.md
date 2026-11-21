@@ -39,9 +39,11 @@ NAIWA_CPU_MOE_THREADS=5 \
 NAIWA_CPU_PHYSICAL_LAYOUT=1 \
 target/release/naiwa-rs serve \
   ...原有模型、缓存及服务参数... \
-  --pcie-frac 0.4 --lookahead-swaps 1 \
-  --mtp --mtp-n-predict 2
+  --pcie-frac 0.4 --no-lookahead \
+  --mtp --mtp-n-predict 2 --mtp-draft-sampling greedy
 ```
+
+> **后续消融更新（Tuned + MTP2）：** 在上述 `physical5 + MTP2` 组合上执行 3 轮轮转 clean 消融对比（`full (swaps=1)` vs `--no-lookahead` vs `NAIWA_PROMOTE_MAX=0`），关闭 lookahead 后 3/3 轮全部更快：**`35.380 → 34.719 ms/token`**（配对中位数 **`-0.650 ms/token` / `-1.84%`**，`28.80 tok/s`），同时关闭 promotion 则回退 `+0.922 ms/token`。对应一键启动脚本见 `harness/serve/serve-tuned-mtp2.sh`。Default（Rayon 无 drafting）下关闭 lookahead 仍回退 `+2.227 ms/token`，故默认路径继续保留 lookahead。
 
 physical5绑定本机CPU1–5的worker及CPU0的caller，依赖本机6C/12T拓扑，不能直接推广到其他机器。无drafting省略 `--mtp` 与 `--mtp-n-predict`；不要为了显式深度误开启MTP。干净测试需清除ambient诊断变量；上方是参数示意，不是完整可运行命令。
 

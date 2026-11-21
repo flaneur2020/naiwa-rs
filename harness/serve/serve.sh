@@ -8,7 +8,8 @@
 # it, then point `harness/tpot/tpot.py` or `harness/chat/run.py` at the port.
 #
 # Env overrides: BIN, FRAC (--pcie-frac), MTP_N (--mtp-n-predict), SAMPLING,
-#                LOOKAHEAD_SWAPS, MIN_TOK, and MTP_FLAG="" for the no-speculation arm.
+#                LOOKAHEAD_SWAPS, NO_LOOKAHEAD (1 passes --no-lookahead), MIN_TOK,
+#                and MTP_FLAG="" for the no-speculation arm.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 PORT=${1:-19980}
@@ -29,13 +30,18 @@ if [ -n "${MTP_FLAG:-}" ]; then
   [ -n "${MTP_N:-}" ] && MTP_ARGS+=(--mtp-n-predict "$MTP_N")
 fi
 
+LOOKAHEAD_ARGS=(--lookahead-swaps "${LOOKAHEAD_SWAPS:-2}")
+if [ "${NO_LOOKAHEAD:-0}" = "1" ]; then
+  LOOKAHEAD_ARGS=(--no-lookahead)
+fi
+
 exec "$BIN" serve -m "$MODEL" -f "$FILES" \
   --cpu-moe --expert-cache-gb "$CACHE_GB" \
   --expert-profile /home/yazhou/code/strata/data/expert-profile-coder.bin \
   --pcie-frac "${FRAC:-0.4}" \
   --prefill-stream --prefill-stream-min-tokens "${MIN_TOK:-64}" \
   --max-num-batched-tokens 8192 --max-prefill-chunk-tokens 8192 --max-seqs 4 \
-  --lookahead-swaps "${LOOKAHEAD_SWAPS:-2}" \
+  "${LOOKAHEAD_ARGS[@]}" \
   "${MTP_ARGS[@]}" \
   --pa-context-len 4096 --prefix-cache-n 1 \
   --host 127.0.0.1 --port "$PORT" --disable-access-log "$@"

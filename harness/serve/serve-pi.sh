@@ -13,7 +13,7 @@
 #     (mistralrs: "the model likely produced NaN/Inf logits"). Without it the same
 #     prompts and multi-turn tool calls are stable.
 #
-# Env overrides: CACHE_GB (2.2), MTP (0), PORT (8095).
+# Env overrides: CACHE_GB (2.2), MTP (0), NO_LOOKAHEAD (0), PORT (8095).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -34,6 +34,9 @@ ARGS=(serve -m "$MODEL" -f "$FILES"
 if [ "${MTP:-0}" = "1" ]; then
   ARGS+=(--mtp --mmproj "${MMPROJ:-$HOME/Models/mtp/mtp-component.gguf}"
          --mtp-draft-sampling "${SAMPLING:-greedy}")
+fi
+if [ "${NO_LOOKAHEAD:-0}" = "1" ]; then
+  ARGS+=(--no-lookahead)
 fi
 
 export MISTRALRS_MTP_PREFIX_REPLAY=none MISTRALRS_ALIGN_CHECKPOINTS=1
