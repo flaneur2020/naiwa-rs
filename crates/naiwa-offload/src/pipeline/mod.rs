@@ -7,7 +7,7 @@
 
 pub(crate) mod decode;
 mod observer;
-pub(crate) mod prefill;
+pub mod prefill;
 pub(crate) mod provider;
 pub(crate) mod stages;
 

@@ -1,0 +1,67 @@
+[package]
+name = "naiwa-server"
+description = "Qwen3.8-Flash-Next inference server CLI & HTTP entrypoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "naiwa-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+candle-core.workspace = true
+clap.workspace = true
+dirs.workspace = true
+mimalloc.workspace = true
+naiwa-offload.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Transitional mistral.rs dependencies (removed in Phases 1-5).
+mistralrs-core.workspace = true
+mistralrs-server-core.workspace = true
+mistralrs-quant.workspace = true
+
+[features]
+default = []
+cuda = [
+    "naiwa-offload/cuda",
+    "mistralrs-core/cuda",
+    "mistralrs-server-core/cuda",
+]
+cutile = ["cuda", "naiwa-offload/cutile", "mistralrs-core/cutile"]
+nccl = [
+    "cuda",
+    "naiwa-offload/nccl",
+    "mistralrs-core/nccl",
+    "mistralrs-server-core/nccl",
+]
+cudnn = [
+    "cuda",
+    "naiwa-offload/cudnn",
+    "mistralrs-core/cudnn",
+    "mistralrs-server-core/cudnn",
+]
+flash-attn = [
+    "cuda",
+    "naiwa-offload/flash-attn",
+    "mistralrs-core/flash-attn",
+    "mistralrs-server-core/flash-attn",
+]
+flash-attn-v3 = [
+    "cuda",
+    "naiwa-offload/flash-attn-v3",
+    "mistralrs-core/flash-attn-v3",
+    "mistralrs-server-core/flash-attn-v3",
+]
+mkl = [
+    "naiwa-offload/mkl",
+    "mistralrs-core/mkl",
+    "mistralrs-server-core/mkl",
+]

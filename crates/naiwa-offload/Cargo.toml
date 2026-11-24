@@ -1,0 +1,35 @@
+[package]
+name = "naiwa-offload"
+description = "Edge heterogeneous MoE offloading engine (transport, VRAM slab/cache memory, decode/prefill pipelines)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+half.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+# Transitional mistral.rs dependencies (replaced by naiwa-quant in Phase 1).
+mistralrs-core.workspace = true
+mistralrs-quant.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "mistralrs-core/cuda", "mistralrs-quant/cuda"]
+cutile = ["cuda", "mistralrs-core/cutile"]
+nccl = ["cuda", "mistralrs-core/nccl"]
+cudnn = ["cuda", "mistralrs-core/cudnn"]
+flash-attn = ["cuda", "mistralrs-core/flash-attn"]
+flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3"]
+mkl = ["mistralrs-core/mkl"]
+
+[build-dependencies]
+cudaforge.workspace = true

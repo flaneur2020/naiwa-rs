@@ -3729,22 +3729,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
-name = "naiwa-rs"
+name = "naiwa-offload"
+version = "0.9.4"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
+ "libc",
+ "mistralrs-core",
+ "mistralrs-quant",
+ "parking_lot",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "naiwa-server"
 version = "0.9.4"
 dependencies = [
  "anyhow",
  "axum",
  "candle-core",
  "clap",
- "cudaforge",
  "dirs",
- "half",
- "libc",
  "mimalloc",
  "mistralrs-core",
  "mistralrs-quant",
  "mistralrs-server-core",
- "parking_lot",
+ "naiwa-offload",
  "serde_json",
  "tokio",
  "tracing",

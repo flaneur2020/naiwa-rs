@@ -23,7 +23,7 @@ pub async fn run_serve(
 
     // The prompt step's ceiling: the prefill path plans below it from the free VRAM it measures at
     // warmup (see `prefill_stream::plan`), so both flags are ceilings here, not settings.
-    crate::pipeline::prefill::set_prompt_step_ceiling(
+    naiwa_offload::pipeline::prefill::set_prompt_step_ceiling(
         runtime
             .max_num_batched_tokens
             .get()
@@ -81,8 +81,8 @@ pub async fn run_serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    if crate::config::diag().stats {
-        let s = crate::stats::dump_cache_stats();
+    if naiwa_offload::config::diag().stats {
+        let s = naiwa_offload::stats::dump_cache_stats();
         if s.installed {
             info!(
                 "expert cache (process totals): {:.1}% hit rate ({} hits, {} misses, {} staged, {} promotions); \

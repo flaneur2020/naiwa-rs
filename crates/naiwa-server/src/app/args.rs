@@ -169,7 +169,7 @@ pub struct ModelOptions {
     #[arg(
         long,
         requires = "prefill_stream",
-        default_value_t = NonZeroUsize::new(crate::pipeline::prefill::DEFAULT_MIN_TOKENS).unwrap()
+        default_value_t = NonZeroUsize::new(naiwa_offload::pipeline::prefill::DEFAULT_MIN_TOKENS).unwrap()
     )]
     pub prefill_stream_min_tokens: NonZeroUsize,
 
@@ -181,7 +181,7 @@ pub struct ModelOptions {
         long,
         requires = "prefill_stream",
         value_parser = clap::value_parser!(u8).range(1..=4),
-        default_value_t = crate::pipeline::prefill::DEFAULT_DEPTH as u8
+        default_value_t = naiwa_offload::pipeline::prefill::DEFAULT_DEPTH as u8
     )]
     pub prefill_stream_depth: u8,
 

@@ -17,8 +17,8 @@ use crate::app::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, DeviceOptions, GlobalOptions,
     ModelOptions, ModelSource,
 };
-use crate::pipeline::GpuCacheMoeProvider;
-use crate::pipeline::prefill::PrefillStreams;
+use naiwa_offload::pipeline::prefill::PrefillStreams;
+use naiwa_offload::pipeline::GpuCacheMoeProvider;
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
 
@@ -55,7 +55,7 @@ pub fn install_cpu_moe(
     // Read here, where a bad path is still a startup error rather than a surprise at warmup.
     let profile = match &profile {
         Some(path) => Some(Arc::new(
-            crate::memory::Profile::read(path, PROFILE_LAYERS, PROFILE_EXPERTS)
+            naiwa_offload::memory::Profile::read(path, PROFILE_LAYERS, PROFILE_EXPERTS)
                 .map_err(|e| anyhow::anyhow!("--expert-profile {}: {e}", path.display()))?,
         )),
         None => None,

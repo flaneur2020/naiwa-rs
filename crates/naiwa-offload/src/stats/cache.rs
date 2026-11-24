@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 /// Expert-cache counters since the last dump.
 #[derive(Default)]
-pub(crate) struct CacheStats {
+pub struct CacheStats {
     /// One expert cache was installed in this process.
     pub installed: bool,
     /// Routed experts of decode steps served from a slot.
@@ -105,7 +105,7 @@ pub(crate) fn record_cache_lookahead_dropped() {
 
 /// Take and reset the counters. `installed` is process-level and survives the reset, so a dump
 /// after the bench's warmup reset still reports the run's counters.
-pub(crate) fn dump_cache_stats() -> CacheStats {
+pub fn dump_cache_stats() -> CacheStats {
     let mut s = CACHE_STATS.lock().unwrap();
     let installed = s.installed;
     let mut out = std::mem::take(&mut *s);

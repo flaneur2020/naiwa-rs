@@ -19,7 +19,7 @@ const DEFAULT_PREFILL_THRESHOLD: usize = 32;
 
 /// Behavior-affecting runtime overrides sourced from `NAIWA_*` environment variables.
 #[derive(Debug, Clone)]
-pub(crate) struct RuntimeConfig {
+pub struct RuntimeConfig {
     /// `NAIWA_CPU_BEFORE_DMA=1`: submit complementary CPU misses before demand DMA.
     pub cpu_before_dma: bool,
     /// `NAIWA_CPU_SPIN_US` (raw value when set): enables `spin_pool::dispatch` and sets spin budget.
@@ -93,7 +93,7 @@ impl RuntimeConfig {
 
 /// Diagnostic, tracing, and profiling switches sourced from `NAIWA_*` environment variables.
 #[derive(Debug, Clone)]
-pub(crate) struct DiagConfig {
+pub struct DiagConfig {
     /// `NAIWA_STREAM_DBG` (presence).
     pub stream_dbg: bool,
     /// `NAIWA_STATS` (presence): print cache totals on graceful `serve` shutdown.
@@ -242,12 +242,12 @@ pub(crate) fn env() -> &'static EnvConfig {
 }
 
 #[inline]
-pub(crate) fn runtime() -> &'static RuntimeConfig {
+pub fn runtime() -> &'static RuntimeConfig {
     &env().runtime
 }
 
 #[inline]
-pub(crate) fn diag() -> &'static DiagConfig {
+pub fn diag() -> &'static DiagConfig {
     &env().diag
 }
 

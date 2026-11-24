@@ -50,7 +50,7 @@ thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) fn install() {
+pub fn install() {
     if crate::config::diag().model_partition_file.is_some() || super::head_partition::enabled() {
         assert!(mistralrs_core::qwen4_split::set_boundary_probe(dispatch));
     }

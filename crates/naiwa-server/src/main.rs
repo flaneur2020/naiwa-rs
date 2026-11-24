@@ -9,19 +9,6 @@
 //! - `app`       (L4): CLI arguments, model loader, and OpenAI/Anthropic HTTP server.
 
 mod app;
-mod config;
-mod memory;
-mod pipeline;
-mod stats;
-mod transport;
-
-/// `NAIWA_STREAM_DBG=1`: the prefill stream's per-layer DMA wait against its compute, so a slow
-/// prefill chunk can be attributed instead of guessed at.
-pub(crate) fn dbg_note(site: &str, msg: &str) {
-    if config::diag().stream_dbg {
-        eprintln!("STREAM_DBG {site}: {msg}");
-    }
-}
 
 use anyhow::Result;
 use clap::Parser;
@@ -43,10 +30,10 @@ async fn main() -> Result<()> {
     std::env::set_var(HF_HUB_OFFLINE_ENV, "1");
     candle_core::utils::init_global_threadpool();
     #[cfg(feature = "cuda")]
-    stats::model_partition::install();
-    if config::runtime().cpu_spin_us_raw.is_some() {
+    naiwa_offload::stats::model_partition::install();
+    if naiwa_offload::config::runtime().cpu_spin_us_raw.is_some() {
         mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(
-            transport::spin_pool::dispatch,
+            naiwa_offload::transport::spin_pool::dispatch,
         ));
     }
     let cli = Cli::parse();
@@ -70,11 +57,22 @@ fn init_tracing(verbose: u8) {
             LogVerbosity::Debug => "debug",
             LogVerbosity::Trace => "trace",
         };
-        default_mistralrs_filter(verbosity).add_directive(
-            format!("naiwa_rs={level}")
-                .parse()
-                .expect("valid directive"),
-        )
+        default_mistralrs_filter(verbosity)
+            .add_directive(
+                format!("naiwa_rs={level}")
+                    .parse()
+                    .expect("valid directive"),
+            )
+            .add_directive(
+                format!("naiwa_offload={level}")
+                    .parse()
+                    .expect("valid directive"),
+            )
+            .add_directive(
+                format!("naiwa_server={level}")
+                    .parse()
+                    .expect("valid directive"),
+            )
     });
     initialize_logging_with_filter(filter);
 }

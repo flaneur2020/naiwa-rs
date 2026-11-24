@@ -18,7 +18,7 @@ fn pin(cpu: usize) {
         assert_eq!(libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set), 0, "pin CPU {cpu}: {}", std::io::Error::last_os_error());
     }
 }
-type Callback<'a> = &'a (dyn Fn(usize) + Sync + Send);
+pub type Callback<'a> = &'a (dyn Fn(usize) + Sync + Send);
 struct Borrowed<'a>(Callback<'a>);
 struct State { epoch: usize, address: usize, stop: bool }
 struct Shared {
@@ -130,7 +130,7 @@ impl Drop for Pool {
         for worker in self.workers.drain(..) { worker.join().unwrap(); }
     }
 }
-pub(crate) fn dispatch(n: usize, f: Callback<'_>) {
+pub fn dispatch(n: usize, f: Callback<'_>) {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let cfg = crate::config::runtime();

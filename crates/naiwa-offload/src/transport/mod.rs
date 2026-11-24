@@ -7,7 +7,7 @@ pub(crate) mod activation_channel;
 pub(crate) mod copy_stream;
 pub(crate) mod doorbell;
 pub(crate) mod executor;
-pub(crate) mod spin_pool;
+pub mod spin_pool;
 
 pub(crate) use activation_channel::LookaheadChannel;
 pub(crate) use copy_stream::{CopyDone, CopyStream, CopyStreams};
