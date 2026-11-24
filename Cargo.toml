@@ -5,6 +5,7 @@ members = [
     "crates/naiwa-attn",
     "crates/naiwa-offload",
     "crates/naiwa-models",
+    "crates/naiwa-runtime",
     "crates/naiwa-server",
 ]
 default-members = ["crates/naiwa-server"]
@@ -30,6 +31,7 @@ naiwa-quant = { path = "crates/naiwa-quant" }
 naiwa-attn = { path = "crates/naiwa-attn" }
 naiwa-offload = { path = "crates/naiwa-offload" }
 naiwa-models = { path = "crates/naiwa-models" }
+naiwa-runtime = { path = "crates/naiwa-runtime" }
 
 # Shared third-party dependencies (all pinned to versions cached in Cargo.lock).
 anyhow = "1.0.100"

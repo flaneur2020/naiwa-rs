@@ -1,0 +1,28 @@
+[package]
+name = "naiwa-runtime"
+description = "GGUF tokenizer/chat-template, paged KV block manager, sampler, continuous-batching scheduler, Built-in MTP driver, and async inference engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+minijinja.workspace = true
+naiwa-attn.workspace = true
+naiwa-models.workspace = true
+naiwa-quant.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+naiwa-offload = { workspace = true, features = ["cuda"] }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "naiwa-quant/cuda", "naiwa-attn/cuda", "naiwa-models/cuda"]
