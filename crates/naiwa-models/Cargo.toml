@@ -1,0 +1,29 @@
+[package]
+name = "naiwa-models"
+description = "Qwen3.8-Flash-Next (qwen4exp) GGUF text model, QSA, PLE, Hyper-Connections, MTP head, and HybridCache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+half.workspace = true
+naiwa-attn.workspace = true
+naiwa-quant.workspace = true
+rayon.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+naiwa-offload = { workspace = true, features = ["cuda"] }
+tokenizers.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "naiwa-quant/cuda", "naiwa-attn/cuda"]

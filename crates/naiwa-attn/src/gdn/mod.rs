@@ -127,32 +127,118 @@ pub struct GatedDeltaNet {
     pub out_proj: QLinear,
 }
 
+/// Stashed pre-step state and projected inputs for one sequence in a GDN layer,
+/// enabling exact prefix replay after partial MTP speculative rejection.
+#[derive(Clone, Debug)]
+pub struct GdnSeqStash {
+    pub pre_state: GdnSeqState,
+    /// `[1, seq_len, conv_dim]`
+    pub qkv_raw: Tensor,
+    /// `[1, seq_len, num_v_heads]`
+    pub b: Tensor,
+    /// `[1, seq_len, num_v_heads]`
+    pub a: Tensor,
+}
+
 impl GatedDeltaNet {
     /// Forward pass for a single sequence `[1, seq_len, hidden]`, updating `state` in place.
     pub fn forward_seq(&self, xs: &Tensor, state: &mut GdnSeqState) -> Result<Tensor> {
-        let (batch, seq_len, _hidden) = xs.dims3()?;
-        if batch != 1 {
-            candle_core::bail!("GatedDeltaNet::forward_seq expects batch=1, got {batch}");
+        self.forward_seq_inner(xs, state, None)
+    }
+
+    /// Forward pass over a flattened/batched input `[batch, seq_len, hidden]` with per-sequence
+    /// token spans `(start, len)` on the flattened token axis and one `GdnSeqState` per sequence.
+    ///
+    /// Runs all 5 linear projections (`in_proj_{qkv,z,b,a}`, `out_proj`) batched once across all
+    /// tokens, and runs the stateful conv + delta-rule recurrence per sequence.
+    /// When `stashes` is `Some`, pushes one [`GdnSeqStash`] per sequence for exact MTP rollback.
+    pub fn forward_batch(
+        &self,
+        xs: &Tensor,
+        spans: &[(usize, usize)],
+        states: &mut [&mut GdnSeqState],
+        mut stashes: Option<&mut Vec<GdnSeqStash>>,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = xs.dims3()?;
+        if spans.len() != states.len() {
+            candle_core::bail!(
+                "GatedDeltaNet::forward_batch spans ({}) != states ({})",
+                spans.len(),
+                states.len()
+            );
         }
-        let dtype = xs.dtype();
-        let qkv_raw = self.in_proj_qkv.forward(xs)?; // [1, S, conv_dim]
-        let z = self.in_proj_z.forward(xs)?.reshape((
+        if spans.len() == 1 && batch == 1 && spans[0] == (0, seq_len) {
+            let mut single_stash = None;
+            let out = self.forward_seq_inner(
+                xs,
+                states[0],
+                stashes.as_ref().map(|_| &mut single_stash),
+            )?;
+            if let (Some(dst), Some(s)) = (stashes, single_stash) {
+                dst.push(s);
+            }
+            return Ok(out);
+        }
+
+        let total_tokens = batch * seq_len;
+        let flat = xs.reshape((1, total_tokens, hidden))?;
+        let qkv_all = self.in_proj_qkv.forward(&flat)?; // [1, T, conv_dim]
+        let z_all = self.in_proj_z.forward(&flat)?.reshape((
             1,
-            seq_len,
+            total_tokens,
             self.cfg.num_v_heads,
             self.cfg.head_v_dim,
         ))?;
-        let b = self.in_proj_b.forward(xs)?; // [1, S, H_v]
-        let a = self.in_proj_a.forward(xs)?; // [1, S, H_v]
+        let b_all = self.in_proj_b.forward(&flat)?; // [1, T, H_v]
+        let a_all = self.in_proj_a.forward(&flat)?; // [1, T, H_v]
 
+        let mut parts = Vec::with_capacity(spans.len());
+        for (&(start, len), state) in spans.iter().zip(states.iter_mut()) {
+            let qkv_i = qkv_all.narrow(1, start, len)?.contiguous()?;
+            let z_i = z_all.narrow(1, start, len)?.contiguous()?;
+            let b_i = b_all.narrow(1, start, len)?.contiguous()?;
+            let a_i = a_all.narrow(1, start, len)?.contiguous()?;
+            if let Some(dst) = stashes.as_mut() {
+                dst.push(GdnSeqStash {
+                    pre_state: state.snapshot()?,
+                    qkv_raw: qkv_i.clone(),
+                    b: b_i.clone(),
+                    a: a_i.clone(),
+                });
+            }
+            let normed_i = self.run_stateful_core(&qkv_i, &z_i, &b_i, &a_i, state)?;
+            parts.push(normed_i.reshape((1, len, self.cfg.value_dim()))?);
+        }
+        let cat = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            Tensor::cat(&parts, 1)?
+        };
+        let out = self.out_proj.forward(&cat)?;
+        out.reshape((batch, seq_len, hidden))
+    }
+
+    /// Restore `state` from `stash.pre_state` and replay only the first `keep` tokens (`0..keep`).
+    /// Used after partial MTP verification rejection.
+    pub fn replay_prefix(
+        &self,
+        state: &mut GdnSeqState,
+        stash: &GdnSeqStash,
+        keep: usize,
+    ) -> Result<()> {
+        *state = stash.pre_state.snapshot()?;
+        if keep == 0 {
+            return Ok(());
+        }
+        let qkv = stash.qkv_raw.narrow(1, 0, keep)?.contiguous()?;
+        let b = stash.b.narrow(1, 0, keep)?.contiguous()?;
+        let a = stash.a.narrow(1, 0, keep)?.contiguous()?;
         let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
-        let sigmoid_gate = self.cfg.gate_activation == GdnGateActivation::Sigmoid;
-
         #[cfg(feature = "cuda")]
-        if xs.device().is_cuda() && matches!(dtype, DType::BF16 | DType::F16) {
+        if qkv.device().is_cuda() && matches!(qkv.dtype(), DType::BF16 | DType::F16) {
             let mixed_qkv =
-                cuda::causal_conv1d_cuda(&qkv_raw, &self.conv_weight, &mut state.conv_state)?;
-            let core_out = if seq_len == 1 {
+                cuda::causal_conv1d_cuda(&qkv, &self.conv_weight, &mut state.conv_state)?;
+            let _ = if keep == 1 {
                 cuda::decode_recurrence_cuda(
                     &mixed_qkv,
                     &b,
@@ -183,20 +269,10 @@ impl GatedDeltaNet {
                     state.value_major,
                 )?
             };
-            let normed = cuda::rmsnorm_gated_cuda(
-                &core_out,
-                &z,
-                &self.norm_weight,
-                self.cfg.rms_norm_eps,
-                sigmoid_gate,
-            )?;
-            let flat = normed.reshape((1, seq_len, self.cfg.value_dim()))?;
-            return self.out_proj.forward(&flat);
+            return Ok(());
         }
-
-        // Pure candle CPU / F32 reference fallback
-        let mixed_qkv = causal_conv1d_ref(&qkv_raw, &self.conv_weight, &mut state.conv_state)?;
-        let core_out = recurrence_ref(
+        let mixed_qkv = causal_conv1d_ref(&qkv, &self.conv_weight, &mut state.conv_state)?;
+        let _ = recurrence_ref(
             &mixed_qkv,
             &b,
             &a,
@@ -206,15 +282,119 @@ impl GatedDeltaNet {
             &self.cfg,
             state.value_major,
         )?;
-        let normed = rmsnorm_gated_ref(
+        Ok(())
+    }
+
+    fn forward_seq_inner(
+        &self,
+        xs: &Tensor,
+        state: &mut GdnSeqState,
+        stash_out: Option<&mut Option<GdnSeqStash>>,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, _hidden) = xs.dims3()?;
+        if batch != 1 {
+            candle_core::bail!("GatedDeltaNet::forward_seq expects batch=1, got {batch}");
+        }
+        let qkv_raw = self.in_proj_qkv.forward(xs)?; // [1, S, conv_dim]
+        let z = self.in_proj_z.forward(xs)?.reshape((
+            1,
+            seq_len,
+            self.cfg.num_v_heads,
+            self.cfg.head_v_dim,
+        ))?;
+        let b = self.in_proj_b.forward(xs)?; // [1, S, H_v]
+        let a = self.in_proj_a.forward(xs)?; // [1, S, H_v]
+
+        if let Some(dst) = stash_out {
+            *dst = Some(GdnSeqStash {
+                pre_state: state.snapshot()?,
+                qkv_raw: qkv_raw.clone(),
+                b: b.clone(),
+                a: a.clone(),
+            });
+        }
+
+        let normed = self.run_stateful_core(&qkv_raw, &z, &b, &a, state)?;
+        let flat = normed.reshape((1, seq_len, self.cfg.value_dim()))?;
+        self.out_proj.forward(&flat)
+    }
+
+    fn run_stateful_core(
+        &self,
+        qkv_raw: &Tensor,
+        z: &Tensor,
+        b: &Tensor,
+        a: &Tensor,
+        state: &mut GdnSeqState,
+    ) -> Result<Tensor> {
+        let (_, seq_len, _) = qkv_raw.dims3()?;
+        let dtype = qkv_raw.dtype();
+        let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
+        let sigmoid_gate = self.cfg.gate_activation == GdnGateActivation::Sigmoid;
+
+        #[cfg(feature = "cuda")]
+        if qkv_raw.device().is_cuda() && matches!(dtype, DType::BF16 | DType::F16) {
+            let mixed_qkv =
+                cuda::causal_conv1d_cuda(qkv_raw, &self.conv_weight, &mut state.conv_state)?;
+            let core_out = if seq_len == 1 {
+                cuda::decode_recurrence_cuda(
+                    &mixed_qkv,
+                    b,
+                    a,
+                    &self.a_log,
+                    &self.dt_bias,
+                    &mut state.recurrent_state,
+                    self.cfg.num_k_heads,
+                    self.cfg.num_v_heads,
+                    self.cfg.head_k_dim,
+                    self.cfg.head_v_dim,
+                    tiled,
+                    state.value_major,
+                )?
+            } else {
+                cuda::prefill_recurrence_cuda(
+                    &mixed_qkv,
+                    b,
+                    a,
+                    &self.a_log,
+                    &self.dt_bias,
+                    &mut state.recurrent_state,
+                    self.cfg.num_k_heads,
+                    self.cfg.num_v_heads,
+                    self.cfg.head_k_dim,
+                    self.cfg.head_v_dim,
+                    tiled,
+                    state.value_major,
+                )?
+            };
+            return cuda::rmsnorm_gated_cuda(
+                &core_out,
+                z,
+                &self.norm_weight,
+                self.cfg.rms_norm_eps,
+                sigmoid_gate,
+            );
+        }
+
+        // Pure candle CPU / F32 reference fallback
+        let mixed_qkv = causal_conv1d_ref(qkv_raw, &self.conv_weight, &mut state.conv_state)?;
+        let core_out = recurrence_ref(
+            &mixed_qkv,
+            b,
+            a,
+            &self.a_log,
+            &self.dt_bias,
+            &mut state.recurrent_state,
+            &self.cfg,
+            state.value_major,
+        )?;
+        rmsnorm_gated_ref(
             &core_out,
-            &z,
+            z,
             &self.norm_weight,
             self.cfg.rms_norm_eps,
             sigmoid_gate,
-        )?;
-        let flat = normed.reshape((1, seq_len, self.cfg.value_dim()))?;
-        self.out_proj.forward(&flat)
+        )
     }
 }
 
@@ -439,6 +619,35 @@ mod tests {
         let diff_norm = (n_cuda.to_dtype(DType::F32)? - n_ref.to_dtype(DType::F32)?)?
             .abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         assert!(diff_norm < 2e-2, "GDN rmsnorm_gated CUDA vs ref max diff = {diff_norm}");
+
+        // Also test exact Qwen4-Exp Layer-0 dimensions: k_heads=16, v_heads=48, dk=128, dv=128, s=15
+        let cfg0 = GdnConfig {
+            hidden_size: 2560,
+            rms_norm_eps: 1e-6,
+            conv_kernel_dim: 4,
+            num_k_heads: 16,
+            num_v_heads: 48,
+            head_k_dim: 128,
+            head_v_dim: 128,
+            v_head_layout: GdnVHeadLayout::Tiled,
+            gate_activation: GdnGateActivation::Sigmoid,
+        };
+        let mut st0 = GdnSeqState::new(&cfg0, DType::BF16, DType::F32, &dev)?;
+        let x0 = Tensor::randn(0f32, 0.2, (1, 15, cfg0.conv_dim()), &dev)?.to_dtype(DType::BF16)?;
+        let w0 = Tensor::randn(0f32, 0.2, (cfg0.conv_dim(), 4), &dev)?.to_dtype(DType::BF16)?;
+        let b0 = Tensor::randn(0f32, 0.5, (1, 15, 48), &dev)?.to_dtype(DType::BF16)?;
+        let a0 = Tensor::randn(0f32, 0.5, (1, 15, 48), &dev)?.to_dtype(DType::BF16)?;
+        let al0 = Tensor::randn(-1f32, 0.2, (48,), &dev)?;
+        let dt0 = Tensor::randn(0f32, 0.2, (48,), &dev)?;
+        let z0 = Tensor::randn(0f32, 0.5, (1, 15, 48, 128), &dev)?.to_dtype(DType::BF16)?;
+        let nw0 = Tensor::ones((128,), DType::BF16, &dev)?;
+        let c0 = cuda::causal_conv1d_cuda(&x0, &w0, &mut st0.conv_state)?;
+        let o0 = cuda::prefill_recurrence_cuda(
+            &c0, &b0, &a0, &al0, &dt0, &mut st0.recurrent_state,
+            16, 48, 128, 128, true, true,
+        )?;
+        let y0 = cuda::rmsnorm_gated_cuda(&o0, &z0, &nw0, 1e-6, true)?;
+        let _ = y0.to_dtype(DType::F32)?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         Ok(())
     }
 }

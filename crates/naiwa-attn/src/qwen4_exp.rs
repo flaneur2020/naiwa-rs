@@ -56,6 +56,18 @@ mod ffi {
         /// M33 §20.7: the m16n8k16 bf16 MMA score tile against a per-element reference. 0 = agree.
         #[link_name = "naiwa_qwen4_qsa_mma_check"]
         pub(super) fn qwen4_qsa_mma_check(head_dim: i32) -> i32;
+        #[link_name = "naiwa_qwen4_router_softmax_topk"]
+        pub(super) fn qwen4_router_softmax_topk(
+            logits: *const c_void,
+            out_vals: *mut f32,
+            out_ids: *mut u32,
+            n_tokens: i32,
+            n_experts: i32,
+            top_k: i32,
+            renormalize: i32,
+            dtype: i32,
+            stream: i64,
+        );
         #[link_name = "naiwa_qwen4_hc_norm"]
         pub(super) fn qwen4_hc_norm(
             x: *const c_void,
@@ -890,6 +902,48 @@ pub fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<Tensor> {
         );
     }
     Ok(out)
+}
+
+/// Fused MoE router F32 softmax + top-k with deterministic ascending-index tie-breaking.
+///
+/// `logits`: `[n_tokens, n_experts]` (`F16`, `BF16`, or `F32` on CUDA, `n_experts <= 1024`).
+/// Returns `(topk_weights: F32 [n_tokens, top_k], topk_ids: U32 [n_tokens, top_k])`.
+pub fn router_softmax_topk(
+    logits: &Tensor,
+    top_k: usize,
+    renormalize: bool,
+) -> Result<(Tensor, Tensor)> {
+    let logits = logits.contiguous()?;
+    let (n_tokens, n_experts) = logits.dims2()?;
+    if n_experts > 1024 {
+        candle_core::bail!("router_softmax_topk supports at most 1024 experts, got {n_experts}");
+    }
+    if top_k == 0 || top_k > n_experts {
+        candle_core::bail!("router_softmax_topk invalid top_k={top_k} for n_experts={n_experts}");
+    }
+    let dtype_code = match logits.dtype() {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        DType::F32 => 2,
+        other => candle_core::bail!("router_softmax_topk unsupported dtype {other:?}"),
+    };
+    let device = logits.device();
+    let out_vals = empty(&[n_tokens, top_k], DType::F32, device)?;
+    let out_ids = empty(&[n_tokens, top_k], DType::U32, device)?;
+    unsafe {
+        ffi::qwen4_router_softmax_topk(
+            dev_ptr(&logits)? as *const _,
+            dev_ptr(&out_vals)? as *mut f32,
+            dev_ptr(&out_ids)? as *mut u32,
+            n_tokens as i32,
+            n_experts as i32,
+            top_k as i32,
+            i32::from(renormalize),
+            dtype_code,
+            stream(device)?,
+        );
+    }
+    Ok((out_vals, out_ids))
 }
 
 #[cfg(test)]

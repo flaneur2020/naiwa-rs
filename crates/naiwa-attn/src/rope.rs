@@ -57,37 +57,76 @@ impl RotaryEmbedding {
     /// When `rotary_dim < head_dim` (partial RoPE), only the first `rotary_dim` channels are rotated
     /// and the remaining pass-through channels are concatenated unchanged.
     pub fn apply_bhsd(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (b, h, s, d) = x.dims4()?;
+        let (b, _h, s, d) = x.dims4()?;
+        let orig_dtype = x.dtype();
         let rot = self.rotary_dim;
+        let half = rot / 2;
         let cos = match cos.rank() {
-            2 => cos.unsqueeze(0)?.broadcast_as((b, s, rot / 2))?.contiguous()?,
+            2 => cos.unsqueeze(0)?.broadcast_as((b, s, half))?.contiguous()?,
             3 => cos.contiguous()?,
             r => candle_core::bail!("RotaryEmbedding::apply_bhsd unexpected cos rank {r}"),
-        };
+        }
+        .to_dtype(DType::F32)?
+        .unsqueeze(1)?; // [b, 1, s, rot/2]
         let sin = match sin.rank() {
-            2 => sin.unsqueeze(0)?.broadcast_as((b, s, rot / 2))?.contiguous()?,
+            2 => sin.unsqueeze(0)?.broadcast_as((b, s, half))?.contiguous()?,
             3 => sin.contiguous()?,
             r => candle_core::bail!("RotaryEmbedding::apply_bhsd unexpected sin rank {r}"),
-        };
-        let cos_4d = cos.unsqueeze(1)?; // [b, 1, s, rot/2]
-        let sin_4d = sin.unsqueeze(1)?;
-        let rotate_part = |t: &Tensor| -> Result<Tensor> {
-            let half = rot / 2;
-            let x1 = t.narrow(D::Minus1, 0, half)?;
-            let x2 = t.narrow(D::Minus1, half, half)?;
-            let r1 = (x1.broadcast_mul(&cos_4d)? - x2.broadcast_mul(&sin_4d)?)?;
-            let r2 = (x1.broadcast_mul(&sin_4d)? + x2.broadcast_mul(&cos_4d)?)?;
-            Tensor::cat(&[&r1, &r2], D::Minus1)
-        };
-        let _ = h;
-        if rot == d {
-            rotate_part(x)
-        } else {
-            let x_rot = x.narrow(D::Minus1, 0, rot)?;
-            let x_pass = x.narrow(D::Minus1, rot, d - rot)?;
-            let rotated = rotate_part(&x_rot)?;
-            Tensor::cat(&[&rotated, &x_pass], D::Minus1)
         }
+        .to_dtype(DType::F32)?
+        .unsqueeze(1)?;
+        let xf = x.to_dtype(DType::F32)?;
+        let x1 = xf.narrow(D::Minus1, 0, half)?;
+        let x2 = xf.narrow(D::Minus1, half, half)?;
+        let r1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+        let r2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
+        let out = if rot == d {
+            Tensor::cat(&[&r1, &r2], D::Minus1)?
+        } else {
+            let x_pass = xf.narrow(D::Minus1, rot, d - rot)?;
+            Tensor::cat(&[&r1, &r2, &x_pass], D::Minus1)?
+        };
+        out.to_dtype(orig_dtype)
+    }
+
+    /// Apply NeoX-style partial RoPE to `x` of shape `[batch, seq_len, heads, head_dim]`,
+    /// with `(cos, sin)` of shape `[batch, seq_len, rotary_dim / 2]`.
+    pub fn apply_bshd(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let orig_dtype = x.dtype();
+        let half = cos.dim(D::Minus1)?;
+        let d = x.dim(D::Minus1)?;
+        let cos = cos.to_dtype(DType::F32)?.unsqueeze(2)?;
+        let sin = sin.to_dtype(DType::F32)?.unsqueeze(2)?;
+        let xf = x.to_dtype(DType::F32)?;
+        let x1 = xf.narrow(D::Minus1, 0, half)?;
+        let x2 = xf.narrow(D::Minus1, half, half)?;
+        let r1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+        let r2 = (x2.broadcast_mul(&cos)? + x1.broadcast_mul(&sin)?)?;
+        let out = if d > 2 * half {
+            Tensor::cat(&[&r1, &r2, &xf.narrow(D::Minus1, 2 * half, d - 2 * half)?], D::Minus1)?
+        } else {
+            Tensor::cat(&[&r1, &r2], D::Minus1)?
+        };
+        out.to_dtype(orig_dtype)
+    }
+
+    /// Apply per-head RMSNorm + partial NeoX RoPE to `q` and `k` (both `[batch, heads, seq_len, head_dim]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_qk_norm(
+        &self,
+        (cos, sin): &(Tensor, Tensor),
+        q: &Tensor,
+        k: &Tensor,
+        q_weight: &Tensor,
+        k_weight: &Tensor,
+        q_eps: f64,
+        k_eps: f64,
+    ) -> Result<(Tensor, Tensor)> {
+        let qn = candle_nn::ops::rms_norm(&q.contiguous()?, q_weight, q_eps as f32)?;
+        let kn = candle_nn::ops::rms_norm(&k.contiguous()?, k_weight, k_eps as f32)?;
+        let qr = self.apply_bhsd(&qn, cos, sin)?;
+        let kr = self.apply_bhsd(&kn, cos, sin)?;
+        Ok((qr, kr))
     }
 }
 

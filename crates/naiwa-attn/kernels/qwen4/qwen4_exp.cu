@@ -1764,3 +1764,145 @@ extern "C" int naiwa_qwen4_qsa_mma_check(int head_dim) {
   free(hq); free(hk); free(href); free(hmma);
   return bad;
 }
+
+// Fused MoE router softmax + top-k with deterministic ascending-index tie-breaking.
+// Supports any n_experts <= 1024 and top_k <= 32, for F16 (dtype=0), BF16 (dtype=1), F32 (dtype=2).
+template <typename T>
+static __global__ void q4_router_softmax_topk_kernel(
+    const T *__restrict__ logits,
+    float *__restrict__ out_vals,
+    unsigned int *__restrict__ out_ids,
+    int n_experts,
+    int top_k,
+    int renormalize) {
+  __shared__ float s_val[1024];
+  __shared__ float s_red[32];
+  __shared__ float s_best_v[8];
+  __shared__ int s_best_i[8];
+
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warps = blockDim.x >> 5;
+  const T *in = logits + (size_t)row * n_experts;
+
+  // 1. Load row and find max
+  float local_max = -FLT_MAX;
+  for (int i = tid; i < n_experts; i += blockDim.x) {
+    float v = q4_f(in[i]);
+    s_val[i] = v;
+    if (v > local_max) local_max = v;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    float other = __shfl_xor_sync(0xffffffff, local_max, o);
+    if (other > local_max) local_max = other;
+  }
+  if (lane == 0) s_red[warp] = local_max;
+  __syncthreads();
+  if (warp == 0) {
+    float v = (tid < warps) ? s_red[tid] : -FLT_MAX;
+    for (int o = 16; o > 0; o >>= 1) {
+      float other = __shfl_xor_sync(0xffffffff, v, o);
+      if (other > v) v = other;
+    }
+    if (lane == 0) s_red[0] = v;
+  }
+  __syncthreads();
+  const float row_max = s_red[0];
+
+  // 2. Softmax denominator
+  float local_sum = 0.0f;
+  for (int i = tid; i < n_experts; i += blockDim.x) {
+    float e = expf(s_val[i] - row_max);
+    s_val[i] = e;
+    local_sum += e;
+  }
+  const float denom = q4_block_sum(local_sum, s_red);
+  const float inv_denom = 1.0f / denom;
+  for (int i = tid; i < n_experts; i += blockDim.x) {
+    s_val[i] *= inv_denom;
+  }
+  __syncthreads();
+
+  // 3. Top-k passes with deterministic tie-breaking (smaller index wins on exact tie)
+  float *ov = out_vals + (size_t)row * top_k;
+  unsigned int *oi = out_ids + (size_t)row * top_k;
+  float topk_sum = 0.0f;
+
+  for (int r = 0; r < top_k; ++r) {
+    float bv = -FLT_MAX;
+    int bi = 0x7fffffff;
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+      float v = s_val[i];
+      if (v > bv || (v == bv && i < bi)) {
+        bv = v;
+        bi = i;
+      }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+      float ov2 = __shfl_xor_sync(0xffffffff, bv, o);
+      int oi2 = __shfl_xor_sync(0xffffffff, bi, o);
+      if (ov2 > bv || (ov2 == bv && oi2 < bi)) {
+        bv = ov2;
+        bi = oi2;
+      }
+    }
+    if (lane == 0) {
+      s_best_v[warp] = bv;
+      s_best_i[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+      float wv = (tid < warps) ? s_best_v[tid] : -FLT_MAX;
+      int wi = (tid < warps) ? s_best_i[tid] : 0x7fffffff;
+      for (int o = 16; o > 0; o >>= 1) {
+        float ov2 = __shfl_xor_sync(0xffffffff, wv, o);
+        int oi2 = __shfl_xor_sync(0xffffffff, wi, o);
+        if (ov2 > wv || (ov2 == wv && oi2 < wi)) {
+          wv = ov2;
+          wi = oi2;
+        }
+      }
+      if (lane == 0) {
+        ov[r] = wv;
+        oi[r] = (unsigned int)wi;
+        s_val[wi] = -FLT_MAX;
+        topk_sum += wv;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (renormalize && tid == 0 && topk_sum > 0.0f) {
+    const float inv = 1.0f / topk_sum;
+    for (int r = 0; r < top_k; ++r) {
+      ov[r] *= inv;
+    }
+  }
+}
+
+extern "C" void naiwa_qwen4_router_softmax_topk(
+    const void *logits,
+    float *out_vals,
+    unsigned int *out_ids,
+    int n_tokens,
+    int n_experts,
+    int top_k,
+    int renormalize,
+    int dtype,
+    int64_t stream) {
+  if (n_tokens <= 0) return;
+  const cudaStream_t s = (cudaStream_t)stream;
+  const int threads = 256;
+  if (dtype == 0) {
+    q4_router_softmax_topk_kernel<__half><<<n_tokens, threads, 0, s>>>(
+        (const __half *)logits, out_vals, out_ids, n_experts, top_k, renormalize);
+  } else if (dtype == 1) {
+    q4_router_softmax_topk_kernel<__nv_bfloat16><<<n_tokens, threads, 0, s>>>(
+        (const __nv_bfloat16 *)logits, out_vals, out_ids, n_experts, top_k, renormalize);
+  } else {
+    q4_router_softmax_topk_kernel<float><<<n_tokens, threads, 0, s>>>(
+        (const float *)logits, out_vals, out_ids, n_experts, top_k, renormalize);
+  }
+}

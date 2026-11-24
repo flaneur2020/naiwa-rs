@@ -1,17 +1,21 @@
 //! Single-device linear layer supporting both GGUF quantized weights (`QTensor`) and dense `Tensor`s.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use candle_core::{quantized::QTensor, Device, Result, Tensor};
+use candle_core::{
+    quantized::{QMatMul, QTensor},
+    DType, Device, Result, Tensor,
+};
 
-use crate::gguf::qtensor_matmul;
+use crate::gguf::{dequant, qtensor_matmul};
 
-/// A single-device linear projection `y = x @ W^T (+ b)`.
+/// A single-device linear projection `y = x @ W^T (+ b)`, also supporting quantized embedding lookup.
 #[derive(Clone)]
 pub enum QLinear {
     Quantized {
         weight: Arc<QTensor>,
         bias: Option<Tensor>,
+        iq_host_bytes: Arc<OnceLock<Option<Vec<u8>>>>,
     },
     Dense {
         weight: Tensor,
@@ -21,7 +25,11 @@ pub enum QLinear {
 
 impl QLinear {
     pub fn from_qtensor(weight: Arc<QTensor>, bias: Option<Tensor>) -> Self {
-        Self::Quantized { weight, bias }
+        Self::Quantized {
+            weight,
+            bias,
+            iq_host_bytes: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn from_dense(weight: Tensor, bias: Option<Tensor>) -> Self {
@@ -42,6 +50,67 @@ impl QLinear {
         }
     }
 
+    /// Embedding lookup for `ids` of any integer shape `[..]` -> `[.., cols]` in `dtype` on `self.device()`.
+    pub fn embedding_forward(&self, ids: &Tensor, dtype: DType) -> Result<Tensor> {
+        match self {
+            Self::Dense { weight, .. } => {
+                let mut out_shape = ids.dims().to_vec();
+                let (_, cols) = weight.dims2()?;
+                out_shape.push(cols);
+                let flat = ids.flatten_all()?.to_device(weight.device())?;
+                weight
+                    .index_select(&flat, 0)?
+                    .reshape(out_shape)?
+                    .to_dtype(dtype)
+            }
+            Self::Quantized {
+                weight,
+                iq_host_bytes,
+                ..
+            } => {
+                let qdtype = weight.dtype();
+                if dequant::is_fork_iq(qdtype) {
+                    let raw = iq_host_bytes.get_or_init(|| weight.data().ok().map(|b| b.into_owned()));
+                    let raw = raw.as_deref().ok_or_else(|| {
+                        candle_core::Error::Msg(format!(
+                            "failed to read host bytes for {qdtype:?} embedding"
+                        ))
+                    })?;
+                    let (rows, cols) = weight.shape().dims2()?;
+                    let row_bytes = (cols / qdtype.block_size()) * qdtype.type_size();
+                    if raw.len() < rows * row_bytes {
+                        candle_core::bail!(
+                            "IQ embedding: {rows}x{cols} {qdtype:?} needs {} bytes, got {}",
+                            rows * row_bytes,
+                            raw.len()
+                        );
+                    }
+                    let mut out_shape = ids.dims().to_vec();
+                    out_shape.push(cols);
+                    let id_vec = ids
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(DType::U32)?
+                        .flatten_all()?
+                        .contiguous()?
+                        .to_vec1::<u32>()?;
+                    let mut out = vec![0f32; id_vec.len() * cols];
+                    for (i, &id) in id_vec.iter().enumerate() {
+                        let idx = id as usize;
+                        if idx >= rows {
+                            candle_core::bail!("embedding id {idx} out of range for {rows} rows");
+                        }
+                        let src = &raw[idx * row_bytes..(idx + 1) * row_bytes];
+                        dequant::dequantize(src, qdtype, &mut out[i * cols..(i + 1) * cols])?;
+                    }
+                    return Tensor::from_vec(out, out_shape, &weight.device())?.to_dtype(dtype);
+                }
+                let qmm = QMatMul::from_arc(Arc::clone(weight))?;
+                let ids_dev = ids.to_device(&weight.device())?;
+                qmm.embedding(&ids_dev)?.to_dtype(dtype)
+            }
+        }
+    }
+
     /// Forward pass: `xs` has shape `[.., in_features]`, output has shape `[.., out_features]`.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut out = match self {
@@ -52,7 +121,20 @@ impl QLinear {
                 } else {
                     weight.clone()
                 };
-                xs.broadcast_matmul(&w.t()?)?
+                let wt = w.t()?;
+                let dims = xs.dims();
+                if dims.len() > 2 {
+                    let k = dims[dims.len() - 1];
+                    let rows: usize = dims[..dims.len() - 1].iter().product();
+                    let out_features = w.dim(0)?;
+                    let flat = xs.contiguous()?.reshape((rows, k))?;
+                    let y = flat.matmul(&wt)?;
+                    let mut out_dims = dims[..dims.len() - 1].to_vec();
+                    out_dims.push(out_features);
+                    y.reshape(out_dims)?
+                } else {
+                    xs.contiguous()?.matmul(&wt)?
+                }
             }
         };
         if let Some(bias) = match self {

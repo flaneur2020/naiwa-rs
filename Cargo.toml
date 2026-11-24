@@ -4,6 +4,7 @@ members = [
     "crates/naiwa-quant",
     "crates/naiwa-attn",
     "crates/naiwa-offload",
+    "crates/naiwa-models",
     "crates/naiwa-server",
 ]
 default-members = ["crates/naiwa-server"]
@@ -28,6 +29,7 @@ mistralrs-quant = { path = "../mistral.rs-iq4xs/mistralrs-quant" }
 naiwa-quant = { path = "crates/naiwa-quant" }
 naiwa-attn = { path = "crates/naiwa-attn" }
 naiwa-offload = { path = "crates/naiwa-offload" }
+naiwa-models = { path = "crates/naiwa-models" }
 
 # Shared third-party dependencies (all pinned to versions cached in Cargo.lock).
 anyhow = "1.0.100"
@@ -51,7 +53,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 tempfile = "3.27"
 thiserror = "2.0"
-tokenizers = "0.23"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

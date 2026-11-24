@@ -9,7 +9,9 @@ pub mod qwen4_exp;
 pub mod rope;
 pub mod sdpa;
 
-pub use gdn::{GatedDeltaNet, GdnConfig, GdnGateActivation, GdnSeqState, GdnVHeadLayout};
+pub use gdn::{
+    GatedDeltaNet, GdnConfig, GdnGateActivation, GdnSeqStash, GdnSeqState, GdnVHeadLayout,
+};
 pub use norm::{grouped_rms_norm, rms_norm_with_weight, GemmaRmsNorm, RmsNorm};
 pub use paged::{alloc_kv_cache, PagedAttention, PagedAttnMeta};
 pub use rope::RotaryEmbedding;

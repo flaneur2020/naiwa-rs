@@ -467,7 +467,8 @@ pub fn prefill_recurrence_cuda(
     let a_log = a_log_f32.to_dtype(DType::F32)?.contiguous()?;
     let dt_bias = dt_bias_f32.to_dtype(DType::F32)?.contiguous()?;
 
-    let (batch, seq_len, token_stride) = mixed_qkv.dims3()?;
+    let (batch, seq_len, _conv_dim) = mixed_qkv.dims3()?;
+    let token_stride = seq_len;
     let dtype = mixed_qkv.dtype();
     let dt_code = act_dtype_code(dtype)?;
     let st_code = state_dtype_code(state.dtype())?;
