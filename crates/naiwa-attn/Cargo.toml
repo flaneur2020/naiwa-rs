@@ -1,0 +1,22 @@
+[package]
+name = "naiwa-attn"
+description = "PagedAttention, SDPA, GatedDeltaNet (GDN), QSA/PLE/Hyper-Connections, RoPE, and RMSNorm operators on candle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+half.workspace = true
+naiwa-quant.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "naiwa-quant/cuda"]
+
+[build-dependencies]
+cudaforge.workspace = true

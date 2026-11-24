@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/naiwa-quant",
+    "crates/naiwa-attn",
     "crates/naiwa-offload",
     "crates/naiwa-server",
 ]
@@ -25,6 +26,7 @@ mistralrs-quant = { path = "../mistral.rs-iq4xs/mistralrs-quant" }
 
 # Workspace crates
 naiwa-quant = { path = "crates/naiwa-quant" }
+naiwa-attn = { path = "crates/naiwa-attn" }
 naiwa-offload = { path = "crates/naiwa-offload" }
 
 # Shared third-party dependencies (all pinned to versions cached in Cargo.lock).
