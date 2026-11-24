@@ -21,11 +21,6 @@ rust-version = "1.94"
 candle-core = { path = "../candle/candle-core", version = "0.11.0" }
 candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
 
-# Transitional mistral.rs dependencies (removed progressively in Phases 1-5).
-mistralrs-core = { path = "../mistral.rs-iq4xs/mistralrs-core" }
-mistralrs-server-core = { path = "../mistral.rs-iq4xs/mistralrs-server-core", default-features = false }
-mistralrs-quant = { path = "../mistral.rs-iq4xs/mistralrs-quant" }
-
 # Workspace crates
 naiwa-quant = { path = "crates/naiwa-quant" }
 naiwa-attn = { path = "crates/naiwa-attn" }

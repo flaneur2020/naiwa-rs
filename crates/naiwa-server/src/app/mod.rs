@@ -1,9 +1,9 @@
-//! Layer 4 (`app`): CLI arguments, local model loader, and HTTP server wiring.
+//! Application layer: CLI parsing, local GGUF model loading, Axum HTTP API, and server lifecycle.
 
-pub(crate) mod args;
-pub(crate) mod load;
-pub(crate) mod mistralrs_bridge;
-pub(crate) mod serve;
+pub mod args;
+pub mod http;
+pub mod load;
+pub mod serve;
 
-pub(crate) use args::{Cli, Command};
-pub(crate) use serve::run_serve;
+pub use args::{Cli, Command};
+pub use serve::run_serve;

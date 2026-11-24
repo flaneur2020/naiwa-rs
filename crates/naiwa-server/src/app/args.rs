@@ -1,4 +1,4 @@
-//! Command-line arguments. Flag names, defaults, and help text follow mistralrs-cli.
+//! Command-line arguments for `naiwa-rs` (preserving compatibility with existing harness scripts).
 
 use std::{
     num::NonZeroUsize,
@@ -6,15 +6,14 @@ use std::{
 };
 
 use anyhow::{bail, Result};
+use candle_core::DType;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use mistralrs_core::{
-    AutoDeviceMapParams, HfConfigOverrides, IsqOrganization, ModelDType, PagedCacheType,
-    DEFAULT_MAX_DECODE_STEPS_BEFORE_PREFILL, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
+use naiwa_runtime::{
+    MtpConfig, MtpDraftSampling, DEFAULT_MAX_DECODE_STEPS_BEFORE_PREFILL,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
 };
-use mistralrs_server_core::metrics::{AccessLogFormat, ObservabilityConfig};
 
-/// Qwen3.8-Flash-Next inference server, powered by mistral.rs
+/// Qwen3.8-Flash-Next GGUF edge inference server
 #[derive(Parser)]
 #[command(name = "naiwa-rs", version, about, long_about = None, propagate_version = true)]
 pub struct Cli {
@@ -27,7 +26,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Serve the model over the OpenAI- and Anthropic-compatible HTTP API
+    /// Serve the GGUF text model over the OpenAI- and Anthropic-compatible HTTP API
     Serve {
         #[command(flatten)]
         model: ModelOptions,
@@ -46,20 +45,46 @@ pub struct GlobalOptions {
     #[arg(long, global = true)]
     pub seed: Option<u64>,
 
-    /// Log all requests and responses to this file
+    /// Log all requests and responses to this file (accepted for CLI compatibility)
     #[arg(long, short, global = true)]
     pub log: Option<PathBuf>,
 
-    /// Increase logging verbosity. Use -v for debug and -vv for trace-level internals.
+    /// Increase logging verbosity (-v for debug, -vv for trace)
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }
 
-/// Where the checkpoint lives. Everything must already be on the local filesystem.
+/// Model activation dtype.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ModelDTypeArg {
+    #[default]
+    Auto,
+    Bf16,
+    F16,
+    F32,
+}
+
+impl ModelDTypeArg {
+    pub fn resolve(self, is_cuda: bool) -> DType {
+        match self {
+            Self::Auto => {
+                if is_cuda {
+                    DType::BF16
+                } else {
+                    DType::F32
+                }
+            }
+            Self::Bf16 => DType::BF16,
+            Self::F16 => DType::F16,
+            Self::F32 => DType::F32,
+        }
+    }
+}
+
+/// Local GGUF checkpoint source.
 #[derive(Args, Clone)]
 pub struct ModelSource {
-    /// Local model directory (config.json, tokenizer, safetensors or UQFF).
-    /// Optional when `-f` names local GGUF files.
+    /// Local directory containing GGUF shard(s). Optional when `-f` names absolute paths.
     #[arg(short = 'm', long)]
     pub model_id: Option<PathBuf>,
 
@@ -67,42 +92,27 @@ pub struct ModelSource {
     #[arg(short = 'f', long)]
     pub quantized_file: Option<String>,
 
-    /// GGUF vision projector file(s) (semicolon-separated for multiple)
+    /// Extra GGUF component file(s) merged into the archive (e.g. MTP component GGUF)
     #[arg(long)]
     pub mmproj: Option<String>,
 
-    /// Local directory overriding configuration, tokenizer, and processor assets for a GGUF model
-    #[arg(long)]
-    pub tok_model_id: Option<PathBuf>,
-
-    /// Path to local tokenizer.json file
+    /// Path to optional external `tokenizer.json` override
     #[arg(short = 't', long)]
     pub tokenizer: Option<PathBuf>,
 
-    /// Model data type
-    #[arg(long, default_value = "auto", value_parser = parse_dtype)]
-    pub dtype: ModelDType,
+    /// Activation data type (`auto`, `bf16`, `f16`, `f32`)
+    #[arg(long, default_value = "auto", value_enum)]
+    pub dtype: ModelDTypeArg,
 
-    /// Recursively merged JSON overrides for the model config
-    #[arg(long)]
-    pub hf_overrides: Option<HfConfigOverrides>,
-
-    /// Runtime model context length
+    /// Optional runtime context length cap
     #[arg(long, value_parser = parse_positive_usize)]
     pub max_model_len: Option<usize>,
-
-    #[command(flatten)]
-    pub multimodal: MultimodalOptions,
 }
 
-/// Model source plus the options every inference command shares.
 #[derive(Args, Clone)]
 pub struct ModelOptions {
     #[command(flatten)]
     pub source: ModelSource,
-
-    #[command(flatten)]
-    pub quantization: QuantizationOptions,
 
     #[command(flatten)]
     pub device: DeviceOptions,
@@ -110,43 +120,32 @@ pub struct ModelOptions {
     #[command(flatten)]
     pub paged_attn: PagedAttentionOptions,
 
-    /// Keep routed MoE experts in host memory and compute them on the CPU; attention, routers,
-    /// shared experts, the MTP head, and the KV cache stay on the GPU. Requires
-    /// `--expert-cache-gb`. Places every layer on the GPU unless `--device-layers` is given.
+    /// Keep routed MoE experts in host memory with an edge GPU cache (`--expert-cache-gb`)
     #[arg(long, requires = "expert_cache_gb")]
     pub cpu_moe: bool,
 
-    /// With `--cpu-moe`, turn the next-layer expert prediction off: no router matmul, no preload copies, so
-    /// the cache only ever holds what the miss path put there. Deterministic for the oracle gates (the
-    /// prediction changes which experts are resident, hence the split, hence the last-bit rounding), and much
-    /// slower - it exists for tests, not for serving.
+    /// Disable next-layer expert lookahead prediction (deterministic for oracle/AB gates)
     #[arg(long = "no-lookahead", requires = "cpu_moe")]
     pub no_lookahead: bool,
 
-    /// With `--cpu-moe`, cache the most-used routed experts in VRAM for decode, in GiB.
+    /// GPU expert cache budget in GiB
     #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
     pub expert_cache_gb: Option<f64>,
 
-    /// With `--expert-cache-gb`, fill the cache before the first token from a strata expert profile
-    /// (`data/expert-profile-coder.bin`): every layer takes its own highest-ranked experts, in rank order, until
-    /// its slots are full. The first conversation then starts warm instead of teaching the cache what it is about.
+    /// Pre-warm expert cache from a binary strata expert profile
     #[arg(long = "expert-profile", requires = "expert_cache_gb")]
-    pub expert_profile: Option<std::path::PathBuf>,
+    pub expert_profile: Option<PathBuf>,
 
-    /// With `--expert-cache-gb`, DMA this share (0.0-1.0) of each decode step's expert-cache
-    /// misses from the pinned host stacks into the staging ring (16 slots shared by all layers)
-    /// and run them on the GPU alongside the residents. Costs a fixed ~tens of MB of VRAM on
-    /// top of the cache. Whether it wins depends on the machine: it moves bytes from host DRAM
-    /// onto PCIe, so it only pays when the CPU experts are the bottleneck and the link has
-    /// headroom.
-    #[arg(long = "pcie-frac", requires = "expert_cache_gb", default_value_t = 0.0,
-          value_parser = parse_unit_fraction)]
+    /// Share (0.0-1.0) of decode misses to DMA over PCIe into the GPU staging ring
+    #[arg(
+        long = "pcie-frac",
+        requires = "expert_cache_gb",
+        default_value_t = 0.0,
+        value_parser = parse_unit_fraction
+    )]
     pub pcie_frac: f32,
 
-    /// With `--cpu-moe`, how many predicted experts may displace a resident one per row and pass
-    /// (`--lookahead-swaps`, default 2, `0` disables replacement entirely so a prediction can only
-    /// fill an empty slot). Each swap is a 2 MB PCIe copy and a cache eviction, so lowering it trades
-    /// hit rate for less copy traffic; raising it trades traffic for hit rate.
+    /// Max lookahead expert replacements per row and pass
     #[arg(
         long = "lookahead-swaps",
         requires = "expert_cache_gb",
@@ -155,17 +154,11 @@ pub struct ModelOptions {
     )]
     pub lookahead_swaps: usize,
 
-    /// With `--cpu-moe`, run the routed experts of long prefill chunks on the GPU,
-    /// uploading each layer's experts while the previous layer computes. Needs two layers' worth
-    /// of expert memory in VRAM, borrowed from `--expert-cache-gb` while a prompt runs when that
-    /// is set. Streams every expert once per chunk, so raise
-    /// `--max-num-batched-tokens` (e.g. 8192) for long prompts. CUDA only.
+    /// Stream routed experts to GPU during long prefill chunks
     #[arg(long, requires = "cpu_moe")]
     pub prefill_stream: bool,
 
-    /// With `--prefill-stream`, the shortest prefill chunk whose experts run on the GPU; shorter
-    /// ones stay on the CPU. A streamed chunk costs about one upload of every routed expert
-    /// whatever its length, so the break-even is that upload time times the CPU prefill rate.
+    /// Minimum prefill chunk token length to engage `--prefill-stream`
     #[arg(
         long,
         requires = "prefill_stream",
@@ -173,10 +166,7 @@ pub struct ModelOptions {
     )]
     pub prefill_stream_min_tokens: NonZeroUsize,
 
-    /// Layer buffers the prompt path may keep in flight (`1`-`4`, default 2). The upload of a
-    /// layer is issued before the previous one is waited for, so a deeper queue keeps the copy
-    /// engine busy across layer boundaries instead of refilling it once per layer. Each buffer is
-    /// one layer's expert set, borrowed from the expert cache when the loan is on.
+    /// In-flight prefill stream layer buffers (1-4)
     #[arg(
         long,
         requires = "prefill_stream",
@@ -185,9 +175,7 @@ pub struct ModelOptions {
     )]
     pub prefill_stream_depth: u8,
 
-    /// Expert sub-ranges a prompt layer's MoE is consumed in (`1`-`8`, default 1 = the whole layer). A masked
-    /// launch per sub-range; the split is what would let a layer be consumed while the rest of it is still
-    /// arriving (M34 S2).
+    /// Expert sub-ranges per prefill layer (1-8)
     #[arg(
         long,
         requires = "prefill_stream",
@@ -198,147 +186,67 @@ pub struct ModelOptions {
 }
 
 #[derive(Args, Clone, Default)]
-pub struct MultimodalOptions {
-    /// Maximum logical tensor memory retained by the multimodal encoder cache, in MiB
-    #[arg(long = "encoder-cache-memory-mb")]
-    pub encoder_cache_memory_mb: Option<NonZeroUsize>,
-
-    /// Maximum edge length for image resizing (aspect ratio preserved)
-    #[arg(long)]
-    pub max_edge: Option<u32>,
-
-    /// Maximum number of images per request
-    #[arg(long)]
-    pub max_num_images: Option<usize>,
-
-    /// Maximum image dimension for device mapping
-    #[arg(long)]
-    pub max_image_length: Option<usize>,
-}
-
-#[derive(Args, Clone, Default)]
-pub struct QuantizationOptions {
-    /// In-situ quantization target. Accepts numeric levels (`2`, `3`, `4`, `5`, `6`, `8`) or
-    /// raw quant names (`q4k`, `q8_0`, etc.).
-    #[arg(long = "isq", conflicts_with = "from_uqff")]
-    pub in_situ_quant: Option<String>,
-
-    /// UQFF artifact in the model directory. Accepts a filename, numeric quantization level
-    /// (`2`, `3`, `4`, `5`, `6`, `8`), or quantization type (`q4k`, `afq8`, etc.).
-    /// Use semicolons only to list disjoint shards manually.
-    #[arg(long)]
-    pub from_uqff: Option<String>,
-
-    /// ISQ organization strategy: default or moqe
-    #[arg(long)]
-    pub isq_organization: Option<IsqOrganization>,
-
-    /// imatrix file for enhanced quantization
-    #[arg(long)]
-    pub imatrix: Option<PathBuf>,
-
-    /// Calibration file for imatrix generation
-    #[arg(long, conflicts_with = "imatrix")]
-    pub calibration_file: Option<PathBuf>,
-}
-
-#[derive(Args, Clone, Default)]
 pub struct DeviceOptions {
     /// Force CPU-only execution
     #[arg(long)]
     pub cpu: bool,
-
-    /// Device layer mapping (format: ORD:NUM;... e.g., "0:10;1:20")
-    /// Omit for automatic device mapping
-    #[arg(short = 'n', long, value_delimiter = ';')]
-    pub device_layers: Option<Vec<String>>,
-
-    /// Topology YAML file for device mapping
-    #[arg(long)]
-    pub topology: Option<PathBuf>,
-
-    /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
-    pub max_seq_len: usize,
-
-    /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
-    pub max_batch_size: usize,
 }
 
 #[derive(Args, Clone)]
 pub struct PagedAttentionOptions {
-    /// PagedAttention mode
-    /// - auto: enabled on CUDA, disabled on CPU (default)
-    /// - on: force enable (fails if unsupported)
-    /// - off: force disable
+    /// PagedAttention mode (`auto`, `on`, `off`; accepted for CLI compatibility)
     #[arg(long = "paged-attn", default_value = "auto", value_enum)]
     pub mode: PagedAttnMode,
 
-    /// Allocate KV cache for this many tokens. Defaults to a memory budget on dedicated GPUs,
-    /// capped to the model context length on CUDA unified-memory devices.
+    /// Allocate KV cache for this many tokens
     #[arg(long = "pa-context-len", value_parser = parse_positive_usize)]
     pub context_len: Option<usize>,
 
-    /// GPU memory to allocate in MBs (alternative to context-len)
+    /// GPU KV cache memory in MiB
     #[arg(long = "pa-memory-mb", conflicts_with = "context_len")]
     pub memory_mb: Option<usize>,
 
-    /// GPU memory utilization fraction 0.0-1.0 (alternative to context-len/memory-mb)
+    /// GPU KV cache utilization fraction 0.0-1.0
     #[arg(long = "pa-memory-fraction", conflicts_with_all = ["context_len", "memory_mb"])]
     pub memory_fraction: Option<f32>,
 
-    /// Tokens per block (default: 32 on CUDA)
+    /// Tokens per paged KV block (default 32)
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type
-    #[arg(long = "pa-cache-type", default_value = "auto", value_parser = parse_cache_type)]
-    pub cache_type: PagedCacheType,
+    /// KV cache dtype (`auto` only; accepted for CLI compatibility)
+    #[arg(long = "pa-cache-type", default_value = "auto")]
+    pub cache_type: String,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 pub enum PagedAttnMode {
-    /// Automatic: enabled on CUDA, disabled on CPU
     #[default]
     Auto,
-    /// Force enable (error if device doesn't support it)
     On,
-    /// Force disable
     Off,
 }
 
-impl PagedAttentionOptions {
-    pub fn enabled(&self) -> Option<bool> {
-        match self.mode {
-            PagedAttnMode::Auto => None,
-            PagedAttnMode::On => Some(true),
-            PagedAttnMode::Off => Some(false),
-        }
-    }
-}
-
-/// Built-in MTP speculative decoding. Qwen3.8-Flash-Next only drafts with its own head.
 #[derive(Args, Clone)]
 pub struct MtpOptions {
-    /// Enable MTP speculative decoding with the head built into the model checkpoint.
+    /// Enable Built-in MTP speculative decoding
     #[arg(long)]
     pub mtp: bool,
 
-    /// Fixed MTP draft tokens per step; omit to adapt the depth automatically.
+    /// Fixed MTP draft tokens per step (default 2)
     #[arg(long, value_parser = parse_positive_usize, requires = "mtp")]
     pub mtp_n_predict: Option<usize>,
 
-    /// MTP draft sampling policy. Auto uses probabilistic drafting when supported.
+    /// MTP draft sampling policy (`auto`, `greedy`, `probabilistic`)
     #[arg(long, value_enum, default_value_t)]
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 }
 
 impl MtpOptions {
-    pub fn config(&self) -> Option<mistralrs_core::MtpConfig> {
-        self.mtp.then(|| {
-            mistralrs_core::MtpConfig::builtin(self.mtp_n_predict)
-                .with_draft_sampling_method(self.mtp_draft_sampling.into())
+    pub fn config(&self) -> Option<MtpConfig> {
+        self.mtp.then(|| MtpConfig {
+            n_predict: self.mtp_n_predict.unwrap_or(2),
+            draft_sampling: self.mtp_draft_sampling.into(),
         })
     }
 }
@@ -351,9 +259,9 @@ pub enum MtpDraftSamplingArg {
     Probabilistic,
 }
 
-impl From<MtpDraftSamplingArg> for mistralrs_core::MtpDraftSamplingMethod {
-    fn from(value: MtpDraftSamplingArg) -> Self {
-        match value {
+impl From<MtpDraftSamplingArg> for MtpDraftSampling {
+    fn from(v: MtpDraftSamplingArg) -> Self {
+        match v {
             MtpDraftSamplingArg::Auto => Self::Auto,
             MtpDraftSamplingArg::Greedy => Self::Greedy,
             MtpDraftSamplingArg::Probabilistic => Self::Probabilistic,
@@ -364,34 +272,34 @@ impl From<MtpDraftSamplingArg> for mistralrs_core::MtpDraftSamplingMethod {
 #[derive(Args, Clone)]
 pub struct RuntimeOptions {
     /// Maximum concurrent sequences
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 4)]
     pub max_seqs: usize,
 
-    /// Maximum tokens processed in one paged-attention scheduler step
+    /// Maximum tokens processed in one scheduler step
     #[arg(long, default_value_t = default_max_num_batched_tokens())]
     pub max_num_batched_tokens: NonZeroUsize,
 
-    /// CUDA prompt-token quantum used while decode is resident and for recurrent prefill batching
+    /// Maximum tokens per prefill chunk
     #[arg(long, default_value_t = default_max_prefill_chunk_tokens())]
     pub max_prefill_chunk_tokens: NonZeroUsize,
 
-    /// Maximum decode steps before a waiting prefill batch is admitted
+    /// Maximum decode steps before admitting a waiting prefill chunk
     #[arg(long, default_value_t = default_max_decode_steps_before_prefill())]
     pub max_decode_steps_before_prefill: NonZeroUsize,
 
-    /// Disable KV cache entirely
+    /// Accepted for CLI compatibility
     #[arg(long)]
     pub no_kv_cache: bool,
 
-    /// Number of prefix caches to hold (0 to disable)
-    #[arg(long, default_value_t = 16)]
+    /// Prefix cache entries (accepted for CLI compatibility)
+    #[arg(long, default_value_t = 0)]
     pub prefix_cache_n: usize,
 
     /// Custom chat template file (.json or .jinja)
     #[arg(long, short)]
     pub chat_template: Option<PathBuf>,
 
-    /// Explicit JINJA template override
+    /// Explicit Jinja chat template file override
     #[arg(long, short)]
     pub jinja_explicit: Option<PathBuf>,
 
@@ -409,54 +317,41 @@ pub struct ServerOptions {
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
 
-    /// Disable per-request HTTP access logs.
+    /// Disable per-request HTTP access logs
     #[arg(long)]
     pub disable_access_log: bool,
 
-    /// Format for HTTP access logs.
-    #[arg(long, value_enum, default_value = "text")]
-    pub access_log_format: AccessLogFormatArg,
+    /// Access log format (accepted for CLI compatibility)
+    #[arg(long, default_value = "text")]
+    pub access_log_format: String,
 
-    /// Include health and metrics requests in HTTP access logs.
+    /// Include health/metrics in access logs (accepted for CLI compatibility)
     #[arg(long)]
     pub access_log_health: bool,
 
-    /// Disable the x-request-id response header.
+    /// Disable x-request-id header (accepted for CLI compatibility)
     #[arg(long)]
     pub disable_request_id_header: bool,
 
-    /// Disable the Prometheus /metrics endpoint.
+    /// Disable the Prometheus `/metrics` endpoint
     #[arg(long)]
     pub disable_metrics: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-pub enum AccessLogFormatArg {
-    #[default]
-    Text,
-    Json,
-}
-
-impl ServerOptions {
-    pub fn observability_config(&self) -> ObservabilityConfig {
-        ObservabilityConfig {
-            access_log: !self.disable_access_log,
-            access_log_format: match self.access_log_format {
-                AccessLogFormatArg::Text => AccessLogFormat::Text,
-                AccessLogFormatArg::Json => AccessLogFormat::Json,
-            },
-            access_log_health: self.access_log_health,
-            request_id_header: !self.disable_request_id_header,
-            metrics: !self.disable_metrics,
-        }
-    }
 }
 
 pub fn parse_positive_usize(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(0) => Err("value must be greater than 0".to_string()),
-        Ok(value) => Ok(value),
-        Err(err) => Err(err.to_string()),
+        Ok(v) => Ok(v),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn parse_unit_fraction(value: &str) -> Result<f32, String> {
+    let v: f32 = value.parse().map_err(|e| format!("{e}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err("value must be between 0.0 and 1.0".to_string())
     }
 }
 
@@ -468,30 +363,11 @@ fn default_max_prefill_chunk_tokens() -> NonZeroUsize {
     NonZeroUsize::new(DEFAULT_MAX_PREFILL_CHUNK_TOKENS).unwrap()
 }
 
-/// A `0.0-1.0` fraction: the knobs these flags drive are meaningless outside that range.
-fn parse_unit_fraction(value: &str) -> Result<f32, String> {
-    let v: f32 = value.parse().map_err(|e| format!("{e}"))?;
-    if (0.0..=1.0).contains(&v) {
-        Ok(v)
-    } else {
-        Err("value must be between 0.0 and 1.0".to_string())
-    }
-}
-
 fn default_max_decode_steps_before_prefill() -> NonZeroUsize {
     NonZeroUsize::new(DEFAULT_MAX_DECODE_STEPS_BEFORE_PREFILL).unwrap()
 }
 
-fn parse_dtype(value: &str) -> Result<ModelDType, String> {
-    value.parse()
-}
-
-fn parse_cache_type(value: &str) -> Result<PagedCacheType, String> {
-    value.parse()
-}
-
-/// Expands a leading `~/` in each entry of a `;`-separated path list, since quoting the
-/// list stops the shell from doing it.
+/// Expands a leading `~/` in each entry of a `;`-separated path list.
 pub fn expand_home_in_list(value: &str) -> String {
     let home = dirs::home_dir();
     value
@@ -517,11 +393,69 @@ pub fn split_path_list(value: &str) -> Result<Vec<&str>> {
 
 pub fn ensure_local_dir(path: &Path, what: &str) -> Result<()> {
     if !path.is_dir() {
-        bail!(
-            "{what} `{}` is not a local directory; naiwa-rs only loads models that already \
-             exist on the filesystem",
-            path.display()
-        );
+        bail!("{what} `{}` is not a local directory", path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_oracle_and_mtp2_cli_invocations() {
+        let cli = Cli::try_parse_from([
+            "naiwa-rs",
+            "serve",
+            "-m",
+            "/tmp/model",
+            "-f",
+            "a.gguf;b.gguf",
+            "--cpu-moe",
+            "--expert-cache-gb",
+            "2.5",
+            "--pcie-frac",
+            "0.4",
+            "--prefill-stream",
+            "--prefill-stream-min-tokens",
+            "64",
+            "--max-num-batched-tokens",
+            "8192",
+            "--max-prefill-chunk-tokens",
+            "8192",
+            "--max-seqs",
+            "4",
+            "--mmproj",
+            "/tmp/mtp.gguf",
+            "--mtp",
+            "--mtp-n-predict",
+            "2",
+            "--mtp-draft-sampling",
+            "greedy",
+            "--no-lookahead",
+            "--pa-context-len",
+            "4096",
+            "--prefix-cache-n",
+            "1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "19980",
+            "--disable-access-log",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve {
+                model,
+                runtime,
+                server,
+            } => {
+                assert!(model.cpu_moe);
+                assert!(model.no_lookahead);
+                assert_eq!(model.expert_cache_gb, Some(2.5));
+                assert_eq!(runtime.mtp.config().unwrap().n_predict, 2);
+                assert_eq!(server.port, 19980);
+            }
+        }
+    }
 }

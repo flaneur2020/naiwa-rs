@@ -11,4 +11,6 @@ pub mod spin_pool;
 
 pub(crate) use activation_channel::LookaheadChannel;
 pub(crate) use copy_stream::{CopyDone, CopyStream, CopyStreams};
+#[cfg(feature = "cuda")]
+pub use copy_stream::free_bytes;
 pub(crate) use doorbell::{PassCell, TopkDoorbell};
