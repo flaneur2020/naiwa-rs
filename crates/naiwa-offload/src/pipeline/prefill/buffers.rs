@@ -7,14 +7,14 @@ use std::time::Instant;
 
 use candle_core::quantized::QTensor;
 use candle_core::Device;
-use mistralrs_core::MoEExperts;
+use naiwa_quant::MoEExperts;
 use tracing::{debug, info, warn};
 
 use crate::transport::copy_stream::{trim_device_pool, CopyDone, ReadFence, SlotMemory};
 
 use super::planner::{
     activation_bytes, chunk_scratch, kv_reserve, log_plan, plan_with_lend_depth, plan_with_reserve,
-    prompt_step_ceiling, Plan, MAX_HEADROOM, PLAN_GRID,
+    prompt_step_ceiling, publish_prompt_step_ceiling, Plan, MAX_HEADROOM, PLAN_GRID,
 };
 use super::PrefillStream;
 
@@ -194,7 +194,7 @@ impl PrefillStream {
                 *self.plan.lock().unwrap() = Some(decision);
                 log_plan(self, decision, free, "first chunk");
                 if decision.chunk < previous.chunk {
-                    mistralrs_core::PROMPT_STEP_CEILING.store(decision.chunk, Ordering::Release);
+                    publish_prompt_step_ceiling(decision.chunk);
                     info!(
                         "prefill: the prompt step drops from {} to {} tokens for the rest of the \
                          session",
@@ -367,9 +367,8 @@ impl PrefillStream {
                 Arc::clone(memory[2].tensor()),
                 self.num_experts,
                 self.top_k,
-                &self.comm,
                 self.act,
-            )?);
+            ));
             buf.memory = Some(memory);
             crate::dbg_note(
                 "prefill_realloc",

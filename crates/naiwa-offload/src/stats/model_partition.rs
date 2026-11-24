@@ -50,13 +50,11 @@ thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn install() {
-    if crate::config::diag().model_partition_file.is_some() || super::head_partition::enabled() {
-        assert!(mistralrs_core::qwen4_split::set_boundary_probe(dispatch));
-    }
+pub fn enabled() -> bool {
+    crate::config::diag().model_partition_file.is_some() || super::head_partition::enabled()
 }
 
-fn dispatch(xs: &Tensor, layer: usize, phase: &'static str) {
+pub fn dispatch(xs: &Tensor, layer: usize, phase: &'static str) {
     if phase.starts_with("sample_") || phase.starts_with("pipeline_") {
         super::head_partition::host_mark(phase);
         return;

@@ -12,15 +12,12 @@ mod diagnostics;
 mod planner;
 mod split;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle_core::{Device, Tensor};
-use mistralrs_core::layers::Activation;
-use mistralrs_core::moe_offload::ExpertLoadContext;
-use mistralrs_core::MoEExperts;
-use mistralrs_quant::Comm;
+use naiwa_quant::{Activation, ExpertLoadRequest, MoEExperts};
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
@@ -28,9 +25,13 @@ use crate::transport::copy_stream::{CopyDone, CopyStream, CopyStreams, ReadFence
 
 use self::buffers::{is_out_of_memory, HostStacks, LayerBuf};
 use self::diagnostics::Peak;
-use self::planner::{log_plan, prompt_step_ceiling, Plan, MAX_DEPTH};
+use self::planner::{
+    log_plan, prompt_step_ceiling, publish_prompt_step_ceiling, Plan, MAX_DEPTH,
+};
 
-pub use self::planner::{set_prompt_step_ceiling, DEFAULT_DEPTH, DEFAULT_MIN_TOKENS};
+pub use self::planner::{
+    set_prompt_step_ceiling, set_prompt_step_publisher, DEFAULT_DEPTH, DEFAULT_MIN_TOKENS,
+};
 
 pub struct PrefillStream {
     pub(super) device: Device,
@@ -40,7 +41,6 @@ pub struct PrefillStream {
     /// `--prefill-split g`: the layer's experts are consumed in `g` sub-ranges (M34 S2). 1 is the whole layer.
     pub(super) split: usize,
     pub(super) act: Activation,
-    pub(super) comm: Arc<Comm>,
     pub(in crate::pipeline::prefill) layers: RwLock<Vec<Option<HostStacks>>>,
     pub(in crate::pipeline::prefill) bufs: Vec<Mutex<LayerBuf>>,
     /// `--prefill-depth`: the most buffers the plan may use.
@@ -63,13 +63,12 @@ pub struct PrefillStream {
 impl PrefillStream {
     /// `None` when `device` has no copy stream (not CUDA).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         device: &Device,
         copy: Option<Arc<CopyStream>>,
         num_experts: usize,
         top_k: usize,
         act: Activation,
-        comm: Arc<Comm>,
         min_tokens: usize,
         depth: usize,
         split: usize,
@@ -105,7 +104,6 @@ impl PrefillStream {
             top_k,
             split: split.clamp(1, 8),
             act,
-            comm,
             layers: RwLock::default(),
             plan: Mutex::new(None),
             refused: AtomicBool::new(false),
@@ -288,7 +286,7 @@ impl PrefillStreams {
             .filter_map(|(_, stream)| stream.plan())
             .min()?;
         drop(streams);
-        mistralrs_core::PROMPT_STEP_CEILING.store(chunk, Ordering::Release);
+        publish_prompt_step_ceiling(chunk);
         info!(
             "prefill: the scheduler's prompt step is capped at {chunk} tokens (from \
              --max-num-batched-tokens/--max-prefill-chunk-tokens {})",
@@ -301,9 +299,9 @@ impl PrefillStreams {
     /// stream. `None` for the MTP head, for stacks that are not all page-locked (`pinned`), and
     /// off CUDA: such a layer keeps its prefill on the CPU.
     #[allow(clippy::too_many_arguments)]
-    pub fn attach(
+    pub(crate) fn attach(
         &self,
-        ctx: &ExpertLoadContext<'_>,
+        ctx: &ExpertLoadRequest<'_>,
         experts: &MoEExperts,
         pinned: bool,
         copy_streams: &CopyStreams,
@@ -325,7 +323,6 @@ impl PrefillStreams {
                     ctx.config.num_experts,
                     ctx.config.num_experts_per_tok,
                     ctx.act,
-                    Arc::clone(ctx.comm),
                     self.min_tokens,
                     self.depth,
                     self.split,
@@ -359,9 +356,7 @@ mod tests {
 
     use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-    use mistralrs_core::layers::Activation;
-    use mistralrs_core::MoEExperts;
-    use mistralrs_quant::{Comm, Id};
+    use naiwa_quant::{Activation, MoEExperts};
 
     fn stack(e: usize, n: usize, k: usize, seed: f32) -> Arc<QTensor> {
         let data: Vec<f32> = (0..e * n * k)
@@ -379,11 +374,9 @@ mod tests {
             stack(e, inter, hidden, 0.7),
             stack(e, hidden, inter, 1.3),
         );
-        let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).unwrap());
         let act = Activation::Silu;
         let experts =
-            MoEExperts::from_qtensors(gate.clone(), up.clone(), down.clone(), e, 2, &comm, act)
-                .unwrap();
+            MoEExperts::from_qtensors(gate.clone(), up.clone(), down.clone(), e, 2, act);
 
         let tokens = 3;
         let xs: Vec<f32> = (0..tokens * hidden)

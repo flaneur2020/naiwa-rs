@@ -4,7 +4,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use tracing::{debug, info, warn};
 
 use crate::memory::host_weights::{self, pin_expert_stacks, PinnedStack};
@@ -19,15 +19,14 @@ use crate::pipeline::prefill::{PrefillStream, PrefillStreams};
 use crate::pipeline::{CachedExperts, CpuExperts};
 use crate::stats;
 use crate::transport::{CopyDone, CopyStreams, LookaheadChannel, PassCell};
-use mistralrs_core::moe_offload::{ExpertLoadContext, RoutedExperts, RoutedExpertsProvider};
-use mistralrs_core::MoEExperts;
+use naiwa_quant::{ExpertLoadRequest, MoEExperts, RoutedExperts, RoutedExpertsProvider};
 
 /// With `--prefill-stream`, pin `experts`' stacks and attach the layer to its device's prefill
 /// stream. The pinned registrations must live as long as the layer.
 #[allow(clippy::too_many_arguments)]
 fn attach_prefill(
     prefill: &Option<PrefillStreams>,
-    ctx: &ExpertLoadContext<'_>,
+    ctx: &ExpertLoadRequest<'_>,
     experts: &MoEExperts,
     copy_streams: &CopyStreams,
     slab: Option<Arc<Slab>>,
@@ -273,12 +272,6 @@ impl GpuCacheMoeProvider {
                 MAX_DECODE_ROWS * first.hidden(),
             )?;
         }
-        // `MISTRALRS_VRAM_DUMP=1`: what the loader actually put in device memory, by kind and by
-        // module. Run it here, where the model is loaded and nothing else has been allocated yet.
-        #[cfg(feature = "cuda")]
-        if let Some(first) = layers.first() {
-            mistralrs_quant::dump_weights(first.slot_device());
-        }
         // The prefill path's memory plan: one decision, now that the cache, the KV and the mapped
         // buffers exist, from the free VRAM it measures. It picks the prompt step and the stream's
         // buffer count together and publishes the step to the scheduler.
@@ -316,25 +309,35 @@ impl GpuCacheMoeProvider {
 impl RoutedExpertsProvider for GpuCacheMoeProvider {
     fn build(
         &self,
-        ctx: ExpertLoadContext<'_>,
+        ctx: ExpertLoadRequest<'_>,
     ) -> candle_core::Result<Option<Arc<dyn RoutedExperts>>> {
         // Never cache CPU-device layers.
         if ctx.layer_device.is_cpu() {
             return Ok(None);
         }
+        let load_cpu = || -> candle_core::Result<MoEExperts> {
+            let (gate, up, down) = (ctx.load_stacks)(&Device::Cpu)?;
+            Ok(MoEExperts::from_qtensors(
+                gate,
+                up,
+                down,
+                ctx.config.num_experts,
+                ctx.config.num_experts_per_tok,
+                ctx.act,
+            ))
+        };
         // The MTP head is the drafter's whole working set: 512 experts that a prompt chunk routes ~33
         // rows to *each*, so there is nothing to cache or stage — the layer *is* its experts. Resident,
         // compressed to Q2_0 (`moe::resident`): 675 MiB instead of the Q4_0 stack's 1.35 GB, and both
         // prefill and decode then run on the GPU through the ordinary expert kernels.
         if ctx.site.is_mtp {
-            let experts = ctx.load_builtin(Device::Cpu)?;
+            let experts = load_cpu()?;
             host_weights::advise_expert_stacks(&experts)?;
             let resident = resident::build(
                 &experts,
                 ctx.layer_device,
                 ctx.config.num_experts,
                 ctx.config.num_experts_per_tok,
-                ctx.comm,
                 ctx.act,
             )?;
             // The host stacks are only needed to build the pool; dropping them returns 1.35 GiB of RAM.
@@ -343,7 +346,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
                 Some(pool) => Ok(Some(pool)),
                 // Not a GGUF-quantized stack (e.g. a dense safetensors build): keep the CPU path.
                 None => {
-                    let experts = ctx.load_builtin(Device::Cpu)?;
+                    let experts = load_cpu()?;
                     host_weights::advise_expert_stacks(&experts)?;
                     Ok(Some(Arc::new(CpuExperts::new(
                         experts,
@@ -357,7 +360,7 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             };
         }
 
-        let cpu_experts = ctx.load_builtin(Device::Cpu)?;
+        let cpu_experts = load_cpu()?;
         let huge_bytes = host_weights::advise_expert_stacks(&cpu_experts)?;
         let num_experts = ctx.config.num_experts;
 
@@ -498,12 +501,15 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
         // predicted. (W92-W99 history: GPU router + logits D2H → CPU router + GPU
         // router + activation D2H → R2a channels; the weights are [128, 2048] F32,
         // ~1 MiB/layer on the host.)
-        let router = match load_router(&ctx, num_experts, hidden, &Device::Cpu) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                debug!("expert cache: layer {layer_idx} has no router for lookahead: {e}");
-                None
-            }
+        let router = match ctx.router_weight {
+            Some(w) => match w.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    debug!("expert cache: layer {layer_idx} router transfer failed: {e}");
+                    None
+                }
+            },
+            None => None,
         };
         // R2a: the publish channel, one per layer (each layer has its own worker-visible
         // activation; sized for the biggest MTP verify window: np4 + 1 target = 5 rows).
@@ -606,17 +612,4 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             prefill,
         })))
     }
-}
-
-fn load_router(
-    ctx: &ExpertLoadContext<'_>,
-    num_experts: usize,
-    hidden: usize,
-    device: &Device,
-) -> candle_core::Result<Tensor> {
-    ctx.vb
-        .pp("gate")
-        .get((num_experts, hidden), "weight")?
-        .to_device(device)?
-        .to_dtype(DType::F32)
 }

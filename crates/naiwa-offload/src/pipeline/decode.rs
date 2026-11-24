@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use candle_core::Tensor;
-use mistralrs_core::layers::Activation;
+use naiwa_quant::Activation;
 
 use super::observer::DecodeObserver;
 use super::stages::{CpuMiss, CpuPending, DmaMiss, Gpu, Hit, Preload, Route};
@@ -176,7 +176,7 @@ mod tests {
     use crate::memory::{LayerCache, LayerState, LayerTransport, LayerWeights, Slot};
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::Device;
-    use mistralrs_core::MoEExperts;
+    use naiwa_quant::MoEExperts;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -191,20 +191,14 @@ mod tests {
             let t = Tensor::from_vec(data, (e, n, k), &Device::Cpu).unwrap();
             Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap())
         };
-        let comm = Arc::new(
-            mistralrs_quant::Comm::from_device(mistralrs_quant::Id::new(), &Device::Cpu, 0, 1)
-                .unwrap(),
-        );
         let cpu = MoEExperts::from_qtensors(
             q(inter, hidden, 0.1),
             q(inter, hidden, 0.7),
             q(hidden, inter, 1.3),
             e,
             2,
-            &comm,
             Activation::Silu,
-        )
-        .unwrap();
+        );
         Arc::new(CachedLayer {
             weights: LayerWeights {
                 _pinned: Vec::new(),

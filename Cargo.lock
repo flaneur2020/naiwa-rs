@@ -3737,10 +3737,27 @@ dependencies = [
  "cudaforge",
  "half",
  "libc",
- "mistralrs-core",
- "mistralrs-quant",
+ "naiwa-quant",
  "parking_lot",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "naiwa-quant"
+version = "0.9.4"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "candle-core",
+ "candle-nn",
+ "cudaforge",
+ "half",
+ "memmap2",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3758,6 +3775,7 @@ dependencies = [
  "mistralrs-quant",
  "mistralrs-server-core",
  "naiwa-offload",
+ "naiwa-quant",
  "serde_json",
  "tokio",
  "tracing",

@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, QTensor};
 use candle_core::Device;
-use mistralrs_core::layers::Activation;
-use mistralrs_core::MoEExperts;
+use naiwa_quant::{Activation, MoEExperts};
 
 /// A decode step's routed experts on the CPU in two parallel passes
-/// (`mistralrs_quant::fused_moe_decode`): gate+up+act per distinct (expert, row), then down with
+/// (`naiwa_quant::fused_moe_decode`): gate+up+act per distinct (expert, row), then down with
 /// the router-weighted sum. Returns `None` when the generic fallback must run instead.
 pub(crate) fn fused_decode(
     experts: &MoEExperts,
@@ -24,7 +23,7 @@ pub(crate) fn fused_decode(
     let Some((gate, up, down)) = experts.expert_qtensors() else {
         return Ok(None);
     };
-    mistralrs_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk)
+    naiwa_quant::fused_moe_decode(&gate, &up, &down, xs, ids, weights, topk)
 }
 
 /// The byte range of expert `e` in a stacked `[E, N, K]` `QTensor`.

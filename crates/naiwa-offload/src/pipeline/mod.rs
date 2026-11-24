@@ -14,9 +14,7 @@ pub(crate) mod stages;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
-use mistralrs_core::layers::Activation;
-use mistralrs_core::moe_offload::RoutedExperts;
-use mistralrs_core::MoEExperts;
+use naiwa_quant::{Activation, MoEExperts, RoutedExperts};
 
 use crate::memory::expert::fused_decode;
 use crate::memory::host_weights::PinnedStack;

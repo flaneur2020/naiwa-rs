@@ -30,12 +30,22 @@ async fn main() -> Result<()> {
     std::env::set_var(HF_HUB_OFFLINE_ENV, "1");
     candle_core::utils::init_global_threadpool();
     #[cfg(feature = "cuda")]
-    naiwa_offload::stats::model_partition::install();
+    if naiwa_offload::stats::model_partition::enabled() {
+        assert!(mistralrs_core::qwen4_split::set_boundary_probe(
+            naiwa_offload::stats::model_partition::dispatch
+        ));
+    }
     if naiwa_offload::config::runtime().cpu_spin_us_raw.is_some() {
+        naiwa_quant::install_task_dispatcher(Some(
+            naiwa_offload::transport::spin_pool::dispatch,
+        ));
         mistralrs_quant::gguf::fused_cpu::install_task_dispatcher(Some(
             naiwa_offload::transport::spin_pool::dispatch,
         ));
     }
+    naiwa_offload::pipeline::prefill::set_prompt_step_publisher(|chunk| {
+        mistralrs_core::PROMPT_STEP_CEILING.store(chunk, std::sync::atomic::Ordering::Release);
+    });
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);
 

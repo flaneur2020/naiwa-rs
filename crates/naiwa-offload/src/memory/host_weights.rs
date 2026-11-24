@@ -13,7 +13,7 @@
 
 use candle_core::quantized::QTensor;
 use candle_core::Device;
-use mistralrs_core::MoEExperts;
+use naiwa_quant::MoEExperts;
 
 const HUGE_PAGE: usize = 2 << 20;
 

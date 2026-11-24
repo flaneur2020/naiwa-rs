@@ -2,6 +2,7 @@
 //! buffer count together from measured free VRAM and optional cache-slab lending capacity.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use tracing::info;
 
@@ -35,6 +36,20 @@ pub(crate) const SUB_ROWS: usize = 256;
 /// --max-prefill-chunk-tokens)`), published by the commands before the model loads. The plan below
 /// only ever chooses at or below it.
 static PROMPT_STEP_CEILING: AtomicUsize = AtomicUsize::new(0);
+static PROMPT_STEP_PUBLISHER: OnceLock<fn(usize)> = OnceLock::new();
+
+/// Register a callback invoked whenever the prefill planner updates the prompt-step ceiling
+/// (used by the scheduler / runtime).
+pub fn set_prompt_step_publisher(publisher: fn(usize)) {
+    let _ = PROMPT_STEP_PUBLISHER.set(publisher);
+}
+
+/// Publish a newly planned prompt-step ceiling to the scheduler/runtime.
+pub(super) fn publish_prompt_step_ceiling(tokens: usize) {
+    if let Some(publisher) = PROMPT_STEP_PUBLISHER.get() {
+        publisher(tokens);
+    }
+}
 
 /// `0` clears the ceiling (tests, non-CUDA).
 pub fn set_prompt_step_ceiling(tokens: usize) {

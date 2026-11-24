@@ -9,7 +9,7 @@ use mistralrs_core::moe_offload::install_routed_experts_provider;
 use mistralrs_core::{
     HfConfigOverrides, IsqOrganization, ModelSelected, MultimodalLoaderType, UqffWriteConfig,
 };
-use mistralrs_quant::GgufArchive;
+use naiwa_quant::GgufArchive;
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 use tracing::info;
 
@@ -69,7 +69,9 @@ pub fn install_cpu_moe(
         profile,
     ));
     let _ = GPU_CACHE_PROVIDER.set(Arc::clone(&provider));
-    install_routed_experts_provider(provider)?;
+    install_routed_experts_provider(Arc::new(
+        crate::app::mistralrs_bridge::MistralRsMoeBridge::new(provider),
+    ))?;
     info!(
         "--cpu-moe + expert cache: routed experts in host memory; {:.1} GB GPU cache",
         expert_cache_gb

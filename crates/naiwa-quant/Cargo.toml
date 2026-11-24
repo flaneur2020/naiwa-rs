@@ -1,0 +1,29 @@
+[package]
+name = "naiwa-quant"
+description = "GGUF quantization, IQ/Q2_0/MMQ/MMVQ/MoE kernels, and single-device MoE/Linear abstractions on candle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+bytemuck.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+half.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[build-dependencies]
+cudaforge.workspace = true

@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use candle_core::quantized::QTensor;
 use candle_core::{DType, Shape, Tensor};
-use mistralrs_core::MoEExperts;
+use naiwa_quant::MoEExperts;
 
 use crate::transport::copy_stream::SlotMemory;
 
@@ -127,9 +127,8 @@ impl PrefillStream {
             it.next().expect("down"),
             n,
             self.top_k,
-            &self.comm,
             self.act,
-        )?))
+        )))
     }
 
     /// `topk_weights` and `topk_ids` restricted to experts `[a, a + n)`: weights outside the range

@@ -21,10 +21,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{Device, Result, Shape, Tensor};
-use mistralrs_core::layers::Activation;
-use mistralrs_core::moe_offload::RoutedExperts;
-use mistralrs_core::MoEExperts;
-use mistralrs_quant::Comm;
+use naiwa_quant::{Activation, MoEExperts, RoutedExperts};
 
 /// Elements per Q2_0 block, and the packed block's size.
 const QK2_0: usize = 64;
@@ -92,7 +89,6 @@ pub fn build(
     device: &Device,
     num_experts: usize,
     top_k: usize,
-    comm: &Arc<Comm>,
     act: Activation,
 ) -> Result<Option<Arc<dyn RoutedExperts>>> {
     let Some((gate, up, down)) = cpu_experts.expert_qtensors() else {
@@ -108,9 +104,8 @@ pub fn build(
         stacks[2].clone(),
         num_experts,
         top_k,
-        comm,
         act,
-    )?;
+    );
     Ok(Some(Arc::new(experts)))
 }
 
@@ -174,7 +169,7 @@ fn requantize(src: &QTensor, device: &Device) -> Result<Arc<QTensor>> {
 
     // candle's `QStorage::from_data` refuses Q2_0 on CUDA; the fork's own builder is the supported
     // route (same bytes, same kernels).
-    let storage = mistralrs_quant::gguf::q2_0::storage_for_device(&packed, device)?;
+    let storage = naiwa_quant::gguf::q2_0::storage_for_device(&packed, device)?;
     let shape = Shape::from_dims(&[num_experts, out, inn]);
     Ok(Arc::new(QTensor::new(storage, shape)?))
 }
@@ -193,7 +188,7 @@ mod tests {
         let mut packed = vec![0u8; x.len() / QK2_0 * Q2_0_BYTES];
         quantize_q2_0(&x, &mut packed);
         let mut back = vec![0f32; x.len()];
-        mistralrs_quant::gguf::q2_0::dequantize(&packed, &mut back).expect("decodes");
+        naiwa_quant::gguf::q2_0::dequantize(&packed, &mut back).expect("decodes");
 
         // 2 bits with scale = block max: the decoded set is {-1,0,1,2} x max, so ~0.1 of the amplitude.
         let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -211,7 +206,7 @@ mod tests {
         let mut packed = vec![0u8; zeros.len() / QK2_0 * Q2_0_BYTES];
         quantize_q2_0(&zeros, &mut packed);
         let mut back = vec![0f32; zeros.len()];
-        mistralrs_quant::gguf::q2_0::dequantize(&packed, &mut back).expect("decodes");
+        naiwa_quant::gguf::q2_0::dequantize(&packed, &mut back).expect("decodes");
         assert!(back.iter().all(|v| *v == 0.0), "zero block decoded to {back:?}");
     }
 }

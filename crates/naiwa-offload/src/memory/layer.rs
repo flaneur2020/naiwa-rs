@@ -12,8 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use candle_core::{Device, Tensor};
-use mistralrs_core::layers::Activation;
-use mistralrs_core::MoEExperts;
+use naiwa_quant::{Activation, MoEExperts};
 
 use crate::stats;
 use crate::transport::{CopyDone, CopyStream, LookaheadChannel, PassCell, TopkDoorbell};

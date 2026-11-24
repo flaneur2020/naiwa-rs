@@ -147,7 +147,7 @@ mod tests {
     #[ignore = "isolated dispatcher installation; run this test alone"]
     fn fused_quantized_output_matches_rayon_bits() {
         use candle_core::{quantized::{QTensor, GgmlDType}, Device, Tensor};
-        use mistralrs_quant::gguf::fused_cpu::{fused_moe_decode, install_task_dispatcher};
+        use naiwa_quant::gguf::fused_cpu::{fused_moe_decode, install_task_dispatcher};
         let mk = |n, k, seed: f32| {
             let v: Vec<_> = (0..4*n*k).map(|i| (i as f32*seed).sin()*0.1).collect();
             QTensor::quantize(&Tensor::from_vec(v, (4,n,k), &Device::Cpu).unwrap(), GgmlDType::Q4_0).unwrap()

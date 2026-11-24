@@ -2,6 +2,7 @@
 
 pub(crate) mod args;
 pub(crate) mod load;
+pub(crate) mod mistralrs_bridge;
 pub(crate) mod serve;
 
 pub(crate) use args::{Cli, Command};

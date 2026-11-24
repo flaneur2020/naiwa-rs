@@ -81,7 +81,7 @@ impl PrefillStream {
             .map(|(l, f)| format!("{l}:{}", (base.saturating_sub(*f)) >> 20))
             .collect();
         info!("prefill peak trace (layer: MiB used): {}", trace.join(" "));
-        let (live, retired) = mistralrs_quant::gguf::cuda::moe_workspace_bytes();
+        let (live, retired) = naiwa_quant::moe_workspace_bytes();
         info!(
             "prefill peak: MoE workspaces {:.0} MiB live + {:.0} MiB retired (freed only when a graph may hold \
              them)",

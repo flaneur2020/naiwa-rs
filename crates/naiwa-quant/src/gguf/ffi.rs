@@ -1,0 +1,2780 @@
+//! FFI bindings for indexed MoE CUDA kernels.
+//!
+//! These bindings allow Rust code to call the optimized CUDA kernels
+//! for indexed MoE forward pass with GGUF quantized weights.
+
+#![allow(dead_code)]
+#![allow(improper_ctypes)]
+
+use std::ffi::c_void;
+
+macro_rules! declare_mmvq_fused_qkv {
+    ($fn_name:ident) => {
+        #[link_name = concat!("naiwa_", stringify!($fn_name))]
+        pub fn $fn_name(
+            vx_q: *const c_void,
+            vx_k: *const c_void,
+            vx_v: *const c_void,
+            vy: *const c_void,
+            q_dst: *mut c_void,
+            k_dst: *mut c_void,
+            v_dst: *mut c_void,
+            ncols_x: i32,
+            nrows_q: i32,
+            nrows_k: i32,
+            nrows_v: i32,
+            stride_col_y: i32,
+            b_size: i32,
+            stream: *mut c_void,
+        );
+    };
+}
+
+macro_rules! declare_moe_lora_decode {
+    ($gate_up:ident, $down:ident) => {
+        #[link_name = concat!("naiwa_", stringify!($gate_up))]
+        pub fn $gate_up(
+            gate_weights: *const c_void,
+            up_weights: *const c_void,
+            all_inputs: *const c_void,
+            indices: *const u32,
+            all_outputs: *mut c_void,
+            n: i32,
+            k: i32,
+            batch: i32,
+            topk: i32,
+            k_padded: i32,
+            num_experts: i32,
+            output_type: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        #[link_name = concat!("naiwa_", stringify!($down))]
+        pub fn $down(
+            all_weights: *const c_void,
+            all_inputs: *const c_void,
+            indices: *const u32,
+            all_outputs: *mut c_void,
+            n: i32,
+            k: i32,
+            batch: i32,
+            topk: i32,
+            k_padded: i32,
+            num_experts: i32,
+            output_type: i32,
+            stream: *mut c_void,
+        ) -> i32;
+    };
+}
+
+macro_rules! declare_mmvq_fused_glu {
+    ($fn_name:ident) => {
+        #[link_name = concat!("naiwa_", stringify!($fn_name))]
+        pub fn $fn_name(
+            vx_gate: *const c_void,
+            vx_up: *const c_void,
+            vy: *const c_void,
+            dst: *mut c_void,
+            ncols_x: i32,
+            nrows_x: i32,
+            stride_col_y: i32,
+            stride_col_dst: i32,
+            b_size: i32,
+            activation: i32,
+            stream: *mut c_void,
+        );
+    };
+}
+
+extern "C" {
+    /// Launch Q8_1 quantization kernel
+    /// Quantizes f32 input to Q8_1 format for use with quantized matmul kernels.
+    #[link_name = "naiwa_launch_quantize_q8_1"]
+    pub fn launch_quantize_q8_1(
+        x: *const f32,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_blocks_x: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch Q8_1 quantization kernel with BF16 input (fuses bf16→f32 + quantize)
+    #[link_name = "naiwa_launch_quantize_q8_1_bf16"]
+    pub fn launch_quantize_q8_1_bf16(
+        x: *const c_void,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch Q8_1 quantization kernel with F16 input (fuses f16→f32 + quantize)
+    #[link_name = "naiwa_launch_quantize_q8_1_f16"]
+    pub fn launch_quantize_q8_1_f16(
+        x: *const c_void,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q2_K weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q2k_q8_1"]
+    pub fn launch_indexed_moe_forward_q2k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q3_K weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q3k_q8_1"]
+    pub fn launch_indexed_moe_forward_q3k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q4_K weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q4k_q8_1"]
+    pub fn launch_indexed_moe_forward_q4k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q5_K weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q5k_q8_1"]
+    pub fn launch_indexed_moe_forward_q5k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q6_K weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q6k_q8_1"]
+    pub fn launch_indexed_moe_forward_q6k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_indexed_moe_forward_iq4xs_q8_1"]
+    pub fn launch_indexed_moe_forward_iq4xs_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_indexed_moe_forward_iq4nl_q8_1"]
+    pub fn launch_indexed_moe_forward_iq4nl_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_indexed_moe_forward_iq3xxs_q8_1"]
+    pub fn launch_indexed_moe_forward_iq3xxs_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_indexed_moe_forward_iq2s_q8_1"]
+    pub fn launch_indexed_moe_forward_iq2s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_indexed_moe_forward_iq3s_q8_1"]
+    pub fn launch_indexed_moe_forward_iq3s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_indexed_moe_forward_q2_0_q8_1"]
+    pub fn launch_indexed_moe_forward_q2_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q8_0 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q8_0_q8_1"]
+    pub fn launch_indexed_moe_forward_q8_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q4_0 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q4_0_q8_1"]
+    pub fn launch_indexed_moe_forward_q4_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q4_1 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q4_1_q8_1"]
+    pub fn launch_indexed_moe_forward_q4_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q5_0 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q5_0_q8_1"]
+    pub fn launch_indexed_moe_forward_q5_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q5_1 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q5_1_q8_1"]
+    pub fn launch_indexed_moe_forward_q5_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Launch indexed MoE forward kernel for Q8_1 weights with Q8_1 input
+    #[link_name = "naiwa_launch_indexed_moe_forward_q8_1_q8_1"]
+    pub fn launch_indexed_moe_forward_q8_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    // ============== Grouped MoE dispatch and GEMM ==============
+
+    /// Build expert dispatch tables on GPU: expert_bounds + sorted_token_ids
+    #[link_name = "naiwa_launch_moe_dispatch"]
+    pub fn launch_moe_dispatch(
+        topk_ids: *const i32,
+        expert_bounds: *mut i32,
+        sorted_token_ids: *mut i32,
+        sorted_source_ids: *mut i32,
+        total_assignments: i32,
+        num_experts: i32,
+        topk: i32,
+        expert_counts: *mut i32,
+        expert_cursors: *mut i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_moe_weighted_reduce_flat"]
+    pub fn launch_moe_weighted_reduce_flat(
+        inputs: *const c_void,
+        topk_weights: *const f32,
+        outputs: *mut c_void,
+        num_tokens: i32,
+        hidden: i32,
+        topk: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[link_name = "naiwa_launch_moe_weighted_reduce_flat_bf16"]
+    pub fn launch_moe_weighted_reduce_flat_bf16(
+        inputs: *const c_void,
+        topk_weights: *const f32,
+        outputs: *mut c_void,
+        num_tokens: i32,
+        hidden: i32,
+        topk: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[link_name = "naiwa_launch_moe_weighted_reduce_flat_f16_input"]
+    pub fn launch_moe_weighted_reduce_flat_f16_input(
+        inputs: *const c_void,
+        topk_weights: *const f32,
+        outputs: *mut c_void,
+        num_tokens: i32,
+        hidden: i32,
+        topk: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[link_name = "naiwa_launch_moe_weighted_reduce_flat_bf16_input"]
+    pub fn launch_moe_weighted_reduce_flat_bf16_input(
+        inputs: *const c_void,
+        topk_weights: *const f32,
+        outputs: *mut c_void,
+        num_tokens: i32,
+        hidden: i32,
+        topk: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Grouped MoE GEMM for Q8_0 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q8_0"]
+    pub fn launch_moe_grouped_gemm_q8_0(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q4_0 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q4_0"]
+    pub fn launch_moe_grouped_gemm_q4_0(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q4_1 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q4_1"]
+    pub fn launch_moe_grouped_gemm_q4_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q5_0 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q5_0"]
+    pub fn launch_moe_grouped_gemm_q5_0(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q5_1 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q5_1"]
+    pub fn launch_moe_grouped_gemm_q5_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q8_1 weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q8_1"]
+    pub fn launch_moe_grouped_gemm_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q2_K weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q2k"]
+    pub fn launch_moe_grouped_gemm_q2k(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q3_K weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q3k"]
+    pub fn launch_moe_grouped_gemm_q3k(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q4_K weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q4k"]
+    pub fn launch_moe_grouped_gemm_q4k(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q5_K weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q5k"]
+    pub fn launch_moe_grouped_gemm_q5k(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    /// Grouped MoE GEMM for Q6_K weights
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q6k"]
+    pub fn launch_moe_grouped_gemm_q6k(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_moe_grouped_gemm_iq4xs"]
+    pub fn launch_moe_grouped_gemm_iq4xs(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_grouped_gemm_iq4nl"]
+    pub fn launch_moe_grouped_gemm_iq4nl(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_grouped_gemm_iq3xxs"]
+    pub fn launch_moe_grouped_gemm_iq3xxs(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_grouped_gemm_iq2s"]
+    pub fn launch_moe_grouped_gemm_iq2s(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_grouped_gemm_iq3s"]
+    pub fn launch_moe_grouped_gemm_iq3s(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_grouped_gemm_q2_0"]
+    pub fn launch_moe_grouped_gemm_q2_0(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
+
+    // ============== Fused MoE decode kernels ==============
+
+    // Fused gate+up+activation+multiply launchers
+    // All share the same signature: (gate_weights, up_weights, inputs_q8_1,
+    //   indices, outputs, n, k, batch, topk, k_padded, act_type, stream)
+
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q8_0_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q8_0_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q4_0_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q4_0_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q4_1_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q4_1_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q5_0_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q5_0_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q5_1_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q5_1_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q8_1_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q8_1_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q2k_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q2k_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q3k_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q3k_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q4k_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q4k_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q5k_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q5k_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q6k_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q6k_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_iq4xs_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_iq4xs_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_iq4nl_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_iq4nl_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_iq3xxs_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_iq3xxs_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_iq2s_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_iq2s_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_iq3s_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_iq3s_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_fused_gate_up_q2_0_q8_1"]
+    pub fn launch_moe_gemv_fused_gate_up_q2_0_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q8_0_q8_1,
+        launch_moe_gemv_lora_down_q8_0_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q4_0_q8_1,
+        launch_moe_gemv_lora_down_q4_0_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q4_1_q8_1,
+        launch_moe_gemv_lora_down_q4_1_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q5_0_q8_1,
+        launch_moe_gemv_lora_down_q5_0_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q5_1_q8_1,
+        launch_moe_gemv_lora_down_q5_1_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q8_1_q8_1,
+        launch_moe_gemv_lora_down_q8_1_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q2k_q8_1,
+        launch_moe_gemv_lora_down_q2k_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q3k_q8_1,
+        launch_moe_gemv_lora_down_q3k_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q4k_q8_1,
+        launch_moe_gemv_lora_down_q4k_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q5k_q8_1,
+        launch_moe_gemv_lora_down_q5k_q8_1
+    );
+    declare_moe_lora_decode!(
+        launch_moe_gemv_gate_up_pair_q6k_q8_1,
+        launch_moe_gemv_lora_down_q6k_q8_1
+    );
+
+    // Fused down+aggregate launchers
+    // All share the same signature: (weights, inputs_q8_1, indices,
+    //   topk_weights, outputs, n, k, batch, topk, k_padded, stream)
+
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q8_0_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q8_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q4_0_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q4_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q4_1_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q4_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q5_0_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q5_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q5_1_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q5_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q8_1_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q8_1_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q2k_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q2k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q3k_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q3k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q4k_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q4k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q5k_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q5k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q6k_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q6k_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_iq4xs_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_iq4xs_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_iq4nl_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_iq4nl_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_iq3xxs_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_iq3xxs_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_iq2s_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_iq2s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_iq3s_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_iq3s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_combine_topk_weights"]
+    pub fn launch_moe_combine_topk_weights(
+        parts: *const f32,
+        topk_weights: *const f32,
+        out: *mut f32,
+        n: i32,
+        topk: i32,
+        batch: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_moe_gemv_down_aggregate_q2_0_q8_1"]
+    pub fn launch_moe_gemv_down_aggregate_q2_0_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
+
+    // Launchers for the dense GGUF mmvq kernels used by `fast_mmvq`.
+
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_0_bf16_plain"]
+    pub fn launch_mmvq_gguf_q4_0_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_1_bf16_plain"]
+    pub fn launch_mmvq_gguf_q4_1_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_0_bf16_plain"]
+    pub fn launch_mmvq_gguf_q5_0_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_1_bf16_plain"]
+    pub fn launch_mmvq_gguf_q5_1_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q8_0_bf16_plain"]
+    pub fn launch_mmvq_gguf_q8_0_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_k_bf16_plain"]
+    pub fn launch_mmvq_gguf_q2_k_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q3_k_bf16_plain"]
+    pub fn launch_mmvq_gguf_q3_k_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_k_bf16_plain"]
+    pub fn launch_mmvq_gguf_q4_k_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_k_bf16_plain"]
+    pub fn launch_mmvq_gguf_q5_k_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q6_k_bf16_plain"]
+    pub fn launch_mmvq_gguf_q6_k_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4xs_bf16_plain"]
+    pub fn launch_mmvq_gguf_iq4xs_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4nl_bf16_plain"]
+    pub fn launch_mmvq_gguf_iq4nl_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3xxs_bf16_plain"]
+    pub fn launch_mmvq_gguf_iq3xxs_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq2s_bf16_plain"]
+    pub fn launch_mmvq_gguf_iq2s_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3s_bf16_plain"]
+    pub fn launch_mmvq_gguf_iq3s_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_0_bf16_plain"]
+    pub fn launch_mmvq_gguf_q2_0_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_0_f32_plain"]
+    pub fn launch_mmvq_gguf_q4_0_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_1_f32_plain"]
+    pub fn launch_mmvq_gguf_q4_1_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_0_f32_plain"]
+    pub fn launch_mmvq_gguf_q5_0_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_1_f32_plain"]
+    pub fn launch_mmvq_gguf_q5_1_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q8_0_f32_plain"]
+    pub fn launch_mmvq_gguf_q8_0_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_k_f32_plain"]
+    pub fn launch_mmvq_gguf_q2_k_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q3_k_f32_plain"]
+    pub fn launch_mmvq_gguf_q3_k_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_k_f32_plain"]
+    pub fn launch_mmvq_gguf_q4_k_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_k_f32_plain"]
+    pub fn launch_mmvq_gguf_q5_k_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q6_k_f32_plain"]
+    pub fn launch_mmvq_gguf_q6_k_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4xs_f32_plain"]
+    pub fn launch_mmvq_gguf_iq4xs_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4nl_f32_plain"]
+    pub fn launch_mmvq_gguf_iq4nl_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3xxs_f32_plain"]
+    pub fn launch_mmvq_gguf_iq3xxs_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq2s_f32_plain"]
+    pub fn launch_mmvq_gguf_iq2s_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3s_f32_plain"]
+    pub fn launch_mmvq_gguf_iq3s_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_0_f32_plain"]
+    pub fn launch_mmvq_gguf_q2_0_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_0_f16_plain"]
+    pub fn launch_mmvq_gguf_q4_0_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_1_f16_plain"]
+    pub fn launch_mmvq_gguf_q4_1_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_0_f16_plain"]
+    pub fn launch_mmvq_gguf_q5_0_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_1_f16_plain"]
+    pub fn launch_mmvq_gguf_q5_1_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q8_0_f16_plain"]
+    pub fn launch_mmvq_gguf_q8_0_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_k_f16_plain"]
+    pub fn launch_mmvq_gguf_q2_k_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q3_k_f16_plain"]
+    pub fn launch_mmvq_gguf_q3_k_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q4_k_f16_plain"]
+    pub fn launch_mmvq_gguf_q4_k_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q5_k_f16_plain"]
+    pub fn launch_mmvq_gguf_q5_k_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q6_k_f16_plain"]
+    pub fn launch_mmvq_gguf_q6_k_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4xs_f16_plain"]
+    pub fn launch_mmvq_gguf_iq4xs_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq4nl_f16_plain"]
+    pub fn launch_mmvq_gguf_iq4nl_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3xxs_f16_plain"]
+    pub fn launch_mmvq_gguf_iq3xxs_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq2s_f16_plain"]
+    pub fn launch_mmvq_gguf_iq2s_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_iq3s_f16_plain"]
+    pub fn launch_mmvq_gguf_iq3s_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmvq_gguf_q2_0_f16_plain"]
+    pub fn launch_mmvq_gguf_q2_0_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_0_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_1_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_0_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_1_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q8_0_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_k_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q3_k_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_k_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_k_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q6_k_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4xs_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_bf16_fused_glu);
+
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_0_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_1_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_0_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_1_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q8_0_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_k_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q3_k_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_k_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_k_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q6_k_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4xs_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_f16_fused_glu);
+
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_0_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_1_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_0_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_1_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q8_0_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_k_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q3_k_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_k_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q5_k_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q6_k_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4xs_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_f32_fused_glu);
+
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_1_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_0_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_1_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q8_0_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_k_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q3_k_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_k_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_k_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q6_k_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4xs_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_bf16_fused_qkv);
+
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_1_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_0_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_1_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q8_0_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_k_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q3_k_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_k_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_k_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q6_k_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4xs_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_f16_fused_qkv);
+
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_1_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_0_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_1_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q8_0_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_k_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q3_k_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_k_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q5_k_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q6_k_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4xs_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_f32_fused_qkv);
+
+    /// BF16 -> Q8_1 quantize
+    #[link_name = "naiwa_launch_mmvq_gguf_quantize_q8_1_bf16"]
+    pub fn launch_mmvq_gguf_quantize_q8_1_bf16(
+        x: *const c_void,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    /// F16 -> Q8_1 quantize
+    #[link_name = "naiwa_launch_mmvq_gguf_quantize_q8_1_f16"]
+    pub fn launch_mmvq_gguf_quantize_q8_1_f16(
+        x: *const c_void,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    /// F32 -> Q8_1 quantize
+    #[link_name = "naiwa_launch_mmvq_gguf_quantize_q8_1_f32"]
+    pub fn launch_mmvq_gguf_quantize_q8_1_f32(
+        x: *const c_void,
+        vy: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        num_rows: i32,
+        stream: *mut c_void,
+    );
+
+    // ---- MMQ (prompt) kernels ----
+
+    // MMQ quantize launchers (f32 -> block_q8_1_mmq)
+    #[link_name = "naiwa_launch_mmq_quantize_q8_1_D4"]
+    pub fn launch_mmq_quantize_q8_1_D4(
+        x: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        s02: i64,
+        s03: i64,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_q8_1_DS4"]
+    pub fn launch_mmq_quantize_q8_1_DS4(
+        x: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        s02: i64,
+        s03: i64,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_q8_1_D2S6"]
+    pub fn launch_mmq_quantize_q8_1_D2S6(
+        x: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        s02: i64,
+        s03: i64,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_D4_f32"]
+    pub fn launch_mmq_quantize_glu_q8_1_D4_f32(
+        gate: *const f32,
+        up: *const f32,
+        ids: *const i32,
+        vy: *mut c_void,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_DS4_f32"]
+    pub fn launch_mmq_quantize_glu_q8_1_DS4_f32(
+        gate: *const f32,
+        up: *const f32,
+        ids: *const i32,
+        vy: *mut c_void,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_D2S6_f32"]
+    pub fn launch_mmq_quantize_glu_q8_1_D2S6_f32(
+        gate: *const f32,
+        up: *const f32,
+        ids: *const i32,
+        vy: *mut c_void,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_D4"]
+    pub fn launch_mmq_quantize_glu_q8_1_D4(
+        gate: *const c_void,
+        up: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_DS4"]
+    pub fn launch_mmq_quantize_glu_q8_1_DS4(
+        gate: *const c_void,
+        up: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_quantize_glu_q8_1_D2S6"]
+    pub fn launch_mmq_quantize_glu_q8_1_D2S6(
+        gate: *const c_void,
+        up: *const c_void,
+        ids: *const i32,
+        vy: *mut c_void,
+        type_x: i32,
+        ne00: i64,
+        s01: i64,
+        ne0: i64,
+        ne1: i64,
+        activation: i32,
+        stream: *mut c_void,
+    );
+
+    // MMQ matmul launchers (one per quant type)
+    #[link_name = "naiwa_launch_mmq_gguf_q4_0"]
+    pub fn launch_mmq_gguf_q4_0(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q4_1"]
+    pub fn launch_mmq_gguf_q4_1(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_0"]
+    pub fn launch_mmq_gguf_q5_0(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_1"]
+    pub fn launch_mmq_gguf_q5_1(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q8_0"]
+    pub fn launch_mmq_gguf_q8_0(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q4_0_moe"]
+    pub fn launch_mmq_gguf_q4_0_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q4_1_moe"]
+    pub fn launch_mmq_gguf_q4_1_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_0_moe"]
+    pub fn launch_mmq_gguf_q5_0_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_1_moe"]
+    pub fn launch_mmq_gguf_q5_1_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q8_0_moe"]
+    pub fn launch_mmq_gguf_q8_0_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q2_k_moe"]
+    pub fn launch_mmq_gguf_q2_k_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q3_k_moe"]
+    pub fn launch_mmq_gguf_q3_k_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q4_k_moe"]
+    pub fn launch_mmq_gguf_q4_k_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_k_moe"]
+    pub fn launch_mmq_gguf_q5_k_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q6_k_moe"]
+    pub fn launch_mmq_gguf_q6_k_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq4_xs_moe"]
+    pub fn launch_mmq_gguf_iq4_xs_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q2_0_moe"]
+    pub fn launch_mmq_gguf_q2_0_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq3_xxs_moe"]
+    pub fn launch_mmq_gguf_iq3_xxs_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq2_s_moe"]
+    pub fn launch_mmq_gguf_iq2_s_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq3_s_moe"]
+    pub fn launch_mmq_gguf_iq3_s_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq4_nl_moe"]
+    pub fn launch_mmq_gguf_iq4_nl_moe(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        ids_dst: *const i32,
+        expert_bounds: *const i32,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_dst: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        num_experts: i64,
+        ncols_max: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q2_k"]
+    pub fn launch_mmq_gguf_q2_k(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q3_k"]
+    pub fn launch_mmq_gguf_q3_k(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q4_k"]
+    pub fn launch_mmq_gguf_q4_k(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q5_k"]
+    pub fn launch_mmq_gguf_q5_k(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q6_k"]
+    pub fn launch_mmq_gguf_q6_k(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq4_xs"]
+    pub fn launch_mmq_gguf_iq4_xs(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_q2_0"]
+    pub fn launch_mmq_gguf_q2_0(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq3_xxs"]
+    pub fn launch_mmq_gguf_iq3_xxs(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq2_s"]
+    pub fn launch_mmq_gguf_iq2_s(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq3_s"]
+    pub fn launch_mmq_gguf_iq3_s(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+    #[link_name = "naiwa_launch_mmq_gguf_iq4_nl"]
+    pub fn launch_mmq_gguf_iq4_nl(
+        tmp_fixup: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        cc: i32,
+        nsm: i32,
+        smpbo: i64,
+        warp_size: i32,
+        type_dst: i32,
+        stream: *mut c_void,
+    );
+}

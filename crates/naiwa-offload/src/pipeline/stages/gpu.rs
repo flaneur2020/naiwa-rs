@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Module, Tensor};
-use mistralrs_core::layers::Activation;
+use naiwa_quant::Activation;
 
 use crate::memory::{Bank, CachedLayer, Projections, SlotData};
 
@@ -14,8 +14,8 @@ use super::Hit;
 #[cfg(feature = "cuda")]
 fn fused_act(act: Activation) -> Option<i32> {
     match act {
-        Activation::Silu | Activation::Swish => Some(mistralrs_quant::ACT_SILU),
-        Activation::GeluPytorchTanh => Some(mistralrs_quant::ACT_GELU_PYTORCH_TANH),
+        Activation::Silu | Activation::Swish => Some(naiwa_quant::ACT_SILU),
+        Activation::GeluPytorchTanh => Some(naiwa_quant::ACT_GELU_PYTORCH_TANH),
         _ => None,
     }
 }
@@ -50,7 +50,7 @@ fn fused_decode(
     // SAFETY: `w_ptr` points at `topk` f32s of `weights`, whose free is ordered on candle's
     // stream after the kernels queued here.
     unsafe {
-        mistralrs_quant::indexed_moe_fused_decode(
+        naiwa_quant::indexed_moe_fused_decode(
             &bank.proj.gate,
             &bank.proj.up,
             &bank.proj.down,
