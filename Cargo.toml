@@ -1,50 +1,60 @@
-[package]
-name = "naiwa-rs"
-description = "Qwen3.8-Flash-Next-only inference server built on mistral.rs"
+[workspace]
+resolver = "2"
+members = [
+    "crates/naiwa-quant",
+    "crates/naiwa-attn",
+    "crates/naiwa-offload",
+    "crates/naiwa-models",
+    "crates/naiwa-runtime",
+    "crates/naiwa-server",
+]
+default-members = ["crates/naiwa-server"]
+
+[workspace.package]
 version = "0.9.4"
 edition = "2021"
 license = "MIT"
 rust-version = "1.94"
 
-[dependencies]
-# mistral.rs crates from local checkouts of the fork, side by side with this repository: the
-# `patch/iq4xs` worktree at ../mistral.rs-iq4xs (upstream Qwen3.8-Flash-Next support, the external
-# routed-experts hook `mistralrs_core::moe_offload`, the native IQ quants and the fused CPU MoE
-# decode) and the candle checkout at ../candle it builds against (the IQ `GgmlDType` variants are
-# not upstream). The fork's own Cargo.toml points at ../candle too, so both resolve to one candle.
-# `half` mirrors the fork's f16 handling for the A/B examples (dot_micro's f16 scale decode).
-half = "2"
-mistralrs-core = { path = "../mistral.rs-iq4xs/mistralrs-core" }
-mistralrs-server-core = { path = "../mistral.rs-iq4xs/mistralrs-server-core", default-features = false }
-mistralrs-quant = { path = "../mistral.rs-iq4xs/mistralrs-quant" }
-
+[workspace.dependencies]
+# Core tensor substrate (local checkout with IQ GgmlDType variants + storage range views).
 candle-core = { path = "../candle/candle-core", version = "0.11.0" }
+candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
 
-# Third-party versions mirror mistral.rs's workspace.
+# Workspace crates
+naiwa-quant = { path = "crates/naiwa-quant" }
+naiwa-attn = { path = "crates/naiwa-attn" }
+naiwa-offload = { path = "crates/naiwa-offload" }
+naiwa-models = { path = "crates/naiwa-models" }
+naiwa-runtime = { path = "crates/naiwa-runtime" }
+
+# Shared third-party dependencies (all pinned to versions cached in Cargo.lock).
 anyhow = "1.0.100"
 axum = "0.8.8"
+byteorder = "1.5"
+bytemuck = "1.25"
+chrono = "0.4"
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
+cudaforge = "=0.1.6"
 dirs = "6.0.0"
+futures = "0.3"
+half = "2"
+libc = "0.2"
+memmap2 = "0.9"
 mimalloc = "0.1"
+minijinja = "2.24"
 parking_lot = "0.12"
+rand = "0.9"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
+tempfile = "3.27"
+thiserror = "2.0"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-# CPU is the default backend; enable `cuda` (and optionally its extensions) for NVIDIA GPUs.
-[features]
-default = []
-cuda = ["mistralrs-core/cuda", "mistralrs-server-core/cuda"]
-cutile = ["cuda", "mistralrs-core/cutile"]
-nccl = ["cuda", "mistralrs-core/nccl", "mistralrs-server-core/nccl"]
-cudnn = ["cuda", "mistralrs-core/cudnn", "mistralrs-server-core/cudnn"]
-flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn"]
-flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3"]
-mkl = ["mistralrs-core/mkl", "mistralrs-server-core/mkl"]
+uuid = { version = "1.27", features = ["v4"] }
 
 [profile.release-with-debug]
 inherits = "release"
@@ -53,7 +63,3 @@ debug = true
 [profile.dev]
 debug = true
 opt-level = 3
-
-[build-dependencies]
-# Same CUDA kernel build helper the fork's build.rs uses.
-cudaforge = "=0.1.6"

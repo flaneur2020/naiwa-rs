@@ -1,0 +1,26 @@
+[package]
+name = "naiwa-offload"
+description = "Edge heterogeneous MoE offloading engine (transport, VRAM slab/cache memory, decode/prefill pipelines)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+half.workspace = true
+naiwa-quant.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "naiwa-quant/cuda"]
+
+[build-dependencies]
+cudaforge.workspace = true

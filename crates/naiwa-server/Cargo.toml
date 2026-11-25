@@ -1,0 +1,43 @@
+[package]
+name = "naiwa-server"
+description = "Qwen3.8-Flash-Next GGUF edge inference server CLI & HTTP entrypoint (zero mistral.rs dependency)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "naiwa-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+candle-core.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+futures.workspace = true
+mimalloc.workspace = true
+naiwa-attn.workspace = true
+naiwa-models.workspace = true
+naiwa-offload.workspace = true
+naiwa-quant.workspace = true
+naiwa-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[features]
+default = []
+cuda = [
+    "candle-core/cuda",
+    "naiwa-quant/cuda",
+    "naiwa-attn/cuda",
+    "naiwa-offload/cuda",
+    "naiwa-models/cuda",
+    "naiwa-runtime/cuda",
+]
