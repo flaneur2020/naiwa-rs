@@ -31,7 +31,7 @@ The shipped path is eager MoE and eager attention. Plan and evidence:
 | MTP | pure Rust/Tensor built-in MTP (`--mtp --mtp-n-predict 2`) with chunked prefill warmup and zero-copy multi-lane GDN checkpoint rollback |
 | reference (MTP2) | `serve-tuned-mtp2.sh` (`--no-lookahead`, 5-round AB/BA): **31.96 ms/tok (31.3 tok/s)** (`−2.51 ms/tok` / `−7.3%` vs pre-refactor `mistral.rs` baseline) |
 | reference (nospec) | default nospec (5-round AB/BA): **46.27 ms/tok (21.6 tok/s)** (`−2.98 ms/tok` / `−6.0%` vs pre-refactor `mistral.rs` baseline) |
-| gate | `frac 0` + `--no-lookahead` **byte-identical** to `harness/m1/reference.oracle.txt` |
+| gate | `frac 0` + `--no-lookahead` **byte-identical** to `harness/oracle/reference.oracle.txt` |
 
 `--depth N` is decode context length (`4` in all current numbers); `--mtp-n-predict N` is draft
 depth (np8 = 8 drafts, 9 verify rows). All performance numbers are short-context and
@@ -337,7 +337,7 @@ naiwa-server  (CLI, model/offload wiring, Axum HTTP server: /health, /metrics, /
       src/                            tokenizer.rs, block_manager.rs, sampler.rs, mtp.rs, engine.rs
     naiwa-server/                     L4: `naiwa-rs` binary (clap CLI, offload/model wiring, Axum HTTP server)
       src/                            main.rs, app/{args,load,serve,http}.rs
-  harness/                            primitives, oracle, attribution, chat, serve profiles
+  harness/                            oracle, serve profiles, attribution, chat, tpot, profile
 ~/code/candle                         local candle-core / candle-nn
 ~/code/naiwa-rs/target                workspace target
 ```
@@ -351,10 +351,8 @@ cargo build --offline --release --features cuda --workspace
 cargo test --offline --release --features cuda --workspace -- --test-threads=1
 
 # frozen greedy oracle (must be byte-identical)
-MODEL=$HOME/Models/qwen3-coder/IQ1_M FRAC=0 NO_LOOKAHEAD=1 \
-  BIN=$PWD/target/release/naiwa-rs TAG=final OUT=/tmp/oracle \
-  ./harness/m1/capture_oracle.sh
-diff -u /tmp/oracle/reference.final.txt harness/m1/reference.oracle.txt
+OUT=/tmp/oracle ./harness/oracle/capture_oracle.sh
+diff -u /tmp/oracle/reference.naiwa-rs.txt harness/oracle/reference.oracle.txt
 
 # attribution harness tests
 python3 -m unittest discover -s harness/attribution -v

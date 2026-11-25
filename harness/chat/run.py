@@ -277,10 +277,16 @@ class Engine:
 # `engine/logger.rs` (`add_speculative_stats`); a turn without speculation reports zeros, an engine without the
 # endpoint (strata) reports None and the columns stay empty rather than invented.
 SPEC_COUNTERS = (
-    "mistralrs_speculative_drafts_total",  # verification steps: one per decode step
-    "mistralrs_speculative_draft_tokens_proposed_total",
-    "mistralrs_speculative_draft_tokens_accepted_total",
+    "naiwa_mtp_steps_total",           # verification steps: one per decode step
+    "naiwa_mtp_drafted_tokens_total",
+    "naiwa_mtp_accepted_tokens_total",
 )
+# Legacy mistralrs Prometheus names accepted as fallback for cross-binary comparisons.
+LEGACY_SPEC_ALIASES = {
+    "mistralrs_speculative_drafts_total": SPEC_COUNTERS[0],
+    "mistralrs_speculative_draft_tokens_proposed_total": SPEC_COUNTERS[1],
+    "mistralrs_speculative_draft_tokens_accepted_total": SPEC_COUNTERS[2],
+}
 # Per drafted position, how often it survived: the shape of acceptance (position 0 is the first draft).
 SPEC_POS = "mistralrs_speculative_draft_tokens_accepted_per_pos_total"
 SPEC_POS_RE = re.compile(r'^' + SPEC_POS + r'\{position="(\d+)"\} ')
@@ -297,9 +303,10 @@ def read_metrics(base: str) -> dict:
         if not line or line.startswith("#"):
             continue
         name, _, value = line.partition(" ")
-        if name in SPEC_COUNTERS:
+        canonical = name if name in SPEC_COUNTERS else LEGACY_SPEC_ALIASES.get(name)
+        if canonical is not None:
             try:
-                got[name] = float(value)
+                got[canonical] = float(value)
             except ValueError:
                 pass
             continue

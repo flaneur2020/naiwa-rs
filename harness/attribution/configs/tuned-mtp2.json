@@ -4,11 +4,14 @@
   "requests": 3,
   "drafting": "on",
   "env": {
-    "MISTRALRS_MTP_PREFIX_REPLAY": "none",
-    "MISTRALRS_ALIGN_CHECKPOINTS": "1",
+    "MISTRALRS_MOE_DET_COMBINE": "1",
+    "NAIWA_CPU_BEFORE_DMA": "1",
+    "NAIWA_SINGLE_GPU_SAMPLE": "1",
+    "NAIWA_CPU_SPIN_US": "20000",
+    "NAIWA_CPU_MOE_THREADS": "5",
+    "NAIWA_CPU_PHYSICAL_LAYOUT": "1",
     "NAIWA_PROMOTE_MAX": "1",
-    "NAIWA_PROMOTE_MIN_HITS": "4",
-    "MISTRALRS_MOE_DET_COMBINE": "1"
+    "NAIWA_PROMOTE_MIN_HITS": "4"
   },
   "body": {
     "messages": [

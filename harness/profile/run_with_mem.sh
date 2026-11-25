@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one `serve` under a 1 Hz RAM/VRAM sampler, and report the peaks with the run.
 #
-#   harness/bench/run_with_mem.sh TAG PORT [extra serve flags...]
+#   harness/profile/run_with_mem.sh TAG PORT [extra serve flags...]
 #
 # The roadmap asks memory/liveness claims to come from samples rather than from the
 # allocator's own reporting, so the sampler is a separate loop and the log next to the

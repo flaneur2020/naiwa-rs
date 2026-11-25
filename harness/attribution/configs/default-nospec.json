@@ -4,8 +4,6 @@
   "requests": 3,
   "drafting": "off",
   "env": {
-    "MISTRALRS_MTP_PREFIX_REPLAY": "none",
-    "MISTRALRS_ALIGN_CHECKPOINTS": "1",
     "NAIWA_PROMOTE_MAX": "1",
     "NAIWA_PROMOTE_MIN_HITS": "4",
     "MISTRALRS_MOE_DET_COMBINE": "1"

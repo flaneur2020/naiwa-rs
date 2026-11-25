@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
-# Capture a frozen greedy reference from a naiwa-rs binary, and (later) the same capture from
-# the v2 binary so the two can be diffed token for token.
+# Capture a frozen greedy reference from a naiwa-rs binary and compare against
+# `harness/oracle/reference.oracle.txt`.
 #
-# Usage:  BIN=<path> OUT=<dir> harness/m1/capture_oracle.sh
-#   BIN  defaults to the qflash-rs oracle binary
-#   OUT  defaults to ~/bench-rel/naiwa-v2/m1
+# Usage:
+#   ./harness/oracle/capture_oracle.sh
+#   BIN=<path> OUT=<dir> FRAC=0 NO_LOOKAHEAD=1 ./harness/oracle/capture_oracle.sh
 set -euo pipefail
 
-BIN=${BIN:-$HOME/code/qflash-rs/target/release/naiwa-rs}
-OUT=${OUT:-$HOME/bench-rel/naiwa-v2/m1}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+BIN=${BIN:-$ROOT/target/release/naiwa-rs}
+OUT=${OUT:-$HOME/wtmp/oracle}
 PORT=${PORT:-12345}
 PROMPT=${PROMPT:-"The quick brown fox jumps over the lazy dog. The capital of France is"}
 MAXTOK=${MAXTOK:-16}
-# A small KV budget: the server's auto-size reserving runtime memory too squeezed the KV pool
-# out on this 12 GB card. Context length does not affect a 16-token greedy decode.
 PA_CTX=${PA_CTX:-4096}
-# Sequence slots. The default (32) reserves ~112 MiB of recurrent state each - 3.5 GiB - which no longer fits beside a
-# 2 GB expert cache on this 12 GB card: measured 2026-11-05, the arm OOM'd at load at both 4.6 and 11.2 GiB of free
-# VRAM, and 4 makes it load and stay byte-identical. The same number the chat config uses (engines/naiwa.json).
 MAX_SEQS=${MAX_SEQS:-4}
-# The frozen reference was captured from the `requant` checkpoint; `IQ1_M` was checked to produce
-# the same text at `frac 0` + `--no-lookahead`, so either can be used as MODEL.
-MODEL=${MODEL:-$HOME/Models/qwen3-coder/requant}
-FRAC=${FRAC:-0.55}
+MODEL=${MODEL:-$HOME/Models/qwen3-coder/IQ1_M}
+FRAC=${FRAC:-0}
+NO_LOOKAHEAD=${NO_LOOKAHEAD:-1}
 EXTRA=${EXTRA:-}
 TAG=${TAG:-$(basename "$BIN")}
 if [ ! -d "$MODEL" ]; then
@@ -32,12 +27,17 @@ fi
 mkdir -p "$OUT"
 LOG="$OUT/serve.$TAG.log"
 
+LOOKAHEAD_FLAG=""
+if [ "${NO_LOOKAHEAD}" != "0" ] && [ -n "${NO_LOOKAHEAD}" ]; then
+    LOOKAHEAD_FLAG="--no-lookahead"
+fi
+
 "$BIN" serve \
-    -m "${MODEL:-$HOME/Models/qwen3-coder/requant}" \
+    -m "$MODEL" \
     -f 'Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf;Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf' \
     --cpu-moe --expert-cache-gb 2 --pcie-frac "$FRAC" --seed 0 \
     --pa-context-len "$PA_CTX" --prefix-cache-n 0 --max-seqs "${MAX_SEQS:-4}" \
-    ${NO_LOOKAHEAD:+--no-lookahead} $EXTRA \
+    $LOOKAHEAD_FLAG $EXTRA \
     --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true' EXIT
