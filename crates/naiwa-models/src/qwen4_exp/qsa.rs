@@ -2,13 +2,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Result, Tensor, D};
+#[cfg(feature = "cuda")]
+use candle_core::DType;
+use candle_core::{Result, Tensor, D};
 use naiwa_attn::{PagedAttention, PagedAttnMeta, RotaryEmbedding};
 use naiwa_quant::QLinear;
 
 use crate::qwen4_exp::config::QsaConfig;
 
 /// Per-token aux cache row width: `[indexer_key | cos | sin]`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn aux_dim(qsa: &QsaConfig, half_rot: usize) -> usize {
     qsa.head_dim + 2 * half_rot
 }
@@ -36,9 +39,12 @@ impl QsaMode {
 
 /// Per-step QSA state shared across all full-attention layers.
 pub(crate) struct QsaStep<'a> {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub mode: QsaMode,
     #[cfg(feature = "cuda")]
     pub layout: Option<&'a naiwa_attn::qwen4_exp::TokenLayout>,
+    #[cfg(not(feature = "cuda"))]
+    pub _marker: std::marker::PhantomData<&'a ()>,
 }
 
 #[derive(Clone)]
@@ -48,6 +54,7 @@ struct QsaAuxCache {
     block_keys: Tensor,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) struct QsaAttention {
     pub(crate) q_proj: QLinear,
     pub(crate) k_proj: QLinear,
@@ -198,7 +205,10 @@ impl QsaAttention {
             .reshape((n_tokens, self.num_kv_heads, self.head_dim))?;
 
         let (key_cache, value_cache) = kv_cache;
+        #[cfg(feature = "cuda")]
         let is_sparse = matches!(step.mode, QsaMode::Sparse { .. });
+        #[cfg(not(feature = "cuda"))]
+        let _ = step;
 
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F16) {

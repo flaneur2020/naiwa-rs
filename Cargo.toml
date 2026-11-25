@@ -17,9 +17,9 @@ license = "MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# Core tensor substrate (local checkout with IQ GgmlDType variants + storage range views).
-candle-core = { path = "../candle/candle-core", version = "0.11.0" }
-candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
+# Core tensor substrate (forked candle with IQ GgmlDType variants + storage range views).
+candle-core = { git = "https://github.com/flaneur2020/candle.git", branch = "fork/naiwa-rs", version = "0.11.0" }
+candle-nn = { git = "https://github.com/flaneur2020/candle.git", branch = "fork/naiwa-rs", version = "0.11.0" }
 
 # Workspace crates
 naiwa-quant = { path = "crates/naiwa-quant" }

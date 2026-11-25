@@ -1,0 +1,149 @@
+name: Release (linux-amd64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cuda:
+    name: Build linux-amd64 (CUDA 12.6 fatbin)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64-cuda12
+
+      - name: Install CUDA 12.6 toolkit (minimal)
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          rm -f cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6 \
+            cuda-cudart-dev-12-6 \
+            libcublas-dev-12-6 \
+            libcurand-dev-12-6 \
+            cuda-nvrtc-dev-12-6 \
+            pkg-config
+          echo "CUDA_HOME=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64" >> "$GITHUB_ENV"
+
+      - name: Build release binary (CUDA SM 80/86/89/90 + PTX)
+        env:
+          CUDA_COMPUTE_CAP: "80"
+          NAIWA_CUDA_EXTRA_GENCODES: >-
+            -gencode=arch=compute_86,code=sm_86
+            -gencode=arch=compute_89,code=sm_89
+            -gencode=arch=compute_90,code=sm_90
+            -gencode=arch=compute_90,code=compute_90
+        run: |
+          nvcc --version
+          cargo build --release --locked --features cuda -p naiwa-server
+
+      - name: Package tarball and checksum
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NAME="naiwa-rs-${TAG}-linux-amd64-cuda12"
+          mkdir -p "dist/${NAME}"
+          cp target/release/naiwa-rs README.md "dist/${NAME}/"
+          strip "dist/${NAME}/naiwa-rs"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          ls -lh dist/*.tar.gz
+
+      - name: Upload CUDA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: naiwa-rs-linux-amd64-cuda12
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  build-cpu:
+    name: Build linux-amd64 (CPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64-cpu
+
+      - name: Build release binary (CPU)
+        run: cargo build --release --locked -p naiwa-server
+
+      - name: Package tarball and checksum
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NAME="naiwa-rs-${TAG}-linux-amd64-cpu"
+          mkdir -p "dist/${NAME}"
+          cp target/release/naiwa-rs README.md "dist/${NAME}/"
+          strip "dist/${NAME}/naiwa-rs"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          ls -lh dist/*.tar.gz
+
+      - name: Upload CPU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: naiwa-rs-linux-amd64-cpu
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-cuda, build-cpu]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS
+        run: |
+          cd release-assets
+          cat *.sha256 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS.txt

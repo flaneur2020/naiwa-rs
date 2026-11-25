@@ -63,6 +63,7 @@ pub struct GdnSeqState {
     /// Currently active lane in `0..checkpoint_lanes`.
     pub active_lane: usize,
     /// Pre-allocated device `[1]` U32 tensors `[0], [1], ...` for zero-alloc CUDA checkpoint launches.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lane_slot_tensors: Vec<Tensor>,
 }
 
@@ -287,6 +288,7 @@ impl GatedDeltaNet {
                 let qkv = qkv_raw.narrow(1, 0, keep)?.contiguous()?;
                 let b = b_all.narrow(1, 0, keep)?.contiguous()?;
                 let a = a_all.narrow(1, 0, keep)?.contiguous()?;
+                #[cfg(feature = "cuda")]
                 let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
                 #[cfg(feature = "cuda")]
                 if qkv.device().is_cuda() && matches!(qkv.dtype(), DType::BF16 | DType::F16) {
@@ -376,6 +378,7 @@ impl GatedDeltaNet {
                 && qkv_raw.device().is_cuda()
                 && matches!(qkv_raw.dtype(), DType::BF16 | DType::F16)
             {
+                #[cfg(feature = "cuda")]
                 let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
                 let sigmoid_gate = self.cfg.gate_activation == GdnGateActivation::Sigmoid;
                 let slot_t = &state.lane_slot_tensors[state.active_lane];
@@ -441,8 +444,11 @@ impl GatedDeltaNet {
         a: &Tensor,
         state: &mut GdnSeqState,
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
         let (_, seq_len, _) = qkv_raw.dims3()?;
+        #[cfg(feature = "cuda")]
         let dtype = qkv_raw.dtype();
+        #[cfg(feature = "cuda")]
         let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
         let sigmoid_gate = self.cfg.gate_activation == GdnGateActivation::Sigmoid;
 

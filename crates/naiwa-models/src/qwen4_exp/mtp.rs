@@ -90,6 +90,7 @@ impl Qwen4ExpMtpHead {
         ))?;
 
         let cos_sin = self.rotary_emb.compute_cos_sin(input.position_ids, res.dtype())?;
+        #[cfg(feature = "cuda")]
         let n_tokens = batch * rows;
         let max_kv = match input.chunk_spans {
             Some((_, kv_lens)) => kv_lens.iter().copied().max().unwrap_or(0),
@@ -119,6 +120,8 @@ impl Qwen4ExpMtpHead {
             mode,
             #[cfg(feature = "cuda")]
             layout: layout.as_ref(),
+            #[cfg(not(feature = "cuda"))]
+            _marker: std::marker::PhantomData,
         };
 
         let xn = self.attn_hc.norm(&res)?;

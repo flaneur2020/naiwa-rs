@@ -3,10 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
 use candle_core::{DType, Device};
 use naiwa_models::Qwen4ExpModel;
+#[cfg(feature = "cuda")]
 use naiwa_offload::pipeline::prefill::PrefillStreams;
+#[cfg(feature = "cuda")]
 use naiwa_offload::pipeline::GpuCacheMoeProvider;
 use naiwa_quant::RoutedExpertsProvider;
 use naiwa_runtime::GgufTokenizer;
@@ -16,7 +20,9 @@ use crate::app::args::{
     ensure_local_dir, expand_home_in_list, split_path_list, ModelOptions, ModelSource,
 };
 
+#[cfg(feature = "cuda")]
 const PROFILE_LAYERS: usize = 128;
+#[cfg(feature = "cuda")]
 const PROFILE_EXPERTS: usize = 1024;
 
 /// Loaded model, tokenizer, display ID, and optional offloading provider ready for `EngineHandle`.
@@ -24,6 +30,7 @@ pub struct LoadedServerModel {
     pub display_id: String,
     pub model: Qwen4ExpModel,
     pub tokenizer: Arc<GgufTokenizer>,
+    #[cfg(feature = "cuda")]
     pub provider: Option<Arc<GpuCacheMoeProvider>>,
     pub device: Device,
     pub dtype: DType,
@@ -114,6 +121,7 @@ pub fn load_model(
     };
     let dtype = model_opts.source.dtype.resolve(device.is_cuda());
 
+    #[cfg(feature = "cuda")]
     let provider: Option<Arc<GpuCacheMoeProvider>> = if model_opts.cpu_moe {
         let cache_gb = model_opts
             .expert_cache_gb
@@ -153,12 +161,21 @@ pub fn load_model(
         None
     };
 
+    #[cfg(not(feature = "cuda"))]
+    if model_opts.cpu_moe {
+        bail!("`--cpu-moe` GPU expert cache offloading requires a CUDA-enabled build of naiwa-rs");
+    }
+
+    #[cfg(feature = "cuda")]
     if naiwa_offload::stats::model_partition::enabled() {
         naiwa_models::set_boundary_probe(naiwa_offload::stats::model_partition::dispatch);
     }
 
+    #[cfg(feature = "cuda")]
     let moe_trait: Option<Arc<dyn RoutedExpertsProvider>> =
         provider.as_ref().map(|p| Arc::clone(p) as Arc<dyn RoutedExpertsProvider>);
+    #[cfg(not(feature = "cuda"))]
+    let moe_trait: Option<Arc<dyn RoutedExpertsProvider>> = None;
 
     info!(
         "Loading `{display_id}` ({} GGUF file(s), device={device:?}, dtype={dtype:?}, mtp={load_mtp})",
@@ -177,6 +194,7 @@ pub fn load_model(
         display_id,
         model,
         tokenizer,
+        #[cfg(feature = "cuda")]
         provider,
         device,
         dtype,

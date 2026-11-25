@@ -3,7 +3,9 @@
 
 mod app;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "cuda")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -25,6 +27,7 @@ async fn main() -> Result<()> {
         naiwa_models::set_boundary_probe(naiwa_offload::stats::model_partition::dispatch);
     }
 
+    #[cfg(feature = "cuda")]
     if naiwa_offload::config::runtime().cpu_spin_us_raw.is_some() {
         naiwa_quant::install_task_dispatcher(Some(
             naiwa_offload::transport::spin_pool::dispatch,
@@ -33,6 +36,7 @@ async fn main() -> Result<()> {
 
     // Live prompt chunk ceiling shared between `naiwa-offload::PrefillStreams` and `naiwa-runtime`.
     let prompt_ceiling = Arc::new(AtomicUsize::new(0));
+    #[cfg(feature = "cuda")]
     {
         static SHARED_CEILING: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
         let _ = SHARED_CEILING.set(Arc::clone(&prompt_ceiling));

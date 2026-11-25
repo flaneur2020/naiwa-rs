@@ -18,6 +18,7 @@ pub async fn run_serve(
     global: GlobalOptions,
     prompt_ceiling: Arc<AtomicUsize>,
 ) -> Result<()> {
+    #[cfg(feature = "cuda")]
     naiwa_offload::pipeline::prefill::set_prompt_step_ceiling(
         runtime
             .max_num_batched_tokens
@@ -35,6 +36,7 @@ pub async fn run_serve(
 
     // Warm up the expert cache & trim CUDA load-time pool BEFORE allocating KV blocks so the
     // driver returns fragmented load buffers and pre-fills `--expert-profile` slots up front.
+    #[cfg(feature = "cuda")]
     if let Some(provider) = &loaded.provider {
         match provider.warmup()? {
             (0, 0) => {}
@@ -101,6 +103,7 @@ pub async fn run_serve(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    #[cfg(feature = "cuda")]
     if naiwa_offload::config::diag().stats {
         let s = naiwa_offload::stats::dump_cache_stats();
         if s.installed {

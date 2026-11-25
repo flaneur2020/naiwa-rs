@@ -40,6 +40,7 @@ fn main() {
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-changed=kernels");
         println!("cargo:rerun-if-env-changed=CUDA_NVCC_FLAGS");
+        println!("cargo:rerun-if-env-changed=NAIWA_CUDA_EXTRA_GENCODES");
         println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -68,6 +69,11 @@ fn main() {
             .arg("-fPIC")
             .arg(&header_hash_arg);
 
+        if let Ok(extra) = std::env::var("NAIWA_CUDA_EXTRA_GENCODES") {
+            for flag in extra.split_whitespace() {
+                builder = builder.arg(flag);
+            }
+        }
         if let Ok(flags) = std::env::var("CUDA_NVCC_FLAGS") {
             builder = builder.arg("--compiler-options").arg(&flags);
         }

@@ -21,7 +21,7 @@ futures.workspace = true
 mimalloc.workspace = true
 naiwa-attn.workspace = true
 naiwa-models.workspace = true
-naiwa-offload.workspace = true
+naiwa-offload = { workspace = true, optional = true }
 naiwa-quant.workspace = true
 naiwa-runtime.workspace = true
 serde.workspace = true
@@ -37,6 +37,7 @@ cuda = [
     "candle-core/cuda",
     "naiwa-quant/cuda",
     "naiwa-attn/cuda",
+    "dep:naiwa-offload",
     "naiwa-offload/cuda",
     "naiwa-models/cuda",
     "naiwa-runtime/cuda",

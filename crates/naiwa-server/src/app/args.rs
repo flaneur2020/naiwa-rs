@@ -13,6 +13,16 @@ use naiwa_runtime::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
 };
 
+#[cfg(feature = "cuda")]
+const DEFAULT_PREFILL_MIN_TOKENS: usize = naiwa_offload::pipeline::prefill::DEFAULT_MIN_TOKENS;
+#[cfg(not(feature = "cuda"))]
+const DEFAULT_PREFILL_MIN_TOKENS: usize = 1024;
+
+#[cfg(feature = "cuda")]
+const DEFAULT_PREFILL_DEPTH: u8 = naiwa_offload::pipeline::prefill::DEFAULT_DEPTH as u8;
+#[cfg(not(feature = "cuda"))]
+const DEFAULT_PREFILL_DEPTH: u8 = 2;
+
 /// Qwen3.8-Flash-Next GGUF edge inference server
 #[derive(Parser)]
 #[command(name = "naiwa-rs", version, about, long_about = None, propagate_version = true)]
@@ -162,7 +172,7 @@ pub struct ModelOptions {
     #[arg(
         long,
         requires = "prefill_stream",
-        default_value_t = NonZeroUsize::new(naiwa_offload::pipeline::prefill::DEFAULT_MIN_TOKENS).unwrap()
+        default_value_t = NonZeroUsize::new(DEFAULT_PREFILL_MIN_TOKENS).unwrap()
     )]
     pub prefill_stream_min_tokens: NonZeroUsize,
 
@@ -171,7 +181,7 @@ pub struct ModelOptions {
         long,
         requires = "prefill_stream",
         value_parser = clap::value_parser!(u8).range(1..=4),
-        default_value_t = naiwa_offload::pipeline::prefill::DEFAULT_DEPTH as u8
+        default_value_t = DEFAULT_PREFILL_DEPTH
     )]
     pub prefill_stream_depth: u8,
 

@@ -243,6 +243,7 @@ impl Qwen4ExpModel {
 
         let cos_sin = self.rotary_emb.compute_cos_sin(input.position_ids, self.dtype)?;
 
+        #[cfg(feature = "cuda")]
         let rectangular = matches!(input.kind, ForwardKind::Decode | ForwardKind::Verify);
         let max_kv = input.kv_lens.iter().copied().max().unwrap_or(0);
         // Dense uses fused paged_attention_decode for both single-token Decode and small Verify
@@ -269,6 +270,8 @@ impl Qwen4ExpModel {
             mode,
             #[cfg(feature = "cuda")]
             layout: layout.as_ref(),
+            #[cfg(not(feature = "cuda"))]
+            _marker: std::marker::PhantomData,
         };
 
         let mut verify_stash = input.capture_verify_stash.then(|| RecurrentVerifyStash {
