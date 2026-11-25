@@ -5,15 +5,13 @@ runnable from the repository root and writes its logs under `$OUT` (default `~/w
 
 | path | what it is |
 |---|---|
-| `m0/`, `m1/`, `m6/`, `m7/` | the per-milestone gates: doorbell visibility, the frozen oracle, region capture, pack layout |
-| `attribution/` | restarted clean/diagnostic A/B, exact MoE-work comparison, CPU window accounting and cross-stream GPU interval unions |
-| `chat/` | multi-class chat comparison against strata; `engines/*.json` are the configs, `run.py` the driver |
-| `chat/chat.sh` | one line to chat: starts `serve/serve-pi.sh`, waits for `/v1/models`, runs `chat/cli.py` (or `$CHAT_CLI`) against it |
-| `serve/serve.sh` | the shipped chat configuration as a plain server, for when you want to drive it yourself |
-| `serve/serve-pi.sh` | the same engine configured for an interactive agent (16k context, 2 slots, MTP off): the arm `pi --model naiwa/default` talks to |
-| `tpot/tpot.py` | time per output token of a running server, median of N greedy rounds |
-| `bench/` | kernel microbenchmarks, and `run_with_mem.sh`, a 1 Hz RAM/VRAM sampler around a run |
-| `profile/nsys_engine.sh` | profile either engine under nsys (`ncu` is refused on this card) |
+| `m1/` | frozen greedy oracle gate (`capture_oracle.sh`, `reference.oracle.txt`) |
+| `attribution/` | restarted clean/diagnostic A/B, exact MoE-work comparison, CPU window accounting, cross-stream GPU unions, and unit tests |
+| `serve/` | launch profiles: `serve-tuned-mtp2.sh` (fastest verified MTP2), `serve.sh`, `serve-pi.sh` (16k interactive coding agent) |
+| `chat/` | interactive REPL (`chat.sh`, `cli.py`) and multi-turn chat benchmark (`run.py`, `summarize.py`, `engines/*.json`) |
+| `tpot/` | time per output token of a running server (`tpot.py`, `ladder.py`), median of N greedy rounds |
+| `bench/run_with_mem.sh` | 1 Hz RAM/VRAM sampler around any run |
+| `profile/nsys_engine.sh` | profile an engine under `nsys` |
 
 Two habits these encode, because both cost time to learn: the number that gets quoted is a
 **median of at least three rounds**, never a mean; and a memory or liveness claim comes from a
