@@ -68,6 +68,32 @@ mod ffi {
             dtype: i32,
             stream: i64,
         );
+        #[link_name = "naiwa_qwen4_qk_norm_rope"]
+        pub(super) fn qwen4_qk_norm_rope(
+            x: *const c_void,
+            weight: *const c_void,
+            cos_buf: *const c_void,
+            sin_buf: *const c_void,
+            out: *mut c_void,
+            n_tokens: i32,
+            n_heads: i32,
+            head_dim: i32,
+            head_stride: i32,
+            half_rot: i32,
+            eps: f32,
+            dtype: i32,
+            stream: i64,
+        );
+        #[link_name = "naiwa_qwen4_qsa_gate_mul"]
+        pub(super) fn qwen4_qsa_gate_mul(
+            y: *const c_void,
+            q_gate: *const c_void,
+            out: *mut c_void,
+            total_elems: i32,
+            head_dim: i32,
+            dtype: i32,
+            stream: i64,
+        );
         #[link_name = "naiwa_qwen4_hc_norm"]
         pub(super) fn qwen4_hc_norm(
             x: *const c_void,
@@ -944,6 +970,87 @@ pub fn router_softmax_topk(
         );
     }
     Ok((out_vals, out_ids))
+}
+
+/// Fused per-head RMSNorm + partial NeoX RoPE on CUDA.
+///
+/// `x`: contiguous `[n_tokens, n_heads, head_stride]` (`head_stride >= head_dim`; pass
+/// `head_stride = 2 * head_dim` to read Q directly out of interleaved `q_gate`).
+/// `weight`: `[head_dim]` (same dtype as `x`), `cos`/`sin`: `[n_tokens, half_rot]` (same dtype).
+/// Returns contiguous `[n_tokens, n_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_rope(
+    x: &Tensor,
+    weight: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    head_stride: usize,
+    half_rot: usize,
+    eps: f64,
+) -> Result<Tensor> {
+    if head_dim > 512 {
+        candle_core::bail!("qk_norm_rope supports head_dim <= 512, got {head_dim}");
+    }
+    let x = x.contiguous()?;
+    let weight = weight.contiguous()?;
+    let cos = cos.contiguous()?;
+    let sin = sin.contiguous()?;
+    let dtype = x.dtype();
+    let device = x.device();
+    let out = empty(&[n_tokens, n_heads, head_dim], dtype, device)?;
+    unsafe {
+        ffi::qwen4_qk_norm_rope(
+            dev_ptr(&x)? as *const _,
+            dev_ptr(&weight)? as *const _,
+            dev_ptr(&cos)? as *const _,
+            dev_ptr(&sin)? as *const _,
+            dev_ptr(&out)? as *mut _,
+            n_tokens as i32,
+            n_heads as i32,
+            head_dim as i32,
+            head_stride as i32,
+            half_rot as i32,
+            eps as f32,
+            half_dtype_code(dtype)?,
+            stream(device)?,
+        );
+    }
+    Ok(out)
+}
+
+/// Fused QSA output gating: `out[t, h, d] = y[t, h, d] * sigmoid(q_gate[t, h, head_dim + d])`.
+///
+/// `y`: contiguous `[n_tokens, n_heads, head_dim]`, `q_gate`: contiguous `[n_tokens, n_heads, 2 * head_dim]`.
+/// Returns contiguous `[b_sz, seq_len, n_heads * head_dim]`.
+pub fn qsa_gate_mul(
+    y: &Tensor,
+    q_gate: &Tensor,
+    b_sz: usize,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let y = y.contiguous()?;
+    let q_gate = q_gate.contiguous()?;
+    let dtype = y.dtype();
+    let device = y.device();
+    let total_elems = b_sz * seq_len * n_heads * head_dim;
+    let out = empty(&[b_sz, seq_len, n_heads * head_dim], dtype, device)?;
+    unsafe {
+        ffi::qwen4_qsa_gate_mul(
+            dev_ptr(&y)? as *const _,
+            dev_ptr(&q_gate)? as *const _,
+            dev_ptr(&out)? as *mut _,
+            total_elems as i32,
+            head_dim as i32,
+            half_dtype_code(dtype)?,
+            stream(device)?,
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

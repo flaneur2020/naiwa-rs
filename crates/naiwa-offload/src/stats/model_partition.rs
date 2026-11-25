@@ -134,8 +134,8 @@ fn mark(xs: &Tensor, layer: usize, phase: &'static str) {
             p.push(a);
         }
         let a = p.last_mut().expect("model layer");
-        // Final head's HC mix is outside an active decoder layer.
-        if a.count == 18 && phase.starts_with("mix_") {
+        // Final head's HC mix or MTP head phases sit outside an active decoder layer.
+        if a.count == 18 && phase != "layer_start" {
             return;
         }
         if phase == "mixer_start" {

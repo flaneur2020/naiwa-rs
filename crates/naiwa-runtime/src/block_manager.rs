@@ -121,9 +121,36 @@ impl BlockManager {
 
         let max_context_len = context_lens_host.iter().copied().max().unwrap_or(0);
         let ctx_u32: Vec<u32> = context_lens_host.iter().map(|&l| l as u32).collect();
+        let total_q: usize = query_lens_host.iter().sum();
+
+        // For small multi-token batches (MTP verify/refresh, total_q <= 8), prebuild per-row
+        // virtual block tables & causal context lengths so PagedAttention::forward runs fused
+        // paged_attention_decode directly without gather_kv_cache!
+        let (row_block_tables, row_context_lens) = if !is_decode && total_q > 0 && total_q <= 8 && device.is_cuda() {
+            let mut rbt = vec![0u32; total_q * max_blocks];
+            let mut rcl = Vec::with_capacity(total_q);
+            let mut row = 0usize;
+            for seq_idx in 0..n_seqs {
+                let table = block_tables_host[seq_idx];
+                let kv_len = context_lens_host[seq_idx];
+                let q_len = query_lens_host[seq_idx];
+                let start_pos = kv_len - q_len;
+                for q in 0..q_len {
+                    rbt[row * max_blocks..row * max_blocks + table.len()].copy_from_slice(table);
+                    rcl.push((start_pos + q + 1) as u32);
+                    row += 1;
+                }
+            }
+            (
+                Some(Tensor::from_vec(rbt, (total_q, max_blocks), device)?),
+                Some(Tensor::from_vec(rcl, (total_q,), device)?),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(PagedAttnMeta {
-            slot_mapping: Tensor::from_vec(slots, (query_lens_host.iter().sum::<usize>(),), device)?,
+            slot_mapping: Tensor::from_vec(slots, (total_q,), device)?,
             block_tables: Tensor::from_vec(bt_flat, (n_seqs, max_blocks), device)?,
             context_lens: Tensor::from_vec(ctx_u32, (n_seqs,), device)?,
             cu_context_lens: Tensor::from_vec(cu_ctx, (n_seqs + 1,), device)?,
@@ -131,6 +158,8 @@ impl BlockManager {
             host_query_lens: query_lens_host.to_vec(),
             max_context_len,
             is_decode,
+            row_block_tables,
+            row_context_lens,
         })
     }
 }

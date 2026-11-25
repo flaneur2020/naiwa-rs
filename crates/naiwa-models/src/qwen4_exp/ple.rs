@@ -168,16 +168,26 @@ impl PleTable {
         let row_bytes = iq4_nl_row_bytes(self.head_dim);
         let bytes = self.archive.tensor_data(GGUF_PLE_TABLE_NAME)?.bytes();
         let mut out = vec![0f32; rows.len() * self.head_dim];
-        out.par_chunks_exact_mut(self.head_dim)
-            .zip(rows.par_iter())
-            .try_for_each(|(dst, &row)| {
+        if rows.len() <= 64 {
+            for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows.iter()) {
                 let offset = row as usize * row_bytes;
                 let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
                     candle_core::Error::msg(format!("PLE row {row} out of range"))
                 })?;
                 dequantize_iq4_nl_row(src, dst);
-                Ok::<_, candle_core::Error>(())
-            })?;
+            }
+        } else {
+            out.par_chunks_exact_mut(self.head_dim)
+                .zip(rows.par_iter())
+                .try_for_each(|(dst, &row)| {
+                    let offset = row as usize * row_bytes;
+                    let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
+                        candle_core::Error::msg(format!("PLE row {row} out of range"))
+                    })?;
+                    dequantize_iq4_nl_row(src, dst);
+                    Ok::<_, candle_core::Error>(())
+                })?;
+        }
         Tensor::from_vec(out, (rows.len(), self.head_dim), device)
     }
 }

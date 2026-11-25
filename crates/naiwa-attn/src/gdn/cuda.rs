@@ -215,6 +215,88 @@ extern "C" {
         dtype: i32,
         stream: i64,
     );
+
+    #[link_name = "naiwa_gdn_speculative_conv_checkpoints"]
+    fn gdn_speculative_conv_checkpoints(
+        x: *const c_void,
+        weight: *const c_void,
+        state_pool: *mut c_void,
+        output: *mut c_void,
+        active_slots: *const u32,
+        batch_size: i32,
+        seq_len: i32,
+        conv_dim: i32,
+        kernel_size: i32,
+        checkpoint_lanes: i32,
+        write_checkpoints: i32,
+        pending_conv_input: *mut c_void,
+        pending_keep_rows: *const u32,
+        pending_epochs: *const u32,
+        conv_applied_epochs: *mut u32,
+        max_pending_rows: i32,
+        pending_capacity: i32,
+        conv_blocks: i32,
+        x_stride_b: i64,
+        x_stride_s: i64,
+        x_stride_c: i64,
+        dtype: i32,
+        stream: i64,
+    );
+
+    #[link_name = "naiwa_gdn_speculative_recurrence_checkpoints"]
+    fn gdn_speculative_recurrence_checkpoints(
+        mixed_qkv: *const c_void,
+        b: *const c_void,
+        a: *const c_void,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_pool: *mut c_void,
+        output: *mut c_void,
+        quantized_output: *mut c_void,
+        output_scales: *mut f32,
+        scale_stride_m: i32,
+        scale_layout: i32,
+        active_slots: *const u32,
+        gate: *const c_void,
+        norm_weight: *const c_void,
+        transition_key: *mut f32,
+        transition_delta: *mut f32,
+        transition_decay: *mut f32,
+        pending_key_banks: *mut f32,
+        pending_key_bank: *const u32,
+        pending_delta: *mut f32,
+        pending_decay: *mut f32,
+        pending_keep_rows: *const u32,
+        pending_epochs: *const u32,
+        recurrent_applied_epochs: *mut u32,
+        max_pending_rows: i32,
+        pending_capacity: i32,
+        slot_indexed_transitions: i32,
+        b_stride_b: i64,
+        b_stride_s: i64,
+        b_stride_h: i64,
+        a_stride_b: i64,
+        a_stride_s: i64,
+        a_stride_h: i64,
+        gate_stride_b: i64,
+        gate_stride_s: i64,
+        gate_stride_h: i64,
+        gate_stride_v: i64,
+        batch_size: i32,
+        seq_len: i32,
+        num_k_heads: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        checkpoint_lanes: i32,
+        tiled_v_heads: i32,
+        value_major: i32,
+        norm_eps: f32,
+        sigmoid_gate: i32,
+        dtype: i32,
+        state_dtype: i32,
+        stream: i64,
+    );
 }
 
 fn act_dtype_code(dt: DType) -> Result<i32> {
@@ -357,7 +439,19 @@ pub fn causal_conv1d_cuda(
                 );
             }
         }
-        *conv_state = new_state;
+        // Copy back in place so sub-views into a multi-lane pool stay valid!
+        let n_bytes = conv_state.elem_count() * dtype.size_in_bytes();
+        let dst_p = raw_ptr(conv_state, &stream)? as u64;
+        let src_p = raw_ptr(&new_state, &stream)? as u64;
+        unsafe {
+            candle_core::cuda_backend::cudarc::driver::result::memcpy_dtod_async(
+                dst_p,
+                src_p,
+                n_bytes,
+                stream.cu_stream(),
+            )
+            .map_err(candle_core::Error::wrap)?;
+        }
     }
 
     Ok(out)
@@ -534,7 +628,8 @@ pub fn prefill_recurrence_cuda(
         let op = raw_ptr_f32(&out_bh, &stream)?;
         unsafe {
             if value_major_state {
-                let rc = if seq_len >= 16 {
+                // `vmajor_chunked_gated_delta_rule_recurrence` returns `cudaError_t` (0 == cudaSuccess).
+                let ran_chunked = if seq_len >= 16 {
                     vmajor_chunked_gated_delta_rule_recurrence(
                         qp,
                         kp,
@@ -551,11 +646,11 @@ pub fn prefill_recurrence_cuda(
                         num_v_heads as i32,
                         st_code,
                         cu_stream,
-                    )
+                    ) == 0
                 } else {
-                    0
+                    false
                 };
-                if rc == 0 {
+                if !ran_chunked {
                     vmajor_warp_gated_delta_rule_recurrence(
                         qp,
                         kp,
@@ -674,6 +769,192 @@ pub fn rmsnorm_gated_cuda(
                 i32::from(sigmoid_gate),
                 dt_code,
                 stream.cu_stream() as i64,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Fused speculative conv1d with per-position state checkpointing (`state_pool`: `[lanes, conv_dim, K]`).
+pub fn speculative_conv_checkpoints_cuda(
+    x: &Tensor,
+    weight: &Tensor,
+    state_pool: &Tensor,
+    active_slot_u32: &Tensor,
+    checkpoint_lanes: usize,
+) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (b, s, conv_dim) = x.dims3()?;
+    let (_, kernel_size) = weight.dims2()?;
+    let dtype = x.dtype();
+    let dt_code = act_dtype_code(dtype)?;
+    let dev = x.device().as_cuda_device()?;
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+    let out = alloc_like_dtype(dev, Shape::from((b, s, conv_dim)), dtype)?;
+
+    let (ss, sl) = active_slot_u32.storage_and_layout();
+    let Storage::Cuda(sc) = &*ss else {
+        candle_core::bail!("speculative_conv_checkpoints expects CUDA u32 slot tensor");
+    };
+    let (slot_p, _sg) =
+        naiwa_quant::utils::slice_ptr_on_stream(sc.as_cuda_slice::<u32>()?, sl.start_offset(), &stream);
+
+    {
+        let xp = raw_ptr(&x, &stream)?;
+        let wp = raw_ptr(&weight, &stream)?;
+        let sp = raw_ptr(state_pool, &stream)?;
+        let op = raw_ptr(&out, &stream)?;
+        unsafe {
+            gdn_speculative_conv_checkpoints(
+                xp,
+                wp,
+                sp as *mut c_void,
+                op as *mut c_void,
+                slot_p as *const u32,
+                b as i32,
+                s as i32,
+                conv_dim as i32,
+                kernel_size as i32,
+                checkpoint_lanes as i32,
+                1, // write_checkpoints = true
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                (s * conv_dim) as i64,
+                conv_dim as i64,
+                1,
+                dt_code,
+                cu_stream,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Fused speculative recurrence + RMSNorm + output gate + per-position state checkpointing.
+///
+/// `mixed_qkv`: `[B, S, conv_dim]`, `b`/`a`: `[B, S, H_v]`, `z`: `[B, S, H_v, V]`,
+/// `state_pool`: `[lanes, H_v, V, K]` (value-major, `K == 128`, `V == 128`, `S <= 8`).
+/// Writes checkpoint states for `position = 0..S` into `state_pool[0..S]` and returns `[B, S, H_v, V]`
+/// already RMS-normalized and gated in activation dtype!
+#[allow(clippy::too_many_arguments)]
+pub fn speculative_recurrence_rmsnorm_cuda(
+    mixed_qkv: &Tensor,
+    b_proj: &Tensor,
+    a_proj: &Tensor,
+    z_gate: &Tensor,
+    a_log_f32: &Tensor,
+    dt_bias_f32: &Tensor,
+    norm_weight: &Tensor,
+    state_pool: &Tensor,
+    active_slot_u32: &Tensor,
+    checkpoint_lanes: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    tiled_v_heads: bool,
+    eps: f64,
+    sigmoid_gate: bool,
+) -> Result<Tensor> {
+    let mixed_qkv = mixed_qkv.contiguous()?;
+    let b_proj = b_proj.contiguous()?;
+    let a_proj = a_proj.contiguous()?;
+    let z_gate = z_gate.contiguous()?;
+    let norm_w = if norm_weight.dtype() == mixed_qkv.dtype() {
+        norm_weight.contiguous()?
+    } else {
+        norm_weight.to_dtype(mixed_qkv.dtype())?.contiguous()?
+    };
+    let a_log = a_log_f32.to_dtype(DType::F32)?.contiguous()?;
+    let dt_bias = dt_bias_f32.to_dtype(DType::F32)?.contiguous()?;
+
+    let (batch, seq_len, _) = mixed_qkv.dims3()?;
+    let dtype = mixed_qkv.dtype();
+    let dt_code = act_dtype_code(dtype)?;
+    let st_code = state_dtype_code(state_pool.dtype())?;
+    let dev = mixed_qkv.device().as_cuda_device()?;
+    let stream = dev.cuda_stream();
+    let cu_stream = stream.cu_stream() as i64;
+
+    let out = alloc_like_dtype(dev, Shape::from((batch, seq_len, num_v_heads, head_v_dim)), dtype)?;
+
+    let (ss, sl) = active_slot_u32.storage_and_layout();
+    let Storage::Cuda(sc) = &*ss else {
+        candle_core::bail!("speculative_recurrence_rmsnorm expects CUDA u32 slot tensor");
+    };
+    let (slot_p, _sg) =
+        naiwa_quant::utils::slice_ptr_on_stream(sc.as_cuda_slice::<u32>()?, sl.start_offset(), &stream);
+
+    {
+        let mqp = raw_ptr(&mixed_qkv, &stream)?;
+        let bp = raw_ptr(&b_proj, &stream)?;
+        let ap = raw_ptr(&a_proj, &stream)?;
+        let alp = raw_ptr_f32(&a_log, &stream)?;
+        let dtp = raw_ptr_f32(&dt_bias, &stream)?;
+        let sp = raw_ptr(state_pool, &stream)?;
+        let op = raw_ptr(&out, &stream)?;
+        let gp = raw_ptr(&z_gate, &stream)?;
+        let nwp = raw_ptr(&norm_w, &stream)?;
+        unsafe {
+            gdn_speculative_recurrence_checkpoints(
+                mqp,
+                bp,
+                ap,
+                alp,
+                dtp,
+                sp as *mut c_void,
+                op as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                slot_p as *const u32,
+                gp,
+                nwp,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                (seq_len * num_v_heads) as i64,
+                num_v_heads as i64,
+                1,
+                (seq_len * num_v_heads) as i64,
+                num_v_heads as i64,
+                1,
+                (seq_len * num_v_heads * head_v_dim) as i64,
+                (num_v_heads * head_v_dim) as i64,
+                head_v_dim as i64,
+                1,
+                batch as i32,
+                seq_len as i32,
+                num_k_heads as i32,
+                num_v_heads as i32,
+                head_k_dim as i32,
+                head_v_dim as i32,
+                checkpoint_lanes as i32,
+                i32::from(tiled_v_heads),
+                1, // value_major = true
+                eps as f32,
+                i32::from(sigmoid_gate),
+                dt_code,
+                st_code,
+                cu_stream,
             );
         }
     }

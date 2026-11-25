@@ -108,8 +108,7 @@ pub fn mtp_warmup_chunk(
     debug_assert_eq!(len, spec_hidden.dim(1)?);
     let end_kv_len = start_pos + len;
 
-    let tok_t = Tensor::from_slice(shifted_tokens, (1, len), device)?;
-    let embeds = model.embed_tokens(&tok_t)?;
+    let embeds = model.embed_tokens_host(shifted_tokens, &[1, len])?;
     let pos_vec: Vec<u32> = (start_pos as u32..end_kv_len as u32).collect();
     let pos_t = Tensor::from_slice(&pos_vec, (1, len), device)?;
 
@@ -133,7 +132,11 @@ pub fn mtp_warmup_chunk(
     }
 
     let last_logits_hidden = out.logits_hidden.i((0, len - 1))?.unsqueeze(0)?; // [1, hidden]
-    let logits = model.lm_head_forward(&last_logits_hidden)?; // [1, vocab] F32
+    let logits = if sampler.is_greedy() || mtp_cfg.draft_sampling == MtpDraftSampling::Greedy {
+        model.lm_head_forward_raw(&last_logits_hidden)?
+    } else {
+        model.lm_head_forward(&last_logits_hidden)?
+    };
     let proposal = sample_draft(&logits, sampler, mtp_cfg)?;
     let last_chain = out.chain_hidden.narrow(1, len - 1, 1)?.contiguous()?; // [1, 1, hc*hidden]
     Ok(Some((proposal, last_chain)))
@@ -166,8 +169,7 @@ pub fn mtp_chain_drafts(
             break;
         }
         let prev_tok = [drafts.last().unwrap().token_id];
-        let tok_t = Tensor::from_slice(&prev_tok, (1, 1), device)?;
-        let embeds = model.embed_tokens(&tok_t)?;
+        let embeds = model.embed_tokens_host(&prev_tok, &[1, 1])?;
         let pos_t = Tensor::from_slice(&[pos as u32], (1, 1), device)?;
         let meta = bm.build_meta(&[block_table.as_slice()], &[kv_len], &[1], true, device)?;
 
@@ -182,7 +184,11 @@ pub fn mtp_chain_drafts(
             cache,
         )?;
         let logits_h = out.logits_hidden.reshape((1, model.config().hidden_size))?;
-        let logits = model.lm_head_forward(&logits_h)?;
+        let logits = if sampler.is_greedy() || mtp_cfg.draft_sampling == MtpDraftSampling::Greedy {
+            model.lm_head_forward_raw(&logits_h)?
+        } else {
+            model.lm_head_forward(&logits_h)?
+        };
         let proposal = sample_draft(&logits, sampler, mtp_cfg)?;
         drafts.push(proposal);
         chain_hidden = out.chain_hidden;

@@ -15,9 +15,29 @@ pub(crate) struct SharedMlp {
 
 impl SharedMlp {
     pub(crate) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
+        #[cfg(feature = "cuda")]
+        if xs.device().is_cuda() {
+            if let (Some(gq), Some(uq)) = (self.gate_proj.qtensor(), self.up_proj.qtensor()) {
+                let k = xs.dim(xs.rank() - 1)?;
+                let rows = xs.elem_count() / k.max(1);
+                if gq.dtype() == uq.dtype()
+                    && rows <= naiwa_quant::gguf::fast_mmvq::MMVQ_MAX_BATCH
+                    && naiwa_quant::gguf::fast_mmvq::supports_fused_glu(xs.dtype(), gq.dtype())
+                {
+                    let inter = naiwa_quant::gguf::fast_mmvq::fused_glu(
+                        gq,
+                        uq,
+                        xs,
+                        naiwa_quant::GluActivationType::Silu,
+                    )?;
+                    return self.down_proj.forward(&inter);
+                }
+            }
+        }
+        let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(gate * up)?)
+        let inter = naiwa_quant::fused_glu(&gate, &up, naiwa_quant::GluActivationType::Silu)?;
+        self.down_proj.forward(&inter)
     }
 }
 

@@ -465,7 +465,6 @@ fn load_mtp_head(
         mixer,
         rotary_emb,
         qsa: cfg.qsa,
-        max_seq_len: cfg.max_position_embeddings,
         kv_layer_idx,
         hc: cfg.hc_count,
         hidden: cfg.hidden_size,
@@ -492,7 +491,39 @@ pub fn load_qwen4_exp_from_archive(
         "Loading Qwen4-Exp GGUF model"
     );
 
-    let embed_tokens = load_qlinear(&archive, "token_embd.weight", device, dtype)?;
+    let embed_tokens = if !cfg.tie_word_embeddings {
+        let emb_info = archive
+            .tensor_info("token_embd.weight")
+            .context("missing GGUF tensor `token_embd.weight`")?;
+        let host_iq_dtype = match emb_info.dtype().raw() {
+            18 => Some(candle_core::quantized::GgmlDType::IQ3_XXS),
+            20 => Some(candle_core::quantized::GgmlDType::IQ4NL),
+            21 => Some(candle_core::quantized::GgmlDType::IQ3_S),
+            22 => Some(candle_core::quantized::GgmlDType::IQ2_S),
+            23 => Some(candle_core::quantized::GgmlDType::IQ4XS),
+            39 => Some(candle_core::quantized::GgmlDType::Q2_0),
+            _ => None,
+        };
+        if let Some(qdt) = host_iq_dtype {
+            let data = archive.tensor_data("token_embd.weight")?;
+            let shape = emb_info.shape();
+            if shape.len() == 2 {
+                QLinear::from_host_iq_embedding(
+                    data.bytes().to_vec(),
+                    shape[0],
+                    shape[1],
+                    qdt,
+                    device.clone(),
+                )
+            } else {
+                load_qlinear(&archive, "token_embd.weight", device, dtype)?
+            }
+        } else {
+            load_qlinear(&archive, "token_embd.weight", device, dtype)?
+        }
+    } else {
+        load_qlinear(&archive, "token_embd.weight", device, dtype)?
+    };
     let lm_head = if cfg.tie_word_embeddings {
         embed_tokens.clone()
     } else {

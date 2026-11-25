@@ -1906,3 +1906,132 @@ extern "C" void naiwa_qwen4_router_softmax_topk(
         (const float *)logits, out_vals, out_ids, n_experts, top_k, renormalize);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Fused per-head RMSNorm + partial NeoX RoPE (supports strided head layout so
+// Q can be read directly out of interleaved q_gate without narrow/transpose).
+// ---------------------------------------------------------------------------
+template <typename T>
+static __global__ void q4_qk_norm_rope_kernel(
+    const T *__restrict__ x,
+    const T *__restrict__ weight,
+    const T *__restrict__ cos_buf,
+    const T *__restrict__ sin_buf,
+    T *__restrict__ out,
+    int n_tokens,
+    int n_heads,
+    int head_dim,
+    int head_stride,
+    int half_rot,
+    float eps) {
+  const int bh = blockIdx.x;
+  const int t = bh / n_heads;
+  const int h = bh - t * n_heads;
+  if (t >= n_tokens) return;
+
+  const int lane = threadIdx.x;
+  const T *src = x + ((size_t)t * n_heads + h) * head_stride;
+  T *dst = out + ((size_t)t * n_heads + h) * head_dim;
+
+  __shared__ float s_norm[512];
+  float sum_sq = 0.0f;
+  for (int d = lane; d < head_dim; d += 32) {
+    float v = q4_f(src[d]);
+    s_norm[d] = v;
+    sum_sq = __fmaf_rn(v, v, sum_sq);
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, o);
+  }
+  const float rstd = rsqrtf(sum_sq / (float)head_dim + eps);
+  for (int d = lane; d < head_dim; d += 32) {
+    s_norm[d] = s_norm[d] * rstd * q4_f(weight[d]);
+  }
+  __syncwarp();
+
+  const T *c_row = cos_buf + (size_t)t * half_rot;
+  const T *s_row = sin_buf + (size_t)t * half_rot;
+  for (int i = lane; i < half_rot; i += 32) {
+    float c = q4_f(c_row[i]);
+    float s = q4_f(s_row[i]);
+    float x1 = s_norm[i];
+    float x2 = s_norm[i + half_rot];
+    dst[i] = q4_t<T>(x1 * c - x2 * s);
+    dst[i + half_rot] = q4_t<T>(x2 * c + x1 * s);
+  }
+  for (int d = 2 * half_rot + lane; d < head_dim; d += 32) {
+    dst[d] = q4_t<T>(s_norm[d]);
+  }
+}
+
+extern "C" void naiwa_qwen4_qk_norm_rope(
+    const void *x,
+    const void *weight,
+    const void *cos_buf,
+    const void *sin_buf,
+    void *out,
+    int n_tokens,
+    int n_heads,
+    int head_dim,
+    int head_stride,
+    int half_rot,
+    float eps,
+    int dtype,
+    int64_t stream) {
+  const int blocks = n_tokens * n_heads;
+  if (blocks <= 0) return;
+  const cudaStream_t s = (cudaStream_t)stream;
+  if (dtype == 0) {
+    q4_qk_norm_rope_kernel<__half><<<blocks, 32, 0, s>>>(
+        (const __half *)x, (const __half *)weight, (const __half *)cos_buf,
+        (const __half *)sin_buf, (__half *)out, n_tokens, n_heads, head_dim,
+        head_stride, half_rot, eps);
+  } else {
+    q4_qk_norm_rope_kernel<__nv_bfloat16><<<blocks, 32, 0, s>>>(
+        (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)weight,
+        (const __nv_bfloat16 *)cos_buf, (const __nv_bfloat16 *)sin_buf,
+        (__nv_bfloat16 *)out, n_tokens, n_heads, head_dim, head_stride,
+        half_rot, eps);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused QSA output gating: out[t, h, d] = y[t, h, d] * sigmoid(q_gate[t, h, head_dim + d])
+// ---------------------------------------------------------------------------
+template <typename T>
+static __global__ void q4_qsa_gate_mul_kernel(
+    const T *__restrict__ y,
+    const T *__restrict__ q_gate,
+    T *__restrict__ out,
+    int total_elems,
+    int head_dim) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_elems) return;
+  const int head_idx = idx / head_dim;
+  const int d = idx - head_idx * head_dim;
+  const float yv = q4_f(y[idx]);
+  const float gv = q4_f(q_gate[(size_t)head_idx * (2 * head_dim) + head_dim + d]);
+  out[idx] = q4_t<T>(yv * q4_sigmoid(gv));
+}
+
+extern "C" void naiwa_qwen4_qsa_gate_mul(
+    const void *y,
+    const void *q_gate,
+    void *out,
+    int total_elems,
+    int head_dim,
+    int dtype,
+    int64_t stream) {
+  if (total_elems <= 0) return;
+  const cudaStream_t s = (cudaStream_t)stream;
+  const int threads = 256;
+  const int blocks = (total_elems + threads - 1) / threads;
+  if (dtype == 0) {
+    q4_qsa_gate_mul_kernel<__half><<<blocks, threads, 0, s>>>(
+        (const __half *)y, (const __half *)q_gate, (__half *)out, total_elems, head_dim);
+  } else {
+    q4_qsa_gate_mul_kernel<__nv_bfloat16><<<blocks, threads, 0, s>>>(
+        (const __nv_bfloat16 *)y, (const __nv_bfloat16 *)q_gate,
+        (__nv_bfloat16 *)out, total_elems, head_dim);
+  }
+}

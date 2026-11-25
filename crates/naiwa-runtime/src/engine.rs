@@ -199,6 +199,9 @@ impl EngineHandle {
             model.device(),
         )
         .context("failed to allocate HybridCache")?;
+        model
+            .warm_aux_caches(&cache)
+            .context("failed to pre-allocate QSA aux caches")?;
         let block_manager = BlockManager::new(cfg.num_blocks, cfg.block_size);
 
         let metrics = Arc::new(EngineMetrics::default());

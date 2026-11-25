@@ -180,6 +180,8 @@ fn direct_forward_matches_frozen_greedy_oracle() -> anyhow::Result<()> {
         host_query_lens: vec![n_prompt],
         max_context_len: n_prompt,
         is_decode: false,
+        row_block_tables: None,
+        row_context_lens: None,
     };
 
     let last_idx = [(n_prompt - 1) as u32];
@@ -226,6 +228,8 @@ fn direct_forward_matches_frozen_greedy_oracle() -> anyhow::Result<()> {
             host_query_lens: vec![1],
             max_context_len: cur_kv_len,
             is_decode: true,
+            row_block_tables: None,
+            row_context_lens: None,
         };
         let out = model.forward(
             &ForwardInput {

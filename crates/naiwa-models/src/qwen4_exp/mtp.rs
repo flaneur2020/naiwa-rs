@@ -49,7 +49,6 @@ pub(crate) struct Qwen4ExpMtpHead {
     pub(crate) mixer: GatedResidual,
     pub(crate) rotary_emb: Arc<RotaryEmbedding>,
     pub(crate) qsa: QsaConfig,
-    pub(crate) max_seq_len: usize,
     pub(crate) kv_layer_idx: usize,
     pub(crate) hc: usize,
     pub(crate) hidden: usize,
@@ -92,26 +91,26 @@ impl Qwen4ExpMtpHead {
 
         let cos_sin = self.rotary_emb.compute_cos_sin(input.position_ids, res.dtype())?;
         let n_tokens = batch * rows;
-        let mode = match input.chunk_spans {
-            Some((_, kv_lens)) => {
-                let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
-                QsaMode::for_max_kv_len(&self.qsa, max_kv)
-            }
-            None => QsaMode::Sparse {
-                max_blocks: self.max_seq_len / self.qsa.compress_ratio,
-            },
+        let max_kv = match input.chunk_spans {
+            Some((_, kv_lens)) => kv_lens.iter().copied().max().unwrap_or(0),
+            None => input.paged_meta.max_context_len,
         };
+        let mode = QsaMode::for_max_kv_len(&self.qsa, max_kv);
 
         #[cfg(feature = "cuda")]
         let layout = if !res.device().is_cuda() {
             None
         } else if let Some((spans, kv_lens)) = input.chunk_spans {
-            Some(naiwa_attn::qwen4_exp::TokenLayout::from_host(
-                spans,
-                kv_lens,
-                n_tokens,
-                res.device(),
-            )?)
+            if spans.len() == 1 && batch == 1 && spans[0] == (0, rows) {
+                Some(naiwa_attn::qwen4_exp::TokenLayout::rectangular(1, rows))
+            } else {
+                Some(naiwa_attn::qwen4_exp::TokenLayout::from_host(
+                    spans,
+                    kv_lens,
+                    n_tokens,
+                    res.device(),
+                )?)
+            }
         } else {
             Some(naiwa_attn::qwen4_exp::TokenLayout::rectangular(batch, rows))
         };

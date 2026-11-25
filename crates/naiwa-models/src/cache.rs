@@ -115,8 +115,21 @@ impl HybridCache {
                 LayerType::LinearAttention => {
                     kv_caches.push(None);
                     let mut slots = Vec::with_capacity(max_seqs);
-                    for _ in 0..max_seqs {
-                        slots.push(GdnSeqState::new(&cfg.gdn, dtype, DType::F32, device)?);
+                    // Slot 0 gets 4 checkpoint lanes when MTP is active so single-sequence MTP
+                    // verification (up to n_predict=3) runs zero-copy/zero-alloc/zero-replay!
+                    for s in 0..max_seqs {
+                        let lanes = if has_mtp && s == 0 && device.is_cuda() {
+                            4
+                        } else {
+                            1
+                        };
+                        slots.push(GdnSeqState::new_with_lanes(
+                            &cfg.gdn,
+                            dtype,
+                            DType::F32,
+                            lanes,
+                            device,
+                        )?);
                     }
                     gdn_states.push(Some(slots));
                 }

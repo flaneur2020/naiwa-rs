@@ -169,8 +169,61 @@ impl Qwen4ExpModel {
         self.mtp.as_ref().map(Qwen4ExpMtpHead::kv_layer_idx)
     }
 
+    /// Pre-allocate QSA auxiliary caches for every FullAttention layer (plus MTP head) and
+    /// warm up Candle CUDA PTX kernels / cuBLAS handles before HTTP serves requests.
+    pub fn warm_aux_caches(&self, cache: &HybridCache) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let block_size = cache.block_size();
+            for (i, layer) in self.layers.iter().enumerate() {
+                if let Mixer::Attention(attn) = &layer.mixer {
+                    if let Some((kc, _)) = cache.kv_layer(i) {
+                        attn.warm_aux_cache(kc, block_size, self.dtype)?;
+                    }
+                }
+            }
+            if let Some(mtp) = &self.mtp {
+                if let Some((kc, _)) = cache.kv_layer(mtp.kv_layer_idx()) {
+                    mtp.attn.warm_aux_cache(kc, block_size, self.dtype)?;
+                }
+            }
+            // Tiny dummy tensor ops pre-load Candle PTX modules & cuBLAS handles without touching
+            // any model weights, KV cache, or `naiwa-offload` state.
+            let a = Tensor::zeros((2, 16), self.dtype, &self.device)?;
+            let b = Tensor::zeros((16, 16), self.dtype, &self.device)?;
+            let w = Tensor::ones((16,), self.dtype, &self.device)?;
+            let _ = a.matmul(&b)?;
+            let _ = candle_nn::ops::silu(&a)?;
+            let _ = candle_nn::ops::sigmoid(&a)?;
+            let _ = candle_nn::ops::rms_norm(&a, &w, 1e-6)?;
+            let _ = a.argmax(1)?;
+            let af = a.to_dtype(DType::F32)?;
+            let _ = af.cos()?;
+            let _ = af.sin()?;
+            let _ = af.argmax(1)?;
+            let _ = (&a + &a)?;
+            let _ = a.broadcast_mul(&w)?;
+            let _ = a.repeat((1, 4))?;
+            let _ = a.narrow(0, 0, 1)?.contiguous()?;
+            self.device.synchronize()?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = cache;
+        Ok(())
+    }
+
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.embedding_forward(input_ids, self.dtype)
+    }
+
+    pub fn embed_tokens_host(&self, ids: &[u32], prefix_shape: &[usize]) -> Result<Tensor> {
+        self.embed_tokens
+            .embedding_forward_host_ids(ids, prefix_shape, self.dtype)
+    }
+
+    /// Project collapsed hidden states `[.., hidden]` through `lm_head` -> `[.., vocab]` in model dtype.
+    pub fn lm_head_forward_raw(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden)
     }
 
     /// Project collapsed hidden states `[.., hidden]` through `lm_head` -> `[.., vocab]` in F32.
@@ -184,21 +237,17 @@ impl Qwen4ExpModel {
         input: &ForwardInput<'_>,
         cache: &mut HybridCache,
     ) -> Result<ForwardOutput> {
-        let xs = self.embed_tokens(input.input_ids)?; // [batch, seq_len, hidden]
-        let (batch, seq_len, _hidden) = xs.dims3()?;
+        let (batch, seq_len) = input.input_ids.dims2()?;
+        let xs = self.embed_tokens_host(input.tokens_host, &[batch, seq_len])?; // [batch, seq_len, hidden]
         let n_tokens = batch * seq_len;
 
         let cos_sin = self.rotary_emb.compute_cos_sin(input.position_ids, self.dtype)?;
 
         let rectangular = matches!(input.kind, ForwardKind::Decode | ForwardKind::Verify);
-        let mode = if rectangular {
-            QsaMode::Sparse {
-                max_blocks: self.cfg.max_position_embeddings / self.cfg.qsa.compress_ratio,
-            }
-        } else {
-            let max_kv = input.kv_lens.iter().copied().max().unwrap_or(0);
-            QsaMode::for_max_kv_len(&self.cfg.qsa, max_kv)
-        };
+        let max_kv = input.kv_lens.iter().copied().max().unwrap_or(0);
+        // Dense uses fused paged_attention_decode for both single-token Decode and small Verify
+        // batches (via per-row virtual block tables), skipping index_q + qsa_select completely!
+        let mode = QsaMode::for_max_kv_len(&self.cfg.qsa, max_kv);
 
         #[cfg(feature = "cuda")]
         let layout = if self.device.is_cuda() {

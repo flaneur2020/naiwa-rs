@@ -153,6 +153,10 @@ pub fn load_model(
         None
     };
 
+    if naiwa_offload::stats::model_partition::enabled() {
+        naiwa_models::set_boundary_probe(naiwa_offload::stats::model_partition::dispatch);
+    }
+
     let moe_trait: Option<Arc<dyn RoutedExpertsProvider>> =
         provider.as_ref().map(|p| Arc::clone(p) as Arc<dyn RoutedExpertsProvider>);
 

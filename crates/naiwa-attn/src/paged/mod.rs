@@ -27,6 +27,11 @@ pub struct PagedAttnMeta {
     pub max_context_len: usize,
     /// True when every sequence in the batch has `query_len == 1` (single-token decode).
     pub is_decode: bool,
+    /// Optional per-query-row `[total_q, max_blocks_per_seq]` block tables for fused multi-row
+    /// `paged_attention_decode` (used by MTP verify/refresh when `total_q <= 8`).
+    pub row_block_tables: Option<Tensor>,
+    /// Optional per-query-row `[total_q]` causal context lengths paired with `row_block_tables`.
+    pub row_context_lens: Option<Tensor>,
 }
 
 /// Number of elements packed in the innermost `x` dimension of the paged key cache (`16 / sizeof(T)`).
@@ -592,6 +597,23 @@ impl PagedAttention {
             );
         }
 
+        // Multi-token verify / small refresh fast path: each query row runs as a virtual
+        // causal decode sequence directly against paged KV (no gather_kv_cache, no SDPA)!
+        if let (Some(rbt), Some(rcl)) = (&meta.row_block_tables, &meta.row_context_lens) {
+            if q.device().is_cuda() {
+                return paged_attention_decode(
+                    q,
+                    key_cache,
+                    value_cache,
+                    rbt,
+                    rcl,
+                    meta.max_context_len,
+                    self.softmax_scale,
+                    self.softcapping,
+                );
+            }
+        }
+
         // Prefill or multi-token verify: gather full KV per sequence from paged cache (supports prefix/chunked prefill + verify!)
         let total_kv: usize = meta.host_context_lens.iter().sum();
         let (all_k, all_v) = gather_kv_cache(
@@ -715,6 +737,34 @@ mod tests {
             .max(0)?
             .to_scalar::<f32>()?;
         assert!(diff < 2e-2, "paged decode vs SDPA max diff = {diff}");
+
+        // Also test multi-row causal paged_attention_decode (MTP verify path: 3 query rows
+        // with causal context_lens [21, 22, 23] sharing physical blocks [2, 5]).
+        let q3 = Tensor::randn(0f32, 0.5, (3, num_heads, head_dim), &dev)?.to_dtype(DType::BF16)?;
+        let rbt = Tensor::from_vec(vec![2u32, 5, 2, 5, 2, 5], (3, 2), &dev)?;
+        let rcl = Tensor::from_vec(vec![21u32, 22, 23], (3,), &dev)?;
+        let got3 = paged_attention_decode(&q3, &kc, &vc, &rbt, &rcl, ctx_len, scale, 1.0)?;
+        let q3_4 = q3.transpose(0, 1)?.unsqueeze(0)?;
+        let want3 = sdpa_forward(
+            &q3_4,
+            &k4,
+            &v4,
+            None,
+            true,
+            SdpaParams {
+                n_kv_groups: num_heads / num_kv_heads,
+                softmax_scale: scale,
+                softcap: None,
+            },
+        )?
+        .squeeze(0)?
+        .transpose(0, 1)?;
+        let diff3 = (got3.to_dtype(DType::F32)? - want3.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff3 < 2e-2, "multi-row causal paged decode vs SDPA max diff = {diff3}");
         Ok(())
     }
 }

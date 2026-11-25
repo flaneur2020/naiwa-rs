@@ -1,6 +1,8 @@
 //! `naiwa-quant`: GGUF archive reading, IQ/Q2_0/MMQ/MMVQ/MoE kernels, single-device `QLinear`,
 //! and `RoutedExperts` offloading traits built directly on `candle-core`.
 
+#[cfg(feature = "cuda")]
+pub mod gemv;
 pub mod gguf;
 pub mod linear;
 pub mod moe;

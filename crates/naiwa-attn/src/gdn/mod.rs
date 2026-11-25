@@ -48,15 +48,22 @@ impl GdnConfig {
     }
 }
 
-/// Per-sequence recurrent state for one GDN layer (supports clone/restore for MTP rollback).
+/// Per-sequence recurrent state for one GDN layer (supports both single-lane copy/replay and
+/// zero-copy multi-lane CUDA speculative checkpointing for MTP).
 #[derive(Clone, Debug)]
 pub struct GdnSeqState {
-    /// `[1, conv_dim, conv_kernel_dim]` in activation dtype (BF16/F16/F32).
+    /// `[lanes, conv_dim, conv_kernel_dim]` in activation dtype (BF16/F16/F32).
     pub conv_state: Tensor,
-    /// `[1, num_v_heads, head_v_dim, head_k_dim]` (value-major) in F32 (or BF16).
+    /// `[lanes, num_v_heads, head_v_dim, head_k_dim]` (value-major) in F32 (or BF16).
     pub recurrent_state: Tensor,
-    /// True when `recurrent_state` is stored value-major `[1, H_v, V, K]`.
+    /// True when `recurrent_state` is stored value-major `[lanes, H_v, V, K]`.
     pub value_major: bool,
+    /// Number of checkpoint lanes allocated (`1` for standard decode; `> 1` for zero-copy MTP).
+    pub checkpoint_lanes: usize,
+    /// Currently active lane in `0..checkpoint_lanes`.
+    pub active_lane: usize,
+    /// Pre-allocated device `[1]` U32 tensors `[0], [1], ...` for zero-alloc CUDA checkpoint launches.
+    lane_slot_tensors: Vec<Tensor>,
 }
 
 impl GdnSeqState {
@@ -66,40 +73,68 @@ impl GdnSeqState {
         state_dtype: DType,
         device: &Device,
     ) -> Result<Self> {
+        Self::new_with_lanes(cfg, act_dtype, state_dtype, 1, device)
+    }
+
+    pub fn new_with_lanes(
+        cfg: &GdnConfig,
+        act_dtype: DType,
+        state_dtype: DType,
+        checkpoint_lanes: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let lanes = checkpoint_lanes.max(1);
         let value_major = device.is_cuda();
-        let conv_state = Tensor::zeros((1, cfg.conv_dim(), cfg.conv_kernel_dim), act_dtype, device)?;
+        let conv_state =
+            Tensor::zeros((lanes, cfg.conv_dim(), cfg.conv_kernel_dim), act_dtype, device)?;
         let recurrent_state = if value_major {
             Tensor::zeros(
-                (1, cfg.num_v_heads, cfg.head_v_dim, cfg.head_k_dim),
+                (lanes, cfg.num_v_heads, cfg.head_v_dim, cfg.head_k_dim),
                 state_dtype,
                 device,
             )?
         } else {
             Tensor::zeros(
-                (1, cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim),
+                (lanes, cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim),
                 state_dtype,
                 device,
             )?
         };
+        let mut lane_slot_tensors = Vec::new();
+        if lanes > 1 && device.is_cuda() {
+            lane_slot_tensors.reserve(lanes);
+            for l in 0..lanes {
+                lane_slot_tensors.push(Tensor::from_slice(&[l as u32], (1,), device)?);
+            }
+        }
         Ok(Self {
             conv_state,
             recurrent_state,
             value_major,
+            checkpoint_lanes: lanes,
+            active_lane: 0,
+            lane_slot_tensors,
         })
     }
 
     pub fn reset(&mut self) -> Result<()> {
         self.conv_state = self.conv_state.zeros_like()?;
         self.recurrent_state = self.recurrent_state.zeros_like()?;
+        self.active_lane = 0;
         Ok(())
     }
 
-    /// Deep-copy snapshot (used for MTP speculative verify rollback).
+    /// Deep-copy snapshot of the active lane (fallback path when `checkpoint_lanes == 1`).
     pub fn snapshot(&self) -> Result<Self> {
+        let conv_active = self.conv_state.narrow(0, self.active_lane, 1)?.copy()?;
+        let rec_active = self.recurrent_state.narrow(0, self.active_lane, 1)?.copy()?;
         Ok(Self {
-            conv_state: self.conv_state.copy()?,
-            recurrent_state: self.recurrent_state.copy()?,
+            conv_state: conv_active,
+            recurrent_state: rec_active,
             value_major: self.value_major,
+            checkpoint_lanes: 1,
+            active_lane: 0,
+            lane_slot_tensors: Vec::new(),
         })
     }
 }
@@ -127,17 +162,19 @@ pub struct GatedDeltaNet {
     pub out_proj: QLinear,
 }
 
-/// Stashed pre-step state and projected inputs for one sequence in a GDN layer,
-/// enabling exact prefix replay after partial MTP speculative rejection.
+/// Stashed pre-step state or zero-copy checkpoint lane marker for exact MTP rollback.
 #[derive(Clone, Debug)]
-pub struct GdnSeqStash {
-    pub pre_state: GdnSeqState,
-    /// `[1, seq_len, conv_dim]`
-    pub qkv_raw: Tensor,
-    /// `[1, seq_len, num_v_heads]`
-    pub b: Tensor,
-    /// `[1, seq_len, num_v_heads]`
-    pub a: Tensor,
+pub enum GdnSeqStash {
+    /// Zero-copy CUDA multi-lane checkpoint: lanes `0..seq_len` already hold exact post-token states;
+    /// rollback to `keep >= 1` is simply `state.active_lane = keep - 1`!
+    CheckpointLanes,
+    /// Fallback full pre-state snapshot + projected inputs for replay.
+    Replay {
+        pre_state: GdnSeqState,
+        qkv_raw: Tensor,
+        b: Tensor,
+        a: Tensor,
+    },
 }
 
 impl GatedDeltaNet {
@@ -199,7 +236,7 @@ impl GatedDeltaNet {
             let b_i = b_all.narrow(1, start, len)?.contiguous()?;
             let a_i = a_all.narrow(1, start, len)?.contiguous()?;
             if let Some(dst) = stashes.as_mut() {
-                dst.push(GdnSeqStash {
+                dst.push(GdnSeqStash::Replay {
                     pre_state: state.snapshot()?,
                     qkv_raw: qkv_i.clone(),
                     b: b_i.clone(),
@@ -218,7 +255,7 @@ impl GatedDeltaNet {
         out.reshape((batch, seq_len, hidden))
     }
 
-    /// Restore `state` from `stash.pre_state` and replay only the first `keep` tokens (`0..keep`).
+    /// Restore `state` to the exact prefix after `keep` tokens (`0..keep`).
     /// Used after partial MTP verification rejection.
     pub fn replay_prefix(
         &self,
@@ -226,63 +263,84 @@ impl GatedDeltaNet {
         stash: &GdnSeqStash,
         keep: usize,
     ) -> Result<()> {
-        *state = stash.pre_state.snapshot()?;
-        if keep == 0 {
-            return Ok(());
-        }
-        let qkv = stash.qkv_raw.narrow(1, 0, keep)?.contiguous()?;
-        let b = stash.b.narrow(1, 0, keep)?.contiguous()?;
-        let a = stash.a.narrow(1, 0, keep)?.contiguous()?;
-        let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
-        #[cfg(feature = "cuda")]
-        if qkv.device().is_cuda() && matches!(qkv.dtype(), DType::BF16 | DType::F16) {
-            let mixed_qkv =
-                cuda::causal_conv1d_cuda(&qkv, &self.conv_weight, &mut state.conv_state)?;
-            let _ = if keep == 1 {
-                cuda::decode_recurrence_cuda(
+        match stash {
+            GdnSeqStash::CheckpointLanes => {
+                if keep == 0 || keep > state.checkpoint_lanes {
+                    candle_core::bail!(
+                        "GdnSeqStash::CheckpointLanes invalid keep={keep} (lanes={})",
+                        state.checkpoint_lanes
+                    );
+                }
+                state.active_lane = keep - 1;
+                return Ok(());
+            }
+            GdnSeqStash::Replay {
+                pre_state,
+                qkv_raw,
+                b: b_all,
+                a: a_all,
+            } => {
+                *state = pre_state.snapshot()?;
+                if keep == 0 {
+                    return Ok(());
+                }
+                let qkv = qkv_raw.narrow(1, 0, keep)?.contiguous()?;
+                let b = b_all.narrow(1, 0, keep)?.contiguous()?;
+                let a = a_all.narrow(1, 0, keep)?.contiguous()?;
+                let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
+                #[cfg(feature = "cuda")]
+                if qkv.device().is_cuda() && matches!(qkv.dtype(), DType::BF16 | DType::F16) {
+                    let mut conv_view = state.conv_state.narrow(0, state.active_lane, 1)?;
+                    let mut rec_view = state.recurrent_state.narrow(0, state.active_lane, 1)?;
+                    let mixed_qkv =
+                        cuda::causal_conv1d_cuda(&qkv, &self.conv_weight, &mut conv_view)?;
+                    let _ = if keep == 1 {
+                        cuda::decode_recurrence_cuda(
+                            &mixed_qkv,
+                            &b,
+                            &a,
+                            &self.a_log,
+                            &self.dt_bias,
+                            &mut rec_view,
+                            self.cfg.num_k_heads,
+                            self.cfg.num_v_heads,
+                            self.cfg.head_k_dim,
+                            self.cfg.head_v_dim,
+                            tiled,
+                            state.value_major,
+                        )?
+                    } else {
+                        cuda::prefill_recurrence_cuda(
+                            &mixed_qkv,
+                            &b,
+                            &a,
+                            &self.a_log,
+                            &self.dt_bias,
+                            &mut rec_view,
+                            self.cfg.num_k_heads,
+                            self.cfg.num_v_heads,
+                            self.cfg.head_k_dim,
+                            self.cfg.head_v_dim,
+                            tiled,
+                            state.value_major,
+                        )?
+                    };
+                    return Ok(());
+                }
+                let mixed_qkv = causal_conv1d_ref(&qkv, &self.conv_weight, &mut state.conv_state)?;
+                let _ = recurrence_ref(
                     &mixed_qkv,
                     &b,
                     &a,
                     &self.a_log,
                     &self.dt_bias,
                     &mut state.recurrent_state,
-                    self.cfg.num_k_heads,
-                    self.cfg.num_v_heads,
-                    self.cfg.head_k_dim,
-                    self.cfg.head_v_dim,
-                    tiled,
+                    &self.cfg,
                     state.value_major,
-                )?
-            } else {
-                cuda::prefill_recurrence_cuda(
-                    &mixed_qkv,
-                    &b,
-                    &a,
-                    &self.a_log,
-                    &self.dt_bias,
-                    &mut state.recurrent_state,
-                    self.cfg.num_k_heads,
-                    self.cfg.num_v_heads,
-                    self.cfg.head_k_dim,
-                    self.cfg.head_v_dim,
-                    tiled,
-                    state.value_major,
-                )?
-            };
-            return Ok(());
+                )?;
+                Ok(())
+            }
         }
-        let mixed_qkv = causal_conv1d_ref(&qkv, &self.conv_weight, &mut state.conv_state)?;
-        let _ = recurrence_ref(
-            &mixed_qkv,
-            &b,
-            &a,
-            &self.a_log,
-            &self.dt_bias,
-            &mut state.recurrent_state,
-            &self.cfg,
-            state.value_major,
-        )?;
-        Ok(())
     }
 
     fn forward_seq_inner(
@@ -305,8 +363,64 @@ impl GatedDeltaNet {
         let b = self.in_proj_b.forward(xs)?; // [1, S, H_v]
         let a = self.in_proj_a.forward(xs)?; // [1, S, H_v]
 
+        // Zero-copy fused CUDA speculative verify fast path!
+        #[cfg(feature = "cuda")]
         if let Some(dst) = stash_out {
-            *dst = Some(GdnSeqStash {
+            if seq_len >= 1
+                && seq_len <= state.checkpoint_lanes
+                && state.checkpoint_lanes > 1
+                && seq_len <= 8
+                && state.value_major
+                && self.cfg.head_k_dim == 128
+                && self.cfg.head_v_dim == 128
+                && qkv_raw.device().is_cuda()
+                && matches!(qkv_raw.dtype(), DType::BF16 | DType::F16)
+            {
+                let tiled = self.cfg.v_head_layout == GdnVHeadLayout::Tiled;
+                let sigmoid_gate = self.cfg.gate_activation == GdnGateActivation::Sigmoid;
+                let slot_t = &state.lane_slot_tensors[state.active_lane];
+                let mixed_qkv = cuda::speculative_conv_checkpoints_cuda(
+                    &qkv_raw,
+                    &self.conv_weight,
+                    &state.conv_state,
+                    slot_t,
+                    state.checkpoint_lanes,
+                )?;
+                let normed = cuda::speculative_recurrence_rmsnorm_cuda(
+                    &mixed_qkv,
+                    &b,
+                    &a,
+                    &z,
+                    &self.a_log,
+                    &self.dt_bias,
+                    &self.norm_weight,
+                    &state.recurrent_state,
+                    slot_t,
+                    state.checkpoint_lanes,
+                    self.cfg.num_k_heads,
+                    self.cfg.num_v_heads,
+                    self.cfg.head_k_dim,
+                    self.cfg.head_v_dim,
+                    tiled,
+                    self.cfg.rms_norm_eps,
+                    sigmoid_gate,
+                )?;
+                state.active_lane = seq_len - 1;
+                *dst = Some(GdnSeqStash::CheckpointLanes);
+                let flat = normed.reshape((1, seq_len, self.cfg.value_dim()))?;
+                return self.out_proj.forward(&flat);
+            }
+            *dst = Some(GdnSeqStash::Replay {
+                pre_state: state.snapshot()?,
+                qkv_raw: qkv_raw.clone(),
+                b: b.clone(),
+                a: a.clone(),
+            });
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        if let Some(dst) = stash_out {
+            *dst = Some(GdnSeqStash::Replay {
                 pre_state: state.snapshot()?,
                 qkv_raw: qkv_raw.clone(),
                 b: b.clone(),
@@ -334,8 +448,10 @@ impl GatedDeltaNet {
 
         #[cfg(feature = "cuda")]
         if qkv_raw.device().is_cuda() && matches!(dtype, DType::BF16 | DType::F16) {
+            let mut conv_view = state.conv_state.narrow(0, state.active_lane, 1)?;
+            let mut rec_view = state.recurrent_state.narrow(0, state.active_lane, 1)?;
             let mixed_qkv =
-                cuda::causal_conv1d_cuda(qkv_raw, &self.conv_weight, &mut state.conv_state)?;
+                cuda::causal_conv1d_cuda(qkv_raw, &self.conv_weight, &mut conv_view)?;
             let core_out = if seq_len == 1 {
                 cuda::decode_recurrence_cuda(
                     &mixed_qkv,
@@ -343,7 +459,7 @@ impl GatedDeltaNet {
                     a,
                     &self.a_log,
                     &self.dt_bias,
-                    &mut state.recurrent_state,
+                    &mut rec_view,
                     self.cfg.num_k_heads,
                     self.cfg.num_v_heads,
                     self.cfg.head_k_dim,
@@ -358,7 +474,7 @@ impl GatedDeltaNet {
                     a,
                     &self.a_log,
                     &self.dt_bias,
-                    &mut state.recurrent_state,
+                    &mut rec_view,
                     self.cfg.num_k_heads,
                     self.cfg.num_v_heads,
                     self.cfg.head_k_dim,
@@ -620,7 +736,8 @@ mod tests {
             .abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         assert!(diff_norm < 2e-2, "GDN rmsnorm_gated CUDA vs ref max diff = {diff_norm}");
 
-        // Also test exact Qwen4-Exp Layer-0 dimensions: k_heads=16, v_heads=48, dk=128, dv=128, s=15
+        // Also test exact Qwen4-Exp Layer-0 dimensions with seq_len=23 (>= 16 chunked path!)
+        // against CPU reference for both output AND final recurrent state.
         let cfg0 = GdnConfig {
             hidden_size: 2560,
             rms_norm_eps: 1e-6,
@@ -633,19 +750,29 @@ mod tests {
             gate_activation: GdnGateActivation::Sigmoid,
         };
         let mut st0 = GdnSeqState::new(&cfg0, DType::BF16, DType::F32, &dev)?;
-        let x0 = Tensor::randn(0f32, 0.2, (1, 15, cfg0.conv_dim()), &dev)?.to_dtype(DType::BF16)?;
+        let mut st0_ref = st0.snapshot()?;
+        let x0 = Tensor::randn(0f32, 0.2, (1, 23, cfg0.conv_dim()), &dev)?.to_dtype(DType::BF16)?;
         let w0 = Tensor::randn(0f32, 0.2, (cfg0.conv_dim(), 4), &dev)?.to_dtype(DType::BF16)?;
-        let b0 = Tensor::randn(0f32, 0.5, (1, 15, 48), &dev)?.to_dtype(DType::BF16)?;
-        let a0 = Tensor::randn(0f32, 0.5, (1, 15, 48), &dev)?.to_dtype(DType::BF16)?;
+        let b0 = Tensor::randn(0f32, 0.5, (1, 23, 48), &dev)?.to_dtype(DType::BF16)?;
+        let a0 = Tensor::randn(0f32, 0.5, (1, 23, 48), &dev)?.to_dtype(DType::BF16)?;
         let al0 = Tensor::randn(-1f32, 0.2, (48,), &dev)?;
         let dt0 = Tensor::randn(0f32, 0.2, (48,), &dev)?;
-        let z0 = Tensor::randn(0f32, 0.5, (1, 15, 48, 128), &dev)?.to_dtype(DType::BF16)?;
+        let z0 = Tensor::randn(0f32, 0.5, (1, 23, 48, 128), &dev)?.to_dtype(DType::BF16)?;
         let nw0 = Tensor::ones((128,), DType::BF16, &dev)?;
         let c0 = cuda::causal_conv1d_cuda(&x0, &w0, &mut st0.conv_state)?;
         let o0 = cuda::prefill_recurrence_cuda(
             &c0, &b0, &a0, &al0, &dt0, &mut st0.recurrent_state,
             16, 48, 128, 128, true, true,
         )?;
+        let o0_ref = recurrence_ref(
+            &c0, &b0, &a0, &al0, &dt0, &mut st0_ref.recurrent_state, &cfg0, true,
+        )?;
+        let o0_diff = (o0.to_dtype(DType::F32)? - o0_ref.to_dtype(DType::F32)?)?
+            .abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        let st0_diff = (st0.recurrent_state.to_dtype(DType::F32)? - st0_ref.recurrent_state.to_dtype(DType::F32)?)?
+            .abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(o0_diff < 2e-2, "GDN chunked prefill (s=23) output diff = {o0_diff}");
+        assert!(st0_diff < 2e-2, "GDN chunked prefill (s=23) state diff = {st0_diff}");
         let y0 = cuda::rmsnorm_gated_cuda(&o0, &z0, &nw0, 1e-6, true)?;
         let _ = y0.to_dtype(DType::F32)?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         Ok(())

@@ -74,8 +74,13 @@ pub fn qtensor_matmul(weight: &Arc<QTensor>, xs: &Tensor) -> Result<Tensor> {
             if batch_rows <= fast_mmvq::MMVQ_MAX_BATCH && fast_mmvq::supports(dtype) {
                 return fast_mmvq::plain(weight, xs);
             }
-            if batch_rows > fast_mmvq::MMVQ_MAX_BATCH && fast_mmq::supports(dtype) {
-                return fast_mmq::plain(weight, xs);
+            if batch_rows > fast_mmvq::MMVQ_MAX_BATCH {
+                if fast_mmq::supports(dtype) {
+                    return fast_mmq::plain(weight, xs);
+                }
+                if fast_mmvq::supports(dtype) {
+                    return GgufMatMul::mmvq_chunked(weight, xs);
+                }
             }
         }
     }
