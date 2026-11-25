@@ -20,15 +20,17 @@ The shipped path is eager MoE and eager attention. Plan and evidence:
 | item | value |
 |---|---|
 | model / card | Qwen3.8-Flash-Next IQ1_M, 48 decoder layers + 1 MTP head / RTX 4070 12 GB |
-| expert cache | 2 GB default; 4 GB only with deep draft (np8); without it 4 GB is slower |
-| `--pcie-frac` | 0.2 optimum at np3/np8; bandwidth knob, not a TPOT lever |
-| experts | fork rayon pool, 8 threads |
+| architecture | 6-crate Cargo workspace (`naiwa-{quant,attn,offload,models,runtime,server}`), **zero `mistral.rs` deps** (depends only on `../candle`) |
+| expert cache | 2 GB default (`2.5 GB` in tuned MTP2 profile); 4 GB only with deep draft (np8) |
+| `--pcie-frac` | 0.2–0.4 depending on profile; bandwidth knob, not a TPOT lever |
+| experts | dedicated CPU spin pool (`NAIWA_CPU_MOE_THREADS`) + rayon fallback |
 | prediction | one dedicated event-driven thread; issue-only, never performs the DMA |
 | staging | residents run **before** the staging DMA's completion event; staged experts after it |
-| MoE / attention | eager; no capture |
-| PLE | host-only table; not implemented on decode |
-| MTP | works in steady state on short/benchmark prompts; long-prompt drafter prefill is an open fault |
-| reference | np8, `frac 0.2`, cache 4, counting prompt: **170 ms, 44 tok/s, 87.7% hit** |
+| MoE / attention | eager; no CUDA Graph capture; fused QK-norm+RoPE, QSA gate-mul, and multi-row paged decode |
+| PLE | host-only mmap IQ4_NL table gathered on host (serial for small batches, rayon for prefill) |
+| MTP | pure Rust/Tensor built-in MTP (`--mtp --mtp-n-predict 2`) with chunked prefill warmup and zero-copy multi-lane GDN checkpoint rollback |
+| reference (MTP2) | `serve-tuned-mtp2.sh` (`--no-lookahead`, 5-round AB/BA): **31.96 ms/tok (31.3 tok/s)** (`−2.51 ms/tok` / `−7.3%` vs pre-refactor `mistral.rs` baseline) |
+| reference (nospec) | default nospec (5-round AB/BA): **46.27 ms/tok (21.6 tok/s)** (`−2.98 ms/tok` / `−6.0%` vs pre-refactor `mistral.rs` baseline) |
 | gate | `frac 0` + `--no-lookahead` **byte-identical** to `harness/m1/reference.oracle.txt` |
 
 `--depth N` is decode context length (`4` in all current numbers); `--mtp-n-predict N` is draft
@@ -285,78 +287,80 @@ now uses the global result doorbell, so the old schedule sizing bug (MTP site = 
 
 ---
 
-## 7. Fork boundary
+## 7. Zero-`mistral.rs` 6-crate workspace boundary
 
-Upstream `bac32a67`: **41 commits, 77 files, +19 448 / −152**; `mistralrs-quant` 65 files /
-+18 742, `mistralrs-core` 10 / +696.
+All dependencies on `mistral.rs` (`mistralrs-core`, `mistralrs-quant`, `mistralrs-paged-attn`, `mistralrs-server-core`) have been removed. `naiwa-rs` now depends only on local `../candle` (`candle-core`, `candle-nn`) and offline-cached Rust crates, organized into a strict unidirectional 6-crate workspace DAG:
 
-- **Stay:** native IQ/Q formats (`mistralrs-quant` ~14k lines, block tables, oracles, MMQ/MMVQ
-  kernels, `gguf/ffi.rs`); CPU fused MoE (`fused_cpu.rs`, `fast_mmq.rs`, `fast_mmvq.rs`);
-  GPU MoE kernels (`indexed_moe.cu`, `moe_grouped.cu`); quant CUDA wiring (`gguf/cuda.rs`);
-  model/pipeline plumbing; speculative drafting.
-- **Done:** the doorbell moved to `src/doorbell/` (−1660 lines).
+```
+naiwa-quant (GGUF archive/quant/IQ/MMQ/MMVQ/GEMV/MoE kernels & traits)
+  ├──→ naiwa-attn    (PagedAttention, SDPA, GDN + multi-lane checkpoints, QSA/PLE/Hyper, RoPE)
+  └──→ naiwa-offload (edge MoE offloading: doorbells, staging ring, LRU cache, CPU spin pool, prefill stream)
+         │
+         ▼ (models depends on quant + attn only; offload injected via RoutedExpertsProvider)
+naiwa-models  (Qwen3.8-Flash-Next GGUF text model, QSA, PLE, Hyper, Built-in MTP head, HybridCache)
+         │
+         ▼
+naiwa-runtime (GGUF BPE tokenizer, Jinja2 chat template, paged BlockManager, Sampler, MTP loop, async Engine)
+         │
+         ▼
+naiwa-server  (CLI, model/offload wiring, Axum HTTP server: /health, /metrics, /v1/{models,completions,chat/completions,messages})
+```
 
-The doorbell was the only clean extraction; everything else is a kernel or model plumbing.
+- **Decoupling invariant:** `naiwa-models` has zero dependency on `naiwa-offload` (edge offloading is injected through `naiwa_quant::RoutedExpertsProvider`), and `naiwa-offload` has zero dependency on model or HTTP code.
+- **Footprint:** release binary shrank from ~338 MB to ~144 MB (−57%), with 0 `mistralrs-*` crates in `cargo tree`.
 
 ---
 
 ## 8. Layout and commands
 
 ```
-~/code/naiwa-rs               engine + docs/ + harness/
-  src/main.rs                 thin entrypoint
-  src/config.rs               cross-cutting NAIWA_* env config (RuntimeConfig + DiagConfig)
-  src/stats/                  cross-cutting cache counters + JSONL attribution sinks
-    mod.rs                    re-exports
-    sink.rs                   shared bounded AsyncJsonSink writer
-    cache.rs                  expert-cache counters (`NAIWA_STATS=1`, `dump_cache_stats`)
-    schedule.rs               NAIWA_SCHEDULE_FILE buffered host-clock trace
-    gpu_partition.rs / model_partition.rs / head_partition.rs
-  src/transport/              L1: hardware async primitives (zero MoE semantics)
-    copy_stream.rs            CUDA copy stream, CopyDone, ReadFence, SlotMemory
-    doorbell/                 mapped doorbells + CUDA kernels (Topk / Activation / Result / PassCell)
-    activation_channel.rs     LookaheadChannel (advisory GPU -> host activation channel)
-    executor.rs               single-thread CPU FIFO executor + result doorbell + idle signal
-    spin_pool.rs              opt-in spin-wait parallel dispatcher for fused CPU MoE
-  src/memory/                 L2: cross-domain host/VRAM weight & cache ownership
-    mod.rs                    lock-ordering DAG + re-exports
-    host_weights.rs           page-locked host stacks + huge-page advice
-    expert.rs                 CpuExperts fallback, fused CPU decode, per-expert byte slicing
-    resident.rs               Q2_0 resident MTP drafter expert pool
-    profile.rs                `--expert-profile` startup ranking loader
-    slab.rs                   VRAM Slab bump allocator + per-provider BorrowGate
-    slot.rs                   Slot/SlotBuf/Bank/Projections + slot byte estimate
-    staging.rs                StagingRings/StagingRing + alloc_bank_in
-    layer.rs                  CachedLayer split into LayerWeights / LayerCache / LayerTransport
-    layer_registry.rs         Layers model-wide registry + loan empty/refill
-    cache_policy.rs           pure ranking/selection/victim functions (#[inline])
-    cache_updates.rs          admit/replace/upload/promote_staged/prefetch_predicted/spawn_fill
-  src/pipeline/               L3: mutually-exclusive Decode & Prefill execution pipelines
-    mod.rs                    CachedExperts router + Decode <-> Prefill slab loan transitions
-    decode.rs                 linear 6-step decode orchestrator + run_and_fence_gpu
-    observer.rs               zero-cost #[inline] DecodeObserver
-    stages/                   route, gpu, cpu_miss, dma_miss, preload
-    provider.rs               GpuCacheMoeProvider factory + warmup
-    prefill/                  streaming GPU prefill (mod, planner, buffers, split, diagnostics)
-  src/app/                    L4: CLI, model loader, HTTP server
-    args.rs                   clap CLI definitions (`serve`)
-    load.rs                   local checkpoint validation + provider install + warmup
-    serve.rs                  OpenAI / Anthropic HTTP server + graceful shutdown stats
-  harness/                    primitives, oracle, attribution, chat, serve profiles
-~/code/mistral.rs-iq4xs       fork
-~/code/naiwa-rs/target        crate target
+~/code/naiwa-rs                       6-crate Cargo workspace + docs/ + harness/
+  Cargo.toml                          workspace manifest (depends only on ../candle)
+  crates/
+    naiwa-quant/                      L0: GGUF archive, IQ/Q dequant & fused CPU/CUDA MoE/MMVQ/MMQ/GEMV kernels
+      kernels/                        indexed_moe, moe_grouped, gguf MMQ/MMVQ, fused_glu, BF16/F16/F32 gemv
+      src/                            gguf/, linear.rs, gemv.rs, moe.rs, provider.rs, utils.rs
+    naiwa-attn/                       L1a: attention & sequence mixers
+      kernels/                        paged_attention, gdn (incl. multi-lane checkpoints), qwen4_exp (QSA/PLE/Hyper/QK-norm+RoPE)
+      src/                            paged/, sdpa.rs, gdn/, qwen4_exp.rs, rope.rs, rms_norm.rs
+    naiwa-offload/                    L1b: edge MoE offloading & streaming engine
+      kernels/                        doorbell wait/publish kernels
+      src/
+        config.rs                     NAIWA_* env config (RuntimeConfig + DiagConfig)
+        stats/                        cache counters + JSONL attribution sinks (gpu/model/head partition, schedule)
+        transport/                    copy_stream, doorbell/, activation_channel, executor, spin_pool
+        memory/                       host_weights, expert, resident (Q2_0 MTP pool), profile, slab, slot, staging, layer*, cache_*
+        pipeline/                     CachedExperts, decode, observer, stages/, provider, prefill/
+    naiwa-models/                     L2: Qwen3.8-Flash-Next (`qwen4exp`) GGUF model + HybridCache + MTP head
+      src/                            cache.rs, probe.rs, qwen4_exp/{config,loader,hyper,ple,qsa,moe,mtp,text}.rs
+    naiwa-runtime/                    L3: serving runtime (GGUF BPE tokenizer, Jinja2 templates, BlockManager, Sampler, MTP, Engine)
+      src/                            tokenizer.rs, block_manager.rs, sampler.rs, mtp.rs, engine.rs
+    naiwa-server/                     L4: `naiwa-rs` binary (clap CLI, offload/model wiring, Axum HTTP server)
+      src/                            main.rs, app/{args,load,serve,http}.rs
+  harness/                            primitives, oracle, attribution, chat, serve profiles
+~/code/candle                         local candle-core / candle-nn
+~/code/naiwa-rs/target                workspace target
 ```
 
 ```bash
-# oracle (must be IDENTICAL)
-BIN=$HOME/code/naiwa-rs/target/release/naiwa-rs TAG=X FRAC=0 NO_LOOKAHEAD=1 \
-  OUT=$HOME/bench-rel/naiwa-v2/m4 timeout 400 ./harness/m1/capture_oracle.sh
-diff ~/bench-rel/naiwa-v2/m4/reference.X.txt harness/m1/reference.oracle.txt
+# verify zero mistral.rs deps
+cargo tree --offline --features cuda --workspace | grep -i mistral   # must be empty
 
-cargo test --offline --release --features cuda     # 33/33
+# full workspace build & tests
+cargo build --offline --release --features cuda --workspace
+cargo test --offline --release --features cuda --workspace -- --test-threads=1
+
+# frozen greedy oracle (must be byte-identical)
+MODEL=$HOME/Models/qwen3-coder/IQ1_M FRAC=0 NO_LOOKAHEAD=1 \
+  BIN=$PWD/target/release/naiwa-rs TAG=final OUT=/tmp/oracle \
+  ./harness/m1/capture_oracle.sh
+diff -u /tmp/oracle/reference.final.txt harness/m1/reference.oracle.txt
+
+# attribution harness tests
+python3 -m unittest discover -s harness/attribution -v
 ```
 
-Reference tuned MTP2 serve (`--no-lookahead` measured 34.7 ms/tok / 28.8 tok/s):
+Reference tuned MTP2 serve (`--no-lookahead` measured 31.96 ms/tok / 31.3 tok/s on 5-round AB/BA):
 
 ```bash
 ./harness/serve/serve-tuned-mtp2.sh
