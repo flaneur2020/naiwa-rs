@@ -1,10 +1,9 @@
 //! Zero-cost (`#[inline]`) per-step decode observer.
 //!
-//! Keeps diagnostic probes (`ALLOC_TRACE`, `NAIWA_XSUM`, `NAIWA_WORK_TRACE`, `NAIWA_SCHEDULE_FILE`,
+//! Keeps diagnostic probes (`NAIWA_XSUM`, `NAIWA_WORK_TRACE`, `NAIWA_SCHEDULE_FILE`,
 //! `NAIWA_GPU_PARTITION_FILE`, `NAIWA_CPU_TIMELINE`, and cache counters) out of the linear control
 //! flow in [`super::decode`]. When probes are disabled, every hook reduces to a cached boolean check.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -25,26 +24,9 @@ pub(super) struct DecodeObserver {
 }
 
 impl DecodeObserver {
-    /// Step entry hook: allocation ledger and optional `NAIWA_XSUM` input checksum.
+    /// Step entry hook: optional `NAIWA_XSUM` input checksum.
     #[inline]
     pub(super) fn begin(layer: &CachedLayer, x2d: &Tensor, rows: usize) -> Self {
-        if candle_core::cuda_backend::alloc_trace::enabled() {
-            static MAXB: AtomicU64 = AtomicU64::new(0);
-            static SUMB: AtomicU64 = AtomicU64::new(0);
-            static SUMC: AtomicU64 = AtomicU64::new(0);
-            let (b, c) = candle_core::cuda_backend::alloc_trace::take();
-            SUMB.fetch_add(b, Ordering::Relaxed);
-            SUMC.fetch_add(c, Ordering::Relaxed);
-            MAXB.fetch_max(b, Ordering::Relaxed);
-            if layer.layer() == 0 && SUMB.load(Ordering::Relaxed) > 0 {
-                eprintln!(
-                    "ALLOC_TRACE step: {} allocs, {:.1} MB total, {:.1} MB peak per layer",
-                    SUMC.swap(0, Ordering::Relaxed),
-                    SUMB.swap(0, Ordering::Relaxed) as f64 / 1e6,
-                    MAXB.swap(0, Ordering::Relaxed) as f64 / 1e6
-                );
-            }
-        }
         if crate::config::diag().xsum {
             let tick = layer.state().lock().unwrap().tick + 1;
             if tick <= 3 {

@@ -237,7 +237,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#6aab77f4d6d88e1767623553440ff8749af91425"
+source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#a0069ac2ab1143d67f76e15ddfcd07f479a9436d"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -265,7 +265,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#6aab77f4d6d88e1767623553440ff8749af91425"
+source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#a0069ac2ab1143d67f76e15ddfcd07f479a9436d"
 dependencies = [
  "cudaforge",
 ]
@@ -273,7 +273,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#6aab77f4d6d88e1767623553440ff8749af91425"
+source = "git+https://github.com/flaneur2020/candle.git?branch=fork%2Fnaiwa-rs#a0069ac2ab1143d67f76e15ddfcd07f479a9436d"
 dependencies = [
  "candle-core",
  "half",
