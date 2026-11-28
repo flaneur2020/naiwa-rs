@@ -76,6 +76,14 @@ impl QLinear {
         }
     }
 
+    /// Returns the dense weight tensor when this projection is an unbiased `QLinear::Dense`.
+    pub fn dense_weight(&self) -> Option<&Tensor> {
+        match self {
+            Self::Dense { weight, bias: None } => Some(weight),
+            _ => None,
+        }
+    }
+
     /// Embedding lookup using host-resident token IDs directly (avoids a synchronous GPU->CPU
     /// copy of `input_ids` when the embedding table is host-dequantized, e.g. `IQ4_XS`).
     pub fn embedding_forward_host_ids(

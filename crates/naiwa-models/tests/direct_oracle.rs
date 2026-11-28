@@ -198,6 +198,7 @@ fn direct_forward_matches_frozen_greedy_oracle() -> anyhow::Result<()> {
             logit_indices: Some(&last_idx),
             capture_spec_hidden: false,
             capture_verify_stash: false,
+            logits_raw: false,
         },
         &mut cache,
     )?;
@@ -244,6 +245,7 @@ fn direct_forward_matches_frozen_greedy_oracle() -> anyhow::Result<()> {
                 logit_indices: None,
                 capture_spec_hidden: false,
                 capture_verify_stash: false,
+                logits_raw: false,
             },
             &mut cache,
         )?;

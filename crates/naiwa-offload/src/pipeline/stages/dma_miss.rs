@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::transport::copy_stream::{self, CopyStream};
 use crate::memory::{
-    expert_range, streamed_misses, CachedLayer, SlotBuf, SlotData, STAGING_RING_FIRST,
+    expert_range, staging_key, streamed_misses, CachedLayer, SlotBuf, SlotData, STAGING_RING_FIRST,
 };
 use crate::stats;
 
@@ -42,16 +42,53 @@ fn stage_misses(
     let Some((gate, up, down)) = layer.cpu().expert_qtensors() else {
         return Ok(Vec::new());
     };
+    let stacks = (Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down));
+    let key = staging_key(&stacks);
     // Lazily create the ring at the first decode step that has misses to stream (model
     // load is over by then, so the allocation is not fighting load-time fragmentation).
-    let Some(ring) = layer.staging().ring(
-        cs,
-        &(Arc::clone(&gate), Arc::clone(&up), Arc::clone(&down)),
-        layer.slot_device(),
-    )?
-    else {
+    let Some(ring) = layer.staging().ring(cs, &stacks, layer.slot_device())? else {
         return Ok(Vec::new());
     };
+    let ring_len = crate::memory::staging_ring_slots();
+    let chosen = streamed_misses(misses, layer.pcie_frac(), ring_len);
+    // Selection is unchanged; the hook may submit only the complementary CPU set.
+    before_dma(misses, &chosen)?;
+    // NAIWA_STAGE_TRACE: the staged set is what decides whether a routed expert is computed by
+    // the GPU (streamed into the ring) or by the CPU, so repeated runs can be compared step by
+    // step. Limited to the first ticks, since only the earliest difference is diagnostic.
+    if crate::config::diag().stage_trace {
+        let tick = layer.state().lock().unwrap().tick;
+        if tick <= 12 {
+            let mut ids: Vec<u32> = chosen.clone();
+            ids.sort_unstable();
+            eprintln!(
+                "STAGE tick={tick} layer={} rows={} n={} chosen={ids:?}",
+                layer.layer(),
+                misses.len(),
+                ids.len()
+            );
+        }
+    }
+    if crate::config::diag().admission_trace {
+        let mut weights: HashMap<u32, f32> = HashMap::new();
+        for &(id, w) in misses.iter().flatten() {
+            *weights.entry(id).or_default() += w;
+        }
+        let mut ranked: Vec<_> = weights.into_iter().collect();
+        ranked.sort_by(|(a, wa), (b, wb)| wb.total_cmp(wa).then(a.cmp(b)));
+        eprintln!(
+            "ADMISSION layer={} rows={} ranked={:?} chosen={:?}",
+            layer.layer(),
+            misses.len(),
+            ranked,
+            chosen
+        );
+    }
+    // If another quant shape previously used the unified staging pool, wait for its readers
+    // BEFORE locking `ring` (zero nested ring locks, zero extra Arc strong_count).
+    if !chosen.is_empty() {
+        layer.staging().wait_cross_shape(key, cs)?;
+    }
     // Everything below runs under the ring mutex: the whole pipeline is on the token
     // thread, so this lock only excludes the (one-time) creation race in `staging_ring`.
     // Working on `&Arc<SlotBuf>` directly matters: `wait_for_readers` waits for the refcount
@@ -59,84 +96,60 @@ fn stage_misses(
     // that clone and spin forever (W105: three 900s-timeout hangs, exactly here).
     let promote = layer.promoting();
     let mut promote_candidates: Vec<(u32, Arc<SlotBuf>)> = Vec::new();
-    let slot_of = {
+    let (slot_of, used_range) = if chosen.is_empty() {
+        (HashMap::new(), None)
+    } else {
         let mut ring = ring.lock().unwrap();
-        let chosen = streamed_misses(misses, layer.pcie_frac(), ring.len());
-        // Selection is unchanged; the hook may submit only the complementary CPU set.
-        before_dma(misses, &chosen)?;
-        // NAIWA_STAGE_TRACE: the staged set is what decides whether a routed expert is computed by
-        // the GPU (streamed into the ring) or by the CPU, so repeated runs can be compared step by
-        // step. Limited to the first ticks, since only the earliest difference is diagnostic.
-        if crate::config::diag().stage_trace {
-            let tick = layer.state().lock().unwrap().tick;
-            if tick <= 12 {
-                let mut ids: Vec<u32> = chosen.clone();
-                ids.sort_unstable();
-                eprintln!("STAGE tick={tick} layer={} rows={} n={} chosen={ids:?}",
-                    layer.layer(), misses.len(), ids.len());
+        let len = ring.len();
+        let start = ring.acquire(chosen.len());
+        let taken = ring.take(start, chosen.len());
+        let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
+        let mut slot_of: HashMap<u32, (Arc<SlotBuf>, usize)> =
+            HashMap::with_capacity(chosen.len());
+        for (i, staging) in taken.into_iter().enumerate() {
+            let expert = chosen[i];
+            let pos = (start + i) % len;
+            // Same guard as `upload_in_place`: wait for the readers that captured this
+            // slot last step of the ring (they record their fence before dropping it),
+            // then let the copy stream wait on that fence before overwriting. This step
+            // is itself the next reader through the `Arc` injected into `slot_of`.
+            copy_stream::wait_for_readers(staging);
+            let buf = staging;
+            let SlotData::Banked { memory, .. } = &buf.data else {
+                unreachable!("staging ring slots are banked");
+            };
+            let (er, e) = (expert_range(&gate, expert as usize)?, expert as usize);
+            let bytes = er.len() + expert_range(&up, e)?.len() + expert_range(&down, e)?.len();
+            // SAFETY: the stacks are page-locked, and `layer.cpu()` keeps them alive and
+            // unmodified for the model's lifetime, well past `done`.
+            unsafe {
+                cs.queue_async(
+                    &buf.fence,
+                    &[
+                        (&memory[0], &g[er]),
+                        (&memory[1], &u[expert_range(&up, e)?]),
+                        (&memory[2], &d[expert_range(&down, e)?]),
+                    ],
+                )?;
             }
+            stats::record_cache_pcie(bytes as u64);
+            if stats::schedule::enabled() {
+                let tick = layer.state().lock().unwrap().tick;
+                stats::schedule::bytes(layer.layer(), tick, "staged_h2d", bytes as u64);
+            }
+            slot_of.insert(expert, (Arc::clone(buf), pos));
         }
-        if crate::config::diag().admission_trace {
-            let mut weights: HashMap<u32, f32> = HashMap::new();
-            for &(id, w) in misses.iter().flatten() {
-                *weights.entry(id).or_default() += w;
-            }
-            let mut ranked: Vec<_> = weights.into_iter().collect();
-            ranked.sort_by(|(a, wa), (b, wb)| wb.total_cmp(wa).then(a.cmp(b)));
-            eprintln!("ADMISSION layer={} rows={} ranked={:?} chosen={:?}",
-                layer.layer(), misses.len(), ranked, chosen);
+        if promote {
+            promote_candidates = slot_of
+                .iter()
+                .map(|(id, (buf, _))| (*id, Arc::clone(buf)))
+                .collect();
         }
-        if chosen.is_empty() {
-            HashMap::new()
-        } else {
-            let len = ring.len();
-            let start = ring.acquire(chosen.len());
-            let taken = ring.take(start, chosen.len());
-            let (g, u, d) = (gate.data()?, up.data()?, down.data()?);
-            let mut slot_of: HashMap<u32, (Arc<SlotBuf>, usize)> =
-                HashMap::with_capacity(chosen.len());
-            for (i, staging) in taken.into_iter().enumerate() {
-                let expert = chosen[i];
-                let pos = (start + i) % len;
-                // Same guard as `upload_in_place`: wait for the readers that captured this
-                // slot last step of the ring (they record their fence before dropping it),
-                // then let the copy stream wait on that fence before overwriting. This step
-                // is itself the next reader through the `Arc` injected into `slot_of`.
-                copy_stream::wait_for_readers(staging);
-                let buf = staging;
-                let SlotData::Banked { memory, .. } = &buf.data else {
-                    unreachable!("staging ring slots are banked");
-                };
-                let (er, e) = (expert_range(&gate, expert as usize)?, expert as usize);
-                let bytes = er.len() + expert_range(&up, e)?.len() + expert_range(&down, e)?.len();
-                // SAFETY: the stacks are page-locked, and `layer.cpu()` keeps them alive and
-                // unmodified for the model's lifetime, well past `done`.
-                unsafe {
-                    cs.queue_async(
-                        &buf.fence,
-                        &[
-                            (&memory[0], &g[er]),
-                            (&memory[1], &u[expert_range(&up, e)?]),
-                            (&memory[2], &d[expert_range(&down, e)?]),
-                        ],
-                    )?;
-                }
-                stats::record_cache_pcie(bytes as u64);
-                if stats::schedule::enabled() {
-                    let tick = layer.state().lock().unwrap().tick;
-                    stats::schedule::bytes(layer.layer(), tick, "staged_h2d", bytes as u64);
-                }
-                slot_of.insert(expert, (Arc::clone(buf), pos));
-            }
-            if promote {
-                promote_candidates = slot_of
-                    .iter()
-                    .map(|(id, (buf, _))| (*id, Arc::clone(buf)))
-                    .collect();
-            }
-            slot_of
-        }
+        (slot_of, Some((start, chosen.len())))
     };
+    if let Some((start, count)) = used_range {
+        layer.staging().record_used(key, start, count);
+    }
     let bank_first = STAGING_RING_FIRST;
     if slot_of.is_empty() {
         return Ok(promote_candidates);

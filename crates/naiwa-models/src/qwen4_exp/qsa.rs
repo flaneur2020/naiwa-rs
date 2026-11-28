@@ -135,6 +135,101 @@ impl QsaAttention {
         Ok(())
     }
 
+    /// Snapshot QSA auxiliary cache blocks (`raw`, `block_keys`) for `block_table` into host RAM.
+    pub(crate) fn snapshot_aux_blocks(
+        &self,
+        block_table: &[u32],
+        block_size: usize,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        #[cfg(feature = "cuda")]
+        {
+            let guard = self.aux_cache.lock().expect("QSA aux cache poisoned");
+            let Some(aux) = guard.as_ref() else {
+                return Ok(None);
+            };
+            if block_table.is_empty() {
+                return Ok(None);
+            }
+            let ratio = self.qsa.compress_ratio;
+            let bk_per_blk = block_size / ratio;
+            let (raw_cpu, bk_cpu) = if block_table.len() == 1 {
+                let b = block_table[0] as usize;
+                (
+                    aux.raw
+                        .narrow(0, b * block_size, block_size)?
+                        .to_device(&candle_core::Device::Cpu)?,
+                    aux.block_keys
+                        .narrow(0, b * bk_per_blk, bk_per_blk)?
+                        .to_device(&candle_core::Device::Cpu)?,
+                )
+            } else {
+                let mut raw_blocks = Vec::with_capacity(block_table.len());
+                let mut bk_blocks = Vec::with_capacity(block_table.len());
+                for &blk in block_table {
+                    let b = blk as usize;
+                    raw_blocks.push(
+                        aux.raw
+                            .narrow(0, b * block_size, block_size)?
+                            .to_device(&candle_core::Device::Cpu)?,
+                    );
+                    bk_blocks.push(
+                        aux.block_keys
+                            .narrow(0, b * bk_per_blk, bk_per_blk)?
+                            .to_device(&candle_core::Device::Cpu)?,
+                    );
+                }
+                (Tensor::cat(&raw_blocks, 0)?, Tensor::cat(&bk_blocks, 0)?)
+            };
+            Ok(Some((raw_cpu, bk_cpu)))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (block_table, block_size);
+            Ok(None)
+        }
+    }
+
+    /// Restore host-RAM QSA auxiliary cache blocks into `block_table` on device.
+    pub(crate) fn restore_aux_blocks(
+        &self,
+        block_table: &[u32],
+        block_size: usize,
+        raw_cpu: &Tensor,
+        bk_cpu: &Tensor,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let guard = self.aux_cache.lock().expect("QSA aux cache poisoned");
+            let Some(aux) = guard.as_ref() else {
+                return Ok(());
+            };
+            let dev = aux.raw.device();
+            let raw_dev = raw_cpu.to_device(dev)?;
+            let bk_dev = bk_cpu.to_device(dev)?;
+            let ratio = self.qsa.compress_ratio;
+            let bk_per_blk = block_size / ratio;
+            for (i, &blk) in block_table.iter().enumerate() {
+                let b = blk as usize;
+                aux.raw.slice_set(
+                    &raw_dev.narrow(0, i * block_size, block_size)?,
+                    0,
+                    b * block_size,
+                )?;
+                aux.block_keys.slice_set(
+                    &bk_dev.narrow(0, i * bk_per_blk, bk_per_blk)?,
+                    0,
+                    b * bk_per_blk,
+                )?;
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (block_table, block_size, raw_cpu, bk_cpu);
+            Ok(())
+        }
+    }
+
     #[cfg(feature = "cuda")]
     fn aux_cache(
         &self,

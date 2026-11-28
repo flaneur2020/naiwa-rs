@@ -1,6 +1,6 @@
 //! Hashed n-gram Per-Layer Embedding (PLE) for Qwen3.8-Flash-Next (GGUF IQ4_NL mmap table).
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use naiwa_attn::grouped_rms_norm;
@@ -120,10 +120,86 @@ fn dequantize_iq4_nl_row(src: &[u8], out: &mut [f32]) {
     }
 }
 
+struct PlePrefetchWorker {
+    tx: mpsc::SyncSender<Vec<u64>>,
+    rx: Mutex<mpsc::Receiver<Result<Vec<f32>>>>,
+}
+
+impl PlePrefetchWorker {
+    fn spawn(archive: Arc<GgufArchive>, head_dim: usize) -> Self {
+        let (req_tx, req_rx) = mpsc::sync_channel::<Vec<u64>>(1);
+        let (res_tx, res_rx) = mpsc::sync_channel::<Result<Vec<f32>>>(1);
+        let _ = std::thread::Builder::new()
+            .name("naiwa-ple-prefetch".to_string())
+            .spawn(move || {
+                while let Ok(rows) = req_rx.recv() {
+                    let res = gather_iq4_nl_host(&archive, head_dim, &rows);
+                    if res_tx.send(res).is_err() {
+                        break;
+                    }
+                }
+            });
+        Self {
+            tx: req_tx,
+            rx: Mutex::new(res_rx),
+        }
+    }
+}
+
+fn gather_iq4_nl_host(archive: &GgufArchive, head_dim: usize, rows: &[u64]) -> Result<Vec<f32>> {
+    let row_bytes = iq4_nl_row_bytes(head_dim);
+    let bytes = archive.tensor_data(GGUF_PLE_TABLE_NAME)?.bytes();
+    // Issue non-blocking MADV_WILLNEED hints for all rows up front so NVMe SSDs can fetch
+    // cold pages in parallel (high queue depth) instead of serially stalling at QD=1.
+    #[cfg(target_os = "linux")]
+    if rows.len() > 1 {
+        let base = bytes.as_ptr() as usize;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        for &row in rows {
+            let offset = row as usize * row_bytes;
+            if offset + row_bytes <= bytes.len() {
+                let addr = (base + offset) & !(page - 1);
+                let end = base + offset + row_bytes;
+                unsafe {
+                    libc::madvise(addr as *mut libc::c_void, end - addr, libc::MADV_WILLNEED);
+                }
+            }
+        }
+    }
+    let mut out = vec![0f32; rows.len() * head_dim];
+    if rows.len() <= 64 {
+        for (dst, &row) in out.chunks_exact_mut(head_dim).zip(rows.iter()) {
+            let offset = row as usize * row_bytes;
+            let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
+                candle_core::Error::msg(format!("PLE row {row} out of range"))
+            })?;
+            dequantize_iq4_nl_row(src, dst);
+        }
+    } else {
+        out.par_chunks_exact_mut(head_dim)
+            .zip(rows.par_iter())
+            .try_for_each(|(dst, &row)| {
+                let offset = row as usize * row_bytes;
+                let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
+                    candle_core::Error::msg(format!("PLE row {row} out of range"))
+                })?;
+                dequantize_iq4_nl_row(src, dst);
+                Ok::<_, candle_core::Error>(())
+            })?;
+    }
+    Ok(out)
+}
+
+/// Token indicating an in-flight background PLE host gather launched before Layer 0.
+pub(crate) struct PlePrefetch {
+    num_rows: usize,
+}
+
 /// Memory-mapped IQ4_NL n-gram embedding table gathered on the host.
 pub(crate) struct PleTable {
     archive: Arc<GgufArchive>,
     head_dim: usize,
+    prefetch: PlePrefetchWorker,
 }
 
 impl PleTable {
@@ -141,7 +217,12 @@ impl PleTable {
                 "Qwen4-Exp PLE table has shape {shape:?}, expected [_, {head_dim}]"
             ),
         }
-        let table = Self { archive, head_dim };
+        let prefetch = PlePrefetchWorker::spawn(Arc::clone(&archive), head_dim);
+        let table = Self {
+            archive,
+            head_dim,
+            prefetch,
+        };
         table.advise_random_access()?;
         tracing::info!(
             "Qwen4-Exp PLE rows are gathered from the memory-mapped IQ4_NL table on the host"
@@ -164,30 +245,28 @@ impl PleTable {
         Ok(())
     }
 
+    fn start_prefetch(&self, rows: Vec<u64>) -> Option<PlePrefetch> {
+        let num_rows = rows.len();
+        self.prefetch
+            .tx
+            .try_send(rows)
+            .ok()
+            .map(|()| PlePrefetch { num_rows })
+    }
+
+    fn finish_prefetch(&self, token: PlePrefetch, device: &Device) -> Result<Tensor> {
+        let data = self
+            .prefetch
+            .rx
+            .lock()
+            .unwrap()
+            .recv()
+            .map_err(|_| candle_core::Error::msg("PLE prefetch worker channel closed"))??;
+        Tensor::from_vec(data, (token.num_rows, self.head_dim), device)
+    }
+
     fn gather_host(&self, rows: &[u64], device: &Device) -> Result<Tensor> {
-        let row_bytes = iq4_nl_row_bytes(self.head_dim);
-        let bytes = self.archive.tensor_data(GGUF_PLE_TABLE_NAME)?.bytes();
-        let mut out = vec![0f32; rows.len() * self.head_dim];
-        if rows.len() <= 64 {
-            for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows.iter()) {
-                let offset = row as usize * row_bytes;
-                let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
-                    candle_core::Error::msg(format!("PLE row {row} out of range"))
-                })?;
-                dequantize_iq4_nl_row(src, dst);
-            }
-        } else {
-            out.par_chunks_exact_mut(self.head_dim)
-                .zip(rows.par_iter())
-                .try_for_each(|(dst, &row)| {
-                    let offset = row as usize * row_bytes;
-                    let src = bytes.get(offset..offset + row_bytes).ok_or_else(|| {
-                        candle_core::Error::msg(format!("PLE row {row} out of range"))
-                    })?;
-                    dequantize_iq4_nl_row(src, dst);
-                    Ok::<_, candle_core::Error>(())
-                })?;
-        }
+        let out = gather_iq4_nl_host(&self.archive, self.head_dim, rows)?;
         Tensor::from_vec(out, (rows.len(), self.head_dim), device)
     }
 }
@@ -202,16 +281,51 @@ pub(crate) struct PleLayer {
     pub(crate) norm_key: Tensor,
     pub(crate) norm_query: Tensor,
     pub(crate) norm_conv: Tensor,
-    /// Depthwise dilated conv1d weight `[hc * hidden, conv_kernel_size]` in F32.
+    /// Depthwise dilated conv1d weight `[hc * hidden, conv_kernel_size]` in F32 (CPU fallback).
     pub(crate) conv_weight: Tensor,
+    /// Same conv1d weight in model activation dtype (for fused `q4_ple_conv` CUDA kernel).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) conv_weight_act: Tensor,
+    /// Pre-allocated `[1]` U32 zero tensor for single-sequence `q4_ple_conv` calls.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) zero_slot: Tensor,
     pub(crate) hc: usize,
     pub(crate) hidden: usize,
     pub(crate) eps: f64,
 }
 
 impl PleLayer {
+    /// Start asynchronous host mmap gather + IQ4_NL dequantization before Layer 0 runs so the
+    /// disk/page-cache latency is hidden behind Layer 0's GPU/CPU execution.
+    pub(crate) fn begin_prefetch(
+        &self,
+        tokens_host: &[u32],
+        spans: &[(usize, usize)],
+        slots: &[usize],
+        states: &[PleSeqState],
+    ) -> Option<PlePrefetch> {
+        let n_tokens: usize = spans.iter().map(|&(_, len)| len).sum();
+        if n_tokens == 0 {
+            return None;
+        }
+        let heads = self.hash.num_heads();
+        let mut rows = vec![self.hash.offsets[0]; n_tokens * heads];
+        for (seq_idx, &(start, len)) in spans.iter().enumerate() {
+            let slot = slots[seq_idx];
+            let seq_tokens = &tokens_host[start..start + len];
+            let hist = &states[slot].history;
+            for local in 0..len {
+                let t = start + local;
+                self.hash
+                    .rows(seq_tokens, local, hist, &mut rows[t * heads..(t + 1) * heads]);
+            }
+        }
+        self.table.start_prefetch(rows)
+    }
+
     /// `hidden_states + ple(hidden_states, tokens)`, advancing per-sequence `states`.
     /// When `stash_out` is `Some`, populates a [`PleVerifyStash`] for MTP speculative rollback.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
@@ -220,6 +334,7 @@ impl PleLayer {
         slots: &[usize],
         states: &mut [PleSeqState],
         stash_out: Option<&mut Option<PleVerifyStash>>,
+        prefetched: Option<PlePrefetch>,
     ) -> Result<Tensor> {
         let dims = hidden_states.dims().to_vec();
         let width = dims[dims.len() - 1];
@@ -236,36 +351,54 @@ impl PleLayer {
             None
         };
 
-        // 1. Hash token n-grams on host, update history, and gather IQ4_NL embeddings
+        // 1. Hash token n-grams on host (or reuse prefetched embeddings) and advance history
         let heads = self.hash.num_heads();
         let context = self.cfg.context_len();
-        let mut rows = vec![self.hash.offsets[0]; n_tokens * heads];
         let mut seq_tokens_copy = if stash_out.is_some() {
             Some(Vec::with_capacity(spans.len()))
         } else {
             None
         };
 
-        for (seq_idx, &(start, len)) in spans.iter().enumerate() {
-            let slot = slots[seq_idx];
-            let seq_tokens = &tokens_host[start..start + len];
-            if let Some(copy) = seq_tokens_copy.as_mut() {
-                copy.push(seq_tokens.to_vec());
+        let emb = if let Some(tok) = prefetched {
+            for (seq_idx, &(start, len)) in spans.iter().enumerate() {
+                let slot = slots[seq_idx];
+                let seq_tokens = &tokens_host[start..start + len];
+                if let Some(copy) = seq_tokens_copy.as_mut() {
+                    copy.push(seq_tokens.to_vec());
+                }
+                let hist = &mut states[slot].history;
+                let mut next_hist = hist.clone();
+                next_hist.extend(seq_tokens.iter().map(|&t| Some(t)));
+                *hist = next_hist[next_hist.len() - context..].to_vec();
             }
-            let hist = &mut states[slot].history;
-            for local in 0..len {
-                let t = start + local;
-                self.hash
-                    .rows(seq_tokens, local, hist, &mut rows[t * heads..(t + 1) * heads]);
+            let gather_start = std::time::Instant::now();
+            let emb = self.table.finish_prefetch(tok, flat.device())?;
+            ple_gather_probe(gather_start.elapsed().as_nanos() as usize, n_tokens * heads);
+            emb
+        } else {
+            let mut rows = vec![self.hash.offsets[0]; n_tokens * heads];
+            for (seq_idx, &(start, len)) in spans.iter().enumerate() {
+                let slot = slots[seq_idx];
+                let seq_tokens = &tokens_host[start..start + len];
+                if let Some(copy) = seq_tokens_copy.as_mut() {
+                    copy.push(seq_tokens.to_vec());
+                }
+                let hist = &mut states[slot].history;
+                for local in 0..len {
+                    let t = start + local;
+                    self.hash
+                        .rows(seq_tokens, local, hist, &mut rows[t * heads..(t + 1) * heads]);
+                }
+                let mut next_hist = hist.clone();
+                next_hist.extend(seq_tokens.iter().map(|&t| Some(t)));
+                *hist = next_hist[next_hist.len() - context..].to_vec();
             }
-            let mut next_hist = hist.clone();
-            next_hist.extend(seq_tokens.iter().map(|&t| Some(t)));
-            *hist = next_hist[next_hist.len() - context..].to_vec();
-        }
-
-        let gather_start = std::time::Instant::now();
-        let emb = self.table.gather_host(&rows, flat.device())?;
-        ple_gather_probe(gather_start.elapsed().as_nanos() as usize, rows.len());
+            let gather_start = std::time::Instant::now();
+            let emb = self.table.gather_host(&rows, flat.device())?;
+            ple_gather_probe(gather_start.elapsed().as_nanos() as usize, rows.len());
+            emb
+        };
         let emb = emb
             .reshape((n_tokens, heads * self.table.head_dim))?
             .to_dtype(flat.dtype())?;
@@ -338,6 +471,32 @@ impl PleLayer {
         let kernel = self.cfg.conv_kernel_size;
         let dilation = self.cfg.conv_dilation();
         let state_len = self.cfg.conv_state_len();
+
+        #[cfg(feature = "cuda")]
+        if flat.device().is_cuda()
+            && spans.len() == 1
+            && spans[0].0 == 0
+            && spans[0].1 == flat.dim(0)?
+            && self.conv_weight_act.dtype() == flat.dtype()
+        {
+            let slot = slots[0];
+            if !states[slot].conv_state.is_contiguous() {
+                states[slot].conv_state = states[slot].conv_state.contiguous()?;
+            }
+            let state_pool = states[slot].conv_state.unsqueeze(0)?;
+            let layout = naiwa_attn::qwen4_exp::TokenLayout::rectangular(1, spans[0].1);
+            return naiwa_attn::qwen4_exp::ple_conv(naiwa_attn::qwen4_exp::PleConvArgs {
+                normed,
+                gated,
+                residual: flat,
+                weight: &self.conv_weight_act,
+                state_pool: &state_pool,
+                slots: &self.zero_slot,
+                layout: &layout,
+                dilation,
+            });
+        }
+
         let mut conv_out = Vec::with_capacity(spans.len());
 
         for (seq_idx, &(start, len)) in spans.iter().enumerate() {

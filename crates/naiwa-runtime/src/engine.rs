@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use candle_core::Tensor;
-use naiwa_models::{ForwardInput, ForwardKind, HybridCache, Qwen4ExpModel};
+use naiwa_models::{ForwardInput, ForwardKind, HybridCache, HybridPrefixSnapshot, Qwen4ExpModel};
 use tokio::sync::mpsc;
 
 use crate::block_manager::{BlockManager, DEFAULT_BLOCK_SIZE};
@@ -37,6 +37,8 @@ pub struct EngineConfig {
     pub block_size: usize,
     pub default_seed: u64,
     pub mtp: Option<MtpConfig>,
+    /// Maximum number of host-RAM hybrid prompt prefix snapshots (`0` disables prefix caching).
+    pub prefix_cache_n: usize,
     /// Optional live prompt-chunk ceiling updated by `naiwa-offload::PrefillStreams`.
     pub prompt_step_ceiling: Option<Arc<AtomicUsize>>,
 }
@@ -52,6 +54,7 @@ impl Default for EngineConfig {
             block_size: DEFAULT_BLOCK_SIZE,
             default_seed: 0,
             mtp: None,
+            prefix_cache_n: 0,
             prompt_step_ceiling: None,
         }
     }
@@ -189,9 +192,11 @@ impl EngineHandle {
             anyhow::bail!("MTP enabled in EngineConfig, but model has no loaded MTP head");
         }
         let max_model_len = model.config().max_position_embeddings;
-        let cache = HybridCache::new(
+        let mtp_lanes = cfg.mtp.as_ref().map_or(1, |m| (m.n_predict + 1).max(2));
+        let cache = HybridCache::new_with_mtp_lanes(
             model.config(),
             has_mtp,
+            mtp_lanes,
             cfg.num_blocks,
             cfg.block_size,
             cfg.max_seqs,
@@ -228,6 +233,7 @@ impl EngineHandle {
                     prefilling: Vec::new(),
                     decoding: Vec::new(),
                     decode_steps_since_prefill: 0,
+                    prefix_cache: VecDeque::new(),
                 };
                 worker.run(rx);
             })
@@ -293,6 +299,8 @@ struct ActiveSequence {
     emitted_text: String,
     last_token: u32,
     mtp: MtpSeqState,
+    /// Populated on exact prompt prefix-cache hit: `(last_final_hidden, last_spec_hidden)` on device.
+    cached_exact: Option<(Tensor, Option<Tensor>)>,
 }
 
 impl ActiveSequence {
@@ -397,6 +405,7 @@ struct EngineWorker {
     prefilling: Vec<ActiveSequence>,
     decoding: Vec<ActiveSequence>,
     decode_steps_since_prefill: usize,
+    prefix_cache: VecDeque<HybridPrefixSnapshot>,
 }
 
 impl EngineWorker {
@@ -492,8 +501,25 @@ impl EngineWorker {
                 continue;
             }
             let first_chunk_len = req.prompt_tokens.len().min(self.effective_prefill_chunk());
+            let matched_idx = if self.cfg.prefix_cache_n > 0 {
+                self.prefix_cache
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.tokens.len() <= req.prompt_tokens.len()
+                            && req.prompt_tokens.starts_with(&s.tokens)
+                    })
+                    .max_by_key(|(_, s)| s.tokens.len())
+                    .map(|(i, _)| i)
+            } else {
+                None
+            };
+            let need_init_tokens = matched_idx
+                .map(|i| self.prefix_cache[i].tokens.len())
+                .unwrap_or(0)
+                .max(first_chunk_len);
             let mut block_table = Vec::new();
-            if !self.bm.ensure_capacity(&mut block_table, first_chunk_len) {
+            if !self.bm.ensure_capacity(&mut block_table, need_init_tokens) {
                 break; // wait for running seqs to free KV blocks
             }
             let slot = match self.cache.alloc_slot() {
@@ -511,11 +537,72 @@ impl EngineWorker {
                 }
             };
             let req = self.waiting.pop_front().unwrap();
-            let sampler = Sampler::new(req.sampling, self.cfg.default_seed);
+            let mut sampler = Sampler::new(req.sampling, self.cfg.default_seed);
+            let mut prompt_cursor = 0usize;
+            let mut kv_len = 0usize;
+            let mut cached_exact = None;
+
+            if let Some(idx) = matched_idx {
+                let dev = self.model.device().clone();
+                let snap = &self.prefix_cache[idx];
+                let snap_len = snap.tokens.len();
+                let restore_res = (|| -> candle_core::Result<()> {
+                    self.model
+                        .restore_prefix(&mut self.cache, slot, &block_table, snap)?;
+                    if req.prompt_tokens.len() == snap_len {
+                        let fh = snap.last_final_hidden.to_device(&dev)?;
+                        let sh = snap
+                            .last_spec_hidden
+                            .as_ref()
+                            .map(|t| t.to_device(&dev))
+                            .transpose()?;
+                        cached_exact = Some((fh, sh));
+                    } else if let (Some(mtp_cfg), Some(spec_cpu)) =
+                        (&self.cfg.mtp, &snap.last_spec_hidden)
+                    {
+                        // Extension match (`P' > P`): overwrite MTP KV slot `P - 1` with the true
+                        // shifted next prompt token `prompt[P]` before prefilling `P..P'`.
+                        let spec_dev = spec_cpu.to_device(&dev)?;
+                        let next_tok = [req.prompt_tokens[snap_len]];
+                        let _ = mtp_warmup_chunk(
+                            &self.model,
+                            &self.cache,
+                            &self.bm,
+                            &block_table,
+                            &spec_dev,
+                            &next_tok,
+                            snap_len - 1,
+                            false,
+                            &mut sampler,
+                            mtp_cfg,
+                            &dev,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                match restore_res {
+                    Ok(()) => {
+                        prompt_cursor = snap_len;
+                        kv_len = snap_len;
+                        tracing::debug!(
+                            reused = snap_len,
+                            total = req.prompt_tokens.len(),
+                            exact = req.prompt_tokens.len() == snap_len,
+                            "Hybrid prefix cache hit"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Hybrid prefix cache restore failed, falling back to cold prefill: {e}");
+                        let _ = self.cache.reset_slot(slot);
+                        cached_exact = None;
+                    }
+                }
+            }
+
             self.prefilling.push(ActiveSequence {
                 prompt_tokens: req.prompt_tokens,
-                prompt_cursor: 0,
-                kv_len: 0,
+                prompt_cursor,
+                kv_len,
                 cache_slot: slot,
                 block_table,
                 sampler,
@@ -527,6 +614,7 @@ impl EngineWorker {
                 emitted_text: String::new(),
                 last_token: 0,
                 mtp: MtpSeqState::default(),
+                cached_exact,
             });
         }
     }
@@ -554,6 +642,100 @@ impl EngineWorker {
         // maximizes prefill-stream batch length for that prompt!).
         let chunk_budget = self.effective_prefill_chunk();
         let mut seq = self.prefilling.remove(0);
+
+        // Fast path: exact prompt prefix-cache hit (`prompt_cursor == prompt_tokens.len()`).
+        if let Some((final_h, spec_h)) = seq.cached_exact.take() {
+            let dev = self.model.device().clone();
+            let logits = if seq.sampler.is_greedy() {
+                self.model.lm_head_forward_raw(&final_h)
+            } else {
+                self.model.lm_head_forward(&final_h)
+            };
+            let first_tok = match logits.and_then(|l| seq.sampler.sample_row(&l)) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.bm.free_all(&mut seq.block_table);
+                    self.cache.free_slot(seq.cache_slot);
+                    seq.fail(format!("prefix-cache lm_head/sample failed: {e}"), &self.metrics);
+                    return;
+                }
+            };
+            let finish = match seq.emit_token(&self.tokenizer, first_tok) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.bm.free_all(&mut seq.block_table);
+                    self.cache.free_slot(seq.cache_slot);
+                    seq.fail(format!("decode token failed: {e}"), &self.metrics);
+                    return;
+                }
+            };
+            if let Some(reason) = finish {
+                self.bm.free_all(&mut seq.block_table);
+                self.cache.free_slot(seq.cache_slot);
+                seq.finish(reason, &self.metrics);
+                return;
+            }
+            if let (Some(mtp_cfg), Some(spec_h)) = (self.cfg.mtp.clone(), spec_h) {
+                let last_pos = seq.kv_len - 1;
+                let warmup = mtp_warmup_chunk(
+                    &self.model,
+                    &self.cache,
+                    &self.bm,
+                    &seq.block_table,
+                    &spec_h,
+                    &[first_tok],
+                    last_pos,
+                    true,
+                    &mut seq.sampler,
+                    &mtp_cfg,
+                    &dev,
+                );
+                match warmup {
+                    Ok(Some((d0, chain_h))) => {
+                        let remaining_budget = seq
+                            .sampler
+                            .params()
+                            .max_tokens
+                            .saturating_sub(seq.generated_tokens.len());
+                        let k = mtp_cfg.n_predict.min(remaining_budget.saturating_sub(1));
+                        if k == 0 {
+                            seq.mtp.pending_drafts.clear();
+                        } else {
+                            match mtp_chain_drafts(
+                                &self.model,
+                                &self.cache,
+                                &mut self.bm,
+                                &mut seq.block_table,
+                                d0,
+                                chain_h,
+                                last_pos,
+                                k,
+                                &mut seq.sampler,
+                                &mtp_cfg,
+                                &dev,
+                            ) {
+                                Ok(drafts) => seq.mtp.pending_drafts = drafts,
+                                Err(e) => {
+                                    self.bm.free_all(&mut seq.block_table);
+                                    self.cache.free_slot(seq.cache_slot);
+                                    seq.fail(format!("MTP draft chain failed: {e}"), &self.metrics);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.bm.free_all(&mut seq.block_table);
+                        self.cache.free_slot(seq.cache_slot);
+                        seq.fail(format!("MTP prefix-cache warmup failed: {e}"), &self.metrics);
+                        return;
+                    }
+                }
+            }
+            self.decoding.push(seq);
+            return;
+        }
 
         let start = seq.prompt_cursor;
         let remaining = seq.prompt_tokens.len() - start;
@@ -603,6 +785,7 @@ impl EngineWorker {
                     logit_indices: is_final_chunk.then_some(&last_idx[..]),
                     capture_spec_hidden: mtp_enabled,
                     capture_verify_stash: false,
+                    logits_raw: seq.sampler.is_greedy(),
                 },
                 &mut self.cache,
             )
@@ -675,14 +858,16 @@ impl EngineWorker {
             return;
         }
 
-        // If MTP is enabled, warm up final chunk & propose initial k drafts!
+        // If MTP is enabled, warm up final chunk (fills MTP_KV[0..P-1]) before snapshotting prefix,
+        // then snapshot to host RAM (0 VRAM), then chain initial k drafts!
+        let mut first_draft_and_chain = None;
         if let (Some(mtp_cfg), Some(spec_h)) = (self.cfg.mtp.clone(), &out.spec_hidden) {
             let mut shifted = Vec::with_capacity(chunk_len);
             if chunk_len > 1 {
                 shifted.extend_from_slice(&seq.prompt_tokens[start + 1..end]);
             }
             shifted.push(first_tok);
-            let warmup = mtp_warmup_chunk(
+            match mtp_warmup_chunk(
                 &self.model,
                 &self.cache,
                 &self.bm,
@@ -694,47 +879,82 @@ impl EngineWorker {
                 &mut seq.sampler,
                 &mtp_cfg,
                 &dev,
-            );
-            match warmup {
-                Ok(Some((d0, chain_h))) => {
-                    let remaining_budget = seq
-                        .sampler
-                        .params()
-                        .max_tokens
-                        .saturating_sub(seq.generated_tokens.len());
-                    let k = mtp_cfg.n_predict.min(remaining_budget.saturating_sub(1));
-                    if k == 0 {
-                        seq.mtp.pending_drafts.clear();
-                    } else {
-                        match mtp_chain_drafts(
-                            &self.model,
-                            &self.cache,
-                            &mut self.bm,
-                            &mut seq.block_table,
-                            d0,
-                            chain_h,
-                            end - 1,
-                            k,
-                            &mut seq.sampler,
-                            &mtp_cfg,
-                            &dev,
-                        ) {
-                            Ok(drafts) => seq.mtp.pending_drafts = drafts,
-                            Err(e) => {
-                                self.bm.free_all(&mut seq.block_table);
-                                self.cache.free_slot(seq.cache_slot);
-                                seq.fail(format!("MTP draft chain failed: {e}"), &self.metrics);
-                                return;
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {}
+            ) {
+                Ok(pair) => first_draft_and_chain = pair.map(|p| (mtp_cfg, p)),
                 Err(e) => {
                     self.bm.free_all(&mut seq.block_table);
                     self.cache.free_slot(seq.cache_slot);
                     seq.fail(format!("MTP final warmup failed: {e}"), &self.metrics);
                     return;
+                }
+            }
+        }
+
+        // Snapshot completed prompt prefix into host-RAM LRU cache (after `first_tok` was already
+        // streamed to the client and before draft tokens advance the KV blocks).
+        if self.cfg.prefix_cache_n > 0
+            && seq.prompt_tokens.len() >= 2
+            && !self
+                .prefix_cache
+                .iter()
+                .any(|s| s.tokens == seq.prompt_tokens)
+        {
+            if let Some(last_final_h) = &out.last_final_hidden {
+                let last_spec_h = out
+                    .spec_hidden
+                    .as_ref()
+                    .and_then(|h| h.narrow(1, chunk_len - 1, 1).ok());
+                match self.model.snapshot_prefix(
+                    &self.cache,
+                    seq.cache_slot,
+                    &seq.block_table,
+                    seq.prompt_tokens.clone(),
+                    last_final_h,
+                    last_spec_h.as_ref(),
+                ) {
+                    Ok(snap) => {
+                        while self.prefix_cache.len() >= self.cfg.prefix_cache_n {
+                            self.prefix_cache.pop_front();
+                        }
+                        self.prefix_cache.push_back(snap);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Hybrid prefix cache snapshot failed: {e}");
+                    }
+                }
+            }
+        }
+
+        if let Some((mtp_cfg, (d0, chain_h))) = first_draft_and_chain {
+            let remaining_budget = seq
+                .sampler
+                .params()
+                .max_tokens
+                .saturating_sub(seq.generated_tokens.len());
+            let k = mtp_cfg.n_predict.min(remaining_budget.saturating_sub(1));
+            if k == 0 {
+                seq.mtp.pending_drafts.clear();
+            } else {
+                match mtp_chain_drafts(
+                    &self.model,
+                    &self.cache,
+                    &mut self.bm,
+                    &mut seq.block_table,
+                    d0,
+                    chain_h,
+                    end - 1,
+                    k,
+                    &mut seq.sampler,
+                    &mtp_cfg,
+                    &dev,
+                ) {
+                    Ok(drafts) => seq.mtp.pending_drafts = drafts,
+                    Err(e) => {
+                        self.bm.free_all(&mut seq.block_table);
+                        self.cache.free_slot(seq.cache_slot);
+                        seq.fail(format!("MTP draft chain failed: {e}"), &self.metrics);
+                        return;
+                    }
                 }
             }
         }
@@ -804,6 +1024,7 @@ impl EngineWorker {
                     logit_indices: None,
                     capture_spec_hidden: false,
                     capture_verify_stash: false,
+                    logits_raw: self.decoding.iter().all(|s| s.sampler.is_greedy()),
                 },
                 &mut self.cache,
             )
@@ -935,6 +1156,7 @@ impl EngineWorker {
                     logit_indices: None,
                     capture_spec_hidden: true,
                     capture_verify_stash: true,
+                    logits_raw: seq.sampler.is_greedy(),
                 },
                 &mut self.cache,
             )
@@ -1017,7 +1239,11 @@ impl EngineWorker {
         if next_k > 0 {
             if let Some(spec_h) = &out.spec_hidden {
                 let res = (|| -> candle_core::Result<()> {
-                    let keep_hidden = spec_h.narrow(1, 0, keep)?.contiguous()?;
+                    let keep_hidden = if keep == verify_len {
+                        spec_h.clone()
+                    } else {
+                        spec_h.narrow(1, 0, keep)?.contiguous()?
+                    };
                     if let Some((d0, chain_h)) = mtp_warmup_chunk(
                         &self.model,
                         &self.cache,

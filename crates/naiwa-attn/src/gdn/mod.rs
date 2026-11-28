@@ -138,6 +138,32 @@ impl GdnSeqState {
             lane_slot_tensors: Vec::new(),
         })
     }
+
+    /// Snapshot the active lane to host CPU RAM (`(conv_state, recurrent_state)`), using 0 VRAM.
+    pub fn snapshot_lane_to_cpu(&self) -> Result<(Tensor, Tensor)> {
+        let conv = self
+            .conv_state
+            .narrow(0, self.active_lane, 1)?
+            .contiguous()?
+            .to_device(&Device::Cpu)?;
+        let rec = self
+            .recurrent_state
+            .narrow(0, self.active_lane, 1)?
+            .contiguous()?
+            .to_device(&Device::Cpu)?;
+        Ok((conv, rec))
+    }
+
+    /// Restore a host CPU lane snapshot into lane 0 of this slot and make lane 0 active.
+    pub fn restore_lane_from_cpu(&mut self, conv_cpu: &Tensor, rec_cpu: &Tensor) -> Result<()> {
+        let dev = self.conv_state.device();
+        let conv_dev = conv_cpu.to_device(dev)?;
+        let rec_dev = rec_cpu.to_device(dev)?;
+        self.conv_state.slice_set(&conv_dev, 0, 0)?;
+        self.recurrent_state.slice_set(&rec_dev, 0, 0)?;
+        self.active_lane = 0;
+        Ok(())
+    }
 }
 
 /// Single-device GatedDeltaNet linear-attention layer (Qwen3.8-Flash-Next split-projection layout).

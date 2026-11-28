@@ -112,7 +112,8 @@ pub fn mtp_warmup_chunk(
     let pos_vec: Vec<u32> = (start_pos as u32..end_kv_len as u32).collect();
     let pos_t = Tensor::from_slice(&pos_vec, (1, len), device)?;
 
-    let meta = bm.build_meta(&[block_table], &[end_kv_len], &[len], false, device)?;
+    let is_single = len == 1;
+    let meta = bm.build_meta(&[block_table], &[end_kv_len], &[len], is_single, device)?;
     let spans = [(0usize, len)];
     let kv_lens = [end_kv_len];
 
@@ -122,7 +123,7 @@ pub fn mtp_warmup_chunk(
             target_hidden: spec_hidden,
             position_ids: &pos_t,
             paged_meta: &meta,
-            chunk_spans: Some((&spans, &kv_lens)),
+            chunk_spans: (!is_single).then_some((&spans[..], &kv_lens[..])),
         },
         cache,
     )?;

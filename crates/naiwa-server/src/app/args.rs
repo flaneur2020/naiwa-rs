@@ -119,6 +119,26 @@ pub struct ModelSource {
     pub max_model_len: Option<usize>,
 }
 
+/// `--expert-cache-gb` budget: either `"auto"` (fill remaining VRAM minus reserves) or an explicit GiB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExpertCacheBudget {
+    Auto,
+    GiB(f64),
+}
+
+fn parse_expert_cache_budget(s: &str) -> std::result::Result<ExpertCacheBudget, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(ExpertCacheBudget::Auto);
+    }
+    let gb: f64 = s
+        .parse()
+        .map_err(|_| format!("expected `auto` or a positive GiB number, got `{s}`"))?;
+    if !gb.is_finite() || gb <= 0.0 {
+        return Err(format!("`--expert-cache-gb` must be `auto` or > 0, got `{s}`"));
+    }
+    Ok(ExpertCacheBudget::GiB(gb))
+}
+
 #[derive(Args, Clone)]
 pub struct ModelOptions {
     #[command(flatten)]
@@ -138,9 +158,9 @@ pub struct ModelOptions {
     #[arg(long = "no-lookahead", requires = "cpu_moe")]
     pub no_lookahead: bool,
 
-    /// GPU expert cache budget in GiB
-    #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = clap::value_parser!(f64))]
-    pub expert_cache_gb: Option<f64>,
+    /// GPU expert cache budget in GiB, or `auto` to fill remaining VRAM automatically
+    #[arg(long = "expert-cache-gb", requires = "cpu_moe", value_parser = parse_expert_cache_budget)]
+    pub expert_cache_gb: Option<ExpertCacheBudget>,
 
     /// Pre-warm expert cache from a binary strata expert profile
     #[arg(long = "expert-profile", requires = "expert_cache_gb")]
@@ -462,9 +482,25 @@ mod tests {
             } => {
                 assert!(model.cpu_moe);
                 assert!(model.no_lookahead);
-                assert_eq!(model.expert_cache_gb, Some(2.5));
+                assert_eq!(model.expert_cache_gb, Some(ExpertCacheBudget::GiB(2.5)));
                 assert_eq!(runtime.mtp.config().unwrap().n_predict, 2);
                 assert_eq!(server.port, 19980);
+            }
+        }
+
+        let cli_auto = Cli::try_parse_from([
+            "naiwa-rs",
+            "serve",
+            "-m",
+            "/tmp",
+            "--cpu-moe",
+            "--expert-cache-gb",
+            "auto",
+        ])
+        .unwrap();
+        match cli_auto.command {
+            Command::Serve { model, .. } => {
+                assert_eq!(model.expert_cache_gb, Some(ExpertCacheBudget::Auto));
             }
         }
     }

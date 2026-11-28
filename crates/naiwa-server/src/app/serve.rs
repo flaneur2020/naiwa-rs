@@ -32,7 +32,7 @@ pub async fn run_serve(
         .as_deref()
         .or(runtime.chat_template.as_deref());
 
-    let loaded = load_model(&model_opts, mtp_cfg.is_some(), chat_tmpl)?;
+    let loaded = load_model(&model_opts, &runtime, mtp_cfg.is_some(), chat_tmpl)?;
 
     // Warm up the expert cache & trim CUDA load-time pool BEFORE allocating KV blocks so the
     // driver returns fragmented load buffers and pre-fills `--expert-profile` slots up front.
@@ -77,6 +77,7 @@ pub async fn run_serve(
         block_size,
         default_seed: global.seed.unwrap_or(0),
         mtp: mtp_cfg,
+        prefix_cache_n: runtime.prefix_cache_n,
         prompt_step_ceiling: Some(prompt_ceiling),
     };
 

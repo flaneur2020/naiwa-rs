@@ -2035,3 +2035,432 @@ extern "C" void naiwa_qwen4_qsa_gate_mul(
         (__nv_bfloat16 *)out, total_elems, head_dim);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Fused Hyper-Connection small-batch kernels (tokens <= 8):
+//   1. q4_hc_down_inject_act_kernel:
+//        lo[t, r]     = silu((xn[t] . W_down[r]) / hc)   for r in 0..rank
+//        inject[t, c] = xn[t] . W_inject[c]              for c in 0..hc (optional)
+//      Replaces 4 launches (down GEMM + div + silu + inject GEMM) with 1 launch,
+//      reading xn once from L2 and each weight row once across all tokens.
+//   2. q4_hc_up_mix_kernel:
+//        out[t, i] = (1/hc) * sum_{c=0..hc-1} xn[t, c, i] * sigmoid(lo[t] . W_up[c*hidden+i])
+//      Replaces 2 launches (up GEMM + hc_mix) with 1 launch, keeping lo in shared
+//      memory and eliminating the intermediate gate[tokens, hc*hidden] global buffer.
+// ---------------------------------------------------------------------------
+
+#define Q4_HC_MAX_TOKENS 8
+
+template <typename T, int TOKENS>
+static __global__ void q4_hc_down_inject_act_kernel(
+    const T *__restrict__ xn,
+    const T *__restrict__ w_down,
+    const T *__restrict__ w_inject,
+    T *__restrict__ lo_out,
+    T *__restrict__ inject_out,
+    int tokens_rt,
+    int rank,
+    int hc,
+    int width) {
+  __shared__ float smem[Q4_HC_MAX_TOKENS * 8];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warps = blockDim.x >> 5; // 8 warps (256 threads)
+  const int nt = (TOKENS > 0) ? TOKENS : tokens_rt;
+  const bool is_inject = (row >= rank);
+  const T *w = is_inject
+                   ? (w_inject + (size_t)(row - rank) * width)
+                   : (w_down + (size_t)row * width);
+
+  constexpr int CAP = (TOKENS > 0) ? TOKENS : Q4_HC_MAX_TOKENS;
+  float acc[CAP];
+#pragma unroll
+  for (int t = 0; t < CAP; ++t) {
+    acc[t] = 0.0f;
+  }
+
+  if ((width & 7) == 0) {
+    const int step = blockDim.x * 8;
+    for (int k = tid * 8; k < width; k += step) {
+      float wv[8];
+      q4_load8(w + k, wv);
+      if constexpr (TOKENS > 0) {
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+          float xv[8];
+          q4_load8(xn + (size_t)t * width + k, xv);
+          float s = acc[t];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            s = fmaf(xv[j], wv[j], s);
+          }
+          acc[t] = s;
+        }
+      } else {
+        for (int t = 0; t < nt; ++t) {
+          float xv[8];
+          q4_load8(xn + (size_t)t * width + k, xv);
+          float s = acc[t];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            s = fmaf(xv[j], wv[j], s);
+          }
+          acc[t] = s;
+        }
+      }
+    }
+  } else {
+    for (int k = tid; k < width; k += blockDim.x) {
+      const float wv = q4_f(w[k]);
+      for (int t = 0; t < nt; ++t) {
+        acc[t] = fmaf(q4_f(xn[(size_t)t * width + k]), wv, acc[t]);
+      }
+    }
+  }
+
+  // Single-barrier block reduction across all tokens simultaneously.
+  if constexpr (TOKENS > 0) {
+#pragma unroll
+    for (int t = 0; t < TOKENS; ++t) {
+      const float ws = q4_warp_sum(acc[t]);
+      if (lane == 0) smem[t * 8 + warp] = ws;
+    }
+  } else {
+    for (int t = 0; t < nt; ++t) {
+      const float ws = q4_warp_sum(acc[t]);
+      if (lane == 0) smem[t * 8 + warp] = ws;
+    }
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    const float inv_hc = 1.0f / (float)hc;
+    if constexpr (TOKENS > 0) {
+#pragma unroll
+      for (int t = 0; t < TOKENS; ++t) {
+        float v = (lane < warps) ? smem[t * 8 + lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+          v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+          if (is_inject) {
+            inject_out[(size_t)t * hc + (row - rank)] = q4_t<T>(v);
+          } else {
+            lo_out[(size_t)t * rank + row] = q4_t<T>(q4_silu(v * inv_hc));
+          }
+        }
+      }
+    } else {
+      for (int t = 0; t < nt; ++t) {
+        float v = (lane < warps) ? smem[t * 8 + lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+          v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+          if (is_inject) {
+            inject_out[(size_t)t * hc + (row - rank)] = q4_t<T>(v);
+          } else {
+            lo_out[(size_t)t * rank + row] = q4_t<T>(q4_silu(v * inv_hc));
+          }
+        }
+      }
+    }
+  }
+}
+
+// Sub-warp (8 threads) per output column `i` when rank is a multiple of 64 (320 = 5 * 64):
+// each 8-thread group issues 5 exact 128-byte coalesced uint4 loads with 100% active lanes,
+// 3-step shuffle reduction, and zero intermediate `gate` global memory traffic.
+template <typename T, int TOKENS>
+static __global__ void q4_hc_up_mix_sub8_kernel(
+    const T *__restrict__ xn,
+    const T *__restrict__ lo,
+    const T *__restrict__ w_up,
+    T *__restrict__ out,
+    int tokens_rt,
+    int rank,
+    int hc,
+    int hidden) {
+  extern __shared__ float s_lo[];
+  const int tid = threadIdx.x;
+  const int nt = (TOKENS > 0) ? TOKENS : tokens_rt;
+  const int total_lo = nt * rank;
+  for (int idx = tid; idx < total_lo; idx += blockDim.x) {
+    s_lo[idx] = q4_f(lo[idx]);
+  }
+  __syncthreads();
+
+  const int group = tid >> 3; // 0..15 (16 columns per 128-thread block)
+  const int sub = tid & 7;    // 0..7  (8 threads per column)
+  const int cols_per_block = blockDim.x >> 3;
+  const int i = blockIdx.x * cols_per_block + group;
+  if (i >= hidden) {
+    return;
+  }
+
+  constexpr int CAP = (TOKENS > 0) ? TOKENS : Q4_HC_MAX_TOKENS;
+  float out_acc[CAP];
+#pragma unroll
+  for (int t = 0; t < CAP; ++t) {
+    out_acc[t] = 0.0f;
+  }
+
+  for (int c = 0; c < hc; ++c) {
+    const size_t o = (size_t)c * hidden + i;
+    const T *w_row = w_up + o * rank;
+    float g[CAP];
+#pragma unroll
+    for (int t = 0; t < CAP; ++t) {
+      g[t] = 0.0f;
+    }
+
+    for (int r = sub * 8; r < rank; r += 64) {
+      float wv[8];
+      q4_load8(w_row + r, wv);
+      if constexpr (TOKENS > 0) {
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+          const float *lt = s_lo + t * rank + r;
+          float s = g[t];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            s = fmaf(lt[j], wv[j], s);
+          }
+          g[t] = s;
+        }
+      } else {
+        for (int t = 0; t < nt; ++t) {
+          const float *lt = s_lo + t * rank + r;
+          float s = g[t];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            s = fmaf(lt[j], wv[j], s);
+          }
+          g[t] = s;
+        }
+      }
+    }
+
+    if constexpr (TOKENS > 0) {
+#pragma unroll
+      for (int t = 0; t < TOKENS; ++t) {
+        float gv = g[t];
+        gv += __shfl_xor_sync(0xffffffff, gv, 4);
+        gv += __shfl_xor_sync(0xffffffff, gv, 2);
+        gv += __shfl_xor_sync(0xffffffff, gv, 1);
+        if (sub == 0) {
+          const size_t x_idx = ((size_t)t * hc + c) * hidden + i;
+          out_acc[t] = fmaf(q4_f(xn[x_idx]), q4_sigmoid(gv), out_acc[t]);
+        }
+      }
+    } else {
+      for (int t = 0; t < nt; ++t) {
+        float gv = g[t];
+        gv += __shfl_xor_sync(0xffffffff, gv, 4);
+        gv += __shfl_xor_sync(0xffffffff, gv, 2);
+        gv += __shfl_xor_sync(0xffffffff, gv, 1);
+        if (sub == 0) {
+          const size_t x_idx = ((size_t)t * hc + c) * hidden + i;
+          out_acc[t] = fmaf(q4_f(xn[x_idx]), q4_sigmoid(gv), out_acc[t]);
+        }
+      }
+    }
+  }
+
+  if (sub == 0) {
+    const float inv_hc = 1.0f / (float)hc;
+    if constexpr (TOKENS > 0) {
+#pragma unroll
+      for (int t = 0; t < TOKENS; ++t) {
+        out[(size_t)t * hidden + i] = q4_t<T>(out_acc[t] * inv_hc);
+      }
+    } else {
+      for (int t = 0; t < nt; ++t) {
+        out[(size_t)t * hidden + i] = q4_t<T>(out_acc[t] * inv_hc);
+      }
+    }
+  }
+}
+
+template <typename T>
+static __global__ void q4_hc_up_mix_generic_kernel(
+    const T *__restrict__ xn,
+    const T *__restrict__ lo,
+    const T *__restrict__ w_up,
+    T *__restrict__ out,
+    int tokens,
+    int rank,
+    int hc,
+    int hidden) {
+  extern __shared__ float s_lo[];
+  const int tid = threadIdx.x;
+  const int total_lo = tokens * rank;
+  for (int idx = tid; idx < total_lo; idx += blockDim.x) {
+    s_lo[idx] = q4_f(lo[idx]);
+  }
+  __syncthreads();
+
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int i = blockIdx.x * warps_per_block + warp;
+  if (i >= hidden) return;
+
+  float out_acc[Q4_HC_MAX_TOKENS];
+#pragma unroll
+  for (int t = 0; t < Q4_HC_MAX_TOKENS; ++t) out_acc[t] = 0.0f;
+
+  for (int c = 0; c < hc; ++c) {
+    const size_t o = (size_t)c * hidden + i;
+    const T *w_row = w_up + o * rank;
+    float g[Q4_HC_MAX_TOKENS];
+#pragma unroll
+    for (int t = 0; t < Q4_HC_MAX_TOKENS; ++t) g[t] = 0.0f;
+    for (int r = lane; r < rank; r += 32) {
+      const float w0 = q4_f(w_row[r]);
+      for (int t = 0; t < tokens; ++t) {
+        g[t] = fmaf(s_lo[t * rank + r], w0, g[t]);
+      }
+    }
+    for (int t = 0; t < tokens; ++t) {
+      const float gv = q4_warp_sum(g[t]);
+      if (lane == 0) {
+        const size_t x_idx = ((size_t)t * hc + c) * hidden + i;
+        out_acc[t] = fmaf(q4_f(xn[x_idx]), q4_sigmoid(gv), out_acc[t]);
+      }
+    }
+  }
+  if (lane == 0) {
+    const float inv_hc = 1.0f / (float)hc;
+    for (int t = 0; t < tokens; ++t) {
+      out[(size_t)t * hidden + i] = q4_t<T>(out_acc[t] * inv_hc);
+    }
+  }
+}
+
+template <typename T>
+static void launch_hc_down_inject_act(
+    const T *xn, const T *w_down, const T *w_inject, T *lo_out, T *inject_out,
+    int tokens, int rank, int hc, int width, cudaStream_t s) {
+  const int blocks = rank + (w_inject != nullptr ? hc : 0);
+  const int threads = 256;
+  switch (tokens) {
+    case 1:
+      q4_hc_down_inject_act_kernel<T, 1><<<blocks, threads, 0, s>>>(
+          xn, w_down, w_inject, lo_out, inject_out, 1, rank, hc, width);
+      break;
+    case 2:
+      q4_hc_down_inject_act_kernel<T, 2><<<blocks, threads, 0, s>>>(
+          xn, w_down, w_inject, lo_out, inject_out, 2, rank, hc, width);
+      break;
+    case 3:
+      q4_hc_down_inject_act_kernel<T, 3><<<blocks, threads, 0, s>>>(
+          xn, w_down, w_inject, lo_out, inject_out, 3, rank, hc, width);
+      break;
+    case 4:
+      q4_hc_down_inject_act_kernel<T, 4><<<blocks, threads, 0, s>>>(
+          xn, w_down, w_inject, lo_out, inject_out, 4, rank, hc, width);
+      break;
+    default:
+      q4_hc_down_inject_act_kernel<T, 0><<<blocks, threads, 0, s>>>(
+          xn, w_down, w_inject, lo_out, inject_out, tokens, rank, hc, width);
+      break;
+  }
+}
+
+template <typename T>
+static void launch_hc_up_mix(
+    const T *xn, const T *lo, const T *w_up, T *out,
+    int tokens, int rank, int hc, int hidden, cudaStream_t s) {
+  const size_t smem = (size_t)tokens * rank * sizeof(float);
+  if ((rank & 63) == 0) {
+    const int threads = 128; // 16 columns per block (8 threads/column)
+    const int blocks = (hidden + 15) / 16;
+    switch (tokens) {
+      case 1:
+        q4_hc_up_mix_sub8_kernel<T, 1><<<blocks, threads, smem, s>>>(
+            xn, lo, w_up, out, 1, rank, hc, hidden);
+        break;
+      case 2:
+        q4_hc_up_mix_sub8_kernel<T, 2><<<blocks, threads, smem, s>>>(
+            xn, lo, w_up, out, 2, rank, hc, hidden);
+        break;
+      case 3:
+        q4_hc_up_mix_sub8_kernel<T, 3><<<blocks, threads, smem, s>>>(
+            xn, lo, w_up, out, 3, rank, hc, hidden);
+        break;
+      case 4:
+        q4_hc_up_mix_sub8_kernel<T, 4><<<blocks, threads, smem, s>>>(
+            xn, lo, w_up, out, 4, rank, hc, hidden);
+        break;
+      default:
+        q4_hc_up_mix_sub8_kernel<T, 0><<<blocks, threads, smem, s>>>(
+            xn, lo, w_up, out, tokens, rank, hc, hidden);
+        break;
+    }
+  } else {
+    const int threads = 128;
+    const int blocks = (hidden + 3) / 4;
+    q4_hc_up_mix_generic_kernel<T><<<blocks, threads, smem, s>>>(
+        xn, lo, w_up, out, tokens, rank, hc, hidden);
+  }
+}
+
+extern "C" void naiwa_qwen4_hc_down_inject_act(
+    const void *xn,
+    const void *w_down,
+    const void *w_inject,
+    void *lo_out,
+    void *inject_out,
+    int tokens,
+    int rank,
+    int hc,
+    int width,
+    int dtype,
+    int64_t stream) {
+  if (tokens <= 0 || tokens > Q4_HC_MAX_TOKENS) return;
+  const cudaStream_t s = (cudaStream_t)stream;
+  if (dtype == 0) {
+    launch_hc_down_inject_act((const __half *)xn, (const __half *)w_down,
+                              (const __half *)w_inject, (__half *)lo_out,
+                              (__half *)inject_out, tokens, rank, hc, width, s);
+  } else if (dtype == 1) {
+    launch_hc_down_inject_act((const __nv_bfloat16 *)xn, (const __nv_bfloat16 *)w_down,
+                              (const __nv_bfloat16 *)w_inject, (__nv_bfloat16 *)lo_out,
+                              (__nv_bfloat16 *)inject_out, tokens, rank, hc, width, s);
+  } else {
+    launch_hc_down_inject_act((const float *)xn, (const float *)w_down,
+                              (const float *)w_inject, (float *)lo_out,
+                              (float *)inject_out, tokens, rank, hc, width, s);
+  }
+}
+
+extern "C" void naiwa_qwen4_hc_up_mix(
+    const void *xn,
+    const void *lo,
+    const void *w_up,
+    void *out,
+    int tokens,
+    int rank,
+    int hc,
+    int hidden,
+    int dtype,
+    int64_t stream) {
+  if (tokens <= 0 || tokens > Q4_HC_MAX_TOKENS) return;
+  const cudaStream_t s = (cudaStream_t)stream;
+  if (dtype == 0) {
+    launch_hc_up_mix((const __half *)xn, (const __half *)lo, (const __half *)w_up,
+                     (__half *)out, tokens, rank, hc, hidden, s);
+  } else if (dtype == 1) {
+    launch_hc_up_mix((const __nv_bfloat16 *)xn, (const __nv_bfloat16 *)lo,
+                     (const __nv_bfloat16 *)w_up, (__nv_bfloat16 *)out,
+                     tokens, rank, hc, hidden, s);
+  } else {
+    launch_hc_up_mix((const float *)xn, (const float *)lo, (const float *)w_up,
+                     (float *)out, tokens, rank, hc, hidden, s);
+  }
+}

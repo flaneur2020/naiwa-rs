@@ -10,6 +10,8 @@ pub(crate) mod qsa;
 pub mod text;
 
 pub use config::{LayerType, PleConfig, PleHashConstants, QsaConfig, Qwen4ExpConfig};
-pub use loader::{load_qwen4_exp_from_archive, open_gguf_archive};
+pub use loader::{
+    estimate_model_vram, load_qwen4_exp_from_archive, open_gguf_archive, ModelVramPlan,
+};
 pub use mtp::{MtpForwardInput, MtpForwardOutput};
 pub use text::{ForwardInput, ForwardKind, ForwardOutput, Qwen4ExpModel};

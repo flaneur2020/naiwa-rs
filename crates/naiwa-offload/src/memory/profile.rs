@@ -18,8 +18,10 @@
 
 use std::path::Path;
 
-/// A parsed profile: for each layer, its experts in descending rank order.
+/// A parsed profile: global `(layer, expert)` frequency ranking plus per-layer expert lists.
 pub struct Profile {
+    /// Global `(layer, expert)` pairs in descending routing-frequency order.
+    global: Vec<(usize, usize)>,
     per_layer: Vec<Vec<usize>>,
     /// The file it came from, for the log line.
     pub source: String,
@@ -72,8 +74,9 @@ impl Profile {
         if blob.len() < need {
             return Err(ProfileError::Truncated { need, have: blob.len() }.into());
         }
-        // The ranking is global, its layers interleaved: keep this layer's pairs in the order they appear, which
-        // is their rank order.
+        // The ranking is global, its layers interleaved: keep both the global order (for
+        // frequency-weighted cross-layer slot budgeting) and each layer's own descending order.
+        let mut global = Vec::with_capacity(n);
         let mut per_layer = vec![Vec::new(); num_layers];
         let mut seen = vec![vec![false; num_experts]; num_layers];
         for i in 0..n {
@@ -84,9 +87,11 @@ impl Profile {
                 continue;
             }
             seen[layer][expert] = true;
+            global.push((layer, expert));
             per_layer[layer].push(expert);
         }
         Ok(Self {
+            global,
             per_layer,
             source: format!("{} ({layers}x{experts}, {n} ranked pairs)", path.display()),
         })
@@ -95,6 +100,62 @@ impl Profile {
     /// This layer's experts, best first.
     pub fn layer(&self, layer: usize) -> &[usize] {
         self.per_layer.get(layer).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Global `(layer, expert)` pairs, best first.
+    pub fn global(&self) -> &[(usize, usize)] {
+        &self.global
+    }
+
+    /// Allocate per-layer slot counts from `budget_bytes` by walking the global `(layer, expert)`
+    /// ranking in descending routing-frequency order and charging `layer_slot_bytes[layer]` per
+    /// expert (matching Strata's global frequency-ranked cache allocation).
+    pub fn plan_layer_slots(
+        &self,
+        layer_slot_bytes: &[u64],
+        budget_bytes: u64,
+        max_experts_per_layer: usize,
+    ) -> Vec<usize> {
+        let n_layers = layer_slot_bytes.len();
+        let mut counts = vec![0usize; n_layers];
+        let mut remaining = budget_bytes;
+
+        for &(layer, _expert) in &self.global {
+            if layer >= n_layers || counts[layer] >= max_experts_per_layer {
+                continue;
+            }
+            let cost = layer_slot_bytes[layer];
+            if cost == 0 || remaining < cost {
+                continue;
+            }
+            counts[layer] += 1;
+            remaining -= cost;
+        }
+
+        // If a partial profile didn't exhaust `budget_bytes`, distribute leftover round-robin.
+        let min_cost = layer_slot_bytes
+            .iter()
+            .copied()
+            .filter(|&c| c > 0)
+            .min()
+            .unwrap_or(0);
+        if min_cost > 0 && remaining >= min_cost {
+            loop {
+                let mut progressed = false;
+                for l in 0..n_layers {
+                    let cost = layer_slot_bytes[l];
+                    if cost > 0 && counts[l] < max_experts_per_layer && remaining >= cost {
+                        counts[l] += 1;
+                        remaining -= cost;
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
+        counts
     }
 
     /// Total pairs read, after the layer/expert filter.
@@ -155,5 +216,15 @@ mod tests {
             Profile::read(&path, 2, 16).map(|_| ()),
             Err(e) if e.to_string().contains("truncated")
         ));
+    }
+
+    #[test]
+    fn plan_layer_slots_follows_global_rank_and_prices_per_layer() {
+        let path = std::env::temp_dir().join("naiwa-profile-plan.bin");
+        std::fs::write(&path, write(&[(1, 10), (1, 11), (0, 5), (1, 12), (2, 1)], 3, 16)).unwrap();
+        let p = Profile::read(&path, 3, 16).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(p.plan_layer_slots(&[100, 100, 100], 400, 16), vec![1, 3, 0]);
+        assert_eq!(p.plan_layer_slots(&[150, 100, 100], 350, 16), vec![1, 2, 0]);
     }
 }

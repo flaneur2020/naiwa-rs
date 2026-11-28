@@ -267,6 +267,18 @@ mod cuda {
             self.stream.wait(&done).map_err(Error::wrap)
         }
 
+        /// Order subsequent work on this copy stream after `fence` (GPU-side event wait, no host sync).
+        pub fn wait_fence(&self, fence: &ReadFence) -> Result<()> {
+            self.stream
+                .context()
+                .bind_to_thread()
+                .map_err(Error::wrap)?;
+            if let Some(event) = fence.event.lock().unwrap().as_ref() {
+                self.stream.wait(event).map_err(Error::wrap)?;
+            }
+            Ok(())
+        }
+
         /// Queue async copies of each `src` into its `dst` once prior readers finish (`fence`),
         /// then record `done`.
         ///

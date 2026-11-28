@@ -7,7 +7,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use naiwa_attn::{GatedDeltaNet, PagedAttnMeta, RotaryEmbedding};
 use naiwa_quant::{GgufArchive, QLinear, RoutedExpertsProvider};
 
-use crate::cache::{HybridCache, RecurrentVerifyStash};
+use crate::cache::{HybridCache, HybridPrefixSnapshot, RecurrentVerifyStash};
 use crate::probe;
 use crate::qwen4_exp::{
     config::Qwen4ExpConfig,
@@ -68,14 +68,19 @@ pub struct ForwardInput<'a> {
     pub capture_spec_hidden: bool,
     /// Capture GDN + PLE rollback stashes so a rejected verify suffix can be undone bit-exactly.
     pub capture_verify_stash: bool,
+    /// Return raw model-dtype logits (e.g. BF16) without converting `[rows, vocab]` to F32
+    /// (bit-exact for GPU greedy `argmax`, saves ~3 MB VRAM bandwidth per step).
+    pub logits_raw: bool,
 }
 
 /// Outputs of [`Qwen4ExpModel::forward`].
 pub struct ForwardOutput {
-    /// Logits `[num_selected_rows, vocab_size]` in F32 (or `[batch * seq_len, vocab_size]`).
+    /// Logits `[num_selected_rows, vocab_size]` in F32 (or model dtype when `logits_raw == true`).
     pub logits: Tensor,
     /// Pre-final-mixer 4-stream residual `[batch, seq_len, hc * hidden]` when requested.
     pub spec_hidden: Option<Tensor>,
+    /// Final collapsed hidden state `[1, hidden]` for the last logit row on `Prefill` (for prefix cache).
+    pub last_final_hidden: Option<Tensor>,
     /// Recurrent rollback stash when `capture_verify_stash == true`.
     pub verify_stash: Option<RecurrentVerifyStash>,
 }
@@ -283,6 +288,14 @@ impl Qwen4ExpModel {
         let mut res = xs.repeat((1, 1, self.cfg.hc_count))?;
         let mut pending_norm: Option<Tensor> = None;
 
+        // Kick off Layer-1 PLE host mmap gather + IQ4_NL dequantization on a background thread
+        // BEFORE Layer 0 runs so disk/page-cache latency is hidden behind Layer 0 (~1.6 ms).
+        let mut ple_prefetch = self.cfg.ple.as_ref().and_then(|ple_cfg| {
+            let ple_layer = self.layers.get(ple_cfg.layer_idx)?.ple.as_ref()?;
+            let ple_states = cache.ple_states()?;
+            ple_layer.begin_prefetch(input.tokens_host, input.seq_spans, input.cache_slots, ple_states)
+        });
+
         for (i, layer) in self.layers.iter().enumerate() {
             if i == 0 {
                 probe::boundary(&res, i, "next_model");
@@ -301,6 +314,7 @@ impl Qwen4ExpModel {
                     input.cache_slots,
                     ple_states,
                     verify_stash.as_ref().map(|_| &mut ple_stash),
+                    ple_prefetch.take(),
                 )?;
                 if let (Some(vs), Some(ps)) = (verify_stash.as_mut(), ple_stash) {
                     vs.ple = Some(ps);
@@ -313,9 +327,8 @@ impl Qwen4ExpModel {
                 None => layer.attn_hc.norm(&res)?,
             };
             probe::boundary(&xn, i, "attn_norm_end");
-            let h = layer.attn_hc.mix(&xn)?;
+            let (h, inject) = layer.attn_hc.mix_and_inject(&xn)?;
             probe::boundary(&h, i, "attn_mix_end");
-            let inject = layer.attn_hc.inject(&xn)?;
             probe::boundary(&h, i, "mixer_start");
 
             let out = match &layer.mixer {
@@ -356,9 +369,8 @@ impl Qwen4ExpModel {
                 None => layer.mlp_hc.norm(&res)?,
             };
             probe::boundary(&xn, i, "mlp_norm_end");
-            let h = layer.mlp_hc.mix(&xn)?;
+            let (h, inject) = layer.mlp_hc.mix_and_inject(&xn)?;
             probe::boundary(&h, i, "mlp_mix_end");
-            let inject = layer.mlp_hc.inject(&xn)?;
             probe::boundary(&h, i, "moe_start");
 
             let out = layer.moe.forward(&h)?;
@@ -391,15 +403,108 @@ impl Qwen4ExpModel {
             None => flat_xn,
         };
         let xs_final = self.final_mixer.mix(&selected_xn)?;
+        let last_final_hidden =
+            (input.kind == ForwardKind::Prefill && input.logit_indices.is_some())
+                .then(|| xs_final.clone());
         probe::boundary(&xs_final, self.layers.len(), "head_start");
-        let logits = self.lm_head_forward(&xs_final)?;
+        let logits = if input.logits_raw {
+            self.lm_head_forward_raw(&xs_final)?
+        } else {
+            self.lm_head_forward(&xs_final)?
+        };
         probe::boundary(&logits, self.layers.len(), "head_end");
 
         Ok(ForwardOutput {
             logits,
             spec_hidden,
+            last_final_hidden,
             verify_stash,
         })
+    }
+
+    /// Snapshot full hybrid state (`KV + QSA aux + GDN + PLE + MTP KV`) for a completed prompt
+    /// into host CPU RAM (zero VRAM).
+    pub fn snapshot_prefix(
+        &self,
+        cache: &HybridCache,
+        slot: usize,
+        block_table: &[u32],
+        tokens: Vec<u32>,
+        last_final_hidden: &Tensor,
+        last_spec_hidden: Option<&Tensor>,
+    ) -> Result<HybridPrefixSnapshot> {
+        let t0 = std::time::Instant::now();
+        let num_blocks = tokens.len().div_ceil(cache.block_size());
+        let used_blocks = &block_table[..num_blocks.min(block_table.len())];
+        let (kv_layers, gdn_layers, ple_state) = cache.snapshot_state_to_cpu(slot, used_blocks)?;
+        let t1 = std::time::Instant::now();
+        let mut qsa_aux_layers = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Mixer::Attention(attn) = &layer.mixer {
+                if let Some((raw, bk)) = attn.snapshot_aux_blocks(used_blocks, cache.block_size())? {
+                    qsa_aux_layers.push((i, raw, bk));
+                }
+            }
+        }
+        if let Some(mtp) = &self.mtp {
+            if let Some((raw, bk)) = mtp.attn.snapshot_aux_blocks(used_blocks, cache.block_size())? {
+                qsa_aux_layers.push((mtp.kv_layer_idx(), raw, bk));
+            }
+        }
+        let t2 = std::time::Instant::now();
+        let snap = HybridPrefixSnapshot {
+            tokens,
+            num_blocks: used_blocks.len(),
+            kv_layers,
+            qsa_aux_layers,
+            gdn_layers,
+            ple_state,
+            last_final_hidden: last_final_hidden.contiguous()?.to_device(&Device::Cpu)?,
+            last_spec_hidden: last_spec_hidden
+                .map(|t| t.contiguous()?.to_device(&Device::Cpu))
+                .transpose()?,
+        };
+        let t3 = std::time::Instant::now();
+        tracing::debug!(
+            kv_gdn_ple_ms = format_args!("{:.1}", (t1 - t0).as_secs_f64() * 1000.0),
+            qsa_aux_ms = format_args!("{:.1}", (t2 - t1).as_secs_f64() * 1000.0),
+            hidden_ms = format_args!("{:.1}", (t3 - t2).as_secs_f64() * 1000.0),
+            total_ms = format_args!("{:.1}", (t3 - t0).as_secs_f64() * 1000.0),
+            blocks = used_blocks.len(),
+            "Hybrid prefix snapshot captured"
+        );
+        Ok(snap)
+    }
+
+    /// Restore a host-RAM [`HybridPrefixSnapshot`] into `(slot, block_table)` on device.
+    pub fn restore_prefix(
+        &self,
+        cache: &mut HybridCache,
+        slot: usize,
+        block_table: &[u32],
+        snap: &HybridPrefixSnapshot,
+    ) -> Result<()> {
+        let dst_blocks = &block_table[..snap.num_blocks.min(block_table.len())];
+        cache.restore_state_from_cpu(
+            slot,
+            dst_blocks,
+            &snap.kv_layers,
+            &snap.gdn_layers,
+            snap.ple_state.as_ref(),
+        )?;
+        for (layer_idx, raw_cpu, bk_cpu) in &snap.qsa_aux_layers {
+            if let Some(layer) = self.layers.get(*layer_idx) {
+                if let Mixer::Attention(attn) = &layer.mixer {
+                    attn.restore_aux_blocks(dst_blocks, cache.block_size(), raw_cpu, bk_cpu)?;
+                }
+            } else if let Some(mtp) = &self.mtp {
+                if *layer_idx == mtp.kv_layer_idx() {
+                    mtp.attn
+                        .restore_aux_blocks(dst_blocks, cache.block_size(), raw_cpu, bk_cpu)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run one Built-in MTP drafter step (warm-up chunk or chained draft token).

@@ -45,6 +45,6 @@ pub use profile::Profile;
 #[cfg(test)]
 pub(in crate::memory) use slot::slot_bytes_from_qtensor;
 pub(crate) use slot::{slot_bytes_from_stack, Bank, Projections, Slot, SlotBuf, SlotData};
-#[cfg(test)]
-pub(in crate::memory) use staging::staging_ring_slots;
-pub(crate) use staging::{alloc_bank_in, StagingRings, STAGING_RING_FIRST};
+pub(crate) use staging::{
+    alloc_bank_in, staging_key, staging_ring_slots, StagingRings, STAGING_RING_FIRST,
+};

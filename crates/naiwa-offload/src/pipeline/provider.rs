@@ -82,6 +82,9 @@ pub struct GpuCacheMoeProvider {
     lookahead: bool,
     /// `--expert-profile`: the experts to put in the cache before the first token (strata's ranking).
     profile: Option<Arc<Profile>>,
+    /// Optional per-layer slot counts precomputed from the global `--expert-profile` ranking
+    /// (replaces uniform `budget / 48` splitting when present).
+    planned_layer_slots: Option<Vec<usize>>,
     /// `NAIWA_CACHE_SLAB=1`: every layer's bank is carved from this one allocation instead of its own, so the
     /// cache's bytes are a contiguous pool the prefill stream can borrow from.
     slab: std::sync::OnceLock<Option<Arc<Slab>>>,
@@ -181,9 +184,16 @@ impl GpuCacheMoeProvider {
             lookahead_swaps,
             lookahead,
             profile,
+            planned_layer_slots: None,
             slab: std::sync::OnceLock::new(),
             borrow_gate: Arc::new(BorrowGate::default()),
         }
+    }
+
+    /// Supply precomputed per-layer slot counts (e.g. from global profile frequency ranking).
+    pub fn with_layer_slots(mut self, slots: Vec<usize>) -> Self {
+        self.planned_layer_slots = Some(slots);
+        self
     }
 
     /// v2 M1: materialize every quant shape's staging ring now, i.e. after model load but
@@ -293,6 +303,22 @@ impl GpuCacheMoeProvider {
         // graphs off 44.1 - identical, so the eager segment is the one fixed configuration.
         let mut rings = 0usize;
         if self.pcie_frac > 0.0 {
+            // Compute max per-projection expert bytes across all layers so all quant shapes share
+            // ONE ~40 MiB staging pool instead of 7 separate 16-slot allocations (~215 MiB).
+            if let Some(first) = layers.first() {
+                let mut max_proj = [0usize; 3];
+                for layer in &layers {
+                    if let Some((g, u, d)) = layer.cpu().expert_qtensors() {
+                        let stacks = [g, u, d];
+                        for (i, s) in stacks.iter().enumerate() {
+                            if let Ok(r) = crate::memory::expert_range(s, 0) {
+                                max_proj[i] = max_proj[i].max(r.len());
+                            }
+                        }
+                    }
+                }
+                self.staging.warmup_pool(max_proj, first.slot_device())?;
+            }
             for layer in &layers {
                 layer.warmup_staging_ring()?;
             }
@@ -385,13 +411,8 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
 
         let mut inner = self.inner.lock().unwrap();
 
-        // On first call, compute per-layer quota.  We assume all layers use the same weight
-        // shape (true for Qwen3.8-Flash-Next).  Since we don't know n_layers up front, we
-        // set bytes_per_layer lazily and refine downward as more layers arrive.
+        // On first call, compute per-layer quota (or report the precomputed global profile plan).
         if inner.bytes_per_layer.is_none() {
-            // Estimate: 48 decoder layers is the Qwen3.8-Flash-Next default; the real value is
-            // refined as layers arrive.  The quota can only stay the same or shrink, never grow,
-            // because earlier layers have already claimed their slots.
             let estimated_layers = 48u64;
             if let Some(free) = crate::transport::copy_stream::free_bytes(&ctx.layer_device) {
                 info!(
@@ -402,23 +423,48 @@ impl RoutedExpertsProvider for GpuCacheMoeProvider {
             }
             let per_layer = inner.remaining_bytes / estimated_layers;
             inner.bytes_per_layer = Some(per_layer);
-            info!(
-                "expert cache: {:.1} GB total, ~{} slots/layer (estimated {} layers, {} bytes/slot for layer 0; \
-                 every layer's slots are priced from its own three projections, so the count varies by layer)",
-                self.cache_gb,
-                per_layer / slot_bytes.max(1),
-                estimated_layers,
-                slot_bytes,
-            );
+            if let Some(plan) = &self.planned_layer_slots {
+                let total: usize = plan.iter().sum();
+                let min_s = plan.iter().copied().min().unwrap_or(0);
+                let max_s = plan.iter().copied().max().unwrap_or(0);
+                info!(
+                    "expert cache: {:.2} GiB total, {} planned slots across {} layers \
+                     (global profile-weighted: min={}, max={}, avg={:.1}/layer)",
+                    self.cache_gb,
+                    total,
+                    plan.len(),
+                    min_s,
+                    max_s,
+                    total as f64 / plan.len().max(1) as f64,
+                );
+            } else {
+                info!(
+                    "expert cache: {:.1} GB total, ~{} slots/layer (estimated {} layers, {} bytes/slot for layer 0; \
+                     every layer's slots are priced from its own three projections, so the count varies by layer)",
+                    self.cache_gb,
+                    per_layer / slot_bytes.max(1),
+                    estimated_layers,
+                    slot_bytes,
+                );
+            }
         }
 
-        let per_layer_budget = inner.bytes_per_layer.unwrap();
-        let num_slots = ((per_layer_budget / slot_bytes.max(1)) as usize).min(num_experts);
+        let num_slots = if let Some(planned) = self
+            .planned_layer_slots
+            .as_ref()
+            .and_then(|p| p.get(ctx.site.layer).copied())
+        {
+            let max_by_rem = (inner.remaining_bytes / slot_bytes.max(1)) as usize;
+            planned.min(num_experts).min(max_by_rem)
+        } else {
+            let per_layer_budget = inner.bytes_per_layer.unwrap();
+            ((per_layer_budget / slot_bytes.max(1)) as usize).min(num_experts)
+        };
 
         if num_slots == 0 {
             debug!(
-                "expert cache: layer {} gets 0 slots ({} bytes/slot > {}/layer budget); skipping",
-                ctx.site.layer, slot_bytes, per_layer_budget
+                "expert cache: layer {} gets 0 slots ({} bytes/slot, remaining {} B); skipping",
+                ctx.site.layer, slot_bytes, inner.remaining_bytes
             );
             drop(inner);
             let (pinned, prefill) = attach_prefill(

@@ -25,6 +25,116 @@ use crate::qwen4_exp::{
     text::{DecoderLayer, Mixer, Qwen4ExpModel},
 };
 
+/// Exact pre-load VRAM accounting derived from GGUF tensor headers (zero I/O or GPU alloc).
+#[derive(Clone, Debug)]
+pub struct ModelVramPlan {
+    /// Per-layer routed expert slot byte size (`gate + up + down` for 1 expert).
+    pub layer_slot_bytes: Vec<u64>,
+    /// Maximum single-expert projection byte size `[gate, up, down]` across all layers.
+    pub max_proj_bytes: [u64; 3],
+    /// Total GPU bytes for all non-routed-expert base model weights.
+    pub base_dense_bytes: u64,
+    /// Total GPU bytes for the MTP head if `load_mtp` is true (Q2_0 drafter pool + MTP dense).
+    pub mtp_bytes: u64,
+}
+
+/// Compute exact pre-load GPU VRAM requirements from an already-opened [`GgufArchive`].
+pub fn estimate_model_vram(
+    archive: &GgufArchive,
+    cfg: &Qwen4ExpConfig,
+    dtype: DType,
+    load_mtp: bool,
+) -> Result<ModelVramPlan> {
+    let mut layer_slot_bytes = vec![0u64; cfg.num_hidden_layers];
+    let mut max_proj_bytes = [0u64; 3];
+    for (l, slot_b) in layer_slot_bytes.iter_mut().enumerate() {
+        let names = [
+            format!("blk.{l}.ffn_gate_exps.weight"),
+            format!("blk.{l}.ffn_up_exps.weight"),
+            format!("blk.{l}.ffn_down_exps.weight"),
+        ];
+        let mut sum = 0u64;
+        for (p, name) in names.iter().enumerate() {
+            if let Ok(info) = archive.tensor_info(name) {
+                if let Some(total) = info.byte_len() {
+                    let per_exp = (total / cfg.num_experts.max(1)) as u64;
+                    sum += per_exp;
+                    max_proj_bytes[p] = max_proj_bytes[p].max(per_exp);
+                }
+            }
+        }
+        *slot_b = sum;
+    }
+
+    let mtp_prefix = cfg.mtp_block_idx.map(|b| format!("blk.{b}."));
+    let host_iq_embed = !cfg.tie_word_embeddings
+        && archive
+            .tensor_info("token_embd.weight")
+            .ok()
+            .is_some_and(|info| matches!(info.dtype().raw(), 18 | 20 | 21 | 22 | 23 | 39));
+
+    let mut base_dense_bytes = 0u64;
+    let mut mtp_dense_bytes = 0u64;
+    let target_elem = dtype.size_in_bytes() as u64;
+
+    for (name, info) in archive.tensors() {
+        if name == "per_layer_token_embd.weight" {
+            continue; // host mmap PLE table
+        }
+        if name == "token_embd.weight" && host_iq_embed {
+            continue; // host IQ embedding table
+        }
+        if name.ends_with("_exps.weight") {
+            continue; // routed experts live on host (or Q2_0 resident pool for MTP)
+        }
+        let raw = info.dtype().raw();
+        let bytes = if matches!(raw, 0 | 1 | 30) {
+            // Unquantized tensors are stored as F32 (for norms/ssm_a/dt_bias) or model `dtype`.
+            let elem = if name.contains("hc_") && name.ends_with("_norm.weight")
+                || name.contains("ple_norm_")
+                || name.ends_with("ple_conv1d.weight")
+                || name.ends_with("indexer.k_norm.weight")
+                || name.ends_with("ssm_a")
+                || name.ends_with("ssm_dt.bias")
+            {
+                4u64
+            } else {
+                target_elem
+            };
+            info.elem_count().unwrap_or(0) as u64 * elem
+        } else {
+            info.byte_len().unwrap_or(0) as u64
+        };
+        let is_mtp = mtp_prefix.as_deref().is_some_and(|p| name.starts_with(p))
+            || name.starts_with("nextn.");
+        if is_mtp {
+            mtp_dense_bytes += bytes;
+        } else {
+            base_dense_bytes += bytes;
+        }
+    }
+
+    let mtp_bytes = if load_mtp && cfg.mtp_block_idx.is_some() {
+        // Resident Q2_0 drafter pool: 3 projections * [mtp_num_experts, inter, hidden] at 18B / 64 elems.
+        let q2_0_exps = 3u64
+            * cfg.mtp_num_experts as u64
+            * cfg.moe_intermediate_size as u64
+            * cfg.hidden_size as u64
+            / 64
+            * 18;
+        mtp_dense_bytes + q2_0_exps
+    } else {
+        0
+    };
+
+    Ok(ModelVramPlan {
+        layer_slot_bytes,
+        max_proj_bytes,
+        base_dense_bytes,
+        mtp_bytes,
+    })
+}
+
 /// Open one or more GGUF files/components (handling split shards + merged MTP component) into a
 /// single [`GgufArchive`].
 pub fn open_gguf_archive<P: AsRef<Path>>(paths: &[P]) -> Result<Arc<GgufArchive>> {
@@ -349,6 +459,8 @@ fn load_ple(
         device,
         DType::F32,
     )?;
+    let conv_weight_act = conv_weight.to_dtype(dtype)?.contiguous()?;
+    let zero_slot = Tensor::zeros((1,), DType::U32, device)?;
     Ok(PleLayer {
         cfg: ple_cfg.clone(),
         hash,
@@ -359,6 +471,8 @@ fn load_ple(
         norm_query,
         norm_conv,
         conv_weight,
+        conv_weight_act,
+        zero_slot,
         hc: cfg.hc_count,
         hidden: cfg.hidden_size,
         eps: cfg.rms_norm_eps,

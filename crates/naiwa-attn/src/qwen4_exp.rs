@@ -117,6 +117,33 @@ mod ffi {
             dtype: i32,
             stream: i64,
         );
+        #[link_name = "naiwa_qwen4_hc_down_inject_act"]
+        pub(super) fn qwen4_hc_down_inject_act(
+            xn: *const c_void,
+            w_down: *const c_void,
+            w_inject: *const c_void,
+            lo_out: *mut c_void,
+            inject_out: *mut c_void,
+            tokens: i32,
+            rank: i32,
+            hc: i32,
+            width: i32,
+            dtype: i32,
+            stream: i64,
+        );
+        #[link_name = "naiwa_qwen4_hc_up_mix"]
+        pub(super) fn qwen4_hc_up_mix(
+            xn: *const c_void,
+            lo: *const c_void,
+            w_up: *const c_void,
+            out: *mut c_void,
+            tokens: i32,
+            rank: i32,
+            hc: i32,
+            hidden: i32,
+            dtype: i32,
+            stream: i64,
+        );
         #[link_name = "naiwa_qwen4_hc_combine"]
         pub(super) fn qwen4_hc_combine(
             res: *const c_void,
@@ -482,6 +509,91 @@ pub fn hc_mix(xn: &Tensor, gate: &Tensor, hc: usize) -> Result<Tensor> {
             dev_ptr(&gate)? as *const _,
             dev_ptr(&out)? as *mut _,
             tokens as i32,
+            hc as i32,
+            hidden as i32,
+            dtype_code(xn.dtype())?,
+            stream(xn.device())?,
+        );
+    }
+    Ok(out)
+}
+
+/// Maximum token count handled by the fused small-batch Hyper-Connection kernels.
+pub const HC_FUSED_MAX_TOKENS: usize = 8;
+
+/// Fused `lo = silu((xn @ w_down^T) / hc)` and optional `inject = xn @ w_inject^T` for `tokens <= 8`.
+pub fn hc_down_inject_act(
+    xn: &Tensor,
+    w_down: &Tensor,
+    w_inject: Option<&Tensor>,
+    hc: usize,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let xn = xn.contiguous()?;
+    let w_down = w_down.contiguous()?;
+    let w_inject = w_inject.map(|w| w.contiguous()).transpose()?;
+    let width = xn.dim(candle_core::D::Minus1)?;
+    let (rank, w_in) = w_down.dims2()?;
+    if w_in != width {
+        candle_core::bail!("hc_down_inject_act: w_down in_dim {w_in} != xn width {width}");
+    }
+    let tokens = xn.elem_count() / width;
+    if tokens == 0 || tokens > HC_FUSED_MAX_TOKENS {
+        candle_core::bail!("hc_down_inject_act: tokens {tokens} not in 1..={HC_FUSED_MAX_TOKENS}");
+    }
+    let mut lo_shape = xn.dims().to_vec();
+    *lo_shape.last_mut().expect("rank >= 1") = rank;
+    let lo_out = empty(&lo_shape, xn.dtype(), xn.device())?;
+    let inject_out = if w_inject.is_some() {
+        let mut inj_shape = xn.dims().to_vec();
+        *inj_shape.last_mut().expect("rank >= 1") = hc;
+        Some(empty(&inj_shape, xn.dtype(), xn.device())?)
+    } else {
+        None
+    };
+    unsafe {
+        ffi::qwen4_hc_down_inject_act(
+            dev_ptr(&xn)? as *const _,
+            dev_ptr(&w_down)? as *const _,
+            opt_ptr(w_inject.as_ref())? as *const _,
+            dev_ptr(&lo_out)? as *mut _,
+            opt_ptr(inject_out.as_ref())? as *mut _,
+            tokens as i32,
+            rank as i32,
+            hc as i32,
+            width as i32,
+            dtype_code(xn.dtype())?,
+            stream(xn.device())?,
+        );
+    }
+    Ok((lo_out, inject_out))
+}
+
+/// Fused `out[t, i] = mean_c(xn[t, c, i] * sigmoid((lo[t] @ w_up^T)[c, i]))` for `tokens <= 8`.
+pub fn hc_up_mix(xn: &Tensor, lo: &Tensor, w_up: &Tensor, hc: usize) -> Result<Tensor> {
+    let xn = xn.contiguous()?;
+    let lo = lo.contiguous()?;
+    let w_up = w_up.contiguous()?;
+    let width = xn.dim(candle_core::D::Minus1)?;
+    let hidden = width / hc;
+    let (w_out, rank) = w_up.dims2()?;
+    if w_out != width {
+        candle_core::bail!("hc_up_mix: w_up out_dim {w_out} != xn width {width}");
+    }
+    let tokens = xn.elem_count() / width;
+    if tokens == 0 || tokens > HC_FUSED_MAX_TOKENS {
+        candle_core::bail!("hc_up_mix: tokens {tokens} not in 1..={HC_FUSED_MAX_TOKENS}");
+    }
+    let mut shape = xn.dims().to_vec();
+    *shape.last_mut().expect("rank >= 1") = hidden;
+    let out = empty(&shape, xn.dtype(), xn.device())?;
+    unsafe {
+        ffi::qwen4_hc_up_mix(
+            dev_ptr(&xn)? as *const _,
+            dev_ptr(&lo)? as *const _,
+            dev_ptr(&w_up)? as *const _,
+            dev_ptr(&out)? as *mut _,
+            tokens as i32,
+            rank as i32,
             hc as i32,
             hidden as i32,
             dtype_code(xn.dtype())?,
@@ -1140,6 +1252,67 @@ mod tests {
             keys.to_dtype(DType::F32)?.to_vec2::<f32>()?,
             fresh_keys.to_dtype(DType::F32)?.to_vec2::<f32>()?
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn hc_fused_matches_unfused_bf16() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::BF16;
+        let hc = 4usize;
+        let hidden = 256usize;
+        let width = hc * hidden;
+        let rank = 64usize;
+        for tokens in [1usize, 3usize] {
+            let xn = (Tensor::arange(0u32, (tokens * width) as u32, &device)?
+                .to_dtype(DType::F32)?
+                .reshape((1, tokens, width))?
+                * 0.013)?
+                .sin()?
+                .to_dtype(dtype)?;
+            let w_down = (Tensor::arange(0u32, (rank * width) as u32, &device)?
+                .to_dtype(DType::F32)?
+                .reshape((rank, width))?
+                * 0.007)?
+                .cos()?
+                .to_dtype(dtype)?;
+            let w_up = (Tensor::arange(0u32, (width * rank) as u32, &device)?
+                .to_dtype(DType::F32)?
+                .reshape((width, rank))?
+                * 0.011)?
+                .sin()?
+                .to_dtype(dtype)?;
+            let w_inject = (Tensor::arange(0u32, (hc * width) as u32, &device)?
+                .to_dtype(DType::F32)?
+                .reshape((hc, width))?
+                * 0.017)?
+                .cos()?
+                .to_dtype(dtype)?;
+
+            // Unfused reference
+            let xn2 = xn.reshape((tokens, width))?;
+            let lo_ref = candle_nn::ops::silu(&(xn2.matmul(&w_down.t()?)? / hc as f64)?)?;
+            let gate_ref = lo_ref.matmul(&w_up.t()?)?.reshape((1, tokens, width))?;
+            let h_ref = hc_mix(&xn, &gate_ref, hc)?;
+            let inj_ref = xn2.matmul(&w_inject.t()?)?.reshape((1, tokens, hc))?;
+
+            // Fused kernels
+            let (lo_fused, inj_fused) = hc_down_inject_act(&xn, &w_down, Some(&w_inject), hc)?;
+            let inj_fused = inj_fused.expect("inject");
+            let h_fused = hc_up_mix(&xn, &lo_fused, &w_up, hc)?;
+
+            let diff_h: f32 = (&h_ref.to_dtype(DType::F32)? - &h_fused.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar()?;
+            let diff_inj: f32 = (&inj_ref.to_dtype(DType::F32)? - &inj_fused.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar()?;
+            assert!(diff_h < 0.05, "tokens={tokens} diff_h={diff_h}");
+            assert!(diff_inj < 0.15, "tokens={tokens} diff_inj={diff_inj}");
+        }
         Ok(())
     }
 }

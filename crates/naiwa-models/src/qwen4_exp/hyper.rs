@@ -29,6 +29,25 @@ impl GatedResidual {
 
     /// Block input: mean over streams of `xn * sigmoid(up(silu(down(xn) / hc)))`.
     pub(crate) fn mix(&self, xn: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if xn.device().is_cuda() && matches!(xn.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            if let (Some(w_down), Some(w_up)) = (self.down.dense_weight(), self.up.dense_weight()) {
+                let width = xn.dim(D::Minus1)?;
+                let tokens = xn.elem_count() / width.max(1);
+                if tokens > 0
+                    && tokens <= naiwa_attn::qwen4_exp::HC_FUSED_MAX_TOKENS
+                    && w_down.dtype() == xn.dtype()
+                    && w_up.dtype() == xn.dtype()
+                {
+                    let (lo, _) = naiwa_attn::qwen4_exp::hc_down_inject_act(xn, w_down, None, self.hc)?;
+                    probe::boundary(&lo, usize::MAX, "mix_down");
+                    probe::boundary(&lo, usize::MAX, "mix_act");
+                    let out = naiwa_attn::qwen4_exp::hc_up_mix(xn, &lo, w_up, self.hc)?;
+                    probe::boundary(&out, usize::MAX, "mix_up");
+                    return Ok(out);
+                }
+            }
+        }
         let lo = self.down.forward(xn)?;
         probe::boundary(&lo, usize::MAX, "mix_down");
         let lo = candle_nn::ops::silu(&(lo / self.hc as f64)?)?;
@@ -48,6 +67,43 @@ impl GatedResidual {
             .to_dtype(DType::F32)?
             .mean(D::Minus2)?
             .to_dtype(xn.dtype())
+    }
+
+    /// Fused `(mix(xn), inject(xn))` — on CUDA for `tokens <= 8`, reads `xn` once across
+    /// `down + silu + inject` (1 launch instead of 4) and fuses `up + hc_mix` (1 launch instead of 2).
+    pub(crate) fn mix_and_inject(&self, xn: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        if xn.device().is_cuda() && matches!(xn.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            if let (Some(w_down), Some(w_up), Some(w_inj)) = (
+                self.down.dense_weight(),
+                self.up.dense_weight(),
+                self.inject.as_ref().and_then(|l| l.dense_weight()),
+            ) {
+                let width = xn.dim(D::Minus1)?;
+                let tokens = xn.elem_count() / width.max(1);
+                if tokens > 0
+                    && tokens <= naiwa_attn::qwen4_exp::HC_FUSED_MAX_TOKENS
+                    && w_down.dtype() == xn.dtype()
+                    && w_up.dtype() == xn.dtype()
+                    && w_inj.dtype() == xn.dtype()
+                {
+                    let (lo, inj) = naiwa_attn::qwen4_exp::hc_down_inject_act(
+                        xn,
+                        w_down,
+                        Some(w_inj),
+                        self.hc,
+                    )?;
+                    probe::boundary(&lo, usize::MAX, "mix_down");
+                    probe::boundary(&lo, usize::MAX, "mix_act");
+                    let out = naiwa_attn::qwen4_exp::hc_up_mix(xn, &lo, w_up, self.hc)?;
+                    probe::boundary(&out, usize::MAX, "mix_up");
+                    return Ok((out, inj.expect("w_inj was Some")));
+                }
+            }
+        }
+        let h = self.mix(xn)?;
+        let inject = self.inject(xn)?;
+        Ok((h, inject))
     }
 
     /// Raw per-stream injection logits `[.., hc]`.
