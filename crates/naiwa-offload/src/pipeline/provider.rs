@@ -326,6 +326,14 @@ impl GpuCacheMoeProvider {
         }
         Ok((captures, rings))
     }
+
+    /// Re-plan `--prefill-stream` after `HybridCache` is allocated so chunk sizing uses actual
+    /// post-KV free VRAM instead of subtracting `kv_reserve()` twice.
+    pub fn replan_prefill_after_kv(&self) {
+        if let Some(prefill) = &self.prefill {
+            prefill.plan_after_kv();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

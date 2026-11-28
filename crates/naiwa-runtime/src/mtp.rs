@@ -85,6 +85,10 @@ pub struct VerifyOutcome {
     pub keep_rows: usize,
 }
 
+/// Maximum tokens per `MtpHead::forward` sub-chunk during prompt warmup so MTP activations
+/// stay under ~60 MiB VRAM even when prefilling long multi-turn prompts on 12 GB GPUs.
+const MTP_WARMUP_SUBCHUNK: usize = 128;
+
 /// Warm up the MTP KV cache on a prefill chunk (`start..start+len`) where the shifted next tokens
 /// `shifted_tokens` (length `len`) are already known.
 ///
@@ -106,40 +110,59 @@ pub fn mtp_warmup_chunk(
 ) -> Result<Option<(DraftProposal, Tensor)>> {
     let len = shifted_tokens.len();
     debug_assert_eq!(len, spec_hidden.dim(1)?);
-    let end_kv_len = start_pos + len;
 
-    let embeds = model.embed_tokens_host(shifted_tokens, &[1, len])?;
-    let pos_vec: Vec<u32> = (start_pos as u32..end_kv_len as u32).collect();
-    let pos_t = Tensor::from_slice(&pos_vec, (1, len), device)?;
+    let mut sub_start = 0usize;
+    let mut last_out = None;
+    while sub_start < len {
+        let sub_len = MTP_WARMUP_SUBCHUNK.min(len - sub_start);
+        let sub_pos = start_pos + sub_start;
+        let end_kv_len = sub_pos + sub_len;
+        let sub_tokens = &shifted_tokens[sub_start..sub_start + sub_len];
+        let sub_hidden = if sub_start == 0 && sub_len == len {
+            spec_hidden.clone()
+        } else {
+            spec_hidden.narrow(1, sub_start, sub_len)?.contiguous()?
+        };
 
-    let is_single = len == 1;
-    let meta = bm.build_meta(&[block_table], &[end_kv_len], &[len], is_single, device)?;
-    let spans = [(0usize, len)];
-    let kv_lens = [end_kv_len];
+        let embeds = model.embed_tokens_host(sub_tokens, &[1, sub_len])?;
+        let pos_vec: Vec<u32> = (sub_pos as u32..end_kv_len as u32).collect();
+        let pos_t = Tensor::from_slice(&pos_vec, (1, sub_len), device)?;
 
-    let out = model.forward_mtp(
-        &MtpForwardInput {
-            input_embeds: &embeds,
-            target_hidden: spec_hidden,
-            position_ids: &pos_t,
-            paged_meta: &meta,
-            chunk_spans: (!is_single).then_some((&spans[..], &kv_lens[..])),
-        },
-        cache,
-    )?;
+        let is_single = sub_len == 1;
+        let meta = bm.build_meta(&[block_table], &[end_kv_len], &[sub_len], is_single, device)?;
+        let spans = [(0usize, sub_len)];
+        let kv_lens = [end_kv_len];
+
+        let out = model.forward_mtp(
+            &MtpForwardInput {
+                input_embeds: &embeds,
+                target_hidden: &sub_hidden,
+                position_ids: &pos_t,
+                paged_meta: &meta,
+                chunk_spans: (!is_single).then_some((&spans[..], &kv_lens[..])),
+            },
+            cache,
+        )?;
+
+        sub_start += sub_len;
+        if sub_start == len {
+            last_out = Some((out, sub_len));
+        }
+    }
 
     if !propose_first_draft {
         return Ok(None);
     }
 
-    let last_logits_hidden = out.logits_hidden.i((0, len - 1))?.unsqueeze(0)?; // [1, hidden]
+    let (out, last_len) = last_out.expect("non-empty mtp_warmup_chunk");
+    let last_logits_hidden = out.logits_hidden.i((0, last_len - 1))?.unsqueeze(0)?; // [1, hidden]
     let logits = if sampler.is_greedy() || mtp_cfg.draft_sampling == MtpDraftSampling::Greedy {
         model.lm_head_forward_raw(&last_logits_hidden)?
     } else {
         model.lm_head_forward(&last_logits_hidden)?
     };
     let proposal = sample_draft(&logits, sampler, mtp_cfg)?;
-    let last_chain = out.chain_hidden.narrow(1, len - 1, 1)?.contiguous()?; // [1, 1, hc*hidden]
+    let last_chain = out.chain_hidden.narrow(1, last_len - 1, 1)?.contiguous()?; // [1, 1, hc*hidden]
     Ok(Some((proposal, last_chain)))
 }
 

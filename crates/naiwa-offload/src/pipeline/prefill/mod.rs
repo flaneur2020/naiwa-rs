@@ -138,6 +138,14 @@ impl PrefillStream {
         Some(decision.chunk)
     }
 
+    /// Re-plan once `HybridCache` is already allocated in VRAM (`kv_reserve = 0`).
+    pub(super) fn plan_after_kv(&self) -> Option<usize> {
+        let (decision, free) = self.decide_with_reserve(0)?;
+        *self.plan.lock().unwrap() = Some(decision);
+        log_plan(self, decision, free, "post-kv");
+        Some(decision.chunk)
+    }
+
     /// Run `layer`'s routed experts on the GPU. `None`: this chunk or layer stays on the CPU.
     pub fn forward(
         &self,
@@ -291,6 +299,22 @@ impl PrefillStreams {
             "prefill: the scheduler's prompt step is capped at {chunk} tokens (from \
              --max-num-batched-tokens/--max-prefill-chunk-tokens {})",
             prompt_step_ceiling()
+        );
+        Some(chunk)
+    }
+
+    /// Re-run the prefill memory plan after `HybridCache` is allocated (`kv_reserve = 0`) and
+    /// update the scheduler's prompt chunk ceiling before serving requests.
+    pub fn plan_after_kv(&self) -> Option<usize> {
+        let streams = self.streams.lock().unwrap();
+        let chunk = streams
+            .iter()
+            .filter_map(|(_, stream)| stream.plan_after_kv())
+            .min()?;
+        drop(streams);
+        publish_prompt_step_ceiling(chunk);
+        info!(
+            "prefill: post-KV prompt step capped at {chunk} tokens"
         );
         Some(chunk)
     }

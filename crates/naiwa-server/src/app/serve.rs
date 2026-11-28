@@ -88,6 +88,11 @@ pub async fn run_serve(
         engine_cfg,
     )?;
 
+    #[cfg(feature = "cuda")]
+    if let Some(provider) = &loaded.provider {
+        provider.replan_prefill_after_kv();
+    }
+
     let app = build_router(AppState {
         engine,
         enable_metrics: !server.disable_metrics,

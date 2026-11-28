@@ -76,13 +76,18 @@ impl PrefillStream {
 
     /// Measure now and return what fits, or `None` if nothing does.
     pub(super) fn decide(&self) -> Option<(Plan, usize)> {
+        self.decide_with_reserve(kv_reserve())
+    }
+
+    /// Measure now with an explicit KV reserve (`0` once `HybridCache` is already allocated).
+    pub(super) fn decide_with_reserve(&self, reserve: usize) -> Option<(Plan, usize)> {
         let free = crate::transport::copy_stream::free_bytes(&self.device).unwrap_or(0);
         let (stride, chunk) = plan_with_lend_depth(
             free,
             self.layer_bytes(),
             prompt_step_ceiling(),
             self.borrows(),
-            kv_reserve(),
+            reserve,
             self.lend_bytes(),
             self.depth,
         )?;
@@ -176,13 +181,17 @@ impl PrefillStream {
     }
 
     /// Re-check the warmup plan once on the first long chunk and publish any smaller prompt step.
+    ///
+    /// By the time a prompt runs, `HybridCache` (KV + GDN + QSA aux) is already allocated in VRAM,
+    /// so we pass `reserve = 0` instead of double-counting `kv_reserve()`.
     pub(super) fn reserve(&self) -> candle_core::Result<usize> {
         let first = !self.checked.swap(true, Ordering::AcqRel);
         if !first {
             return Ok(self.current().stride);
         }
+        let _ = trim_device_pool(&self.device);
         let previous = self.current();
-        match self.decide() {
+        match self.decide_with_reserve(0) {
             Some((now, free)) => {
                 let decision = Plan {
                     stride: now.stride.min(previous.stride.max(1)),
@@ -207,9 +216,9 @@ impl PrefillStream {
                 let mib = |b: usize| (b as f64) / (1u64 << 20) as f64;
                 let free = crate::transport::copy_stream::free_bytes(&self.device).unwrap_or(0);
                 let floor = if self.borrows() {
-                    chunk_scratch(PLAN_GRID) + MAX_HEADROOM + kv_reserve()
+                    chunk_scratch(PLAN_GRID) + super::planner::CHUNK_HEAD
                 } else {
-                    self.layer_bytes() + chunk_scratch(PLAN_GRID) + MAX_HEADROOM + kv_reserve()
+                    self.layer_bytes() + chunk_scratch(PLAN_GRID) + MAX_HEADROOM
                 };
                 let give_up = {
                     let mut r = 0usize;
@@ -219,7 +228,7 @@ impl PrefillStream {
                             self.layer_bytes(),
                             prompt_step_ceiling(),
                             self.borrows(),
-                            kv_reserve(),
+                            0,
                         )
                         .is_some()
                         {
@@ -231,8 +240,8 @@ impl PrefillStream {
                 };
                 warn!(
                     "prefill stream: off ({} + {:.0} MiB chunk scratch for a {}-row chunk + \
-                     {:.0} MiB headroom + {:.0} MiB KV reserve = {:.0} MiB does not fit in {:.0} MiB free, of \
-                     which the KV will take its own {:.0}). The whole prompt then runs on the CPU, 41x slower: \
+                     {:.0} MiB headroom = {:.0} MiB does not fit in {:.0} MiB free). \
+                     The whole prompt then runs on the CPU, 41x slower: \
                      drop --expert-cache-gb by at least {:.2} GB (or drop --prefill-stream, or set \
                      NAIWA_PREFILL_ALLOW_CPU=1 to accept the slow path)",
                     if self.borrows() {
@@ -242,11 +251,13 @@ impl PrefillStream {
                     },
                     mib(chunk_scratch(previous.chunk.max(PLAN_GRID))),
                     previous.chunk.max(PLAN_GRID),
-                    mib(MAX_HEADROOM),
-                    mib(kv_reserve()),
+                    mib(if self.borrows() {
+                        super::planner::CHUNK_HEAD
+                    } else {
+                        MAX_HEADROOM
+                    }),
                     mib(floor),
                     mib(free),
-                    mib(kv_reserve()),
                     (give_up as f64) / (1024.0 * 1024.0 * 1024.0),
                 );
                 if !Self::allow_cpu() {

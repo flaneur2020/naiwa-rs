@@ -181,10 +181,11 @@ pub fn load_model(
                 let free = pre_free
                     .context("`--expert-cache-gb auto` requires a CUDA device with free VRAM info")?
                     as u64;
+                let default_reserve_mib: u64 = if model_opts.prefill_stream { 800 } else { 550 };
                 let reserve_mib: u64 = std::env::var("NAIWA_AUTO_CACHE_RESERVE_MIB")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(550);
+                    .unwrap_or(default_reserve_mib);
                 let reserve_bytes = reserve_mib << 20;
                 let non_cache = vram_plan.base_dense_bytes
                     + vram_plan.mtp_bytes
